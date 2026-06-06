@@ -705,7 +705,7 @@ def select_paper_pages(
     return selected
 
 
-def render_pdf_pages_for_llm(paper_path: Path, pages: list[int]) -> list[LLMImage]:
+def render_pdf_pages_for_llm(paper_path: Path, pages: list[int] | None = None, max_pages: int = MAX_PAPER_PAGES) -> list[LLMImage]:
     try:
         import fitz
     except ImportError as exc:
@@ -714,7 +714,9 @@ def render_pdf_pages_for_llm(paper_path: Path, pages: list[int]) -> list[LLMImag
     images: list[LLMImage] = []
     document = fitz.open(str(paper_path))
     try:
-        for page_number in pages[:MAX_PAPER_PAGES]:
+        if pages is None:
+            pages = list(range(1, document.page_count + 1))
+        for page_number in pages[:max_pages]:
             if page_number < 1 or page_number > document.page_count:
                 continue
             page = document.load_page(page_number - 1)

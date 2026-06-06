@@ -50,10 +50,54 @@ def _load_text(path: Path) -> list[PaperChunk]:
 
 
 def _load_pdf(path: Path, max_pages: int | None) -> list[PaperChunk]:
+    """Chunk a PDF into text blocks. Prefer PyMuPDF (fitz) for higher-quality text
+    extraction (better layout and figure-caption handling than pypdf); fall back to pypdf
+    when fitz is unavailable or extracts nothing."""
+    chunks = _load_pdf_fitz(path, max_pages)
+    if chunks:
+        return chunks
+    return _load_pdf_pypdf(path, max_pages)
+
+
+def _load_pdf_fitz(path: Path, max_pages: int | None) -> list[PaperChunk]:
+    try:
+        import fitz
+    except ImportError:
+        return []
+    try:
+        document = fitz.open(str(path))
+    except Exception:
+        return []
+    chunks: list[PaperChunk] = []
+    try:
+        page_total = document.page_count
+        last_page = page_total if max_pages is None else min(max_pages, page_total)
+        for page_index in range(1, last_page + 1):
+            try:
+                text = (document.load_page(page_index - 1).get_text("text") or "").strip()
+            except Exception:
+                continue
+            if not text:
+                continue
+            for chunk_index, piece in enumerate(split_text(text), start=1):
+                chunks.append(
+                    PaperChunk(
+                        chunk_id=f"p{page_index}_c{chunk_index}",
+                        page=page_index,
+                        section=_guess_section(piece),
+                        text=piece,
+                    )
+                )
+    finally:
+        document.close()
+    return chunks
+
+
+def _load_pdf_pypdf(path: Path, max_pages: int | None) -> list[PaperChunk]:
     try:
         from pypdf import PdfReader
     except ImportError as exc:
-        raise RuntimeError("读取 PDF 需要安装 pypdf：python -m pip install pypdf") from exc
+        raise RuntimeError("读取 PDF 需要安装 pymupdf 或 pypdf：python -m pip install pymupdf pypdf") from exc
 
     reader = PdfReader(str(path))
     pages = reader.pages[:max_pages] if max_pages is not None else reader.pages

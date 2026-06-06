@@ -102,7 +102,7 @@ class ReviewPipeline:
         template_fallback: bool = True,
         prompt_adjustments: dict[str, str] | None = None,
         code_review: bool = False,
-        code_review_attempts: int = 1,
+        code_review_attempts: int = 5,
     ) -> PipelineResult:
         stage_cleanup = {
             "facts": "facts",
@@ -162,7 +162,7 @@ class ReviewPipeline:
         template_fallback: bool = True,
         prompt_adjustments: dict[str, str] | None = None,
         code_review: bool = False,
-        code_review_attempts: int = 1,
+        code_review_attempts: int = 5,
     ) -> PipelineResult:
         output_dir = output_dir.expanduser().resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -185,6 +185,11 @@ class ReviewPipeline:
         paper_context_raw = _paper_context_for_prompt(paper["chunks"])
         paper_context = wrap_untrusted("paper_chunks_json", paper_context_raw)
 
+        # Render paper pages once so fact-extraction (round 1) and code-generation (round 3)
+        # can SEE the figures/diagrams/in-figure values that plain text chunking drops.
+        # Empty for non-PDF papers or non-multimodal clients -> those stages stay text-only.
+        paper_images = self._render_paper_images(paper_path=paper_path, paper=paper)
+
         prompt_1 = self.prompt_book.render(
             "extract_engineering_facts.md",
             paper_chunks_json=paper_context,
@@ -200,6 +205,7 @@ class ReviewPipeline:
             max_attempts=json_repair_attempts + 1,
             resume=resume,
             prompt_adjustment=(prompt_adjustments or {}).get("facts"),
+            images=paper_images,
             extra_validation=lambda parsed: (
                 validate_fact_sources(parsed, valid_chunk_ids)
                 + engineering_facts_floor_issues(parsed)
@@ -266,6 +272,7 @@ class ReviewPipeline:
             paper_context_json=paper_context,
             template_fallback=template_fallback,
             project_timeout=project_timeout,
+            images=paper_images,
         )
         repro_project_dir = output_dir / "repro_project"
         written_files = self._ensure_repro_project_from_manifest(
@@ -504,6 +511,7 @@ class ReviewPipeline:
         candidate_normalizer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         truncation_recovery: Callable[[str], dict[str, Any] | None] | None = None,
         prompt_adjustment: str | None = None,
+        images: list | None = None,
     ) -> dict[str, Any]:
         if resume and output_path.exists():
             cached = _load_valid_stage_cache(
@@ -530,6 +538,7 @@ class ReviewPipeline:
                 request_timeout=request_timeout,
                 candidate_normalizer=candidate_normalizer,
                 truncation_recovery=truncation_recovery,
+                images=images,
             )
         except Exception as exc:
             if fallback_factory is None:
@@ -603,6 +612,7 @@ class ReviewPipeline:
         paper_context_json: str,
         template_fallback: bool,
         project_timeout: float | None,
+        images: list | None = None,
     ) -> dict[str, Any]:
         output_path = output_dir / "repro_project_manifest.json"
         stage_label = "03_generate_repro_project"
@@ -632,6 +642,7 @@ class ReviewPipeline:
                 audit_dir=audit_dir,
                 max_attempts=max_attempts,
                 request_timeout=project_timeout,
+                images=images,
             )
         except Exception as exc:
             if not template_fallback:
@@ -661,6 +672,7 @@ class ReviewPipeline:
         audit_dir: Path,
         max_attempts: int,
         request_timeout: float | None,
+        images: list | None = None,
     ) -> dict[str, Any]:
         facts_json = wrap_untrusted("engineering_facts_json", pretty_json(facts))
         tasks_json = wrap_untrusted("repro_tasks_json", pretty_json(tasks))
@@ -680,6 +692,7 @@ class ReviewPipeline:
             max_attempts=max_attempts,
             extra_validation=_validate_project_plan_paths,
             request_timeout=request_timeout,
+            images=images,
         )
         write_json(audit_dir / "03a_generate_repro_project_plan.json", plan)
 
@@ -704,6 +717,9 @@ class ReviewPipeline:
                 max_attempts=max_attempts,
                 extra_validation=lambda candidate, expected=path: _validate_project_file(candidate, expected),
                 request_timeout=request_timeout,
+                # Page images are sent to the plan (03a) only, not to every per-file call:
+                # the plan already encodes the figures' design and each file follows it, so
+                # this avoids re-uploading all page images once per generated file.
             )
             file_item = {"path": parsed["path"], "content_lines": parsed["content_lines"]}
             files.append(file_item)
@@ -821,6 +837,39 @@ class ReviewPipeline:
         write_json(output_dir / "runtime_result.json", runtime_result)
         return runtime_result
 
+    def _render_paper_images(self, *, paper_path: Path, paper: dict[str, Any]) -> list:
+        """Render every page of a PDF paper to images for multimodal prompting, so the
+        figures/diagrams/axis-labels/in-figure values that plain text extraction drops are
+        still seen by fact-extraction and code-generation. Returns [] for non-PDF papers,
+        when the main client has no multimodal support, or if rendering is unavailable, so
+        callers transparently fall back to text-only."""
+        if paper.get("format") != "pdf":
+            return []
+        if not hasattr(self.client, "complete_multimodal"):
+            return []
+        try:
+            from .result_review import render_pdf_pages_for_llm
+
+            # No token budget concern here; render all pages up to a generous safety cap.
+            return render_pdf_pages_for_llm(paper_path, pages=None, max_pages=60)
+        except Exception:
+            return []
+
+    def _complete_maybe_multimodal(self, prompt: str, *, schema_stage: str, images: list | None) -> str:
+        """Call the LLM for a JSON stage. When page images are available and the client
+        supports multimodal input, send them alongside the prompt; on any multimodal
+        failure (or no support) fall back to text-only so a non-multimodal client never
+        breaks the stage."""
+        response_format = response_format_for_stage(schema_stage)
+        if images and hasattr(self.client, "complete_multimodal"):
+            try:
+                return self.client.complete_multimodal(
+                    prompt, images=images, system=SYSTEM_MESSAGE, response_format=response_format
+                )
+            except Exception:
+                pass
+        return self.client.complete(prompt, system=SYSTEM_MESSAGE, response_format=response_format)
+
     def _call_validated_json(
         self,
         prompt: str,
@@ -833,16 +882,17 @@ class ReviewPipeline:
         request_timeout: float | None = None,
         candidate_normalizer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         truncation_recovery: Callable[[str], dict[str, Any] | None] | None = None,
+        images: list | None = None,
     ) -> dict[str, Any]:
         current_prompt = prompt
         last_errors = ""
         for attempt in range(1, max_attempts + 1):
             try:
                 with _temporary_client_timeout(self.client, request_timeout):
-                    raw = self.client.complete(
+                    raw = self._complete_maybe_multimodal(
                         current_prompt,
-                        system=SYSTEM_MESSAGE,
-                        response_format=response_format_for_stage(schema_stage),
+                        schema_stage=schema_stage,
+                        images=images,
                     )
             except Exception as exc:
                 last_errors = f"LLM request error: {type(exc).__name__}: {exc}"

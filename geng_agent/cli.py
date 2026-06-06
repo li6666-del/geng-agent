@@ -67,7 +67,7 @@ def _add_common_review_args(parser: argparse.ArgumentParser, *, include_resume: 
     parser.add_argument("--run-timeout", type=float, default=120.0, help="单次复现运行超时时间，单位秒。")
     parser.add_argument("--json-repair-attempts", type=int, default=3, help="每轮 JSON 结构审查失败后的返修次数。")
     parser.add_argument("--code-review", action="store_true", help="生成复现项目后运行代码忠实度审查（对照已抽取的事实/任务做内容审查并按需返修）；默认关闭。")
-    parser.add_argument("--code-review-attempts", type=int, default=1, help="代码忠实度审查发现 blocking 问题后的返修次数。")
+    parser.add_argument("--code-review-attempts", type=int, default=5, help="代码忠实度审查发现 blocking 问题后的返修轮数；默认 5（每轮含一次修复+一次复审，慢模型会更耗时）。")
     parser.add_argument("--code-review-model", default=None, help="代码忠实度审查使用的模型（异构审查者）；默认取 GENG_CODE_REVIEW_MODEL，未设则与主模型相同。")
     parser.add_argument("--code-review-timeout", type=float, default=1200.0, help="代码忠实度审查单次 LLM 请求超时时间，单位秒，默认 1200（整项目审查较慢，给足时间避免超时）。")
 

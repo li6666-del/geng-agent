@@ -71,7 +71,7 @@ class SuperviseOptions:
     resume: bool = True
     template_fallback: bool = True
     code_review: bool = False
-    code_review_attempts: int = 1
+    code_review_attempts: int = 5
     max_supervisor_steps: int = 12
     max_stage_retries: int = 2
     use_llm_reflection: bool = True
