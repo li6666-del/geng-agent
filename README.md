@@ -2,6 +2,36 @@
 
 耿同学agent 是一个本地运行的通信领域论文工程复现审查 CLI。它不直接判定论文真假，而是把论文转换成可追溯的工程事实、复现任务、复现项目、运行结果和复现风险报告。
 
+## 快速开始（新用户）
+
+在自己的机器上从零跑通（Windows / PowerShell；用你自己的 Python，不是仓库里写死的 `D:\python`）：
+
+```powershell
+# 1. 拉代码
+git clone https://github.com/li6666-del/geng-agent.git
+cd geng-agent
+
+# 2. 一条命令装齐（运行本体 + 复现白名单库）
+python -m pip install -e ".[repro]"
+
+# 3. 喂 PDF 前先自检环境，全绿再继续
+python -m geng_agent doctor
+
+# 4. 配自己的 key 和模型（本会话有效；持久化改用 setx）
+$env:GENG_LLM_API_KEY="你的 API Key"
+$env:GENG_LLM_MODEL="gpt-4o"          # 需支持图像，结果级审查才跑得起来
+# 非 OpenAI 才需设 base url，例如 deepseek：
+# $env:GENG_LLM_BASE_URL="https://api.deepseek.com"
+
+# 5. 拿仓库自带的示例论文跑一遍“全流程”
+#    = 监督/反思层 + LLM 代码忠实度审查 + 运行复现 + 结果级多模态审查（结果级审查与兜底默认开）
+python -m geng_agent supervise sample_papers\rayleigh_error_probability_2406.16548.pdf --out case_001 --run-repro --code-review
+```
+
+跑完看 `case_001\` 下的 `review.md`（主报告）、`repro_project\`（生成的复现项目）、`result_review.md`（结果级审查）。
+
+> 要点：① API key 是你自己的、要花钱，本项目不含 key；② 模型需支持多模态，否则结果级审查会写 `result_review_error.json`（其余仍正常），不想跑可加 `--no-result-review`；③ 只想生成、不运行代码就去掉 `--run-repro`；④ 想跑得更稳可加 `--repair-attempts 3 --max-supervisor-steps 16 --run-timeout 600` 等调优参数。安装、运行解释器、模型配置的细节见下文各节。
+
 ## 工作流
 
 ```text
