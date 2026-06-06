@@ -1,0 +1,105 @@
+{
+  "$defs": {
+    "CodeReviewFinding": {
+      "additionalProperties": false,
+      "properties": {
+        "spec_kind": {
+          "enum": [
+            "fact",
+            "task"
+          ],
+          "title": "Spec Kind",
+          "type": "string"
+        },
+        "spec_ref": {
+          "minLength": 1,
+          "title": "Spec Ref",
+          "type": "string"
+        },
+        "evidence_spec": {
+          "minLength": 1,
+          "title": "Evidence Spec",
+          "type": "string"
+        },
+        "code_location": {
+          "minLength": 1,
+          "title": "Code Location",
+          "type": "string"
+        },
+        "evidence_code": {
+          "minLength": 1,
+          "title": "Evidence Code",
+          "type": "string"
+        },
+        "severity": {
+          "enum": [
+            "blocking",
+            "minor"
+          ],
+          "title": "Severity",
+          "type": "string"
+        },
+        "issue": {
+          "minLength": 1,
+          "title": "Issue",
+          "type": "string"
+        },
+        "suggested_fix": {
+          "minLength": 1,
+          "title": "Suggested Fix",
+          "type": "string"
+        }
+      },
+      "required": [
+        "spec_kind",
+        "spec_ref",
+        "evidence_spec",
+        "code_location",
+        "evidence_code",
+        "severity",
+        "issue",
+        "suggested_fix"
+      ],
+      "title": "CodeReviewFinding",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "verdict": {
+      "enum": [
+        "pass",
+        "revise"
+      ],
+      "title": "Verdict",
+      "type": "string"
+    },
+    "findings": {
+      "items": {
+        "$ref": "#/$defs/CodeReviewFinding"
+      },
+      "title": "Findings",
+      "type": "array"
+    },
+    "unverifiable": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Unverifiable",
+      "type": "array"
+    },
+    "note": {
+      "minLength": 1,
+      "title": "Note",
+      "type": "string"
+    }
+  },
+  "required": [
+    "verdict",
+    "findings",
+    "unverifiable",
+    "note"
+  ],
+  "title": "CodeFaithfulnessReviewDocument",
+  "type": "object"
+}

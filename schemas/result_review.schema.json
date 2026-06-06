@@ -1,0 +1,156 @@
+{
+  "$defs": {
+    "ExperimentResultReview": {
+      "additionalProperties": false,
+      "properties": {
+        "task_id": {
+          "minLength": 1,
+          "title": "Task Id",
+          "type": "string"
+        },
+        "local_result_credibility": {
+          "enum": [
+            "high",
+            "medium",
+            "low",
+            "unknown"
+          ],
+          "title": "Local Result Credibility",
+          "type": "string"
+        },
+        "paper_alignment": {
+          "enum": [
+            "match",
+            "partial_match",
+            "mismatch",
+            "inconclusive"
+          ],
+          "title": "Paper Alignment",
+          "type": "string"
+        },
+        "paper_result_summary": {
+          "minLength": 1,
+          "title": "Paper Result Summary",
+          "type": "string"
+        },
+        "local_result_summary": {
+          "minLength": 1,
+          "title": "Local Result Summary",
+          "type": "string"
+        },
+        "differences": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Differences",
+          "type": "array"
+        },
+        "possible_causes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Possible Causes",
+          "type": "array"
+        },
+        "evidence": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Evidence",
+          "type": "array"
+        },
+        "limitations": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Limitations",
+          "type": "array"
+        },
+        "confidence": {
+          "enum": [
+            "high",
+            "medium",
+            "low"
+          ],
+          "title": "Confidence",
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_id",
+        "local_result_credibility",
+        "paper_alignment",
+        "paper_result_summary",
+        "local_result_summary",
+        "differences",
+        "possible_causes",
+        "evidence",
+        "limitations",
+        "confidence"
+      ],
+      "title": "ExperimentResultReview",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "overall_result_credibility": {
+      "enum": [
+        "high",
+        "medium",
+        "low",
+        "unknown"
+      ],
+      "title": "Overall Result Credibility",
+      "type": "string"
+    },
+    "overall_alignment": {
+      "enum": [
+        "match",
+        "partial_match",
+        "mismatch",
+        "inconclusive"
+      ],
+      "title": "Overall Alignment",
+      "type": "string"
+    },
+    "experiment_reviews": {
+      "items": {
+        "$ref": "#/$defs/ExperimentResultReview"
+      },
+      "minItems": 1,
+      "title": "Experiment Reviews",
+      "type": "array"
+    },
+    "cross_experiment_findings": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Cross Experiment Findings",
+      "type": "array"
+    },
+    "recommended_human_checks": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Recommended Human Checks",
+      "type": "array"
+    },
+    "note": {
+      "minLength": 1,
+      "title": "Note",
+      "type": "string"
+    }
+  },
+  "required": [
+    "overall_result_credibility",
+    "overall_alignment",
+    "experiment_reviews",
+    "cross_experiment_findings",
+    "recommended_human_checks",
+    "note"
+  ],
+  "title": "ResultReviewDocument",
+  "type": "object"
+}

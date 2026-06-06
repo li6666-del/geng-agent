@@ -1,0 +1,87 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "action": {
+      "enum": [
+        "continue",
+        "retry_stage",
+        "use_fallback",
+        "repair_code",
+        "ask_human",
+        "stop"
+      ],
+      "title": "Action",
+      "type": "string"
+    },
+    "target_stage": {
+      "minLength": 1,
+      "title": "Target Stage",
+      "type": "string"
+    },
+    "reason": {
+      "minLength": 1,
+      "title": "Reason",
+      "type": "string"
+    },
+    "evidence_paths": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "title": "Evidence Paths",
+      "type": "array"
+    },
+    "risk_level": {
+      "enum": [
+        "low",
+        "medium",
+        "high"
+      ],
+      "title": "Risk Level",
+      "type": "string"
+    },
+    "confidence": {
+      "enum": [
+        "high",
+        "medium",
+        "low"
+      ],
+      "title": "Confidence",
+      "type": "string"
+    },
+    "prompt_adjustment": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Prompt Adjustment"
+    },
+    "human_question": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Human Question"
+    }
+  },
+  "required": [
+    "action",
+    "target_stage",
+    "reason",
+    "evidence_paths",
+    "risk_level",
+    "confidence"
+  ],
+  "title": "SupervisorDecisionDocument",
+  "type": "object"
+}

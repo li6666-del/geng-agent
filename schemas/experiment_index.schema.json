@@ -1,0 +1,147 @@
+{
+  "$defs": {
+    "ExperimentIndexItem": {
+      "additionalProperties": false,
+      "properties": {
+        "experiment_id": {
+          "minLength": 1,
+          "title": "Experiment Id",
+          "type": "string"
+        },
+        "title": {
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        },
+        "figure_or_table": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Figure Or Table"
+        },
+        "task_id": {
+          "minLength": 1,
+          "title": "Task Id",
+          "type": "string"
+        },
+        "metric": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Metric"
+        },
+        "source_pages": {
+          "items": {
+            "type": "integer"
+          },
+          "title": "Source Pages",
+          "type": "array"
+        },
+        "source_chunk_ids": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Source Chunk Ids",
+          "type": "array"
+        },
+        "required_facts": {
+          "items": {
+            "$ref": "#/$defs/RequiredFactRef"
+          },
+          "title": "Required Facts",
+          "type": "array"
+        },
+        "status": {
+          "enum": [
+            "ready",
+            "ready_with_limitations",
+            "blocked"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "limitations": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Limitations",
+          "type": "array"
+        }
+      },
+      "required": [
+        "experiment_id",
+        "title",
+        "task_id",
+        "source_pages",
+        "source_chunk_ids",
+        "required_facts",
+        "status",
+        "limitations"
+      ],
+      "title": "ExperimentIndexItem",
+      "type": "object"
+    },
+    "RequiredFactRef": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "enum": [
+            "channel_model",
+            "modulation",
+            "coding",
+            "metric",
+            "simulation_parameter",
+            "baseline",
+            "figure_claim",
+            "algorithm",
+            "dataset",
+            "topology",
+            "hardware",
+            "other"
+          ],
+          "title": "Type",
+          "type": "string"
+        },
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "name"
+      ],
+      "title": "RequiredFactRef",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "experiments": {
+      "items": {
+        "$ref": "#/$defs/ExperimentIndexItem"
+      },
+      "title": "Experiments",
+      "type": "array"
+    }
+  },
+  "required": [
+    "experiments"
+  ],
+  "title": "ExperimentIndexDocument",
+  "type": "object"
+}

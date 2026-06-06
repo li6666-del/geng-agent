@@ -1,0 +1,47 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "verdict": {
+      "enum": [
+        "fully_reproduced",
+        "mostly_reproduced",
+        "partially_reproduced",
+        "inconclusive",
+        "high_reproducibility_risk",
+        "failed_to_reproduce"
+      ],
+      "title": "Verdict",
+      "type": "string"
+    },
+    "confidence": {
+      "enum": [
+        "high",
+        "medium",
+        "low"
+      ],
+      "title": "Confidence",
+      "type": "string"
+    },
+    "reasons": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "title": "Reasons",
+      "type": "array"
+    },
+    "recommended_action": {
+      "minLength": 1,
+      "title": "Recommended Action",
+      "type": "string"
+    }
+  },
+  "required": [
+    "verdict",
+    "confidence",
+    "reasons",
+    "recommended_action"
+  ],
+  "title": "ReproducibilityVerdictDocument",
+  "type": "object"
+}

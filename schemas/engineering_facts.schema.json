@@ -1,0 +1,177 @@
+{
+  "$defs": {
+    "EngineeringFact": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "enum": [
+            "channel_model",
+            "modulation",
+            "coding",
+            "metric",
+            "simulation_parameter",
+            "baseline",
+            "figure_claim",
+            "algorithm",
+            "dataset",
+            "topology",
+            "hardware",
+            "other"
+          ],
+          "title": "Type",
+          "type": "string"
+        },
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "value": {
+          "additionalProperties": true,
+          "title": "Value",
+          "type": "object"
+        },
+        "source": {
+          "$ref": "#/$defs/FactSource"
+        },
+        "confidence": {
+          "enum": [
+            "high",
+            "medium",
+            "low"
+          ],
+          "title": "Confidence",
+          "type": "string"
+        },
+        "used_for_reproduction": {
+          "title": "Used For Reproduction",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "type",
+        "name",
+        "value",
+        "source",
+        "confidence",
+        "used_for_reproduction"
+      ],
+      "title": "EngineeringFact",
+      "type": "object"
+    },
+    "FactSource": {
+      "additionalProperties": false,
+      "properties": {
+        "chunk_id": {
+          "minLength": 1,
+          "title": "Chunk Id",
+          "type": "string"
+        },
+        "page": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Page"
+        },
+        "section": {
+          "title": "Section",
+          "type": "string"
+        },
+        "quote": {
+          "minLength": 1,
+          "title": "Quote",
+          "type": "string"
+        }
+      },
+      "required": [
+        "chunk_id",
+        "page",
+        "section",
+        "quote"
+      ],
+      "title": "FactSource",
+      "type": "object"
+    },
+    "MissingInformation": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "why_needed": {
+          "minLength": 1,
+          "title": "Why Needed",
+          "type": "string"
+        },
+        "impact": {
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "title": "Impact",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "why_needed",
+        "impact"
+      ],
+      "title": "MissingInformation",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "paper_domain": {
+      "const": "communication",
+      "title": "Paper Domain",
+      "type": "string"
+    },
+    "paper_repro_type": {
+      "enum": [
+        "signal_chain",
+        "modulation_recognition",
+        "channel_coding",
+        "mimo_ofdm",
+        "network_protocol",
+        "ml_communication",
+        "optimization_algorithm",
+        "hardware_dataset",
+        "other"
+      ],
+      "title": "Paper Repro Type",
+      "type": "string"
+    },
+    "engineering_facts": {
+      "items": {
+        "$ref": "#/$defs/EngineeringFact"
+      },
+      "title": "Engineering Facts",
+      "type": "array"
+    },
+    "missing_information": {
+      "items": {
+        "$ref": "#/$defs/MissingInformation"
+      },
+      "title": "Missing Information",
+      "type": "array"
+    }
+  },
+  "required": [
+    "paper_domain",
+    "paper_repro_type",
+    "engineering_facts",
+    "missing_information"
+  ],
+  "title": "EngineeringFactsDocument",
+  "type": "object"
+}

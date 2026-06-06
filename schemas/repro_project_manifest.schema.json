@@ -1,0 +1,95 @@
+{
+  "$defs": {
+    "ManifestBase64File": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "content_b64": {
+          "title": "Content B64",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "content_b64"
+      ],
+      "title": "ManifestBase64File",
+      "type": "object"
+    },
+    "ManifestLinesFile": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "content_lines": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Content Lines",
+          "type": "array"
+        }
+      },
+      "required": [
+        "path",
+        "content_lines"
+      ],
+      "title": "ManifestLinesFile",
+      "type": "object"
+    },
+    "ManifestTextFile": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "content": {
+          "maxLength": 2000000,
+          "title": "Content",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "content"
+      ],
+      "title": "ManifestTextFile",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "files": {
+      "items": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ManifestTextFile"
+          },
+          {
+            "$ref": "#/$defs/ManifestLinesFile"
+          },
+          {
+            "$ref": "#/$defs/ManifestBase64File"
+          }
+        ]
+      },
+      "maxItems": 64,
+      "minItems": 1,
+      "title": "Files",
+      "type": "array"
+    }
+  },
+  "required": [
+    "files"
+  ],
+  "title": "ReproProjectManifest",
+  "type": "object"
+}

@@ -1,0 +1,374 @@
+from __future__ import annotations
+
+import ast
+import importlib.util
+import os
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+
+ALLOWED_REQUIREMENTS = {
+    "numpy",
+    "scipy",
+    "matplotlib",
+    "scikit-learn",
+    "sklearn",
+    "reedsolo",
+    "pillow",
+}
+
+REQUIREMENT_IMPORT_NAMES = {
+    "scikit-learn": {"sklearn"},
+    "sklearn": {"sklearn"},
+    "pillow": {"PIL"},
+}
+
+IMPORT_REQUIREMENT_NAMES = {
+    "sklearn": "scikit-learn",
+    "PIL": "pillow",
+}
+
+FORBIDDEN_IMPORTS = {
+    "socket",
+    "requests",
+    "urllib",
+    "http",
+    "ftplib",
+    "paramiko",
+    "subprocess",
+    "multiprocessing",
+    "webbrowser",
+    "ctypes",
+    "importlib",
+}
+
+# Dynamic-execution / reflection builtins. Clean numerical reproduction code never
+# needs these, but they are the standard way to bypass the static name-based scan
+# (e.g. getattr(os, "sys"+"tem"), __import__("sock"+"et"), eval/exec of a string).
+# Blocking the call sites closes the obvious obfuscation paths.
+FORBIDDEN_BUILTINS = {
+    "eval",
+    "exec",
+    "compile",
+    "__import__",
+    "getattr",
+    "setattr",
+    "delattr",
+    "globals",
+    "vars",
+}
+
+FORBIDDEN_CALLS = {
+    "os.system",
+    "os.popen",
+    "os.spawnl",
+    "os.spawnlp",
+    "os.spawnv",
+    "os.spawnvp",
+    "os.remove",
+    "os.unlink",
+    "os.rmdir",
+    "shutil.rmtree",
+    "shutil.move",
+    "subprocess.run",
+    "subprocess.call",
+    "subprocess.Popen",
+    "Path.home",
+    "Path.expanduser",
+}
+
+SENSITIVE_ENV_KEYS = {
+    "GENG_LLM_API_KEY",
+    "OPENAI_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "HF_TOKEN",
+    "HUGGINGFACE_HUB_TOKEN",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "GOOGLE_API_KEY",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+}
+
+SECRET_PATTERNS = [
+    re.compile(r"sk-[A-Za-z0-9_\-]{12,}"),
+    re.compile(r"Bearer\s+[A-Za-z0-9_\-\.]{12,}", re.IGNORECASE),
+    re.compile(r"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*['\"]?[^'\"\s]+"),
+]
+
+
+def build_safe_env() -> dict[str, str]:
+    keep = {
+        "PATH",
+        "SystemRoot",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+        "PYTHONIOENCODING",
+        "MPLBACKEND",
+    }
+    safe_env = {key: value for key, value in os.environ.items() if key in keep}
+    safe_env["PYTHONIOENCODING"] = "utf-8"
+    safe_env["MPLBACKEND"] = "Agg"
+    safe_env["MPLCONFIGDIR"] = safe_env.get("TEMP") or safe_env.get("TMP") or "."
+    for key in SENSITIVE_ENV_KEYS:
+        safe_env.pop(key, None)
+    return safe_env
+
+
+def redact_text(text: str) -> str:
+    redacted = text
+    for pattern in SECRET_PATTERNS:
+        redacted = pattern.sub("[REDACTED]", redacted)
+    return redacted
+
+
+def redact_data(value: Any) -> Any:
+    if isinstance(value, str):
+        return redact_text(value)
+    if isinstance(value, list):
+        return [redact_data(item) for item in value]
+    if isinstance(value, dict):
+        return {key: redact_data(item) for key, item in value.items()}
+    return value
+
+
+def validate_requirements(root: Path) -> list[dict[str, str]]:
+    requirements = root / "requirements.txt"
+    if not requirements.exists():
+        return [{"file": "requirements.txt", "message": "requirements.txt is missing"}]
+
+    issues: list[dict[str, str]] = []
+    declared_packages: set[str] = set()
+    for line_no, raw_line in enumerate(requirements.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("-") or "://" in line or "@" in line or "\\" in line or "/" in line:
+            issues.append({"file": "requirements.txt", "line": str(line_no), "message": f"disallowed requirement syntax: {line}"})
+            continue
+        package = re.split(r"[<>=!~\[]", line, maxsplit=1)[0].strip().lower().replace("_", "-")
+        declared_packages.add(package)
+        if package not in ALLOWED_REQUIREMENTS:
+            issues.append({"file": "requirements.txt", "line": str(line_no), "message": f"package is not whitelisted: {package}"})
+            continue
+        for import_name in import_names_for_requirement(package):
+            if importlib.util.find_spec(import_name) is None:
+                issues.append(
+                    {
+                        "file": "requirements.txt",
+                        "line": str(line_no),
+                        "message": f"declared package is not installed in current environment: {package} (import {import_name})",
+                    }
+                )
+    issues.extend(validate_import_requirements(root, declared_packages))
+    return issues
+
+
+def dependency_policy_prompt_text() -> str:
+    available = []
+    unavailable = []
+    for package in sorted(ALLOWED_REQUIREMENTS):
+        import_names = sorted(import_names_for_requirement(package))
+        item = f"{package} (import: {', '.join(import_names)})"
+        if all(importlib.util.find_spec(import_name) is not None for import_name in import_names):
+            available.append(item)
+        else:
+            unavailable.append(item)
+
+    lines = [
+        "依赖与 import 规则：",
+        "1. Python 标准库和本项目本地模块不需要写入 requirements.txt。",
+        "2. 第三方库只能从“当前环境已安装且允许使用”的清单中选择；清单外的库不要 import，改用标准库/本地实现/更简单的近似模型。",
+        "3. 只要 Python 代码里出现第三方 import，就必须在 requirements.txt 里写对应包名，一行一个包名。",
+        "4. requirements.txt 只写纯包名，不写版本号、URL、本地路径、VCS 地址、安装参数或解释性文字。",
+        "5. 不要用 broad try/except 包住第三方 import 来静默降级；缺库时应避免使用该库，而不是隐藏错误。",
+        "当前环境已安装且允许使用：",
+    ]
+    lines.extend(f"- {item}" for item in available)
+    if unavailable:
+        lines.append("白名单中但当前环境未安装，默认不要使用：")
+        lines.extend(f"- {item}" for item in unavailable)
+    return "\n".join(lines)
+
+
+def validate_import_requirements(root: Path, declared_packages: set[str]) -> list[dict[str, str]]:
+    issues: list[dict[str, str]] = []
+    local_modules = collect_local_module_roots(root)
+    for py_file in iter_project_python_files(root):
+        rel = py_file.relative_to(root).as_posix()
+        try:
+            tree = ast.parse(py_file.read_text(encoding="utf-8", errors="replace"), filename=rel)
+        except SyntaxError:
+            continue
+        third_party_imports = collect_third_party_imports(tree, local_modules)
+        for import_ref in third_party_imports:
+            package = requirement_name_for_import(import_ref["root"])
+            if package not in declared_packages:
+                issues.append(
+                    {
+                        "file": rel,
+                        "line": str(import_ref["line"]),
+                        "message": f"third-party import is not declared in requirements.txt: {import_ref['name']} (expected package {package})",
+                    }
+                )
+            elif importlib.util.find_spec(import_ref["root"]) is None:
+                issues.append(
+                    {
+                        "file": rel,
+                        "line": str(import_ref["line"]),
+                        "message": f"third-party import is declared but not installed in current environment: {import_ref['name']}",
+                    }
+                )
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Try) and catches_broad_exception(node):
+                guarded_imports = []
+                for child in node.body:
+                    if isinstance(child, (ast.Import, ast.ImportFrom)):
+                        guarded_imports.extend(collect_imports_from_node(child, local_modules))
+                for import_ref in guarded_imports:
+                    issues.append(
+                        {
+                            "file": rel,
+                            "line": str(import_ref["line"]),
+                            "message": f"third-party import is guarded by broad try/except and may silently degrade scientific behavior: {import_ref['name']}",
+                        }
+                    )
+    return issues
+
+
+def import_names_for_requirement(package: str) -> set[str]:
+    return REQUIREMENT_IMPORT_NAMES.get(package, {package.replace("-", "_")})
+
+
+def requirement_name_for_import(import_root: str) -> str:
+    return IMPORT_REQUIREMENT_NAMES.get(import_root, import_root.lower().replace("_", "-"))
+
+
+def collect_local_module_roots(root: Path) -> set[str]:
+    modules = set()
+    for path in root.iterdir():
+        if path.name.startswith("."):
+            continue
+        if path.is_dir() and (path / "__init__.py").exists():
+            modules.add(path.name)
+        elif path.is_file() and path.suffix == ".py":
+            modules.add(path.stem)
+    if (root / "src").is_dir():
+        modules.add("src")
+    return modules
+
+
+def iter_project_python_files(root: Path):
+    for py_file in root.rglob("*.py"):
+        rel_parts = py_file.relative_to(root).parts
+        if "__pycache__" in rel_parts or "repair_logs" in rel_parts or "outputs" in rel_parts:
+            continue
+        yield py_file
+
+
+def collect_third_party_imports(tree: ast.AST, local_modules: set[str]) -> list[dict[str, Any]]:
+    imports: list[dict[str, Any]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            imports.extend(collect_imports_from_node(node, local_modules))
+    return imports
+
+
+def collect_imports_from_node(node: ast.Import | ast.ImportFrom, local_modules: set[str]) -> list[dict[str, Any]]:
+    imports: list[dict[str, Any]] = []
+    if isinstance(node, ast.Import):
+        names = [alias.name for alias in node.names]
+    elif node.level:
+        names = []
+    else:
+        names = [node.module or ""]
+    for name in names:
+        root_name = name.split(".", 1)[0]
+        if is_third_party_import(root_name, local_modules):
+            imports.append({"name": name, "root": root_name, "line": getattr(node, "lineno", 0)})
+    return imports
+
+
+def is_third_party_import(root_name: str, local_modules: set[str]) -> bool:
+    if not root_name or root_name in local_modules:
+        return False
+    if root_name in FORBIDDEN_IMPORTS:
+        return False
+    stdlib_names = getattr(sys, "stdlib_module_names", set())
+    if root_name in stdlib_names or root_name in sys.builtin_module_names:
+        return False
+    return True
+
+
+def catches_broad_exception(node: ast.Try) -> bool:
+    for handler in node.handlers:
+        if handler.type is None:
+            return True
+        if isinstance(handler.type, ast.Name) and handler.type.id in {"Exception", "BaseException"}:
+            return True
+        if isinstance(handler.type, ast.Tuple):
+            for item in handler.type.elts:
+                if isinstance(item, ast.Name) and item.id in {"Exception", "BaseException"}:
+                    return True
+    return False
+
+
+def static_scan_repro_project(root: Path) -> list[dict[str, str]]:
+    issues: list[dict[str, str]] = []
+    for py_file in iter_project_python_files(root):
+        rel = py_file.relative_to(root).as_posix()
+        try:
+            tree = ast.parse(py_file.read_text(encoding="utf-8", errors="replace"), filename=rel)
+        except SyntaxError as exc:
+            issues.append({"file": rel, "line": str(exc.lineno or 0), "message": f"syntax error: {exc.msg}"})
+            continue
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    root_name = alias.name.split(".", 1)[0]
+                    if root_name in FORBIDDEN_IMPORTS:
+                        issues.append({"file": rel, "line": str(node.lineno), "message": f"forbidden import: {alias.name}"})
+            elif isinstance(node, ast.ImportFrom):
+                root_name = (node.module or "").split(".", 1)[0]
+                if root_name in FORBIDDEN_IMPORTS:
+                    issues.append({"file": rel, "line": str(node.lineno), "message": f"forbidden import: {node.module}"})
+            elif isinstance(node, ast.Call):
+                name = _call_name(node.func)
+                if name in FORBIDDEN_CALLS:
+                    issues.append({"file": rel, "line": str(getattr(node, "lineno", 0)), "message": f"forbidden call: {name}"})
+                if name in FORBIDDEN_BUILTINS:
+                    issues.append({"file": rel, "line": str(getattr(node, "lineno", 0)), "message": f"forbidden dynamic builtin: {name}"})
+                if name in {"open", "Path", "PurePath"}:
+                    _check_absolute_path_literal(node, rel, issues)
+            elif isinstance(node, ast.Attribute):
+                name = _call_name(node)
+                if name in {"os.environ", "os.getenv"}:
+                    issues.append({"file": rel, "line": str(getattr(node, "lineno", 0)), "message": f"forbidden environment access: {name}"})
+    return issues
+
+
+def _call_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        prefix = _call_name(node.value)
+        return f"{prefix}.{node.attr}" if prefix else node.attr
+    return ""
+
+
+def _check_absolute_path_literal(node: ast.Call, rel: str, issues: list[dict[str, str]]) -> None:
+    if not node.args:
+        return
+    first = node.args[0]
+    if isinstance(first, ast.Constant) and isinstance(first.value, str):
+        value = first.value
+        if re.match(r"^[A-Za-z]:[\\/]", value) or value.startswith(("/", "\\")):
+            issues.append({"file": rel, "line": str(getattr(node, "lineno", 0)), "message": f"absolute path literal is forbidden: {value}"})

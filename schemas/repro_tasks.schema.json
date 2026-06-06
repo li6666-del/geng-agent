@@ -1,0 +1,253 @@
+{
+  "$defs": {
+    "Assumption": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "default_value": {
+          "title": "Default Value"
+        },
+        "reason": {
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        },
+        "risk": {
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "title": "Risk",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "default_value",
+        "reason",
+        "risk"
+      ],
+      "title": "Assumption",
+      "type": "object"
+    },
+    "Comparison": {
+      "additionalProperties": false,
+      "properties": {
+        "baselines": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Baselines",
+          "type": "array"
+        },
+        "curve_groups": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Curve Groups",
+          "type": "array"
+        },
+        "tolerance": {
+          "minLength": 1,
+          "title": "Tolerance",
+          "type": "string"
+        }
+      },
+      "required": [
+        "baselines",
+        "curve_groups",
+        "tolerance"
+      ],
+      "title": "Comparison",
+      "type": "object"
+    },
+    "ExpectedTrend": {
+      "additionalProperties": false,
+      "properties": {
+        "x_axis": {
+          "title": "X Axis",
+          "type": "string"
+        },
+        "y_axis": {
+          "title": "Y Axis",
+          "type": "string"
+        },
+        "direction": {
+          "enum": [
+            "decreasing",
+            "increasing",
+            "flat",
+            "unknown"
+          ],
+          "title": "Direction",
+          "type": "string"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "x_axis",
+        "y_axis",
+        "direction",
+        "reason"
+      ],
+      "title": "ExpectedTrend",
+      "type": "object"
+    },
+    "ReproTask": {
+      "additionalProperties": false,
+      "properties": {
+        "task_id": {
+          "minLength": 1,
+          "title": "Task Id",
+          "type": "string"
+        },
+        "target": {
+          "minLength": 1,
+          "title": "Target",
+          "type": "string"
+        },
+        "metric": {
+          "enum": [
+            "bit_error_rate",
+            "symbol_error_rate",
+            "throughput",
+            "delay",
+            "spectral_efficiency",
+            "outage_probability",
+            "energy_efficiency",
+            "accuracy",
+            "loss",
+            "other"
+          ],
+          "title": "Metric",
+          "type": "string"
+        },
+        "metric_formula": {
+          "minLength": 1,
+          "title": "Metric Formula",
+          "type": "string"
+        },
+        "figure_or_claim": {
+          "minLength": 1,
+          "title": "Figure Or Claim",
+          "type": "string"
+        },
+        "expected_artifacts": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Expected Artifacts",
+          "type": "array"
+        },
+        "output_columns": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Output Columns",
+          "type": "array"
+        },
+        "expected_trend": {
+          "$ref": "#/$defs/ExpectedTrend"
+        },
+        "comparison": {
+          "$ref": "#/$defs/Comparison"
+        },
+        "required_facts": {
+          "items": {
+            "$ref": "#/$defs/RequiredFactRef"
+          },
+          "title": "Required Facts",
+          "type": "array"
+        },
+        "assumptions": {
+          "items": {
+            "$ref": "#/$defs/Assumption"
+          },
+          "title": "Assumptions",
+          "type": "array"
+        },
+        "risk_if_unreproducible": {
+          "minLength": 1,
+          "title": "Risk If Unreproducible",
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_id",
+        "target",
+        "metric",
+        "metric_formula",
+        "figure_or_claim",
+        "expected_artifacts",
+        "output_columns",
+        "expected_trend",
+        "comparison",
+        "required_facts",
+        "assumptions",
+        "risk_if_unreproducible"
+      ],
+      "title": "ReproTask",
+      "type": "object"
+    },
+    "RequiredFactRef": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "enum": [
+            "channel_model",
+            "modulation",
+            "coding",
+            "metric",
+            "simulation_parameter",
+            "baseline",
+            "figure_claim",
+            "algorithm",
+            "dataset",
+            "topology",
+            "hardware",
+            "other"
+          ],
+          "title": "Type",
+          "type": "string"
+        },
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "name"
+      ],
+      "title": "RequiredFactRef",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "repro_tasks": {
+      "items": {
+        "$ref": "#/$defs/ReproTask"
+      },
+      "minItems": 1,
+      "title": "Repro Tasks",
+      "type": "array"
+    }
+  },
+  "required": [
+    "repro_tasks"
+  ],
+  "title": "ReproTasksDocument",
+  "type": "object"
+}

@@ -1,0 +1,110 @@
+from __future__ import annotations
+
+from pathlib import Path
+from tempfile import TemporaryDirectory
+import unittest
+
+from docx import Document
+
+from geng_agent.docx_writer import write_result_review_docx, write_review_docx
+
+
+class DocxWriterTests(unittest.TestCase):
+    def test_write_review_docx_creates_openable_report(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            path = root / "review.docx"
+
+            write_review_docx(
+                path,
+                paper={"source_path": "paper.pdf", "chunk_count": 3},
+                facts={
+                    "paper_repro_type": "signal_chain",
+                    "engineering_facts": [
+                        {
+                            "type": "channel_model",
+                            "name": "AWGN",
+                            "source": {"chunk_id": "text_c1"},
+                            "confidence": "high",
+                            "used_for_reproduction": True,
+                        }
+                    ],
+                    "missing_information": [],
+                },
+                tasks={
+                    "repro_tasks": [
+                        {
+                            "task_id": "reproduce_fig_1",
+                            "target": "BER vs SNR",
+                            "metric": "bit_error_rate",
+                            "figure_or_claim": "Fig. 1",
+                            "expected_trend": {"direction": "decreasing"},
+                            "comparison": {"baselines": ["AWGN reference"]},
+                        }
+                    ]
+                },
+                risk_report={
+                    "risk_level": "medium",
+                    "missing_information_count": 0,
+                    "assumptions_count": 1,
+                    "risk_dimensions": {
+                        "runtime_reliability": {"level": "medium", "evidence": ["runtime_enabled=False"]}
+                    },
+                    "findings": [],
+                },
+                validation={"required_files_present": True, "python_compiles": True},
+                runtime_result={"enabled": False, "passed": None, "attempts": []},
+                result_review_result={"enabled": False, "passed": None, "reason": "not run"},
+                repro_project_dir=root / "repro_project",
+            )
+
+            document = Document(path)
+            text = "\n".join(paragraph.text for paragraph in document.paragraphs)
+            self.assertIn("耿同学agent 论文工程复现审查报告", text)
+            self.assertIn("人工复核建议", text)
+            self.assertGreaterEqual(len(document.tables), 5)
+
+    def test_write_result_review_docx_creates_experiment_sections(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            path = root / "result_review.docx"
+
+            write_result_review_docx(
+                path,
+                result_review={
+                    "overall_result_credibility": "medium",
+                    "overall_alignment": "partial_match",
+                    "experiment_reviews": [
+                        {
+                            "task_id": "reproduce_fig_1",
+                            "local_result_credibility": "medium",
+                            "paper_alignment": "partial_match",
+                            "paper_result_summary": "Paper reports BER decreasing with SNR.",
+                            "local_result_summary": "Local CSV shows BER decreasing.",
+                            "differences": ["Only smoke-scale data were generated."],
+                            "possible_causes": ["Fewer samples than the paper."],
+                            "evidence": ["outputs/results.csv"],
+                            "limitations": ["No precise figure digitization."],
+                            "confidence": "medium",
+                        }
+                    ],
+                    "cross_experiment_findings": ["Qualitative trend is present."],
+                    "recommended_human_checks": ["Run full config.json."],
+                    "note": "Risk review only.",
+                },
+                status={
+                    "passed": True,
+                    "result_review_path": str(root / "result_review.json"),
+                    "result_review_markdown_path": str(root / "result_review.md"),
+                },
+            )
+
+            document = Document(path)
+            text = "\n".join(paragraph.text for paragraph in document.paragraphs)
+            self.assertIn("复现结果二次审查报告", text)
+            self.assertIn("reproduce_fig_1", text)
+            self.assertGreaterEqual(len(document.tables), 2)
+
+
+if __name__ == "__main__":
+    unittest.main()
