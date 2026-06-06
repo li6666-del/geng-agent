@@ -50,8 +50,8 @@
 4. 如果生成 Python 文件，代码必须能独立语法编译，并与已有文件接口一致。
 5. 如果生成 JSON 配置文件，内容必须是合法 JSON 文本的 content_lines。
 6. 代码风格必须在实现功能的基础上尽可能简洁：少函数、少类、少注释、少分支、少重复，不要写通用框架或完整协议栈。
-7. 硬性规模上限，超过就是错误：每个生成文件最多 100 行；README/config/Python 文件最多 10000 字符；requirements.txt 最多 4000 字符。
-8. 如果 target_path 是 src/simulation.py，不要重写 modulation/channel/metrics 逻辑；只导入并编排已有模块，控制在 100 行以内。
+7. 硬性规模上限，超过就是错误：每个生成文件最多 200 行；README/config/Python 文件最多 20000 字符；requirements.txt 最多 4000 字符。
+8. 如果 target_path 是 src/simulation.py，不要重写 modulation/channel/metrics 逻辑；只导入并编排已有模块，控制在 200 行以内。
 9. 如果 target_path 是 src/metrics.py，只实现必要指标函数，不要生成长篇统计工具库。
 
 输出 schema：

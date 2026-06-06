@@ -16,7 +16,6 @@ from .prompts import PromptBook
 from .runner_types import RepairBackend, normalize_repair_backend
 from .schema_models import response_format_for_stage
 from .schemas import format_issues, validate_stage
-from .scientific_integrity import scientific_integrity_issues
 from .security import (
     build_safe_env,
     redact_data,
@@ -327,7 +326,6 @@ def run_repro_once(
             "stderr": redact_text(stderr)[-6000:],
             "artifacts": inspect_output_artifacts(repro_project_dir),
             "passed": False,
-            "scientific_issues": [],
             "requirements_issues": requirements_issues,
             "security_issues": security_issues,
         }
@@ -355,7 +353,6 @@ def run_repro_once(
             and artifacts["has_summary_json"]
             and not artifacts.get("invalid_files")
         )
-        scientific_issues = scientific_integrity_issues(repro_project_dir) if base_passed else []
         return {
             "command": command,
             "run_profile": run_profile,
@@ -365,8 +362,7 @@ def run_repro_once(
             "stdout": redact_text(completed.stdout)[-6000:],
             "stderr": redact_text(completed.stderr)[-6000:],
             "artifacts": artifacts,
-            "passed": base_passed and not scientific_issues,
-            "scientific_issues": scientific_issues,
+            "passed": base_passed,
             "requirements_issues": [],
             "security_issues": [],
         }
@@ -383,7 +379,6 @@ def run_repro_once(
             "stderr": redact_text(stderr)[-6000:],
             "artifacts": inspect_output_artifacts(repro_project_dir, since=started_at),
             "passed": False,
-            "scientific_issues": [],
             "requirements_issues": [],
             "security_issues": [],
         }

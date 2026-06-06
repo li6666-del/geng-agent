@@ -69,6 +69,7 @@ def _add_common_review_args(parser: argparse.ArgumentParser, *, include_resume: 
     parser.add_argument("--code-review", action="store_true", help="生成复现项目后运行代码忠实度审查（对照已抽取的事实/任务做内容审查并按需返修）；默认关闭。")
     parser.add_argument("--code-review-attempts", type=int, default=1, help="代码忠实度审查发现 blocking 问题后的返修次数。")
     parser.add_argument("--code-review-model", default=None, help="代码忠实度审查使用的模型（异构审查者）；默认取 GENG_CODE_REVIEW_MODEL，未设则与主模型相同。")
+    parser.add_argument("--code-review-timeout", type=float, default=1200.0, help="代码忠实度审查单次 LLM 请求超时时间，单位秒，默认 1200（整项目审查较慢，给足时间避免超时）。")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -198,15 +199,28 @@ def _build_client_or_error(args: argparse.Namespace, parser: argparse.ArgumentPa
 
 
 def _build_code_review_client_or_error(args: argparse.Namespace, parser: argparse.ArgumentParser):
-    """Heterogeneous reviewer for --code-review. Returns None when no review model is
-    configured (then the pipeline falls back to the main generator client)."""
-    from .config import build_code_review_client
+    """Client for the code-faithfulness review. Uses the heterogeneous reviewer model
+    when GENG_CODE_REVIEW_MODEL / --code-review-model is set; otherwise reviews with the
+    main model. Either way the review gets its own (longer) --code-review-timeout so a slow
+    model does not time out mid-review."""
+    from .config import build_code_review_client, build_llm_client, get_config_value
 
     try:
-        return build_code_review_client(
+        client = build_code_review_client(
             model=args.code_review_model,
             temperature=args.temperature,
-            timeout=args.timeout,
+            timeout=args.code_review_timeout,
+            thinking=args.thinking,
+            reasoning_effort=args.reasoning_effort,
+        )
+        if client is not None:
+            return client
+        return build_llm_client(
+            api_key=args.api_key or get_config_value("GENG_LLM_API_KEY"),
+            base_url=args.base_url or get_config_value("GENG_LLM_BASE_URL"),
+            model=args.model or get_config_value("GENG_LLM_MODEL"),
+            temperature=args.temperature,
+            timeout=args.code_review_timeout,
             thinking=args.thinking,
             reasoning_effort=args.reasoning_effort,
         )

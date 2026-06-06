@@ -13,6 +13,7 @@
 3. severity：会改变科学结果的记 "blocking"(公式错、星座/能量错、Eb/Es 混用、符号错、逆映射错…)；不影响数值的记 "minor"。
 4. 静态看不出对错（必须运行才能判断数值是否吻合论文）的，放进 unverifiable，不要当 finding。
 5. 没有问题时 verdict="pass" 且 findings=[]；存在 blocking 时 verdict="revise"。
+6. 注意审查效率：聚焦"会改变科学结果"的 blocking 问题，迅速得出结论；不要逐行赘述、不纠结代码风格、不重复论证同一处；只要没有 blocking 就尽快给出 verdict="pass"，避免拖长审查时间。
 
 输出 schema：
 {

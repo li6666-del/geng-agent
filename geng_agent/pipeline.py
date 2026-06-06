@@ -1154,15 +1154,15 @@ REPRO_PROJECT_FILE_ORDER = [
 
 
 REPRO_PROJECT_FILE_LIMITS = {
-    "README.md": {"lines": 100, "chars": 10000},
-    "requirements.txt": {"lines": 100, "chars": 4000},
-    "config.json": {"lines": 100, "chars": 10000},
-    "config_smoke.json": {"lines": 100, "chars": 10000},
-    "run_experiment.py": {"lines": 100, "chars": 10000},
-    "src/channel.py": {"lines": 100, "chars": 10000},
-    "src/modulation.py": {"lines": 100, "chars": 10000},
-    "src/metrics.py": {"lines": 100, "chars": 10000},
-    "src/simulation.py": {"lines": 100, "chars": 10000},
+    "README.md": {"lines": 200, "chars": 20000},
+    "requirements.txt": {"lines": 200, "chars": 4000},
+    "config.json": {"lines": 200, "chars": 20000},
+    "config_smoke.json": {"lines": 200, "chars": 20000},
+    "run_experiment.py": {"lines": 200, "chars": 20000},
+    "src/channel.py": {"lines": 200, "chars": 20000},
+    "src/modulation.py": {"lines": 200, "chars": 20000},
+    "src/metrics.py": {"lines": 200, "chars": 20000},
+    "src/simulation.py": {"lines": 200, "chars": 20000},
 }
 
 

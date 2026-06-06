@@ -72,7 +72,7 @@ def main() -> None:
     add_para(
         doc,
         "当前第三轮不是完全模板化，也不是完全放飞。LLM 仍然可以写 run_experiment.py 和 src/ 下的实现逻辑，"
-        "但必须在固定项目结构、固定输出产物、安全规则、依赖规则、100 行文件上限内完成。"
+        "但必须在固定项目结构、固定输出产物、安全规则、依赖规则、200 行文件上限内完成。"
     )
     add_image(doc, diagrams["codegen"], "图 3  第三轮代码生成和本地审查的关系")
     add_codegen_table(doc)
@@ -285,7 +285,7 @@ def add_json_table(doc: Document) -> None:
 def add_codegen_table(doc: Document) -> None:
     rows = [
         ("固定结构", "LLM 只能生成 README、requirements、config、run_experiment 和 src 下几个文件。"),
-        ("100 行上限", "每个生成文件最多 100 行，避免一口气写出难修的大工程。"),
+        ("200 行上限", "每个生成文件最多 200 行，避免一口气写出难修的大工程。"),
         ("依赖规则", "代码 import 的第三方库必须写进 requirements，且只能用当前环境允许的库。"),
         ("运行产物", "必须生成 CSV、PNG、summary JSON，不能只打印文字。"),
         ("本地审查", "路径、安全、依赖、语法、产物都会被本地代码硬检查。"),
@@ -571,7 +571,7 @@ def draw_codegen_diagram(path: Path) -> Path:
     d.text((60, 35), "第三轮：LLM 写代码，但在护栏里写", fill="#" + DARK, font=font(40, True))
     draw_box(d, (80, 160, 430, 310), "LLM 自由发挥\n写每个文件", "F6F8FB")
     draw_box(d, (620, 120, 980, 230), "固定项目结构\n9 个核心文件", "E8EEF5")
-    draw_box(d, (620, 270, 980, 380), "每文件最多 100 行\n避免大工程失控", "E8EEF5")
+    draw_box(d, (620, 270, 980, 380), "每文件最多 200 行\n避免大工程失控", "E8EEF5")
     draw_box(d, (620, 420, 980, 530), "依赖必须写 requirements\n禁止乱 import", "E8EEF5")
     draw_box(d, (620, 570, 980, 680), "必须输出 CSV/PNG/summary\n可被本地审查", "E8EEF5")
     draw_box(d, (1160, 310, 1500, 500), "本地校验\n不通过就返修/兜底", "F4F6F9")

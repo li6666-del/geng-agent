@@ -167,11 +167,11 @@ class PipelineTests(unittest.TestCase):
 
     def test_project_file_validation_rejects_oversized_file(self) -> None:
         issues = _validate_project_file(
-            {"path": "src/simulation.py", "content_lines": ["print('x')"] * 101},
+            {"path": "src/simulation.py", "content_lines": ["print('x')"] * 201},
             "src/simulation.py",
         )
 
-        self.assertTrue(any("100 lines" in issue.message for issue in issues))
+        self.assertTrue(any("200 lines" in issue.message for issue in issues))
 
     def test_pipeline_creates_review_bundle(self) -> None:
         with TemporaryDirectory() as temp_dir:

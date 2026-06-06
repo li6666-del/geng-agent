@@ -28,7 +28,7 @@
 4. assumptions 写必须简化的科学假设，例如 synthetic data、简化 AWGN/Rayleigh、理论近似、未实现完整协议栈等。
 5. 文件计划必须让后续逐文件生成时能保持一致。
 6. 代码风格必须简洁，优先少量函数和直接清晰的数据流，不要生成框架化、大而全、重复封装或工业级抽象。
-7. 全项目硬性规模上限：所有 Python 文件合计不超过 500 行；单个项目文件不超过 100 行；README、requirements 和每个 JSON 配置文件也不超过 100 行。
+7. 全项目硬性规模上限：所有 Python 文件合计不超过 1000 行；单个项目文件不超过 200 行；README、requirements 和每个 JSON 配置文件也不超过 200 行。
 8. 如果某个功能会导致代码超出上限，必须降低模型复杂度，用最小 Monte Carlo、理论近似或 synthetic data，并把简化写入 assumptions。
 
 输出 schema：

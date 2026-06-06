@@ -165,7 +165,7 @@ def round3(path: Path) -> Path:
     img, d = new_canvas()
     header(d, "第三轮：生成并运行复现项目", "目标：LLM 写代码，但代码必须经过本地护栏")
     box(d, (70, 215, 285, 345), "任务输入", "facts + tasks")
-    box(d, (410, 215, 670, 345), "分文件生成", "每文件 <= 100 行")
+    box(d, (410, 215, 670, 345), "分文件生成", "每文件 <= 200 行")
     box(d, (800, 215, 1035, 345), "代码审查", "路径 / import / 依赖")
     box(d, (1165, 215, 1435, 345), "落地项目", "repro_project")
     box(d, (410, 505, 670, 635), "smoke 运行", "先小规模试跑")
@@ -313,7 +313,7 @@ def build_doc() -> Path:
         "第三轮：复现任务 -> 本地 outputs",
         paths[2],
         [
-            "LLM 可以自由写代码，但每个文件最多 100 行，并且要通过依赖、import、安全和路径审查。",
+            "LLM 可以自由写代码，但每个文件最多 200 行，并且要通过依赖、import、安全和路径审查。",
             "运行顺序改成先 smoke，再跑 full config；最终产物必须是 CSV、PNG 和 summary JSON。",
             "失败时进入修复链：LLM repair、OpenHands 候选副本、本地模板 fallback。",
         ],

@@ -307,13 +307,26 @@ class RunnerTests(unittest.TestCase):
             self.assertTrue(any("not declared" in issue["message"] for issue in result["requirements_issues"]))
 
     def test_guard_refuses_uninstalled_declared_dependency(self) -> None:
+        import importlib.util as importlib_util
+        from unittest.mock import patch
+
+        real_find_spec = importlib_util.find_spec
+
+        def fake_find_spec(name, *args, **kwargs):
+            # Simulate a whitelisted package that is absent from the runner interpreter,
+            # independent of whether reedsolo happens to be installed in the test env.
+            if name == "reedsolo":
+                return None
+            return real_find_spec(name, *args, **kwargs)
+
         files = base_repro_files("import reedsolo\nprint('ok')\n")
         files[1] = ("requirements.txt", "reedsolo\n")
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             write_file_manifest({"files": [{"path": p, "content": c} for p, c in files]}, root)
 
-            result = run_repro_once(root, timeout_seconds=10)
+            with patch("importlib.util.find_spec", side_effect=fake_find_spec):
+                result = run_repro_once(root, timeout_seconds=10)
 
             self.assertFalse(result["passed"])
             self.assertTrue(result["blocked_by_security"])
