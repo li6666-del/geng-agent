@@ -245,7 +245,12 @@ class PipelineIntegrationTests(unittest.TestCase):
             main = FakeLLM()
             reviewer = ReviewerLLM()
 
-            ReviewPipeline(client=main, code_review_client=reviewer).run(paper, temp / "case", run_repro=False, code_review=True)
+            # facts_gap_rounds=0 keeps this test focused on reviewer-vs-main routing; the
+            # gap-finder pass (default on) adds main-client facts calls that are exercised
+            # separately in test_facts_coverage / the gap-finder integration test.
+            ReviewPipeline(client=main, code_review_client=reviewer).run(
+                paper, temp / "case", run_repro=False, code_review=True, facts_gap_rounds=0
+            )
 
             # The heterogeneous reviewer handled the reviews (and only reviews: per-file
             # faithfulness reviews during generation + the final whole-project review);

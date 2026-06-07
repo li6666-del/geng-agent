@@ -64,6 +64,7 @@ def _add_common_review_args(parser: argparse.ArgumentParser, *, include_resume: 
     parser.add_argument("--code-review-attempts", type=int, default=5, help="代码忠实度审查发现 blocking 问题后的返修轮数；默认 5（每轮含一次修复+一次复审，慢模型会更耗时）。")
     parser.add_argument("--code-review-model", default=None, help="代码忠实度审查使用的模型（异构审查者）；默认取 GENG_CODE_REVIEW_MODEL，未设则与主模型相同。")
     parser.add_argument("--code-review-timeout", type=float, default=1200.0, help="代码忠实度审查单次 LLM 请求超时时间，单位秒，默认 1200（整项目审查较慢，给足时间避免超时）。")
+    parser.add_argument("--facts-gap-rounds", type=int, default=3, help="第一轮事实抽取后的“查漏补缺”追加轮数（确定性覆盖校验图/表锚点 + 定向补抽遗漏事实），循环到一轮无新增为止；默认 3，设 0 关闭。")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -101,6 +102,7 @@ def main(argv: list[str] | None = None) -> int:
             template_fallback=not args.no_template_fallback,
             code_review=args.code_review,
             code_review_attempts=args.code_review_attempts,
+            facts_gap_rounds=args.facts_gap_rounds,
         )
         print(f"审查完成：{result.output_dir}")
         print(f"报告：{result.review_path}")

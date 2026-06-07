@@ -9,6 +9,7 @@ from typing import Any, Callable
 from .code_review import review_single_generated_file, run_code_faithfulness_review
 from .documents import load_paper
 from .experiment_index import build_local_experiment_index
+from .facts_coverage import compute_fact_coverage, merge_engineering_facts
 from .facts_normalize import (
     engineering_facts_floor_issues,
     finalize_engineering_facts,
@@ -207,6 +208,7 @@ class ReviewPipeline:
         prompt_adjustments: dict[str, str] | None = None,
         code_review: bool = False,
         code_review_attempts: int = 5,
+        facts_gap_rounds: int = 3,
     ) -> PipelineResult:
         stage_cleanup = {
             "facts": "facts",
@@ -245,6 +247,7 @@ class ReviewPipeline:
             prompt_adjustments=prompt_adjustments,
             code_review=code_review,
             code_review_attempts=code_review_attempts,
+            facts_gap_rounds=facts_gap_rounds,
         )
 
     def run(
@@ -267,6 +270,7 @@ class ReviewPipeline:
         prompt_adjustments: dict[str, str] | None = None,
         code_review: bool = False,
         code_review_attempts: int = 5,
+        facts_gap_rounds: int = 3,
     ) -> PipelineResult:
         output_dir = output_dir.expanduser().resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -344,6 +348,22 @@ class ReviewPipeline:
                 if template_fallback
                 else None
             ),
+        )
+
+        # Round-1 recall hardening: deterministically check figure/table coverage and run a
+        # targeted gap-finder pass for the omissions (a miss here diverges everything below).
+        facts = self._augment_facts_with_gap_finder(
+            facts=facts,
+            paper=paper,
+            paper_context=paper_context,
+            paper_images=paper_images,
+            valid_chunk_ids=valid_chunk_ids,
+            valid_pages=valid_pages,
+            output_dir=output_dir,
+            audit_dir=audit_dir,
+            resume=resume,
+            max_attempts=json_repair_attempts + 1,
+            max_rounds=facts_gap_rounds,
         )
 
         _mark("facts")
@@ -740,6 +760,97 @@ class ReviewPipeline:
             )
         write_json(output_path, parsed)
         return parsed
+
+    def _augment_facts_with_gap_finder(
+        self,
+        *,
+        facts: dict[str, Any],
+        paper: dict[str, Any],
+        paper_context: str,
+        paper_images: list,
+        valid_chunk_ids: set[str],
+        valid_pages: set[int],
+        output_dir: Path,
+        audit_dir: Path,
+        resume: bool,
+        max_attempts: int,
+        max_rounds: int,
+    ) -> dict[str, Any]:
+        """Round-1 recall hardening. After the first extraction, deterministically compute
+        which paper figures/tables the facts actually cover, then run a targeted LLM
+        gap-finder pass that re-queries only the omissions. Loop until a round adds nothing
+        new (cap ``max_rounds``).
+
+        Non-fatal by design: a gap round that errors keeps the base facts and stops -- this
+        only ever *adds* grounded facts, never removes or weakens round 1. Idempotent under
+        resume: dedup by (type, name) means re-merging cached rounds adds zero.
+        """
+        if max_rounds <= 0:
+            return facts
+        chunks = paper.get("chunks", []) if isinstance(paper, dict) else []
+        for round_no in range(1, max_rounds + 1):
+            coverage = compute_fact_coverage(chunks, facts.get("engineering_facts", []))
+            write_json(audit_dir / f"facts_coverage_round_{round_no}.json", coverage)
+
+            gap_prompt = self.prompt_book.render(
+                "extract_engineering_facts_gaps.md",
+                paper_chunks_json=paper_context,
+                existing_facts_json=wrap_untrusted(
+                    "existing_facts_json",
+                    pretty_json({"engineering_facts": facts.get("engineering_facts", [])}),
+                ),
+                coverage_report_json=wrap_untrusted("coverage_report_json", pretty_json(coverage)),
+            )
+            try:
+                gap_doc = self._load_or_create_stage_json(
+                    output_path=output_dir / f"engineering_facts_gap_round_{round_no}.json",
+                    output_dir=output_dir,
+                    audit_dir=audit_dir,
+                    prompt=gap_prompt,
+                    stage_label=f"01b_facts_gap_round_{round_no}",
+                    cleanup_stage="facts_gap",  # unknown stage -> clears nothing (keep base facts)
+                    schema_stage="engineering_facts",
+                    max_attempts=max_attempts,
+                    resume=resume,
+                    # No floor check: an empty gap result (nothing missing) is a valid outcome.
+                    extra_validation=lambda parsed: validate_fact_sources(
+                        parsed, valid_chunk_ids, valid_pages
+                    ),
+                    candidate_normalizer=lambda parsed: finalize_engineering_facts(
+                        parsed, valid_chunk_ids, valid_pages
+                    ),
+                    truncation_recovery=recover_truncated_engineering_facts,
+                    images=paper_images,
+                    fallback_factory=None,
+                )
+            except Exception as exc:
+                write_json(
+                    audit_dir / f"facts_gap_round_{round_no}_error.json",
+                    {"ok": False, "error": f"{type(exc).__name__}: {exc}"},
+                )
+                break
+
+            facts, added = merge_engineering_facts(facts, gap_doc)
+            meta = dict(facts.get("_meta", {})) if isinstance(facts.get("_meta"), dict) else {}
+            gap_meta = dict(meta.get("gap_finder", {})) if isinstance(meta.get("gap_finder"), dict) else {}
+            gap_meta[f"round_{round_no}_added"] = added
+            gap_meta["rounds_run"] = round_no
+            meta["gap_finder"] = gap_meta
+            facts["_meta"] = meta
+            write_json(output_dir / "engineering_facts.json", facts)
+            write_json(
+                audit_dir / f"facts_gap_round_{round_no}_summary.json",
+                {
+                    "ok": True,
+                    "added_facts": added,
+                    "total_facts": len(facts.get("engineering_facts", [])),
+                    "uncovered_figures_before": coverage.get("uncovered_figures"),
+                    "uncovered_tables_before": coverage.get("uncovered_tables"),
+                },
+            )
+            if added == 0:
+                break
+        return facts
 
     def _load_or_create_experiment_index(
         self,
