@@ -247,9 +247,11 @@ class PipelineIntegrationTests(unittest.TestCase):
 
             ReviewPipeline(client=main, code_review_client=reviewer).run(paper, temp / "case", run_repro=False, code_review=True)
 
-            # The heterogeneous reviewer handled the review (and only the review);
+            # The heterogeneous reviewer handled the reviews (and only reviews: per-file
+            # faithfulness reviews during generation + the final whole-project review);
             # the main generator client never saw a code-review call.
-            self.assertEqual(reviewer.stages, ["code_faithfulness_review"])
+            self.assertTrue(reviewer.stages)
+            self.assertTrue(all(stage == "code_faithfulness_review" for stage in reviewer.stages))
             self.assertEqual(len(main.calls), 12)
 
 

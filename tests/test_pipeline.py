@@ -9,6 +9,7 @@ from unittest.mock import patch
 from geng_agent.pipeline import (
     ReviewPipeline,
     _assess_partial_success,
+    _clear_project_code_files,
     _validate_project_file,
     normalize_repro_project_manifest_candidate,
 )
@@ -166,12 +167,140 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(normalized["_meta"]["manifest_normalized"])
 
     def test_project_file_validation_rejects_oversized_file(self) -> None:
+        # Ordinary files keep the 200-line cap.
         issues = _validate_project_file(
-            {"path": "src/simulation.py", "content_lines": ["print('x')"] * 201},
-            "src/simulation.py",
+            {"path": "src/metrics.py", "content_lines": ["print('x')"] * 201},
+            "src/metrics.py",
         )
 
         self.assertTrue(any("200 lines" in issue.message for issue in issues))
+
+    def test_simulation_file_allows_up_to_500_lines(self) -> None:
+        # simulation.py is the integration/orchestration file; it gets a 500-line cap so a
+        # complex multi-experiment driver doesn't trigger a whole-project template fallback.
+        ok = _validate_project_file(
+            {"path": "src/simulation.py", "content_lines": ["print('x')"] * 201},
+            "src/simulation.py",
+        )
+        self.assertFalse(any("lines for" in issue.message for issue in ok))
+        too_big = _validate_project_file(
+            {"path": "src/simulation.py", "content_lines": ["print('x')"] * 501},
+            "src/simulation.py",
+        )
+        self.assertTrue(any("500 lines" in issue.message for issue in too_big))
+
+    def test_clear_project_code_files_removes_orphans_keeps_scratch(self) -> None:
+        # Bug B: a template fallback must atomically replace the project; orphan code from an
+        # earlier generation must not survive, but outputs/ and repair_logs/ are preserved.
+        with TemporaryDirectory() as tmp:
+            proj = Path(tmp) / "repro_project"
+            (proj / "src").mkdir(parents=True)
+            (proj / "src" / "orphan.py").write_text("x = 1\n", encoding="utf-8")
+            (proj / "run_experiment.py").write_text("print(1)\n", encoding="utf-8")
+            (proj / "outputs").mkdir()
+            (proj / "outputs" / "results.csv").write_text("a\n", encoding="utf-8")
+            (proj / "repair_logs").mkdir()
+            (proj / "repair_logs" / "attempt_01_run.json").write_text("{}", encoding="utf-8")
+
+            _clear_project_code_files(proj)
+
+            self.assertFalse((proj / "src").exists())
+            self.assertFalse((proj / "run_experiment.py").exists())
+            self.assertTrue((proj / "outputs" / "results.csv").exists())
+            self.assertTrue((proj / "repair_logs" / "attempt_01_run.json").exists())
+
+    def test_project_file_rejects_prose_in_python_file(self) -> None:
+        # The exact failure that sank arXiv 2603.29359: the model returned a prose review
+        # instead of code for src/simulation.py. It passed per-file structural checks, then
+        # failed the project-level compile check -> whole project discarded for a template.
+        issues = _validate_project_file(
+            {
+                "path": "src/simulation.py",
+                "content_lines": [
+                    "Review of reproducibility risks for the provided paper.",
+                    "Key risks include: 1. Mathematical model implementation.",
+                ],
+            },
+            "src/simulation.py",
+        )
+        self.assertTrue(any("not valid Python" in issue.message for issue in issues))
+
+    def test_project_file_accepts_valid_python(self) -> None:
+        issues = _validate_project_file(
+            {
+                "path": "src/simulation.py",
+                "content_lines": ["import numpy as np", "", "def run():", "    return np.zeros(3)"],
+            },
+            "src/simulation.py",
+        )
+        self.assertFalse(any("not valid Python" in issue.message for issue in issues))
+
+    def test_project_file_rejects_malformed_json(self) -> None:
+        issues = _validate_project_file(
+            {"path": "config.json", "content_lines": ["this is not json at all"]},
+            "config.json",
+        )
+        self.assertTrue(any("not valid JSON" in issue.message for issue in issues))
+
+    def test_project_file_accepts_valid_json(self) -> None:
+        issues = _validate_project_file(
+            {"path": "config.json", "content_lines": ["{", '  "bits": 1000', "}"]},
+            "config.json",
+        )
+        self.assertFalse(any("not valid JSON" in issue.message for issue in issues))
+
+    def test_generated_files_context_keeps_full_content(self) -> None:
+        import json as _json
+
+        from geng_agent.pipeline import _generated_files_context
+
+        long_lines = ["filler_%03d = %d  # %s" % (i, i, "a" * 40) for i in range(40)] + ["UNIQUE_TAIL_MARKER = 1"]
+        ctx = _json.loads(_generated_files_context([{"path": "src/channel.py", "content_lines": long_lines}]))
+        self.assertEqual(ctx[0]["path"], "src/channel.py")
+        self.assertIn("content", ctx[0])
+        self.assertNotIn("content_preview", ctx[0])
+        # Full content, no 1200-char truncation: a marker well past char 1200 survives.
+        self.assertGreater(len(ctx[0]["content"]), 1500)
+        self.assertIn("UNIQUE_TAIL_MARKER", ctx[0]["content"])
+
+    def test_per_file_review_grounding_keeps_only_target_file_findings(self) -> None:
+        from geng_agent.code_review import _ground_findings_against
+
+        facts = {"engineering_facts": [{"value": "ber equals q function of sqrt two ebn0"}]}
+        tasks = {"repro_tasks": []}
+        code = "def ber(x):\n    return special_q_function(x)\n"
+        grounded = {"spec_ref": "ber", "evidence_spec": "ber equals q function", "evidence_code": "special_q_function", "severity": "blocking"}
+        ungrounded = {"spec_ref": "ber", "evidence_spec": "ber equals q function", "evidence_code": "absent_symbol_xyz", "severity": "blocking"}
+        kept, dropped = _ground_findings_against([grounded, ungrounded], facts, tasks, code)
+        self.assertEqual(len(kept), 1)
+        self.assertIs(kept[0], grounded)
+        self.assertEqual(len(dropped), 1)
+
+    def test_per_file_revise_rounds_default_is_three(self) -> None:
+        from geng_agent.pipeline import PER_FILE_REVIEW_REVISE_ROUNDS
+
+        self.assertEqual(PER_FILE_REVIEW_REVISE_ROUNDS, 3)
+
+    def test_code_review_snapshot_restore_roundtrip(self) -> None:
+        from geng_agent.code_review import _restore_project, _snapshot_project
+
+        with TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            proj = base / "proj"
+            (proj / "src").mkdir(parents=True)
+            (proj / "run_experiment.py").write_text("print('best')\n", encoding="utf-8")
+            (proj / "src" / "metrics.py").write_text("X = 1\n", encoding="utf-8")
+            (proj / "outputs").mkdir()
+            (proj / "outputs" / "junk.csv").write_text("a\n", encoding="utf-8")
+
+            snap = _snapshot_project(proj, base / "snap")
+            self.assertFalse((snap / "outputs").exists())  # outputs/ ignored in snapshot
+
+            # simulate a regressing revise, then restore the best-reviewed snapshot
+            (proj / "run_experiment.py").write_text("print('worse-regressed')\n", encoding="utf-8")
+            _restore_project(snap, proj)
+            self.assertEqual((proj / "run_experiment.py").read_text(encoding="utf-8"), "print('best')\n")
+            self.assertEqual((proj / "src" / "metrics.py").read_text(encoding="utf-8"), "X = 1\n")
 
     def test_pipeline_creates_review_bundle(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -433,6 +562,32 @@ class PipelineTests(unittest.TestCase):
             manifest = json.loads((output_dir / "repro_project_manifest.json").read_text(encoding="utf-8"))
             self.assertTrue(manifest["_meta"]["template_fallback_used"])
 
+    def test_code_review_is_skipped_on_template_fallback(self) -> None:
+        # Bug C: a template fallback must not be reviewed/revised by the whole-project code
+        # review (doing so regenerates code over the template and desyncs disk/manifest/flag).
+        class GenerateProjectTimeoutLLM(FakeLLM):
+            def complete(self, prompt: str, *, system: str | None = None, response_format: dict | None = None) -> str:
+                if len(self.calls) < 2:
+                    return super().complete(prompt, system=system, response_format=response_format)
+                self.calls.append(prompt)
+                raise RuntimeError("LLM request failed: TimeoutError: The read operation timed out")
+
+        with TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            paper = temp / "paper.md"
+            paper.write_text("Simulation Results\nAWGN channel, BER vs SNR.", encoding="utf-8")
+            output_dir = temp / "case"
+
+            ReviewPipeline(client=GenerateProjectTimeoutLLM()).run(
+                paper, output_dir, run_repro=False, code_review=True
+            )
+
+            manifest = json.loads((output_dir / "repro_project_manifest.json").read_text(encoding="utf-8"))
+            self.assertTrue(manifest["_meta"]["template_fallback_used"])
+            code_review = json.loads((output_dir / "code_review.json").read_text(encoding="utf-8"))
+            self.assertFalse(code_review["enabled"])
+            self.assertIn("template fallback", code_review["reason"])
+
     def test_pipeline_uses_template_fallback_when_runtime_repairs_fail(self) -> None:
         class BrokenProjectLLM(FakeLLM):
             def complete(self, prompt: str, *, system: str | None = None, response_format: dict | None = None) -> str:
@@ -527,32 +682,24 @@ class PipelineTests(unittest.TestCase):
                 if len(self.calls) < 2:
                     return super().complete(prompt, system=system, response_format=response_format)
                 self.calls.append(prompt)
-                return json.dumps(
-                    {
-                        "files": [
-                            {"path": "README.md", "content": "Run smoke.\n"},
-                            {"path": "requirements.txt", "content": "\n"},
-                            {"path": "config.json", "content": "{\"assumptions\": []}\n"},
-                            {"path": "config_smoke.json", "content": "{\"assumptions\": []}\n"},
-                            {
-                                "path": "run_experiment.py",
-                                "content": (
-                                    "import base64\n"
-                                    "from pathlib import Path\n"
-                                    f"PNG_B64 = '{PNG_B64}'\n"
-                                    "Path('outputs').mkdir(exist_ok=True)\n"
-                                    "Path('outputs/results.csv').write_text('snr_db,bit_error_rate\\n0,0.1\\n2,0.05\\n', encoding='utf-8')\n"
-                                    "Path('outputs/ber_vs_snr.png').write_bytes(base64.b64decode(PNG_B64))\n"
-                                    "Path('outputs/summary.json').write_text('{\"task_id\":\"reproduce_fig_1\",\"metrics\":{\"ber0\":0.1},\"assumptions\":[]}', encoding='utf-8')\n"
-                                ),
-                            },
-                            {"path": "src/channel.py", "content": "\n"},
-                            {"path": "src/modulation.py", "content": "\n"},
-                            {"path": "src/metrics.py", "content": "\n"},
-                            {"path": "src/simulation.py", "content": "\n"},
-                        ]
-                    }
-                )
+                overrides = {
+                    # No third-party deps so the guarded runner executes in any interpreter.
+                    "requirements.txt": "\n",
+                    "run_experiment.py": (
+                        "import base64\n"
+                        "from pathlib import Path\n"
+                        f"PNG_B64 = '{PNG_B64}'\n"
+                        "Path('outputs').mkdir(exist_ok=True)\n"
+                        "Path('outputs/results.csv').write_text('snr_db,bit_error_rate\\n0,0.1\\n2,0.05\\n', encoding='utf-8')\n"
+                        "Path('outputs/ber_vs_snr.png').write_bytes(base64.b64decode(PNG_B64))\n"
+                        "Path('outputs/summary.json').write_text('{\"task_id\":\"reproduce_fig_1\",\"metrics\":{\"ber0\":0.1},\"assumptions\":[]}', encoding='utf-8')\n"
+                    ),
+                }
+                if schema_name(response_format) == "repro_project_plan":
+                    return project_plan_response()
+                if schema_name(response_format) == "repro_project_file":
+                    return project_file_response(prompt, overrides=overrides)
+                return project_manifest_response(overrides=overrides)
 
             def complete_multimodal(self, prompt: str, *, images: list, system: str | None = None, response_format: dict | None = None) -> str:
                 self.multimodal_calls.append({"prompt": prompt, "images": images, "response_format": response_format})
@@ -596,10 +743,17 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue((result.output_dir / "review.docx").exists())
             self.assertTrue((result.output_dir / "result_review.docx").exists())
             risk_report = json.loads((result.output_dir / "risk_report.json").read_text(encoding="utf-8"))
-            self.assertEqual(risk_report["reproducibility_verdict"]["verdict"], "partially_reproduced")
+            # Genuine (non-template) generation + partial_match review -> mostly_reproduced.
+            # (Previously this fake fell back to a template, which capped the verdict to
+            # partially_reproduced; P0-1 now reviews only real generated projects.)
+            self.assertEqual(risk_report["reproducibility_verdict"]["verdict"], "mostly_reproduced")
             self.assertIsNotNone(result.review_docx_path)
             self.assertIsNotNone(result.result_review_docx_path)
             self.assertTrue((result.output_dir / "audit" / "04_review_reproduction_results.md").exists())
+            run_cost = json.loads((result.output_dir / "run_cost.json").read_text(encoding="utf-8"))
+            self.assertIn("wall_clock_s", run_cost)
+            self.assertIn("by_stage", run_cost)
+            self.assertTrue(any(stage["stage"] == "result_review" for stage in run_cost["by_stage"]))
 
     def test_pipeline_writes_result_review_error_when_multimodal_fails(self) -> None:
         class FailingVisionLLM(FakeLLM):
@@ -607,32 +761,23 @@ class PipelineTests(unittest.TestCase):
                 if len(self.calls) < 2:
                     return super().complete(prompt, system=system, response_format=response_format)
                 self.calls.append(prompt)
-                return json.dumps(
-                    {
-                        "files": [
-                            {"path": "README.md", "content": "Run smoke.\n"},
-                            {"path": "requirements.txt", "content": "\n"},
-                            {"path": "config.json", "content": "{\"assumptions\": []}\n"},
-                            {"path": "config_smoke.json", "content": "{\"assumptions\": []}\n"},
-                            {
-                                "path": "run_experiment.py",
-                                "content": (
-                                    "import base64\n"
-                                    "from pathlib import Path\n"
-                                    f"PNG_B64 = '{PNG_B64}'\n"
-                                    "Path('outputs').mkdir(exist_ok=True)\n"
-                                    "Path('outputs/results.csv').write_text('snr_db,bit_error_rate\\n0,0.1\\n', encoding='utf-8')\n"
-                                    "Path('outputs/ber_vs_snr.png').write_bytes(base64.b64decode(PNG_B64))\n"
-                                    "Path('outputs/summary.json').write_text('{\"task_id\":\"reproduce_fig_1\",\"metrics\":{\"ber0\":0.1},\"assumptions\":[]}', encoding='utf-8')\n"
-                                ),
-                            },
-                            {"path": "src/channel.py", "content": "\n"},
-                            {"path": "src/modulation.py", "content": "\n"},
-                            {"path": "src/metrics.py", "content": "\n"},
-                            {"path": "src/simulation.py", "content": "\n"},
-                        ]
-                    }
-                )
+                overrides = {
+                    "requirements.txt": "\n",
+                    "run_experiment.py": (
+                        "import base64\n"
+                        "from pathlib import Path\n"
+                        f"PNG_B64 = '{PNG_B64}'\n"
+                        "Path('outputs').mkdir(exist_ok=True)\n"
+                        "Path('outputs/results.csv').write_text('snr_db,bit_error_rate\\n0,0.1\\n', encoding='utf-8')\n"
+                        "Path('outputs/ber_vs_snr.png').write_bytes(base64.b64decode(PNG_B64))\n"
+                        "Path('outputs/summary.json').write_text('{\"task_id\":\"reproduce_fig_1\",\"metrics\":{\"ber0\":0.1},\"assumptions\":[]}', encoding='utf-8')\n"
+                    ),
+                }
+                if schema_name(response_format) == "repro_project_plan":
+                    return project_plan_response()
+                if schema_name(response_format) == "repro_project_file":
+                    return project_file_response(prompt, overrides=overrides)
+                return project_manifest_response(overrides=overrides)
 
             def complete_multimodal(self, prompt: str, *, images: list, system: str | None = None, response_format: dict | None = None) -> str:
                 raise RuntimeError("LLM request failed: HTTP 400: image input unsupported")

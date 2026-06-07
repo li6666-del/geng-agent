@@ -37,7 +37,6 @@ ORCHESTRATOR_DEPENDENCIES: tuple[tuple[str, str, str], ...] = (
     ("pymupdf", "fitz", "把论文页面渲染成 PNG 供多模态审查"),
     ("pydantic", "pydantic", "JSON 结构校验"),
     ("python-docx", "docx", "生成 Word 报告"),
-    ("langgraph", "langgraph", "流水线编排"),
     ("pillow", "PIL", "图像处理（也供复现代码使用）"),
 )
 
@@ -201,7 +200,7 @@ def format_report(report: EnvironmentReport) -> str:
 
 
 def environment_warning(report: EnvironmentReport) -> str | None:
-    """Compact one-block warning for the start of `review`/`supervise`. Returns
+    """Compact one-block warning for the start of `review`. Returns
     None when the environment is fully ready. Printed to stderr so it never
     pollutes the stdout result lines."""
     if report.ok:

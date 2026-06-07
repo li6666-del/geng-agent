@@ -151,12 +151,12 @@ def _result(verdict: str, confidence: str, reasons: list[str], recommended_actio
 def _limited_by_template(result: dict[str, Any], template_fallback_used: bool) -> dict[str, Any]:
     if not template_fallback_used:
         return result
-    if result["verdict"] in {"fully_reproduced", "mostly_reproduced"}:
+    if result["verdict"] in {"fully_reproduced", "mostly_reproduced", "partially_reproduced"}:
         result = dict(result)
-        result["verdict"] = "partially_reproduced"
-        result["confidence"] = _min_confidence(result["confidence"], "medium")
+        result["verdict"] = "inconclusive"
+        result["confidence"] = _min_confidence(result["confidence"], "low")
         result["recommended_action"] = (
-            "Template fallback was used; label the outcome as partial and request human review of the generated assumptions."
+            "Template fallback was used: the paper's own reproduction code did not run, so the result evidence comes from a generic template, not the paper's method. Treat as inconclusive and reproduce the paper's method manually before any positive claim."
         )
     return result
 

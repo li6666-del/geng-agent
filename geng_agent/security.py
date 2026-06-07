@@ -17,17 +17,30 @@ ALLOWED_REQUIREMENTS = {
     "sklearn",
     "reedsolo",
     "pillow",
+    # Broadened scientific / communications stack so the generator is not forced into
+    # crude simplifications (which drive template fallback). All pure-computation, no
+    # network/system access. Kept in sync with pyproject [repro] and installed locally.
+    "pandas",
+    "sympy",
+    "numba",
+    "scikit-commpy",
+    "galois",
+    "networkx",
+    "h5py",
+    "tqdm",
 }
 
 REQUIREMENT_IMPORT_NAMES = {
     "scikit-learn": {"sklearn"},
     "sklearn": {"sklearn"},
     "pillow": {"PIL"},
+    "scikit-commpy": {"commpy"},
 }
 
 IMPORT_REQUIREMENT_NAMES = {
     "sklearn": "scikit-learn",
     "PIL": "pillow",
+    "commpy": "scikit-commpy",
 }
 
 FORBIDDEN_IMPORTS = {
@@ -168,6 +181,52 @@ def validate_requirements(root: Path) -> list[dict[str, str]]:
                 )
     issues.extend(validate_import_requirements(root, declared_packages))
     return issues
+
+
+def reconcile_whitelisted_requirements(root: Path) -> list[str]:
+    """Auto-add to requirements.txt any third-party import that maps to a WHITELISTED and
+    INSTALLED package but was left undeclared.
+
+    Rationale (Bug A): the generator/repair sometimes imports e.g. ``scipy.linalg`` while
+    forgetting to list ``scipy`` in requirements.txt, and the consistency gate then refuses
+    to run it. For a whitelisted+installed library that omission is harmless friction, not a
+    security risk, so we normalise it by declaring it. Imports that are NOT whitelisted, or
+    whitelisted but NOT installed, are intentionally left undeclared so the gate still blocks
+    them. Returns the package names that were added (empty if nothing changed)."""
+    req_path = root / "requirements.txt"
+    declared: set[str] = set()
+    existing: list[str] = []
+    if req_path.exists():
+        for raw in req_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            existing.append(raw)
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            pkg = re.split(r"[<>=!~\[]", line, maxsplit=1)[0].strip().lower().replace("_", "-")
+            declared.add(pkg)
+
+    local_modules = collect_local_module_roots(root)
+    to_add: set[str] = set()
+    for py_file in iter_project_python_files(root):
+        try:
+            tree = ast.parse(py_file.read_text(encoding="utf-8", errors="replace"))
+        except SyntaxError:
+            continue
+        for import_ref in collect_third_party_imports(tree, local_modules):
+            package = requirement_name_for_import(import_ref["root"])
+            if package in ALLOWED_REQUIREMENTS and package not in declared and all(
+                importlib.util.find_spec(name) is not None
+                for name in import_names_for_requirement(package)
+            ):
+                to_add.add(package)
+
+    if not to_add:
+        return []
+    added = sorted(to_add)
+    lines = [line for line in existing if line.strip()]
+    lines.extend(added)
+    req_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return added
 
 
 def dependency_policy_prompt_text() -> str:

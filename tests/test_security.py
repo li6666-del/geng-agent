@@ -2,7 +2,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from geng_agent.security import FORBIDDEN_BUILTINS, static_scan_repro_project
+from geng_agent.security import (
+    FORBIDDEN_BUILTINS,
+    reconcile_whitelisted_requirements,
+    static_scan_repro_project,
+)
 
 
 def scan_source(source: str) -> list[dict[str, str]]:
@@ -58,6 +62,42 @@ class StaticScanDynamicBuiltinTests(unittest.TestCase):
             "    fh.write('x\\n')\n"
         )
         self.assertEqual(scan_source(source), [])
+
+
+class ReconcileRequirementsTests(unittest.TestCase):
+    def _project(self, tmp: str, *, requirements: str, sim_source: str) -> Path:
+        root = Path(tmp)
+        (root / "requirements.txt").write_text(requirements, encoding="utf-8")
+        (root / "src").mkdir(exist_ok=True)
+        (root / "src" / "__init__.py").write_text("", encoding="utf-8")
+        (root / "src" / "simulation.py").write_text(sim_source, encoding="utf-8")
+        return root
+
+    def test_adds_undeclared_whitelisted_installed_import(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = self._project(
+                tmp, requirements="numpy\n", sim_source="import numpy as np\nimport scipy.linalg\n"
+            )
+            added = reconcile_whitelisted_requirements(root)
+            self.assertEqual(added, ["scipy"])
+            text = (root / "requirements.txt").read_text(encoding="utf-8")
+            self.assertIn("scipy", text)
+            self.assertIn("numpy", text)
+
+    def test_does_not_add_non_whitelisted_import(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = self._project(
+                tmp, requirements="numpy\n", sim_source="import numpy as np\nimport yaml\n"
+            )
+            self.assertEqual(reconcile_whitelisted_requirements(root), [])
+            self.assertNotIn("yaml", (root / "requirements.txt").read_text(encoding="utf-8"))
+
+    def test_noop_when_all_declared(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = self._project(
+                tmp, requirements="numpy\nscipy\n", sim_source="import numpy as np\nimport scipy.linalg\n"
+            )
+            self.assertEqual(reconcile_whitelisted_requirements(root), [])
 
 
 if __name__ == "__main__":

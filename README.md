@@ -24,13 +24,13 @@ $env:GENG_LLM_MODEL="gpt-4o"          # 需支持图像，结果级审查才跑�
 # $env:GENG_LLM_BASE_URL="https://api.deepseek.com"
 
 # 5. 拿仓库自带的示例论文跑一遍“全流程”
-#    = 监督/反思层 + LLM 代码忠实度审查 + 运行复现 + 结果级多模态审查（结果级审查与兜底默认开）
-python -m geng_agent supervise sample_papers\rayleigh_error_probability_2406.16548.pdf --out case_001 --run-repro --code-review
+#    = LLM 代码忠实度审查 + 运行复现 + 结果级多模态审查（结果级审查与兜底默认开）
+python -m geng_agent review sample_papers\rayleigh_error_probability_2406.16548.pdf --out case_001 --run-repro --code-review
 ```
 
 跑完看 `case_001\` 下的 `review.md`（主报告）、`repro_project\`（生成的复现项目）、`result_review.md`（结果级审查）。
 
-> 要点：① API key 是你自己的、要花钱，本项目不含 key；② 模型需支持多模态，否则结果级审查会写 `result_review_error.json`（其余仍正常），不想跑可加 `--no-result-review`；③ 只想生成、不运行代码就去掉 `--run-repro`；④ 想跑得更稳可加 `--repair-attempts 3 --max-supervisor-steps 16 --run-timeout 600` 等调优参数。安装、运行解释器、模型配置的细节见下文各节。
+> 要点：① API key 是你自己的、要花钱，本项目不含 key；② 模型需支持多模态，否则结果级审查会写 `result_review_error.json`（其余仍正常），不想跑可加 `--no-result-review`；③ 只想生成、不运行代码就去掉 `--run-repro`；④ 想跑得更稳可加 `--repair-attempts 3 --run-timeout 600` 等调优参数。安装、运行解释器、模型配置的细节见下文各节。
 
 ## 工作流
 
@@ -71,8 +71,8 @@ D:\python\python.exe -m pip install -e ".[repro]"
 
 | 这条命令装的两类 | 包 | 缺了会怎样 |
 |---|---|---|
-| 运行 geng-agent 本体 | pypdf、pymupdf、pydantic、python-docx、langgraph、pillow | CLI 起不来 |
-| 复现代码白名单 | numpy、scipy、matplotlib、scikit-learn、reedsolo | 复现代码跑不了 → 每篇论文吃兜底（缺 numpy 时生成阶段还会反过来让模型“别用 numpy”） |
+| 运行 geng-agent 本体 | pypdf、pymupdf、pydantic、python-docx、pillow | CLI 起不来 |
+| 复现代码白名单 | numpy、scipy、matplotlib、scikit-learn、reedsolo、pandas、sympy、numba、scikit-commpy、galois、networkx、h5py、tqdm | 复现代码跑不了 → 每篇论文吃兜底（缺 numpy/scipy/matplotlib 这三个关键库时生成阶段还会反过来让模型“别用它们”） |
 
 > 需要极简 Web 就装 `".[repro,web]"`。从项目目录直接运行时 `geng_agent` 包本身可以不装，但上面这些库必须装。
 
@@ -84,7 +84,7 @@ D:\python\python.exe -m pip install -e ".[repro]"
 
 `doctor` 回显它实际使用的解释器路径、Python 版本是否达标、每个库装没装：**全绿才喂 PDF**；缺什么它直接给出修复命令（致命缺失退出码 1、可用 0）。因为它报的是真实解释器路径，能当场看出有没有指错 Python——所以那条路径本身不用记死，让 `doctor` 替你确认。
 
-> 白名单的唯一真源是 `security.py` 的 `ALLOWED_REQUIREMENTS`，`pyproject.toml` 的 `[repro]` 由 `tests/test_preflight.py` 锁死、不会漂移。`review`/`supervise` 启动时也会自动做一次轻量自检，缺关键库会在 stderr 告警（不阻断运行）。
+> 白名单的唯一真源是 `security.py` 的 `ALLOWED_REQUIREMENTS`，`pyproject.toml` 的 `[repro]` 由 `tests/test_preflight.py` 锁死、不会漂移。`review` 启动时也会自动做一次轻量自检，缺关键库会在 stderr 告警（不阻断运行）。
 
 ## 运行解释器（重要）
 

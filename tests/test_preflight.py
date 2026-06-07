@@ -73,7 +73,14 @@ class CheckEnvironmentTests(unittest.TestCase):
         self.assertIn("pypdf", orchestrator_names)
         self.assertIn("pymupdf", orchestrator_names)
         repro_names = {item.package for item in report.repro}
-        self.assertEqual(repro_names, {"numpy", "scipy", "matplotlib", "scikit-learn", "reedsolo"})
+        self.assertEqual(
+            repro_names,
+            {
+                "numpy", "scipy", "matplotlib", "scikit-learn", "reedsolo",
+                "pandas", "sympy", "numba", "scikit-commpy", "galois",
+                "networkx", "h5py", "tqdm",
+            },
+        )
 
     def test_pillow_listed_under_orchestrator_not_repro(self) -> None:
         report = check_environment()

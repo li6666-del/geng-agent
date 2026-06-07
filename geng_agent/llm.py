@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 
@@ -44,6 +44,9 @@ class OpenAICompatibleClient:
     timeout: float = 120.0
     thinking: str | None = None
     reasoning_effort: str | None = None
+    # Cumulative per-call token usage as reported by the API (one entry per request).
+    # Used by the pipeline to write run_cost.json; never affects request behaviour.
+    usage_log: list[dict[str, Any]] = field(default_factory=list)
 
     def complete(
         self,
@@ -71,6 +74,7 @@ class OpenAICompatibleClient:
 
         raw = self._post_chat_completion(payload)
         data = json.loads(raw)
+        self._record_usage(data, kind="text")
         try:
             return data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
@@ -116,10 +120,23 @@ class OpenAICompatibleClient:
 
         raw = self._post_chat_completion(payload, allow_response_format_fallback=False)
         data = json.loads(raw)
+        self._record_usage(data, kind="multimodal")
         try:
             return data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise RuntimeError(f"Unexpected LLM response shape: {raw}") from exc
+
+    def _record_usage(self, data: Any, *, kind: str) -> None:
+        """Append the API-reported token usage for one request. Missing/absent usage is
+        recorded as an entry with null token counts so call counts stay accurate even when
+        a provider omits the usage block."""
+        usage = data.get("usage") if isinstance(data, dict) else None
+        entry: dict[str, Any] = {"model": self.model, "kind": kind}
+        if isinstance(usage, dict):
+            entry["prompt_tokens"] = usage.get("prompt_tokens")
+            entry["completion_tokens"] = usage.get("completion_tokens")
+            entry["total_tokens"] = usage.get("total_tokens")
+        self.usage_log.append(entry)
 
     def _post_chat_completion(self, payload: dict[str, Any], *, allow_response_format_fallback: bool = True) -> str:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")

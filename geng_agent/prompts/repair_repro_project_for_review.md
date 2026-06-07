@@ -15,6 +15,7 @@
 1. files[].path 必须是 repro_project 内的相对路径；touched_files 必须都出现在 files[].path。
 2. files[] 只包含需要替换或新增的**完整文件**，不要输出 diff；每条只含 content、content_lines、content_b64 之一，优先 content_lines。
 3. 若修复改变了科学含义，必须在 scientific_changes 中说明；否则写空数组。
+4. 依赖纪律（重要）：修复若需要用到某个第三方库，这个库**必须在上面 dependency_policy 的白名单之内**；白名单里没有的库一律不要 import，改用标准库、numpy 等白名单内的库或更简单的实现来达到同样目的。**任何新增的第三方 import 都必须同时在 requirements.txt 写上对应包名**——漏写会被本地依赖一致性安全闸直接拦截、导致整次修复白做。
 
 输出 schema：
 {

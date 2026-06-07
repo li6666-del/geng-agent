@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import ast
 import json
+import re
 import shutil
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from .code_review import run_code_faithfulness_review
+from .code_review import review_single_generated_file, run_code_faithfulness_review
 from .documents import load_paper
 from .experiment_index import build_local_experiment_index
 from .facts_normalize import (
@@ -30,6 +33,7 @@ from .schemas import (
     validate_stage,
     validate_task_fact_refs,
 )
+from .security import reconcile_whitelisted_requirements
 from .template_project import build_template_repro_project_manifest
 from .tasks_normalize import finalize_repro_tasks, recover_truncated_repro_tasks
 from .verdict import derive_reproducibility_verdict
@@ -60,7 +64,7 @@ class PipelineResult:
 
 
 def _apply_prompt_adjustment(prompt: str, adjustment: str | None) -> str:
-    """Append supervisor guidance to a stage prompt so a retry actually changes the input.
+    """Append optional retry guidance to a stage prompt so a retry actually changes the input.
 
     Returns the prompt unchanged when no adjustment is given, so default runs stay
     byte-for-byte identical to before.
@@ -82,6 +86,43 @@ class ReviewPipeline:
         # Optional heterogeneous reviewer for the code-faithfulness stage; falls back to
         # the main generator client when not provided.
         self.code_review_client = code_review_client
+
+    def _llm_clients(self) -> list[Any]:
+        """The distinct LLM clients whose token usage should roll up into run_cost.json."""
+        clients: list[Any] = [self.client]
+        if self.code_review_client is not None and self.code_review_client is not self.client:
+            clients.append(self.code_review_client)
+        return clients
+
+    def _cumulative_usage(self) -> dict[str, int]:
+        calls = prompt = completion = total = 0
+        for client in self._llm_clients():
+            for entry in getattr(client, "usage_log", None) or []:
+                calls += 1
+                prompt += int(entry.get("prompt_tokens") or 0)
+                completion += int(entry.get("completion_tokens") or 0)
+                total += int(entry.get("total_tokens") or 0)
+        return {
+            "llm_calls": calls,
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": total,
+        }
+
+    def _usage_by_model(self) -> dict[str, dict[str, int]]:
+        by_model: dict[str, dict[str, int]] = {}
+        for client in self._llm_clients():
+            for entry in getattr(client, "usage_log", None) or []:
+                model = str(entry.get("model") or "unknown")
+                bucket = by_model.setdefault(
+                    model,
+                    {"llm_calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                )
+                bucket["llm_calls"] += 1
+                bucket["prompt_tokens"] += int(entry.get("prompt_tokens") or 0)
+                bucket["completion_tokens"] += int(entry.get("completion_tokens") or 0)
+                bucket["total_tokens"] += int(entry.get("total_tokens") or 0)
+        return by_model
 
     def run_stage(
         self,
@@ -169,6 +210,20 @@ class ReviewPipeline:
         audit_dir = output_dir / "audit"
         audit_dir.mkdir(parents=True, exist_ok=True)
 
+        run_start = time.perf_counter()
+        cost_marks: list[dict[str, Any]] = []
+
+        def _mark(stage: str) -> None:
+            cost_marks.append(
+                {
+                    "stage": stage,
+                    "elapsed_s": round(time.perf_counter() - run_start, 3),
+                    **self._cumulative_usage(),
+                }
+            )
+
+        _mark("start")
+
         paper_path = paper_path.expanduser().resolve()
         paper = self._load_or_create_paper(
             paper_path=paper_path,
@@ -222,6 +277,8 @@ class ReviewPipeline:
             ),
         )
 
+        _mark("facts")
+
         prompt_2 = self.prompt_book.render(
             "build_repro_tasks.md",
             engineering_facts_json=wrap_untrusted("engineering_facts_json", pretty_json(facts)),
@@ -252,6 +309,7 @@ class ReviewPipeline:
                 else None
             ),
         )
+        _mark("tasks")
         experiment_index = self._load_or_create_experiment_index(
             output_dir=output_dir,
             audit_dir=audit_dir,
@@ -261,6 +319,7 @@ class ReviewPipeline:
             resume=resume,
         )
 
+        _mark("experiment_index")
         manifest = self._load_or_create_repro_manifest(
             output_dir=output_dir,
             audit_dir=audit_dir,
@@ -273,6 +332,7 @@ class ReviewPipeline:
             template_fallback=template_fallback,
             project_timeout=project_timeout,
             images=paper_images,
+            code_review=code_review,
         )
         repro_project_dir = output_dir / "repro_project"
         written_files = self._ensure_repro_project_from_manifest(
@@ -293,9 +353,23 @@ class ReviewPipeline:
             )
             validation = validate_repro_project(repro_project_dir)
         scientific_check = build_scientific_check(tasks)
+        template_fallback_now = bool((manifest.get("_meta") or {}).get("template_fallback_used"))
+        _mark("generation")
 
         code_review_result = None
-        if code_review:
+        if code_review and template_fallback_now:
+            # Bug C: never review/revise a template fallback. code_review's revise loop would
+            # regenerate paper-facing code over the generic template, leaving the on-disk
+            # project, the manifest, and template_fallback_used mutually inconsistent (and can
+            # strand a non-compiling project on disk). A template fallback is already a
+            # failure -- report it as such rather than half-rewriting it.
+            code_review_result = {
+                "enabled": False,
+                "passed": None,
+                "reason": "skipped because the project is a template fallback; a faithfulness review of a generic template is not meaningful",
+            }
+            write_json(output_dir / "code_review.json", code_review_result)
+        elif code_review:
             code_review_result = run_code_faithfulness_review(
                 client=self.code_review_client or self.client,
                 prompt_book=self.prompt_book,
@@ -310,6 +384,15 @@ class ReviewPipeline:
             write_json(output_dir / "code_review.json", code_review_result)
             if code_review_result.get("revised"):
                 validation = validate_repro_project(repro_project_dir)
+
+        # Bug A: keep requirements.txt consistent with the whitelisted+installed imports the
+        # generated/revised code actually uses, so a forgotten declaration (e.g. code imports
+        # scipy.linalg but omits scipy) is not refused by the runner's dependency-consistency
+        # gate. Only whitelisted+installed packages are added; anything else stays blocked.
+        reconciled = reconcile_whitelisted_requirements(repro_project_dir)
+        if reconciled:
+            write_json(audit_dir / "requirements_reconciled.json", {"added": reconciled})
+        _mark("code_review")
 
         if run_repro:
             runtime_result = self._load_or_run_repro(
@@ -357,6 +440,15 @@ class ReviewPipeline:
                     )
                     runtime_result["template_fallback_used"] = True
                     write_json(output_dir / "runtime_result.json", runtime_result)
+                    # The reviewed generated project was just replaced by a template, so any
+                    # earlier code-review result no longer describes what is on disk (Bug C).
+                    if code_review_result is not None:
+                        code_review_result = {
+                            "enabled": False,
+                            "passed": None,
+                            "reason": "skipped because the generated project was replaced by a template fallback after guarded execution failed",
+                        }
+                        write_json(output_dir / "code_review.json", code_review_result)
         else:
             runtime_result = {
                 "enabled": False,
@@ -364,11 +456,16 @@ class ReviewPipeline:
                 "attempts": [],
                 "reason": "automatic execution is disabled by default; pass --run-repro to enable the guarded runner",
             }
+        _mark("runtime")
 
         result_review_result = self._run_result_review_if_ready(
             enabled=result_review,
             run_repro=run_repro,
             runtime_result=runtime_result,
+            template_fallback_used=bool(
+                runtime_result.get("template_fallback_used")
+                or (manifest.get("_meta") or {}).get("template_fallback_used")
+            ),
             paper_path=paper_path,
             paper=paper,
             facts=facts,
@@ -380,6 +477,7 @@ class ReviewPipeline:
             max_attempts=json_repair_attempts + 1,
             resume=resume,
         )
+        _mark("result_review")
 
         validation = validate_repro_project(repro_project_dir)
         risk_report = build_risk_report(
@@ -402,6 +500,8 @@ class ReviewPipeline:
                         "findings": code_review_result.get("unresolved_findings", []),
                     }
                 )
+        for nd_finding in detect_nondeterminism_findings(repro_project_dir):
+            risk_report.setdefault("findings", []).append(nd_finding)
         result_review_document = _load_result_review_document(output_dir, result_review_result)
         reproducibility_verdict = derive_reproducibility_verdict(
             risk_report=risk_report,
@@ -456,6 +556,15 @@ class ReviewPipeline:
                 "reproducibility_verdict": reproducibility_verdict,
                 "docx_generation": docx_generation,
             },
+        )
+        _mark("reports")
+        write_json(
+            output_dir / "run_cost.json",
+            _build_run_cost(
+                cost_marks,
+                total_wall_s=round(time.perf_counter() - run_start, 3),
+                by_model=self._usage_by_model(),
+            ),
         )
 
         result_review_path = output_dir / "result_review.json"
@@ -613,6 +722,7 @@ class ReviewPipeline:
         template_fallback: bool,
         project_timeout: float | None,
         images: list | None = None,
+        code_review: bool = False,
     ) -> dict[str, Any]:
         output_path = output_dir / "repro_project_manifest.json"
         stage_label = "03_generate_repro_project"
@@ -643,6 +753,7 @@ class ReviewPipeline:
                 max_attempts=max_attempts,
                 request_timeout=project_timeout,
                 images=images,
+                code_review=code_review,
             )
         except Exception as exc:
             if not template_fallback:
@@ -673,6 +784,7 @@ class ReviewPipeline:
         max_attempts: int,
         request_timeout: float | None,
         images: list | None = None,
+        code_review: bool = False,
     ) -> dict[str, Any]:
         facts_json = wrap_untrusted("engineering_facts_json", pretty_json(facts))
         tasks_json = wrap_untrusted("repro_tasks_json", pretty_json(tasks))
@@ -697,30 +809,77 @@ class ReviewPipeline:
         write_json(audit_dir / "03a_generate_repro_project_plan.json", plan)
 
         files: list[dict[str, Any]] = []
+        science_files = {"src/channel.py", "src/modulation.py", "src/metrics.py", "src/simulation.py"}
+        reviewer_client = self.code_review_client or self.client
         for index, path in enumerate(_ordered_project_paths(plan), start=1):
             file_label = f"03b_generate_repro_project_file_{index:02d}_{_manifest_path_slug(path)}"
-            file_prompt = self.prompt_book.render(
-                "generate_repro_project_file.md",
-                target_path=path,
-                project_plan_json=wrap_untrusted("project_plan_json", pretty_json(plan)),
-                generated_files_context_json=wrap_untrusted("generated_files_context_json", _generated_files_context(files)),
-                engineering_facts_json=facts_json,
-                repro_tasks_json=tasks_json,
-                paper_context_json=paper_context_json,
-            )
-            write_text(audit_dir / f"{file_label}.md", file_prompt)
-            parsed = self._call_validated_json(
-                prompt=file_prompt,
-                stage_label=file_label,
-                schema_stage="repro_project_file",
-                audit_dir=audit_dir,
-                max_attempts=max_attempts,
-                extra_validation=lambda candidate, expected=path: _validate_project_file(candidate, expected),
-                request_timeout=request_timeout,
-                # Page images are sent to the plan (03a) only, not to every per-file call:
-                # the plan already encodes the figures' design and each file follows it, so
-                # this avoids re-uploading all page images once per generated file.
-            )
+            do_review = code_review and path in science_files
+            review_feedback = ""
+            # Every candidate returned by _call_validated_json already compiles (ast-checked
+            # in _validate_project_file). When the single-file review can't be fully cleared
+            # within the revise budget, keep the candidate with the FEWEST blocking findings
+            # ("best-of") -- never discard a compilable file or fall back just because review
+            # didn't reach zero blocking.
+            best_parsed: dict[str, Any] | None = None
+            best_blocking: int | None = None
+            # round 0 = initial generation; rounds 1..N = regenerations driven by review feedback.
+            for review_round in range(PER_FILE_REVIEW_REVISE_ROUNDS + 1 if do_review else 1):
+                file_prompt = self.prompt_book.render(
+                    "generate_repro_project_file.md",
+                    target_path=path,
+                    project_plan_json=wrap_untrusted("project_plan_json", pretty_json(plan)),
+                    generated_files_context_json=wrap_untrusted("generated_files_context_json", _generated_files_context(files)),
+                    engineering_facts_json=facts_json,
+                    repro_tasks_json=tasks_json,
+                    paper_context_json=paper_context_json,
+                    review_feedback_json=review_feedback,
+                )
+                write_text(audit_dir / f"{file_label}.md", file_prompt)
+                parsed = self._call_validated_json(
+                    prompt=file_prompt,
+                    stage_label=file_label,
+                    schema_stage="repro_project_file",
+                    audit_dir=audit_dir,
+                    max_attempts=max_attempts,
+                    extra_validation=lambda candidate, expected=path: _validate_project_file(candidate, expected),
+                    request_timeout=request_timeout,
+                    # Page images go to the plan (03a) only, not to every per-file call.
+                )
+                if not do_review:
+                    best_parsed = parsed
+                    break
+                review = review_single_generated_file(
+                    client=reviewer_client,
+                    prompt_book=self.prompt_book,
+                    target_path=path,
+                    content="\n".join(str(line) for line in parsed.get("content_lines", [])),
+                    facts=facts,
+                    tasks=tasks,
+                    paper_context=paper_context_json,
+                    prior_files_context=_generated_files_context(files),
+                    system_message=SYSTEM_MESSAGE,
+                    audit_dir=audit_dir,
+                    label=f"{file_label}_review_{review_round + 1:02d}",
+                )
+                n_blocking = len(review.get("blocking", []))
+                write_json(
+                    audit_dir / f"{file_label}_review_{review_round + 1:02d}.json",
+                    {
+                        "verdict": review.get("verdict"),
+                        "blocking": n_blocking,
+                        "minor": len(review.get("minor", [])),
+                        "dropped_ungrounded": review.get("dropped"),
+                        "error": review.get("error"),
+                        "findings": review.get("blocking", []),
+                    },
+                )
+                if best_blocking is None or n_blocking < best_blocking:
+                    best_parsed, best_blocking = parsed, n_blocking
+                if n_blocking == 0 or review_round >= PER_FILE_REVIEW_REVISE_ROUNDS:
+                    break
+                # regenerate just this file, feeding the blocking findings back as guidance.
+                review_feedback = wrap_untrusted("review_feedback_json", pretty_json(review["blocking"]))
+            parsed = best_parsed if best_parsed is not None else parsed
             file_item = {"path": parsed["path"], "content_lines": parsed["content_lines"]}
             files.append(file_item)
             write_json(
@@ -729,6 +888,7 @@ class ReviewPipeline:
                     "ok": True,
                     "path": parsed["path"],
                     "line_count": len(parsed.get("content_lines", [])),
+                    "kept_blocking_findings": best_blocking,
                     "generated_files": [item["path"] for item in files],
                 },
             )
@@ -776,6 +936,11 @@ class ReviewPipeline:
                 "template": manifest.get("_meta", {}).get("template_name"),
             },
         )
+        # Bug B: atomically replace the on-disk project. Without this, orphan files from the
+        # earlier free-form generation (e.g. a stray src/precoding.py or a syntax-errored
+        # channel.py) survive the template write and are what actually get run/reviewed,
+        # making the manifest, the disk, and template_fallback_used mutually inconsistent.
+        _clear_project_code_files(repro_project_dir)
         written_files = write_file_manifest(manifest, repro_project_dir)
         return manifest, written_files
 
@@ -956,6 +1121,7 @@ class ReviewPipeline:
         enabled: bool,
         run_repro: bool,
         runtime_result: dict[str, Any],
+        template_fallback_used: bool,
         paper_path: Path,
         paper: dict[str, Any],
         facts: dict[str, Any],
@@ -971,6 +1137,16 @@ class ReviewPipeline:
             return {"enabled": False, "passed": None, "reason": "skipped because --run-repro was not requested"}
         if not enabled:
             return {"enabled": False, "passed": None, "reason": "disabled by --no-result-review"}
+        if template_fallback_used:
+            # A template fallback project is a generic, paper-agnostic simulation. Comparing
+            # its plots/metrics against the paper would manufacture a misleading
+            # result-alignment signal, so we refuse to review it and let the verdict fall to
+            # inconclusive instead. (P0-1: a fallback is a failure, not a success to dress up.)
+            return {
+                "enabled": False,
+                "passed": None,
+                "reason": "skipped because a template fallback project was used; reviewing a generic template against the paper is not meaningful",
+            }
         if not runtime_result.get("passed"):
             return {"enabled": False, "passed": None, "reason": "skipped because guarded reproduction did not pass"}
 
@@ -1203,6 +1379,10 @@ REPRO_PROJECT_FILE_ORDER = [
 ]
 
 
+# Max single-file review-driven regenerations for a science file before keeping the
+# best-reviewed (fewest-blocking) compilable version. Only applies when --code-review is on.
+PER_FILE_REVIEW_REVISE_ROUNDS = 3
+
 REPRO_PROJECT_FILE_LIMITS = {
     "README.md": {"lines": 200, "chars": 20000},
     "requirements.txt": {"lines": 200, "chars": 4000},
@@ -1212,7 +1392,10 @@ REPRO_PROJECT_FILE_LIMITS = {
     "src/channel.py": {"lines": 200, "chars": 20000},
     "src/modulation.py": {"lines": 200, "chars": 20000},
     "src/metrics.py": {"lines": 200, "chars": 20000},
-    "src/simulation.py": {"lines": 200, "chars": 20000},
+    # simulation.py is the integration/orchestration file (imports + wires the other
+    # modules, drives all experiments); it legitimately needs more room. A too-tight cap
+    # here was the single biggest template-fallback trigger across the 5-thread run.
+    "src/simulation.py": {"lines": 500, "chars": 50000},
 }
 
 
@@ -1268,7 +1451,37 @@ def _validate_project_file(file_data: dict[str, Any], expected_path: str) -> lis
                 issues.append(ValidationIssue("$.content_lines", f"must be at most {limit['lines']} lines for {expected_path}"))
             if char_count > limit["chars"]:
                 issues.append(ValidationIssue("$.content_lines", f"must be at most {limit['chars']} characters for {expected_path}"))
+        issues.extend(_content_type_issues(expected_path, lines))
     return issues
+
+
+def _content_type_issues(expected_path: str, lines: list[Any]) -> list[ValidationIssue]:
+    """Catch a generated file whose body is not actually the declared type -- e.g. an LLM
+    that returns prose/markdown instead of Python, or malformed JSON. Without this such a
+    file passes the per-file structural checks but later fails the project-level
+    python_compiles check, which discards the whole generated project for a generic
+    template fallback. Flagging it here makes the per-file generation loop regenerate just
+    this one file instead of sinking the entire project."""
+    content = "\n".join(str(line) for line in lines)
+    if not content.strip():
+        return []
+    if expected_path.endswith(".py"):
+        try:
+            ast.parse(content)
+        except SyntaxError as exc:
+            return [
+                ValidationIssue(
+                    "$.content_lines",
+                    f"{expected_path} is not valid Python (looks like prose or has a syntax error, "
+                    f"not runnable code): {exc.msg} at line {exc.lineno}",
+                )
+            ]
+    elif expected_path.endswith(".json"):
+        try:
+            json.loads(content)
+        except ValueError as exc:
+            return [ValidationIssue("$.content_lines", f"{expected_path} is not valid JSON: {exc}")]
+    return []
 
 
 def _normalize_manifest_path_for_pipeline(path: Any) -> str | None:
@@ -1286,7 +1499,10 @@ def _manifest_path_slug(path: str) -> str:
     return "".join(char if char.isalnum() else "_" for char in path).strip("_") or "file"
 
 
-def _generated_files_context(files: list[dict[str, Any]], max_chars: int = 9000) -> str:
+def _generated_files_context(files: list[dict[str, Any]], max_chars: int = 120000) -> str:
+    """Full content of already-generated files, so the next file (e.g. src/simulation.py)
+    sees the REAL interfaces of channel/modulation/metrics it must import and wire, not a
+    truncated preview. The generous overall cap only guards against pathological size."""
     context: list[dict[str, Any]] = []
     remaining = max_chars
     for item in files:
@@ -1296,11 +1512,12 @@ def _generated_files_context(files: list[dict[str, Any]], max_chars: int = 9000)
             continue
         content = "\n".join(str(line) for line in lines)
         if remaining <= 0:
-            context.append({"path": path, "content_preview": "[truncated]"})
+            context.append({"path": path, "content": "[omitted: context budget exhausted]"})
             continue
-        preview = content[: min(remaining, 1200)]
-        remaining -= len(preview)
-        context.append({"path": path, "content_preview": preview})
+        if len(content) > remaining:
+            content = content[:remaining] + "\n# [truncated: context budget exhausted]"
+        remaining -= len(content)
+        context.append({"path": path, "content": content})
     return pretty_json(context)
 
 
@@ -1710,6 +1927,102 @@ def build_scientific_check(tasks: dict[str, Any]) -> dict[str, Any]:
     return {"ok": not issues, "issues": issues}
 
 
+def _clear_project_code_files(repro_project_dir: Path) -> None:
+    """Remove stale generated code/config from the repro project before a fresh manifest is
+    written, preserving only the scratch dirs (outputs/, repair_logs/). Used to make a
+    template fallback an ATOMIC replacement so orphan files from an earlier generation can't
+    survive and silently become the thing that runs."""
+    if not repro_project_dir.exists():
+        return
+    preserve = {"outputs", "repair_logs"}
+    for child in repro_project_dir.iterdir():
+        if child.name in preserve:
+            continue
+        try:
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink()
+        except OSError:
+            pass
+
+
+_RANDOM_USE = re.compile(
+    r"\b(?:np\.random|numpy\.random|default_rng|RandomState|SeedSequence)\b"
+    r"|\brandom\.(?:random|randint|randrange|choice|choices|sample|shuffle|normal|uniform|gauss|seed)\b"
+)
+_SEED_SET = re.compile(
+    r"np\.random\.seed\s*\(|numpy\.random\.seed\s*\(|\brandom\.seed\s*\("
+    r"|default_rng\s*\(\s*[^)\s]|RandomState\s*\(\s*[^)\s]|SeedSequence\s*\(\s*[^)\s]"
+    r"|set_seed|manual_seed"
+)
+
+
+def detect_nondeterminism_findings(repro_project_dir: Path) -> list[dict[str, Any]]:
+    """Advisory (non-blocking) check: flag a generated project that draws random numbers
+    but never sets a seed anywhere, because its results would not be reproducible
+    run-to-run. Project-level (not per-file) to avoid false positives when the seed lives
+    in a shared setup module — only emits when randomness is used and NO seed is detected."""
+    try:
+        py_files = sorted(repro_project_dir.rglob("*.py"))
+    except OSError:
+        return []
+    uses_random = False
+    sets_seed = False
+    random_files: list[str] = []
+    for path in py_files:
+        if "__pycache__" in path.parts:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if _RANDOM_USE.search(text):
+            uses_random = True
+            try:
+                random_files.append(path.relative_to(repro_project_dir).as_posix())
+            except ValueError:
+                random_files.append(path.name)
+        if _SEED_SET.search(text):
+            sets_seed = True
+    if uses_random and not sets_seed:
+        return [
+            {
+                "type": "nondeterministic_randomness",
+                "message": "生成项目使用了随机数但全项目未检测到固定随机种子，复现结果可能每次运行不同，难以与论文数值对照；建议在每个实验入口设置 numpy/random 种子并写入产物。",
+                "files": random_files,
+            }
+        ]
+    return []
+
+
+def _build_run_cost(
+    marks: list[dict[str, Any]],
+    *,
+    total_wall_s: float,
+    by_model: dict[str, dict[str, int]],
+) -> dict[str, Any]:
+    """Turn the cumulative stage marks into a per-stage cost ledger (time + tokens)."""
+    keys = ("llm_calls", "prompt_tokens", "completion_tokens", "total_tokens")
+    by_stage: list[dict[str, Any]] = []
+    for prev, cur in zip(marks, marks[1:]):
+        entry: dict[str, Any] = {
+            "stage": cur.get("stage"),
+            "seconds": round(float(cur.get("elapsed_s", 0)) - float(prev.get("elapsed_s", 0)), 3),
+        }
+        for key in keys:
+            entry[key] = int(cur.get(key, 0)) - int(prev.get(key, 0))
+        by_stage.append(entry)
+    totals = marks[-1] if marks else {}
+    return {
+        "wall_clock_s": total_wall_s,
+        "totals": {key: int(totals.get(key, 0)) for key in keys},
+        "by_stage": by_stage,
+        "by_model": by_model,
+        "note": "墙钟为各阶段实测耗时；token 由 LLM API 的 usage 字段汇总，缺失字段按 0 计（部分服务商不返回 usage，此时 token 显示为 0 但调用次数仍准确）。",
+    }
+
+
 def build_risk_report(
     facts: dict[str, Any],
     tasks: dict[str, Any],
@@ -1856,9 +2169,9 @@ def build_risk_dimensions(
         ),
         "implementation_fidelity": _dimension(
             "high"
-            if not validation.get("required_files_present") or not validation.get("python_compiles")
+            if not validation.get("required_files_present") or not validation.get("python_compiles") or template_fallback_used
             else "medium"
-            if scientific_issues or template_fallback_used
+            if scientific_issues
             else "low",
             [
                 f"required_files_present={validation.get('required_files_present')}",
@@ -1876,11 +2189,19 @@ def build_risk_dimensions(
             ],
         ),
         "result_alignment": _dimension(
-            _result_alignment_level(runtime_enabled, runtime_passed, result_review_enabled, result_review_passed, scientific_issues),
+            _result_alignment_level(
+                runtime_enabled,
+                runtime_passed,
+                result_review_enabled,
+                result_review_passed,
+                scientific_issues,
+                template_fallback_used,
+            ),
             [
                 f"result_review_enabled={result_review_enabled}",
                 f"result_review_passed={result_review_passed}",
                 f"scientific_issues={len(scientific_issues)}",
+                f"template_fallback_used={template_fallback_used}",
             ],
         ),
         "baseline_fairness": _dimension("high" if _count_missing_baselines(tasks) else "low", [f"tasks_without_baseline={_count_missing_baselines(tasks)}"]),
@@ -1916,7 +2237,12 @@ def _result_alignment_level(
     result_review_enabled: bool,
     result_review_passed: Any,
     scientific_issues: list[Any],
+    template_fallback_used: bool = False,
 ) -> str:
+    if template_fallback_used:
+        # A generic template was run, not the paper's method: its outputs cannot align
+        # with the paper, regardless of whether the template itself executed cleanly.
+        return "high"
     if not runtime_enabled:
         return "medium"
     if runtime_enabled and not runtime_passed:
