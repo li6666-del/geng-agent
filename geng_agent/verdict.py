@@ -29,13 +29,49 @@ def derive_reproducibility_verdict(
     template_fallback_used = _template_fallback_used(risk_report, runtime_result, manifest)
     risk_level = _risk_level(risk_report)
 
-    if runtime_result.get("passed") is False:
-        reasons.append("guarded runtime execution did not pass")
+    if runtime_result.get("passed") is False and not _has_partial_output(runtime_result):
+        reasons.append("guarded runtime execution did not pass and produced no usable output")
         return _result(
             "failed_to_reproduce",
             "high",
             reasons,
             "Fix runtime, dependency, or security failures first, then rerun reproduction and result review.",
+        )
+
+    if runtime_result.get("passed") is False and _has_partial_output(runtime_result):
+        # PARTIAL reproduction: some experiments produced valid output, others failed even
+        # after repair. A single failed experiment must NOT negate the whole reproduction --
+        # judge it per-experiment via the result review and report it as partial.
+        reasons.append("partial reproduction: some experiments produced valid output, others did not complete")
+        if not result_review:
+            reasons.append("result_review is missing")
+            return _result("inconclusive", "low", reasons, "Run the per-experiment result review on the partial outputs, then judge.")
+        if result_review.get("passed") is False:
+            reasons.append("result_review failed")
+            return _result("inconclusive", "low", reasons, "Inspect result_review_error.json and rerun the per-experiment review.")
+        alignment = _normalized_label(
+            result_review.get("overall_alignment") or result_review.get("paper_alignment") or result_review.get("alignment")
+        )
+        credibility = _normalized_label(
+            result_review.get("overall_result_credibility") or result_review.get("credibility") or result_review.get("local_result_credibility")
+        )
+        if alignment:
+            reasons.append(f"overall_alignment={alignment}")
+        if credibility:
+            reasons.append(f"credibility={credibility}")
+        if alignment in {"mismatch", "contradiction"}:
+            return _result(
+                "high_reproducibility_risk",
+                "medium",
+                reasons,
+                "已完成的实验与论文结果不符；逐实验核对后再判断，不要报为复现。",
+            )
+        positive = alignment in {"match", "matched", "high", "exact", "close", "partial_match", "mostly_match"}
+        return _result(
+            "partially_reproduced",
+            "medium" if positive else "low",
+            reasons,
+            "按部分复现处理：逐实验核对哪些已复现、哪些缺失或失败；尽量补齐失败的实验后重跑，再追求更完整的结论。",
         )
 
     if template_fallback_used:
@@ -159,6 +195,14 @@ def _limited_by_template(result: dict[str, Any], template_fallback_used: bool) -
             "Template fallback was used: the paper's own reproduction code did not run, so the result evidence comes from a generic template, not the paper's method. Treat as inconclusive and reproduce the paper's method manually before any positive claim."
         )
     return result
+
+
+def _has_partial_output(runtime_result: dict[str, Any]) -> bool:
+    """True when a not-fully-passing run still produced usable per-experiment outputs (kept
+    instead of falling back to a template). Lets the verdict treat it as partial reproduction
+    rather than total failure."""
+    partial = runtime_result.get("partial_success")
+    return isinstance(partial, dict) and bool(partial.get("has_partial_output"))
 
 
 def _template_fallback_used(

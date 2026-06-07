@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from geng_agent.pipeline import (
     ReviewPipeline,
@@ -169,6 +170,55 @@ class ResultReviewSkipsTemplateTests(unittest.TestCase):
         self.assertFalse(result["enabled"])
         self.assertIsNone(result["passed"])
         self.assertIn("template", result["reason"])
+
+
+class ResultReviewPartialTests(unittest.TestCase):
+    def test_runs_on_partial_output(self) -> None:
+        # A not-fully-passing run that produced partial outputs should still get the
+        # per-experiment result review (so one failed experiment doesn't negate the rest).
+        pipe = ReviewPipeline(_UsageClient("m", []))
+        runtime = {"enabled": True, "passed": False, "partial_success": {"has_partial_output": True}}
+        stub = {"enabled": True, "passed": True, "mode": "stub"}
+        with TemporaryDirectory() as tmp, patch("geng_agent.pipeline.run_result_review", return_value=stub) as mocked:
+            result = pipe._run_result_review_if_ready(
+                enabled=True,
+                run_repro=True,
+                runtime_result=runtime,
+                template_fallback_used=False,
+                paper_path=Path("paper.pdf"),
+                paper={},
+                facts={},
+                tasks={},
+                paper_context_json="[]",
+                repro_project_dir=Path(tmp),
+                output_dir=Path(tmp),
+                audit_dir=Path(tmp) / "audit",
+                max_attempts=1,
+                resume=False,
+            )
+        self.assertTrue(mocked.called)
+        self.assertEqual(result.get("mode"), "stub")
+
+    def test_skipped_when_no_usable_output(self) -> None:
+        pipe = ReviewPipeline(_UsageClient("m", []))
+        result = pipe._run_result_review_if_ready(
+            enabled=True,
+            run_repro=True,
+            runtime_result={"enabled": True, "passed": False},
+            template_fallback_used=False,
+            paper_path=Path("paper.pdf"),
+            paper={},
+            facts={},
+            tasks={},
+            paper_context_json="[]",
+            repro_project_dir=Path("."),
+            output_dir=Path("."),
+            audit_dir=Path("."),
+            max_attempts=1,
+            resume=False,
+        )
+        self.assertFalse(result["enabled"])
+        self.assertIn("no usable output", result["reason"])
 
 
 if __name__ == "__main__":

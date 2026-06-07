@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import base64
 import json
 import re
 import shutil
@@ -848,6 +849,7 @@ class ReviewPipeline:
                     audit_dir=audit_dir,
                     max_attempts=max_attempts,
                     extra_validation=lambda candidate, expected=path: _validate_project_file(candidate, expected),
+                    candidate_normalizer=normalize_repro_project_file_candidate,
                     request_timeout=request_timeout,
                     # Page images go to the plan (03a) only, not to every per-file call.
                 )
@@ -1153,8 +1155,13 @@ class ReviewPipeline:
                 "passed": None,
                 "reason": "skipped because a template fallback project was used; reviewing a generic template against the paper is not meaningful",
             }
-        if not runtime_result.get("passed"):
-            return {"enabled": False, "passed": None, "reason": "skipped because guarded reproduction did not pass"}
+        partial = runtime_result.get("partial_success")
+        has_partial = isinstance(partial, dict) and partial.get("has_partial_output")
+        if not runtime_result.get("passed") and not has_partial:
+            return {"enabled": False, "passed": None, "reason": "skipped because guarded reproduction produced no usable output"}
+        # Run the per-experiment review on a fully-passed OR a partial run: it objectively
+        # judges which experiments reproduced and which did not, so one failed experiment does
+        # not negate the whole reproduction (it is recorded and the rest are still assessed).
 
         if resume:
             cached_status = _load_cached_result_review_status(output_dir)
@@ -1655,6 +1662,34 @@ def normalize_repro_project_manifest_candidate(candidate: dict[str, Any]) -> dic
             "manifest_normalized": True,
         }
     return normalized_manifest
+
+
+def normalize_repro_project_file_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Coerce one generated-file payload to the strict per-file shape {path, content_lines}.
+
+    The whole-manifest schema accepts the file body as `content` (string), `content_lines`
+    (list) or `content_b64`, but the per-file schema only accepts `content_lines`. Models
+    sometimes return `content`/`content_b64` for a single file; without this, that one file
+    fails JSON validation on the key name and the whole project gets nuked to a template
+    (observed on 2603.29359: a correct src/metrics.py was discarded purely because it came
+    back under `content`). Normalising to content_lines here absorbs that variance locally."""
+    if not isinstance(candidate, dict):
+        return candidate
+    normalized: dict[str, Any] = {}
+    path = candidate.get("path")
+    if isinstance(path, str):
+        normalized["path"] = path
+    if isinstance(candidate.get("content_lines"), list):
+        normalized["content_lines"] = candidate["content_lines"]
+    elif isinstance(candidate.get("content"), str):
+        normalized["content_lines"] = candidate["content"].splitlines()
+    elif isinstance(candidate.get("content_b64"), str):
+        try:
+            decoded = base64.b64decode(candidate["content_b64"], validate=True).decode("utf-8")
+            normalized["content_lines"] = decoded.splitlines()
+        except Exception:
+            pass  # leave content_lines unset -> strict validation reports it and we retry
+    return normalized
 
 
 def _clear_stage_outputs(output_dir: Path, stage: str) -> None:

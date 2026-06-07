@@ -11,6 +11,7 @@ from geng_agent.pipeline import (
     _assess_partial_success,
     _clear_project_code_files,
     _validate_project_file,
+    normalize_repro_project_file_candidate,
     normalize_repro_project_manifest_candidate,
 )
 from geng_agent.schemas import validate_stage
@@ -186,6 +187,53 @@ class PipelineTests(unittest.TestCase):
             "README.md",
         )
         self.assertTrue(any("200 lines" in issue.message for issue in issues))
+
+    def test_normalize_repro_project_file_accepts_content_and_b64(self) -> None:
+        # A per-file body returned as `content` or `content_b64` (not content_lines) must be
+        # coerced to content_lines so one stray key name doesn't sink the project to a template.
+        import base64 as _b64
+
+        from_content = normalize_repro_project_file_candidate(
+            {"path": "src/metrics.py", "content": "import numpy as np\n\ndef ber():\n    return 0.0\n", "note": "x"}
+        )
+        self.assertEqual(from_content["path"], "src/metrics.py")
+        self.assertEqual(from_content["content_lines"], ["import numpy as np", "", "def ber():", "    return 0.0"])
+        self.assertNotIn("content", from_content)
+        self.assertNotIn("note", from_content)
+
+        from_b64 = normalize_repro_project_file_candidate(
+            {"path": "src/metrics.py", "content_b64": _b64.b64encode(b"a = 1\nb = 2\n").decode("ascii")}
+        )
+        self.assertEqual(from_b64["content_lines"], ["a = 1", "b = 2"])
+
+        passthrough = normalize_repro_project_file_candidate({"path": "src/metrics.py", "content_lines": ["x = 1"]})
+        self.assertEqual(passthrough["content_lines"], ["x = 1"])
+
+    def test_per_file_generation_accepts_content_key(self) -> None:
+        # End-to-end: a model that returns per-file bodies under `content` (not content_lines)
+        # must still generate a real project, not fall back to a template (2603.29359 failure).
+        class ContentKeyLLM(FakeLLM):
+            def complete(self, prompt: str, *, system: str | None = None, response_format: dict | None = None) -> str:
+                if len(self.calls) < 2:
+                    return super().complete(prompt, system=system, response_format=response_format)
+                self.calls.append(prompt)
+                if schema_name(response_format) == "repro_project_plan":
+                    return project_plan_response()
+                if schema_name(response_format) == "repro_project_file":
+                    target = target_path_from_prompt(prompt)
+                    return json.dumps({"path": target, "content": PROJECT_FILE_CONTENTS[target]})
+                return project_manifest_response()
+
+        with TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            paper = temp / "paper.md"
+            paper.write_text("Simulation Results\nAWGN channel, BER vs SNR.", encoding="utf-8")
+
+            result = ReviewPipeline(client=ContentKeyLLM()).run(paper, temp / "case", run_repro=False)
+
+            manifest = json.loads((result.output_dir / "repro_project_manifest.json").read_text(encoding="utf-8"))
+            self.assertFalse(manifest.get("_meta", {}).get("template_fallback_used"))
+            self.assertTrue((result.repro_project_dir / "src" / "metrics.py").exists())
 
     def test_clear_project_code_files_removes_orphans_keeps_scratch(self) -> None:
         # Bug B: a template fallback must atomically replace the project; orphan code from an

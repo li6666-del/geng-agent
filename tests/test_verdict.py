@@ -14,7 +14,7 @@ class ReproducibilityVerdictTests(unittest.TestCase):
 
         self.assertEqual(verdict["verdict"], "failed_to_reproduce")
         self.assertEqual(verdict["confidence"], "high")
-        self.assertIn("guarded runtime execution did not pass", verdict["reasons"])
+        self.assertTrue(any("did not pass" in reason for reason in verdict["reasons"]))
 
     def test_template_fallback_caps_positive_verdict_at_inconclusive(self) -> None:
         # A template fallback means the paper's own code never ran; even a clean
@@ -42,6 +42,39 @@ class ReproducibilityVerdictTests(unittest.TestCase):
         )
 
         self.assertEqual(verdict["verdict"], "inconclusive")
+
+    def test_partial_output_yields_partially_reproduced(self) -> None:
+        # One experiment failing must not negate the whole run: partial output + a passing
+        # per-experiment review -> partially_reproduced, not failed_to_reproduce.
+        verdict = derive_reproducibility_verdict(
+            risk_report={"risk_level": "medium"},
+            runtime_result={"enabled": True, "passed": False, "partial_success": {"has_partial_output": True}},
+            result_review={"overall_alignment": "match", "overall_result_credibility": "high"},
+        )
+        self.assertEqual(verdict["verdict"], "partially_reproduced")
+        self.assertTrue(any("partial reproduction" in reason for reason in verdict["reasons"]))
+
+    def test_partial_output_with_mismatch_is_high_risk(self) -> None:
+        verdict = derive_reproducibility_verdict(
+            runtime_result={"enabled": True, "passed": False, "partial_success": {"has_partial_output": True}},
+            result_review={"overall_alignment": "mismatch", "overall_result_credibility": "medium"},
+        )
+        self.assertEqual(verdict["verdict"], "high_reproducibility_risk")
+
+    def test_partial_output_without_review_is_inconclusive(self) -> None:
+        verdict = derive_reproducibility_verdict(
+            runtime_result={"enabled": True, "passed": False, "partial_success": {"has_partial_output": True}},
+            result_review=None,
+        )
+        self.assertEqual(verdict["verdict"], "inconclusive")
+
+    def test_no_usable_output_is_failed_to_reproduce(self) -> None:
+        # No partial output at all -> still a hard failure.
+        verdict = derive_reproducibility_verdict(
+            runtime_result={"enabled": True, "passed": False},
+            result_review=None,
+        )
+        self.assertEqual(verdict["verdict"], "failed_to_reproduce")
 
     def test_mismatch_returns_high_reproducibility_risk(self) -> None:
         verdict = derive_reproducibility_verdict(

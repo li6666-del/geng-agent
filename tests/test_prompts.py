@@ -126,9 +126,13 @@ class PromptTests(unittest.TestCase):
         self.assertIn("Inf", file_prompt)
         self.assertIn("json.load", file_prompt)
         self.assertIn("谎报", file_prompt)
+        # rerun2 fixes: forbid float(array), and summary.json must be written unconditionally
+        self.assertIn("length-1", file_prompt)
+        self.assertIn("无条件", file_prompt)
         # the runtime-repair prompt carries the same discipline
         self.assertIn("np.real", repair_prompt)
         self.assertIn("谎报", repair_prompt)
+        self.assertIn("无条件", repair_prompt)
 
     def test_result_review_prompts_require_chinese_report_text(self) -> None:
         book = PromptBook()

@@ -19,6 +19,7 @@
 6. evidence 必须引用你看到的材料，例如 CSV 列名、summary 字段、本地图像标签、论文页面图标签、chunk_id 或任务 ID。
 7. 只返回这个实验的审查对象，不要返回 overall_result_credibility、experiment_reviews 或完整总报告。
 8. 这份审查对象会直接进入最终 Markdown 和 Word 报告，所以不要输出英文说明句；如果引用英文论文原句，先用中文概括，再保留必要短引用。
+9. 客观、独立地只评判这一个实验：如果本地证据里没有该实验的产物（实验失败或缺失），就如实把 paper_alignment 记为 inconclusive、local_result_credibility 记为 low/unknown，并在 differences/limitations 说明"本地未产出该实验结果"；**绝不要因为这个实验失败就否定其它实验，也不要凭空给它打分**。整体复现是逐实验汇总出来的——某个实验没完成只代表它自己未复现，不代表整次复现失败。
 
 输出 schema：
 {
