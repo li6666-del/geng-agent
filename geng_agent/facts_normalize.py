@@ -50,7 +50,8 @@ _ALLOWED_CONFIDENCE = set(get_args(Confidence))
 _ALLOWED_IMPACT = set(get_args(MissingImpact))
 
 _FACT_KEYS = {"type", "name", "value", "source", "confidence", "used_for_reproduction"}
-_SOURCE_KEYS = {"chunk_id", "page", "section", "quote"}
+_SOURCE_KEYS = {"source_kind", "chunk_id", "page", "section", "quote", "figure_ref"}
+_FIGURE_SOURCE_TOKENS = {"figure", "image", "diagram", "plot", "fig", "chart", "graph", "subfigure"}
 
 FACT_TYPE_SYNONYMS = {
     "parameter": "simulation_parameter",
@@ -262,6 +263,24 @@ def _normalize_source(source: dict[str, Any], index: int, coercions: list[str]) 
     if extra:
         coercions.append(f"facts[{index}].source dropped unknown keys {sorted(extra)}")
 
+    # source_kind: map figure synonyms to "figure", everything else to "text". New fields are
+    # filled silently (the model may omit them); only an actually-changed value is logged.
+    raw_kind = source.get("source_kind")
+    if isinstance(raw_kind, str):
+        kind = "figure" if _norm_token(raw_kind) in _FIGURE_SOURCE_TOKENS else "text"
+        if kind != raw_kind:
+            coercions.append(f"facts[{index}].source.source_kind {raw_kind!r} -> {kind!r}")
+        source["source_kind"] = kind
+    else:
+        source["source_kind"] = "text"
+
+    # chunk_id is optional for figure sources; ensure the key exists (may be null).
+    if "chunk_id" not in source:
+        source["chunk_id"] = None
+
+    if not isinstance(source.get("figure_ref"), str):
+        source["figure_ref"] = "" if source.get("figure_ref") is None else str(source.get("figure_ref"))
+
     section = source.get("section")
     if section is None or "section" not in source:
         source["section"] = ""
@@ -307,7 +326,9 @@ def _normalize_missing(missing: Any, coercions: list[str]) -> list[dict[str, Any
     return cleaned
 
 
-def _fact_rejection_reason(fact: Any, valid_chunk_ids: set[str] | None) -> str | None:
+def _fact_rejection_reason(
+    fact: Any, valid_chunk_ids: set[str] | None, valid_pages: set[int] | None = None
+) -> str | None:
     if not isinstance(fact, dict):
         return "not a JSON object"
     try:
@@ -316,21 +337,29 @@ def _fact_rejection_reason(fact: Any, valid_chunk_ids: set[str] | None) -> str |
         error = exc.errors()[0]
         loc = ".".join(str(part) for part in error.get("loc", ()))
         return f"{loc or '$'}: {error.get('msg', 'invalid value')}"
-    source = fact.get("source")
-    chunk_id = source.get("chunk_id") if isinstance(source, dict) else None
-    if valid_chunk_ids is not None and chunk_id not in valid_chunk_ids:
-        return "source.chunk_id not found in paper_chunks.json"
+    source = fact.get("source") if isinstance(fact.get("source"), dict) else {}
+    if source.get("source_kind") == "figure":
+        # figure-sourced fact must cite a page the model actually saw (a rendered page image)
+        page = source.get("page")
+        if valid_pages is not None and (not isinstance(page, int) or page not in valid_pages):
+            return "source.page is not a known/rendered paper page (figure source)"
+    else:
+        chunk_id = source.get("chunk_id")
+        if valid_chunk_ids is not None and chunk_id not in valid_chunk_ids:
+            return "source.chunk_id not found in paper_chunks.json"
     return None
 
 
-def select_valid_engineering_facts(data: dict[str, Any], valid_chunk_ids: set[str] | None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def select_valid_engineering_facts(
+    data: dict[str, Any], valid_chunk_ids: set[str] | None, valid_pages: set[int] | None = None
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     kept: list[dict[str, Any]] = []
     dropped: list[dict[str, Any]] = []
     facts = data.get("engineering_facts")
     if not isinstance(facts, list):
         return kept, dropped
     for index, fact in enumerate(facts):
-        reason = _fact_rejection_reason(fact, valid_chunk_ids)
+        reason = _fact_rejection_reason(fact, valid_chunk_ids, valid_pages)
         if reason is None:
             kept.append(fact)
         else:
@@ -344,10 +373,12 @@ def select_valid_engineering_facts(data: dict[str, Any], valid_chunk_ids: set[st
     return kept, dropped
 
 
-def finalize_engineering_facts(data: Any, valid_chunk_ids: set[str] | None) -> dict[str, Any]:
+def finalize_engineering_facts(
+    data: Any, valid_chunk_ids: set[str] | None, valid_pages: set[int] | None = None
+) -> dict[str, Any]:
     """Normalize, drop irreparable facts, and assemble a strict-schema-clean document."""
     normalized, coercions = normalize_engineering_facts_candidate(data)
-    kept, dropped = select_valid_engineering_facts(normalized, valid_chunk_ids)
+    kept, dropped = select_valid_engineering_facts(normalized, valid_chunk_ids, valid_pages)
 
     doc: dict[str, Any] = {
         "paper_domain": "communication",

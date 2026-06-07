@@ -97,6 +97,39 @@ class PromptTests(unittest.TestCase):
         self.assertIn("seed", file_prompt)
         self.assertIn("summary.json", file_prompt)
 
+    def test_generation_and_repair_prompts_guard_serialization_and_false_success(self) -> None:
+        book = PromptBook()
+
+        file_prompt = book.render(
+            "generate_repro_project_file.md",
+            target_path="run_experiment.py",
+            project_plan_json="{}",
+            generated_files_context_json="[]",
+            engineering_facts_json="{}",
+            repro_tasks_json="{}",
+            paper_context_json="[]",
+            review_feedback_json="",
+        )
+        repair_prompt = book.render(
+            "repair_repro_project.md",
+            command="[]",
+            returncode="1",
+            stdout="",
+            stderr="",
+            validation_json="{}",
+            code_context="",
+        )
+
+        # complex -> real, plain-type/JSON-safe serialization, write-then-verify, no false success
+        self.assertIn("np.real", file_prompt)
+        self.assertIn(".tolist()", file_prompt)
+        self.assertIn("Inf", file_prompt)
+        self.assertIn("json.load", file_prompt)
+        self.assertIn("谎报", file_prompt)
+        # the runtime-repair prompt carries the same discipline
+        self.assertIn("np.real", repair_prompt)
+        self.assertIn("谎报", repair_prompt)
+
     def test_result_review_prompts_require_chinese_report_text(self) -> None:
         book = PromptBook()
 

@@ -166,28 +166,26 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(set(normalized["files"][0]), {"path", "content"})
         self.assertTrue(normalized["_meta"]["manifest_normalized"])
 
-    def test_project_file_validation_rejects_oversized_file(self) -> None:
-        # Ordinary files keep the 200-line cap.
+    def test_code_files_have_no_size_limit(self) -> None:
+        # User decision: generated CODE (.py) files carry no line/char cap (a too-tight cap
+        # was the main template-fallback trigger). They must still compile.
+        for path in ("src/simulation.py", "run_experiment.py", "src/metrics.py", "src/channel.py"):
+            issues = _validate_project_file(
+                {"path": path, "content_lines": ["print('x')"] * 2000},
+                path,
+            )
+            self.assertFalse(
+                any("lines for" in issue.message or "characters for" in issue.message for issue in issues),
+                f"{path} should have no size limit",
+            )
+
+    def test_non_code_files_keep_size_limit(self) -> None:
+        # Non-code files (README / config / requirements) keep their caps.
         issues = _validate_project_file(
-            {"path": "src/metrics.py", "content_lines": ["print('x')"] * 201},
-            "src/metrics.py",
+            {"path": "README.md", "content_lines": ["x"] * 201},
+            "README.md",
         )
-
         self.assertTrue(any("200 lines" in issue.message for issue in issues))
-
-    def test_simulation_file_allows_up_to_500_lines(self) -> None:
-        # simulation.py is the integration/orchestration file; it gets a 500-line cap so a
-        # complex multi-experiment driver doesn't trigger a whole-project template fallback.
-        ok = _validate_project_file(
-            {"path": "src/simulation.py", "content_lines": ["print('x')"] * 201},
-            "src/simulation.py",
-        )
-        self.assertFalse(any("lines for" in issue.message for issue in ok))
-        too_big = _validate_project_file(
-            {"path": "src/simulation.py", "content_lines": ["print('x')"] * 501},
-            "src/simulation.py",
-        )
-        self.assertTrue(any("500 lines" in issue.message for issue in too_big))
 
     def test_clear_project_code_files_removes_orphans_keeps_scratch(self) -> None:
         # Bug B: a template fallback must atomically replace the project; orphan code from an

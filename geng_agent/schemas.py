@@ -44,7 +44,9 @@ def format_issues(issues: list[ValidationIssue]) -> str:
     return "\n".join(f"- {issue.path}: {issue.message}" for issue in issues)
 
 
-def validate_fact_sources(data: dict[str, Any], valid_chunk_ids: set[str]) -> list[ValidationIssue]:
+def validate_fact_sources(
+    data: dict[str, Any], valid_chunk_ids: set[str], valid_pages: set[int] | None = None
+) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
     facts = data.get("engineering_facts")
     if not isinstance(facts, list):
@@ -55,9 +57,16 @@ def validate_fact_sources(data: dict[str, Any], valid_chunk_ids: set[str]) -> li
         source = fact.get("source")
         if not isinstance(source, dict):
             continue
-        chunk_id = source.get("chunk_id")
-        if isinstance(chunk_id, str) and chunk_id not in valid_chunk_ids:
-            issues.append(ValidationIssue(f"$.engineering_facts[{index}].source.chunk_id", "must refer to paper_chunks.json"))
+        base = f"$.engineering_facts[{index}].source"
+        if source.get("source_kind") == "figure":
+            # figure-sourced fact must cite a page the model actually saw (a rendered page image)
+            page = source.get("page")
+            if valid_pages is not None and (not isinstance(page, int) or page not in valid_pages):
+                issues.append(ValidationIssue(f"{base}.page", "figure source must cite a rendered paper page"))
+        else:
+            chunk_id = source.get("chunk_id")
+            if isinstance(chunk_id, str) and chunk_id not in valid_chunk_ids:
+                issues.append(ValidationIssue(f"{base}.chunk_id", "must refer to paper_chunks.json"))
     return issues
 
 

@@ -22,7 +22,9 @@
    - 物理量越界：概率/误码率（BER/SER/BLER/outage）算出负值或 >1 → 计算后裁剪到 [0, 1]；若取对数或画对数坐标，用极小正数下界（如 1e-12）替代 0/负值。
    - 空数组/退化输入崩溃：np.polyfit/np.mean/np.max/曲线拟合前未判空 → 加非空判断，空了写 NaN/哨兵并跳过该点，绝不抛异常；np.log/np.sqrt 参数先 max(x, 极小正数)，除法分母先保证非零。
    - 单实验拖垮全局：run_experiment.py 未隔离各实验 → 把每个实验包进 try/except，失败者把错误记入 summary.json 并继续；只要有一个实验产出有效结果，就以退出码 0 结束。
-   - 修复手段是让计算变稳健（裁剪/判空/隔离），不是把结果硬编码成通过，也不是删掉实验。
+   - 复数/类型/序列化（json.dump 报 “not JSON serializable” 或 summary 坏/截断）：物理实数量算成 complex → 取实部或模（np.real/np.abs）；写 summary 的值必须是内置 float/int/bool（数组 .tolist()），不得含 numpy 标量/复数/NaN/Inf；CSV 单元格先 float(np.real(x))。
+   - 谎报成功：必需产物（csv/png/summary）写入或序列化失败被 try/except 吞掉、却仍 print 成功或 `sys.exit(0)` → 改成保存/序列化失败必须以非 0 退出码失败，绝不粉饰成成功；单实验计算失败才可跳过保留 partial。
+   - 修复手段是让计算变稳健（取实部/裁剪/判空/隔离）+ 产物可序列化 + 失败诚实退出，不是把结果硬编码成通过，也不是删掉实验。
 
 输出 schema：
 {

@@ -25,7 +25,7 @@ class StatusTests(unittest.TestCase):
                             "type": "channel_model",
                             "name": "AWGN",
                             "value": {},
-                            "source": {"chunk_id": "text_c1", "page": None, "section": "", "quote": "AWGN"},
+                            "source": {"source_kind": "text", "chunk_id": "text_c1", "page": None, "section": "", "quote": "AWGN", "figure_ref": ""},
                             "confidence": "high",
                             "used_for_reproduction": True,
                         }

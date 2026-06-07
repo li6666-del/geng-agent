@@ -189,18 +189,22 @@ def _source_for(chunks: list[dict[str, Any]], keywords: list[str]) -> dict[str, 
         if any(keyword in lowered_text for keyword in lowered_keywords):
             quote = _quote_for(text, keywords)
             return {
+                "source_kind": "text",
                 "chunk_id": str(chunk.get("chunk_id") or "unknown"),
                 "page": chunk.get("page") if isinstance(chunk.get("page"), int) else None,
                 "section": str(chunk.get("section") or "unknown"),
                 "quote": quote,
+                "figure_ref": "",
             }
     if chunks:
         chunk = chunks[0]
         return {
+            "source_kind": "text",
             "chunk_id": str(chunk.get("chunk_id") or "unknown"),
             "page": chunk.get("page") if isinstance(chunk.get("page"), int) else None,
             "section": str(chunk.get("section") or "unknown"),
             "quote": _quote_for(str(chunk.get("text") or ""), []),
+            "figure_ref": "",
         }
     return None
 

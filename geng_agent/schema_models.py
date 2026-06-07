@@ -82,10 +82,15 @@ class StrictModel(BaseModel):
 
 
 class FactSource(StrictModel):
-    chunk_id: NonEmptyStr
+    # A fact may be sourced from a text chunk OR from a figure/diagram the model saw in the
+    # rendered page image. source_kind selects which: "text" -> chunk_id must be a real
+    # paper_chunks id; "figure" -> chunk_id is null and page must be the page the figure is on.
+    source_kind: Literal["text", "figure"]
+    chunk_id: str | None
     page: int | None
     section: str
     quote: NonEmptyStr
+    figure_ref: str
 
 
 class EngineeringFact(StrictModel):

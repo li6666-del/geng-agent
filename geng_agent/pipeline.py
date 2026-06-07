@@ -244,6 +244,12 @@ class ReviewPipeline:
         # can SEE the figures/diagrams/in-figure values that plain text chunking drops.
         # Empty for non-PDF papers or non-multimodal clients -> those stages stay text-only.
         paper_images = self._render_paper_images(paper_path=paper_path, paper=paper)
+        # Pages the model actually saw as images -> the set a "figure"-sourced fact may cite.
+        valid_pages: set[int] = set()
+        for image in paper_images:
+            label = getattr(image, "label", "") or ""
+            if label.startswith("paper_page:") and label.split(":", 1)[1].isdigit():
+                valid_pages.add(int(label.split(":", 1)[1]))
 
         prompt_1 = self.prompt_book.render(
             "extract_engineering_facts.md",
@@ -262,10 +268,10 @@ class ReviewPipeline:
             prompt_adjustment=(prompt_adjustments or {}).get("facts"),
             images=paper_images,
             extra_validation=lambda parsed: (
-                validate_fact_sources(parsed, valid_chunk_ids)
+                validate_fact_sources(parsed, valid_chunk_ids, valid_pages)
                 + engineering_facts_floor_issues(parsed)
             ),
-            candidate_normalizer=lambda parsed: finalize_engineering_facts(parsed, valid_chunk_ids),
+            candidate_normalizer=lambda parsed: finalize_engineering_facts(parsed, valid_chunk_ids, valid_pages),
             truncation_recovery=recover_truncated_engineering_facts,
             fallback_factory=(
                 (lambda exc: build_fallback_engineering_facts(
@@ -1383,19 +1389,16 @@ REPRO_PROJECT_FILE_ORDER = [
 # best-reviewed (fewest-blocking) compilable version. Only applies when --code-review is on.
 PER_FILE_REVIEW_REVISE_ROUNDS = 3
 
+# Size limits apply to NON-code files only. Generated CODE (.py) files are intentionally
+# left UNCAPPED (no line or char limit): a too-tight size cap on code was the single biggest
+# template-fallback trigger, and a long-but-real reproduction beats discarding it for length.
+# Code conciseness is steered by the generation prompt and code review, not a hard cap; .py
+# files are still required to compile (ast check in _content_type_issues).
 REPRO_PROJECT_FILE_LIMITS = {
     "README.md": {"lines": 200, "chars": 20000},
     "requirements.txt": {"lines": 200, "chars": 4000},
     "config.json": {"lines": 200, "chars": 20000},
     "config_smoke.json": {"lines": 200, "chars": 20000},
-    "run_experiment.py": {"lines": 200, "chars": 20000},
-    "src/channel.py": {"lines": 200, "chars": 20000},
-    "src/modulation.py": {"lines": 200, "chars": 20000},
-    "src/metrics.py": {"lines": 200, "chars": 20000},
-    # simulation.py is the integration/orchestration file (imports + wires the other
-    # modules, drives all experiments); it legitimately needs more room. A too-tight cap
-    # here was the single biggest template-fallback trigger across the 5-thread run.
-    "src/simulation.py": {"lines": 500, "chars": 50000},
 }
 
 

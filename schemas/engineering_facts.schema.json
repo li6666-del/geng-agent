@@ -62,10 +62,24 @@
     "FactSource": {
       "additionalProperties": false,
       "properties": {
-        "chunk_id": {
-          "minLength": 1,
-          "title": "Chunk Id",
+        "source_kind": {
+          "enum": [
+            "text",
+            "figure"
+          ],
+          "title": "Source Kind",
           "type": "string"
+        },
+        "chunk_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Chunk Id"
         },
         "page": {
           "anyOf": [
@@ -86,13 +100,19 @@
           "minLength": 1,
           "title": "Quote",
           "type": "string"
+        },
+        "figure_ref": {
+          "title": "Figure Ref",
+          "type": "string"
         }
       },
       "required": [
+        "source_kind",
         "chunk_id",
         "page",
         "section",
-        "quote"
+        "quote",
+        "figure_ref"
       ],
       "title": "FactSource",
       "type": "object"

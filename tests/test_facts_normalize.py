@@ -18,8 +18,28 @@ def good_fact(**overrides):
         "type": "channel_model",
         "name": "AWGN",
         "value": {"snr_db": [0, 2, 4]},
-        "source": {"chunk_id": "text_c1", "page": 3, "section": "Simulation", "quote": "AWGN channel"},
+        "source": {"source_kind": "text", "chunk_id": "text_c1", "page": 3, "section": "Simulation", "quote": "AWGN channel", "figure_ref": ""},
         "confidence": "high",
+        "used_for_reproduction": True,
+    }
+    fact.update(overrides)
+    return fact
+
+
+def figure_fact(**overrides):
+    fact = {
+        "type": "figure_claim",
+        "name": "fig7_curves",
+        "value": {"curves": 5},
+        "source": {
+            "source_kind": "figure",
+            "chunk_id": None,
+            "page": 7,
+            "section": "Results",
+            "quote": "y-axis sum rate 0-15 bps/Hz, 5 curves",
+            "figure_ref": "Fig.7",
+        },
+        "confidence": "medium",
         "used_for_reproduction": True,
     }
     fact.update(overrides)
@@ -103,8 +123,8 @@ class PartialAcceptanceTests(unittest.TestCase):
         data = {
             "engineering_facts": [
                 good_fact(name="AWGN"),
-                good_fact(name="ghost", source={"chunk_id": "text_unknown", "page": 1, "section": "x", "quote": "q"}),
-                good_fact(name="noquote", source={"chunk_id": "text_c1", "page": 1, "section": "x", "quote": ""}),
+                good_fact(name="ghost", source={"source_kind": "text", "chunk_id": "text_unknown", "page": 1, "section": "x", "quote": "q", "figure_ref": ""}),
+                good_fact(name="noquote", source={"source_kind": "text", "chunk_id": "text_c1", "page": 1, "section": "x", "quote": "", "figure_ref": ""}),
             ]
         }
         kept, dropped = select_valid_engineering_facts(data, CHUNK_IDS)
@@ -177,6 +197,58 @@ class TruncationRecoveryTests(unittest.TestCase):
         recovered = recover_truncated_engineering_facts(raw)
         self.assertIsNotNone(recovered)
         self.assertEqual(len(recovered["engineering_facts"]), 1)
+
+
+class FigureSourceTests(unittest.TestCase):
+    def test_figure_fact_passes_schema_with_null_chunk_id(self) -> None:
+        doc = {
+            "paper_domain": "communication",
+            "paper_repro_type": "mimo_ofdm",
+            "engineering_facts": [figure_fact()],
+            "missing_information": [],
+        }
+        self.assertEqual(validate_stage("engineering_facts", doc), [])
+
+    def test_figure_fact_kept_when_page_was_rendered(self) -> None:
+        data = {"engineering_facts": [figure_fact()]}
+        kept, dropped = select_valid_engineering_facts(data, CHUNK_IDS, {7})
+        self.assertEqual([f["name"] for f in kept], ["fig7_curves"])
+        self.assertEqual(dropped, [])
+
+    def test_figure_fact_dropped_when_page_not_seen(self) -> None:
+        data = {"engineering_facts": [figure_fact()]}
+        kept, dropped = select_valid_engineering_facts(data, CHUNK_IDS, {3})
+        self.assertEqual(kept, [])
+        self.assertIn("page", dropped[0]["reason"])
+
+    def test_finalize_keeps_figure_fact_for_rendered_page(self) -> None:
+        messy = {
+            "paper_repro_type": "mimo_ofdm",
+            "engineering_facts": [figure_fact()],
+            "missing_information": [],
+        }
+        doc = finalize_engineering_facts(messy, CHUNK_IDS, {7})
+        self.assertEqual(validate_stage("engineering_facts", doc), [])
+        self.assertEqual(len(doc["engineering_facts"]), 1)
+        self.assertEqual(doc["engineering_facts"][0]["source"]["source_kind"], "figure")
+
+    def test_validate_fact_sources_branches_on_kind(self) -> None:
+        from geng_agent.schemas import validate_fact_sources
+
+        self.assertEqual(validate_fact_sources({"engineering_facts": [figure_fact()]}, CHUNK_IDS, {7}), [])
+        bad_page = figure_fact(
+            source={"source_kind": "figure", "chunk_id": None, "page": 99, "section": "", "quote": "x", "figure_ref": "Fig.9"}
+        )
+        self.assertTrue(validate_fact_sources({"engineering_facts": [bad_page]}, CHUNK_IDS, {7}))
+
+    def test_figure_synonym_is_normalized_to_figure(self) -> None:
+        fact = figure_fact()
+        fact["source"]["source_kind"] = "image"
+        out, coercions = normalize_engineering_facts_candidate(
+            {"paper_repro_type": "mimo_ofdm", "engineering_facts": [fact], "missing_information": []}
+        )
+        self.assertEqual(out["engineering_facts"][0]["source"]["source_kind"], "figure")
+        self.assertTrue(any("source_kind" in c for c in coercions))
 
 
 if __name__ == "__main__":
