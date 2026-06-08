@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -9,7 +10,13 @@ from typing import Any, Callable
 from .code_review import review_single_generated_file, run_code_faithfulness_review
 from .documents import load_paper
 from .experiment_index import build_local_experiment_index
-from .facts_coverage import compute_fact_coverage, merge_engineering_facts
+from .facts_coverage import (
+    compute_fact_coverage,
+    compute_task_coverage,
+    is_concrete_experiment_task,
+    merge_engineering_facts,
+    merge_repro_tasks,
+)
 from .facts_normalize import (
     engineering_facts_floor_issues,
     finalize_engineering_facts,
@@ -144,18 +151,28 @@ def _apply_prompt_adjustment(prompt: str, adjustment: str | None) -> str:
 
 
 class ReviewPipeline:
-    def __init__(self, client: LLMClient, prompt_book: PromptBook | None = None, code_review_client: LLMClient | None = None) -> None:
+    def __init__(
+        self,
+        client: LLMClient,
+        prompt_book: PromptBook | None = None,
+        code_review_client: LLMClient | None = None,
+        extraction_client_2: LLMClient | None = None,
+    ) -> None:
         self.client = client
         self.prompt_book = prompt_book or PromptBook()
         # Optional heterogeneous reviewer for the code-faithfulness stage; falls back to
         # the main generator client when not provided.
         self.code_review_client = code_review_client
+        # Optional second multimodal extraction model for the round-1 cross-model fact
+        # ensemble; None -> single-model extraction (behavior unchanged).
+        self.extraction_client_2 = extraction_client_2
 
     def _llm_clients(self) -> list[Any]:
         """The distinct LLM clients whose token usage should roll up into run_cost.json."""
         clients: list[Any] = [self.client]
-        if self.code_review_client is not None and self.code_review_client is not self.client:
-            clients.append(self.code_review_client)
+        for extra in (self.code_review_client, self.extraction_client_2):
+            if extra is not None and all(extra is not existing for existing in clients):
+                clients.append(extra)
         return clients
 
     def _cumulative_usage(self) -> dict[str, int]:
@@ -209,6 +226,7 @@ class ReviewPipeline:
         code_review: bool = False,
         code_review_attempts: int = 5,
         facts_gap_rounds: int = 3,
+        tasks_gap_rounds: int = 3,
     ) -> PipelineResult:
         stage_cleanup = {
             "facts": "facts",
@@ -248,6 +266,7 @@ class ReviewPipeline:
             code_review=code_review,
             code_review_attempts=code_review_attempts,
             facts_gap_rounds=facts_gap_rounds,
+            tasks_gap_rounds=tasks_gap_rounds,
         )
 
     def run(
@@ -271,6 +290,7 @@ class ReviewPipeline:
         code_review: bool = False,
         code_review_attempts: int = 5,
         facts_gap_rounds: int = 3,
+        tasks_gap_rounds: int = 3,
     ) -> PipelineResult:
         output_dir = output_dir.expanduser().resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -322,33 +342,51 @@ class ReviewPipeline:
             "extract_engineering_facts.md",
             paper_chunks_json=paper_context,
         )
-        facts = self._load_or_create_stage_json(
-            output_path=output_dir / "engineering_facts.json",
-            output_dir=output_dir,
-            audit_dir=audit_dir,
-            prompt=prompt_1,
-            stage_label="01_extract_engineering_facts",
-            cleanup_stage="facts",
-            schema_stage="engineering_facts",
-            max_attempts=json_repair_attempts + 1,
-            resume=resume,
-            prompt_adjustment=(prompt_adjustments or {}).get("facts"),
-            images=paper_images,
-            extra_validation=lambda parsed: (
-                validate_fact_sources(parsed, valid_chunk_ids, valid_pages)
-                + engineering_facts_floor_issues(parsed)
-            ),
-            candidate_normalizer=lambda parsed: finalize_engineering_facts(parsed, valid_chunk_ids, valid_pages),
-            truncation_recovery=recover_truncated_engineering_facts,
-            fallback_factory=(
-                (lambda exc: build_fallback_engineering_facts(
-                    paper=paper,
-                    reason=f"LLM engineering fact extraction failed after retries: {exc}",
-                ))
-                if template_fallback
-                else None
-            ),
-        )
+        if self.extraction_client_2 is None:
+            facts = self._load_or_create_stage_json(
+                output_path=output_dir / "engineering_facts.json",
+                output_dir=output_dir,
+                audit_dir=audit_dir,
+                prompt=prompt_1,
+                stage_label="01_extract_engineering_facts",
+                cleanup_stage="facts",
+                schema_stage="engineering_facts",
+                max_attempts=json_repair_attempts + 1,
+                resume=resume,
+                prompt_adjustment=(prompt_adjustments or {}).get("facts"),
+                images=paper_images,
+                extra_validation=lambda parsed: (
+                    validate_fact_sources(parsed, valid_chunk_ids, valid_pages)
+                    + engineering_facts_floor_issues(parsed)
+                ),
+                candidate_normalizer=lambda parsed: finalize_engineering_facts(parsed, valid_chunk_ids, valid_pages),
+                truncation_recovery=recover_truncated_engineering_facts,
+                fallback_factory=(
+                    (lambda exc: build_fallback_engineering_facts(
+                        paper=paper,
+                        reason=f"LLM engineering fact extraction failed after retries: {exc}",
+                    ))
+                    if template_fallback
+                    else None
+                ),
+            )
+        else:
+            # Cross-model ensemble: primary + secondary multimodal model extract in parallel,
+            # union by (type, name). Cancels each model's blind spots at the highest-leverage
+            # stage. Secondary failure is non-fatal -> falls back to the primary result.
+            facts = self._extract_facts_ensemble(
+                prompt_1=prompt_1,
+                paper=paper,
+                paper_images=paper_images,
+                valid_chunk_ids=valid_chunk_ids,
+                valid_pages=valid_pages,
+                output_dir=output_dir,
+                audit_dir=audit_dir,
+                resume=resume,
+                max_attempts=json_repair_attempts + 1,
+                template_fallback=template_fallback,
+                prompt_adjustment=(prompt_adjustments or {}).get("facts"),
+            )
 
         # Round-1 recall hardening: deterministically check figure/table coverage and run a
         # targeted gap-finder pass for the omissions (a miss here diverges everything below).
@@ -397,6 +435,20 @@ class ReviewPipeline:
                 if template_fallback
                 else None
             ),
+        )
+
+        # Round-2 recall hardening: ensure every reproducible experiment (a figure_claim fact)
+        # has a repro task; gap-find tasks for any uncovered experiments (loop until none left).
+        tasks = self._augment_tasks_with_gap_finder(
+            tasks=tasks,
+            facts=facts,
+            paper_context=paper_context,
+            output_dir=output_dir,
+            audit_dir=audit_dir,
+            resume=resume,
+            max_attempts=json_repair_attempts + 1,
+            max_rounds=tasks_gap_rounds,
+            tasks_timeout=tasks_timeout,
         )
         _mark("tasks")
         experiment_index = self._load_or_create_experiment_index(
@@ -711,6 +763,7 @@ class ReviewPipeline:
         truncation_recovery: Callable[[str], dict[str, Any] | None] | None = None,
         prompt_adjustment: str | None = None,
         images: list | None = None,
+        client: Any = None,
     ) -> dict[str, Any]:
         if resume and output_path.exists():
             cached = _load_valid_stage_cache(
@@ -738,6 +791,7 @@ class ReviewPipeline:
                 candidate_normalizer=candidate_normalizer,
                 truncation_recovery=truncation_recovery,
                 images=images,
+                client=client,
             )
         except Exception as exc:
             if fallback_factory is None:
@@ -760,6 +814,106 @@ class ReviewPipeline:
             )
         write_json(output_path, parsed)
         return parsed
+
+    def _extract_facts_ensemble(
+        self,
+        *,
+        prompt_1: str,
+        paper: dict[str, Any],
+        paper_images: list,
+        valid_chunk_ids: set[str],
+        valid_pages: set[int],
+        output_dir: Path,
+        audit_dir: Path,
+        resume: bool,
+        max_attempts: int,
+        template_fallback: bool,
+        prompt_adjustment: str | None,
+    ) -> dict[str, Any]:
+        """Round-1 cross-model ensemble: run the primary and the secondary multimodal model
+        on the SAME extraction prompt+images in parallel, then union the two fact sets by
+        (type, name). The primary keeps the full safety net (floor check + template fallback);
+        the secondary is best-effort (no floor, no fallback) so a secondary failure just
+        leaves the primary result. Both reuse the same validation/normalization/repair path
+        via the threaded ``client`` parameter."""
+        primary_path = output_dir / "engineering_facts.json"
+        # Clear stale downstream ONCE up front, so neither parallel call races on cleanup.
+        if not (resume and primary_path.exists()):
+            _clear_stage_outputs(output_dir, "facts")
+
+        def _extract(client: Any, output_path: Path, stage_label: str, *, with_floor: bool, with_fallback: bool) -> dict[str, Any]:
+            return self._load_or_create_stage_json(
+                output_path=output_path,
+                output_dir=output_dir,
+                audit_dir=audit_dir,
+                prompt=prompt_1,
+                stage_label=stage_label,
+                cleanup_stage="facts_ensemble",  # unknown stage -> no-op (cleanup done above)
+                schema_stage="engineering_facts",
+                max_attempts=max_attempts,
+                resume=resume,
+                prompt_adjustment=prompt_adjustment,
+                images=paper_images,
+                extra_validation=lambda parsed: (
+                    validate_fact_sources(parsed, valid_chunk_ids, valid_pages)
+                    + (engineering_facts_floor_issues(parsed) if with_floor else [])
+                ),
+                candidate_normalizer=lambda parsed: finalize_engineering_facts(parsed, valid_chunk_ids, valid_pages),
+                truncation_recovery=recover_truncated_engineering_facts,
+                fallback_factory=(
+                    (lambda exc: build_fallback_engineering_facts(
+                        paper=paper,
+                        reason=f"LLM engineering fact extraction failed after retries: {exc}",
+                    ))
+                    if with_fallback
+                    else None
+                ),
+                client=client,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fut_primary = pool.submit(
+                _extract, self.client, primary_path, "01_extract_engineering_facts",
+                with_floor=True, with_fallback=template_fallback,
+            )
+            fut_secondary = pool.submit(
+                _extract, self.extraction_client_2, output_dir / "engineering_facts_model2.json",
+                "01b_extract_facts_model2", with_floor=False, with_fallback=False,
+            )
+            facts = fut_primary.result()  # primary failure stays fatal, as in single-model mode
+            try:
+                facts2 = fut_secondary.result()
+            except Exception as exc:
+                facts2 = None
+                write_json(
+                    audit_dir / "facts_ensemble_summary.json",
+                    {"ok": False, "secondary_error": f"{type(exc).__name__}: {exc}"},
+                )
+
+        if not isinstance(facts2, dict):
+            return facts
+
+        facts, added = merge_engineering_facts(facts, facts2)
+        meta = dict(facts.get("_meta", {})) if isinstance(facts.get("_meta"), dict) else {}
+        secondary_facts = facts2.get("engineering_facts", [])
+        meta["ensemble"] = {
+            "secondary_model": getattr(self.extraction_client_2, "model", "unknown"),
+            "secondary_fact_count": len(secondary_facts) if isinstance(secondary_facts, list) else 0,
+            "added_by_secondary": added,
+        }
+        facts["_meta"] = meta
+        write_json(primary_path, facts)
+        write_json(
+            audit_dir / "facts_ensemble_summary.json",
+            {
+                "ok": True,
+                "primary_model": getattr(self.client, "model", "unknown"),
+                "secondary_model": getattr(self.extraction_client_2, "model", "unknown"),
+                "added_by_secondary": added,
+                "total_facts": len(facts.get("engineering_facts", [])),
+            },
+        )
+        return facts
 
     def _augment_facts_with_gap_finder(
         self,
@@ -851,6 +1005,104 @@ class ReviewPipeline:
             if added == 0:
                 break
         return facts
+
+    def _augment_tasks_with_gap_finder(
+        self,
+        *,
+        tasks: dict[str, Any],
+        facts: dict[str, Any],
+        paper_context: str,
+        output_dir: Path,
+        audit_dir: Path,
+        resume: bool,
+        max_attempts: int,
+        max_rounds: int,
+        tasks_timeout: float,
+    ) -> dict[str, Any]:
+        """Round-2 recall hardening -- the round-1 idea applied to task building. Deterministically
+        check that every reproducible experiment (a figure_claim fact) has a repro task; for any
+        uncovered experiments, run a targeted gap-finder that designs ONLY the missing tasks.
+        Loop until coverage is complete or a round adds nothing.
+
+        Non-fatal + idempotent: a gap round that errors keeps the existing tasks; dedup by
+        task_id / figure_or_claim means a re-merge adds zero and the same experiment is never
+        scheduled to reproduce twice."""
+        if max_rounds <= 0:
+            return tasks
+        for round_no in range(1, max_rounds + 1):
+            coverage = compute_task_coverage(facts, tasks)
+            write_json(audit_dir / f"tasks_coverage_round_{round_no}.json", coverage)
+            if coverage["fully_covered"]:
+                break  # every reproducible experiment already has a task
+
+            gap_prompt = self.prompt_book.render(
+                "build_repro_tasks_gaps.md",
+                engineering_facts_json=wrap_untrusted("engineering_facts_json", pretty_json(facts)),
+                existing_tasks_json=wrap_untrusted(
+                    "existing_tasks_json",
+                    pretty_json({"repro_tasks": tasks.get("repro_tasks", [])}),
+                ),
+                coverage_report_json=wrap_untrusted("coverage_report_json", pretty_json(coverage)),
+                paper_context_json=paper_context,
+            )
+            try:
+                gap_doc = self._load_or_create_stage_json(
+                    output_path=output_dir / f"repro_tasks_gap_round_{round_no}.json",
+                    output_dir=output_dir,
+                    audit_dir=audit_dir,
+                    prompt=gap_prompt,
+                    stage_label=f"02b_tasks_gap_round_{round_no}",
+                    cleanup_stage="tasks_gap",  # unknown stage -> no-op (keep base tasks)
+                    schema_stage="repro_tasks",
+                    max_attempts=max_attempts,
+                    resume=resume,
+                    extra_validation=lambda parsed: validate_task_fact_refs(parsed, facts),
+                    candidate_normalizer=lambda parsed: finalize_repro_tasks(parsed, facts),
+                    truncation_recovery=recover_truncated_repro_tasks,
+                    request_timeout=tasks_timeout,
+                    fallback_factory=None,
+                )
+            except Exception as exc:
+                write_json(
+                    audit_dir / f"tasks_gap_round_{round_no}_error.json",
+                    {"ok": False, "error": f"{type(exc).__name__}: {exc}"},
+                )
+                break
+
+            # #1 deterministic metric gate: a real reproduction experiment computes a specific
+            # measurable metric with concrete output columns. Reject gap tasks with metric=other
+            # / no real columns -- usually a non-reproducible figure (concept/system diagram)
+            # misjudged as an experiment, caught regardless of how the figure was worded.
+            gap_tasks = gap_doc.get("repro_tasks") if isinstance(gap_doc.get("repro_tasks"), list) else []
+            concrete = [t for t in gap_tasks if is_concrete_experiment_task(t)]
+            rejected = [t.get("task_id") for t in gap_tasks if not is_concrete_experiment_task(t)]
+            if rejected:
+                write_json(
+                    audit_dir / f"tasks_gap_round_{round_no}_rejected.json",
+                    {"rejected": rejected, "reason": "metric=other or no concrete output_columns -> likely a non-reproducible figure"},
+                )
+            gap_doc = {**gap_doc, "repro_tasks": concrete}
+            tasks, added = merge_repro_tasks(tasks, gap_doc)
+            meta = dict(tasks.get("_meta", {})) if isinstance(tasks.get("_meta"), dict) else {}
+            gap_meta = dict(meta.get("gap_finder", {})) if isinstance(meta.get("gap_finder"), dict) else {}
+            gap_meta[f"round_{round_no}_added"] = added
+            gap_meta["rounds_run"] = round_no
+            meta["gap_finder"] = gap_meta
+            tasks["_meta"] = meta
+            write_json(output_dir / "repro_tasks.json", tasks)
+            write_json(
+                audit_dir / f"tasks_gap_round_{round_no}_summary.json",
+                {
+                    "ok": True,
+                    "added_tasks": added,
+                    "total_tasks": len(tasks.get("repro_tasks", [])),
+                    "uncovered_figures_before": coverage.get("uncovered_figures"),
+                    "uncovered_tables_before": coverage.get("uncovered_tables"),
+                },
+            )
+            if added == 0:
+                break
+        return tasks
 
     def _load_or_create_experiment_index(
         self,
@@ -1202,20 +1454,22 @@ class ReviewPipeline:
         except Exception:
             return []
 
-    def _complete_maybe_multimodal(self, prompt: str, *, schema_stage: str, images: list | None) -> str:
+    def _complete_maybe_multimodal(self, prompt: str, *, schema_stage: str, images: list | None, client: Any = None) -> str:
         """Call the LLM for a JSON stage. When page images are available and the client
         supports multimodal input, send them alongside the prompt; on any multimodal
         failure (or no support) fall back to text-only so a non-multimodal client never
-        breaks the stage."""
+        breaks the stage. ``client`` defaults to the primary client; the ensemble passes
+        the secondary extraction client here."""
+        client = client or self.client
         response_format = response_format_for_stage(schema_stage)
-        if images and hasattr(self.client, "complete_multimodal"):
+        if images and hasattr(client, "complete_multimodal"):
             try:
-                return self.client.complete_multimodal(
+                return client.complete_multimodal(
                     prompt, images=images, system=SYSTEM_MESSAGE, response_format=response_format
                 )
             except Exception:
                 pass
-        return self.client.complete(prompt, system=SYSTEM_MESSAGE, response_format=response_format)
+        return client.complete(prompt, system=SYSTEM_MESSAGE, response_format=response_format)
 
     def _call_validated_json(
         self,
@@ -1230,16 +1484,19 @@ class ReviewPipeline:
         candidate_normalizer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         truncation_recovery: Callable[[str], dict[str, Any] | None] | None = None,
         images: list | None = None,
+        client: Any = None,
     ) -> dict[str, Any]:
+        client = client or self.client
         current_prompt = prompt
         last_errors = ""
         for attempt in range(1, max_attempts + 1):
             try:
-                with _temporary_client_timeout(self.client, request_timeout):
+                with _temporary_client_timeout(client, request_timeout):
                     raw = self._complete_maybe_multimodal(
                         current_prompt,
                         schema_stage=schema_stage,
                         images=images,
+                        client=client,
                     )
             except Exception as exc:
                 last_errors = f"LLM request error: {type(exc).__name__}: {exc}"

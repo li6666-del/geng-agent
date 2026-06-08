@@ -7,9 +7,11 @@ from tempfile import TemporaryDirectory
 
 from geng_agent.facts_coverage import (
     compute_fact_coverage,
+    compute_task_coverage,
     enumerate_paper_anchors,
     facts_referenced_anchors,
     merge_engineering_facts,
+    merge_repro_tasks,
 )
 from geng_agent.pipeline import ReviewPipeline
 
@@ -205,6 +207,193 @@ class GapFinderIntegrationTests(unittest.TestCase):
             )
         self.assertEqual(client.calls, 0)
         self.assertEqual(out, base)
+
+
+def _fclaim(name: str) -> dict:
+    return {"type": "figure_claim", "name": name, "value": {},
+            "source": {"source_kind": "text", "chunk_id": "c1", "page": 1, "section": "R", "quote": name, "figure_ref": ""},
+            "confidence": "high", "used_for_reproduction": True}
+
+
+class TaskCoverageTests(unittest.TestCase):
+    def test_uncovered_experiment_reported_and_diagram_excluded(self) -> None:
+        facts = {"engineering_facts": [
+            _fclaim("Figure 4: Empirical CDF of UPA ZF sum rate"),  # experiment (cdf/sum rate)
+            _fclaim("Figure 2: STAB system model with L=3"),        # diagram -> excluded
+            _fclaim("Figure 7: Average sum rate vs transmit power"),  # experiment
+        ]}
+        tasks = {"repro_tasks": [{"task_id": "reproduce_fig_4", "figure_or_claim": "Fig. 4", "target": "CDF"}]}
+        cov = compute_task_coverage(facts, tasks)
+        self.assertEqual(cov["experiment_figures"], ["4", "7"])  # Fig 2 (diagram) not an experiment
+        self.assertEqual(cov["uncovered_figures"], ["7"])
+        self.assertFalse(cov["fully_covered"])
+
+    def test_fully_covered(self) -> None:
+        facts = {"engineering_facts": [_fclaim("Figure 1: BER vs SNR curve")]}
+        tasks = {"repro_tasks": [{"task_id": "t1", "figure_or_claim": "Figure 1", "target": "BER"}]}
+        self.assertTrue(compute_task_coverage(facts, tasks)["fully_covered"])
+
+    def test_concept_figure_is_not_an_experiment(self) -> None:
+        # positive-evidence: a concept/geometry illustration (no measurable metric) is NOT an
+        # experiment, so it never enters the gap worklist (the Fig.1 misjudgement).
+        facts = {"engineering_facts": [
+            _fclaim("Fig. 1 concept figure"),  # geometry illustration -> excluded
+            _fclaim("Figure 7: average sum rate versus transmit power"),  # result -> experiment
+        ]}
+        cov = compute_task_coverage(facts, {"repro_tasks": []})
+        self.assertEqual(cov["experiment_figures"], ["7"])
+        self.assertNotIn("1", cov["experiment_figures"])
+
+
+class ConcreteTaskGateTests(unittest.TestCase):
+    def test_metric_other_rejected(self) -> None:
+        from geng_agent.facts_coverage import is_concrete_experiment_task
+        self.assertFalse(is_concrete_experiment_task({"metric": "other", "output_columns": ["x"]}))
+
+    def test_empty_columns_rejected(self) -> None:
+        from geng_agent.facts_coverage import is_concrete_experiment_task
+        self.assertFalse(is_concrete_experiment_task({"metric": "bit_error_rate", "output_columns": []}))
+
+    def test_concrete_metric_with_columns_accepted(self) -> None:
+        from geng_agent.facts_coverage import is_concrete_experiment_task
+        self.assertTrue(is_concrete_experiment_task({"metric": "throughput", "output_columns": ["snr_db", "rate"]}))
+
+
+class MergeReproTasksTests(unittest.TestCase):
+    def test_dedup_by_figure_and_task_id(self) -> None:
+        base = {"repro_tasks": [{"task_id": "reproduce_fig_4", "figure_or_claim": "Fig. 4"}]}
+        addition = {"repro_tasks": [
+            {"task_id": "reproduce_fig_4b", "figure_or_claim": "Fig. 4"},  # same experiment -> drop
+            {"task_id": "reproduce_fig_4", "figure_or_claim": "Fig. 9"},   # same task_id -> drop
+            {"task_id": "reproduce_fig_7", "figure_or_claim": "Fig. 7"},   # new -> keep
+        ]}
+        merged, added = merge_repro_tasks(base, addition)
+        self.assertEqual(added, 1)
+        self.assertEqual({t["figure_or_claim"] for t in merged["repro_tasks"]}, {"Fig. 4", "Fig. 7"})
+
+
+class _GapTaskLLM:
+    """Returns a task for the uncovered Fig.7 on the first gap call."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def complete(self, prompt: str, *, system=None, response_format=None) -> str:
+        self.calls += 1
+        return json.dumps({"repro_tasks": [{
+            "task_id": "reproduce_fig_7",
+            "target": "sum rate vs transmit power",
+            "metric": "spectral_efficiency",
+            "metric_formula": "spectral_efficiency = log2(1+SINR)",
+            "figure_or_claim": "Fig. 7",
+            "expected_artifacts": ["outputs/results.csv", "outputs/fig7.png", "outputs/summary.json"],
+            "output_columns": ["transmit_power_dbm", "sum_rate"],
+            "expected_trend": {"x_axis": "transmit_power_dbm", "y_axis": "sum_rate", "direction": "increasing", "reason": "more power -> higher rate"},
+            "comparison": {"baselines": ["ZF"], "curve_groups": ["STAB+SDS"], "tolerance": "qualitative trend"},
+            "required_facts": [{"type": "figure_claim", "name": "Figure 7: Average sum rate vs transmit power"}],
+            "assumptions": [],
+            "risk_if_unreproducible": "core sum-rate curve cannot be checked",
+        }]})
+
+
+class TasksGapFinderIntegrationTests(unittest.TestCase):
+    def test_gap_finder_adds_missing_task_and_stops_when_covered(self) -> None:
+        facts = {"paper_domain": "communication", "paper_repro_type": "signal_chain", "engineering_facts": [
+            _fclaim("Figure 4: Empirical CDF of sum rate"),
+            _fclaim("Figure 7: Average sum rate vs transmit power"),
+        ], "missing_information": []}
+        base = {"repro_tasks": [{
+            "task_id": "reproduce_fig_4", "target": "CDF of sum rate", "metric": "spectral_efficiency",
+            "metric_formula": "spectral_efficiency = log2(1+SINR)", "figure_or_claim": "Fig. 4",
+            "expected_artifacts": ["outputs/results.csv", "outputs/fig4.png", "outputs/summary.json"],
+            "output_columns": ["sum_rate"],
+            "expected_trend": {"x_axis": "sum_rate", "y_axis": "cdf", "direction": "increasing", "reason": "cdf"},
+            "comparison": {"baselines": ["ZF"], "curve_groups": ["UPA"], "tolerance": "qualitative trend"},
+            "required_facts": [{"type": "figure_claim", "name": "Figure 4: Empirical CDF of sum rate"}],
+            "assumptions": [], "risk_if_unreproducible": "core",
+        }]}
+        with TemporaryDirectory() as d:
+            out_dir = Path(d)
+            (out_dir / "audit").mkdir()
+            client = _GapTaskLLM()
+            pipe = ReviewPipeline(client=client)
+            result = pipe._augment_tasks_with_gap_finder(
+                tasks=base, facts=facts, paper_context="ctx",
+                output_dir=out_dir, audit_dir=out_dir / "audit",
+                resume=False, max_attempts=2, max_rounds=3, tasks_timeout=120.0,
+            )
+            figs = {t["figure_or_claim"] for t in result["repro_tasks"]}
+            self.assertEqual(figs, {"Fig. 4", "Fig. 7"})   # gap task added
+            self.assertEqual(client.calls, 1)              # 1 gap call; then fully covered -> stop
+            self.assertEqual(result["_meta"]["gap_finder"]["round_1_added"], 1)
+            self.assertTrue((out_dir / "repro_tasks.json").exists())
+
+    def test_no_gap_call_when_already_fully_covered(self) -> None:
+        facts = {"engineering_facts": [_fclaim("Figure 1: BER vs SNR")], "missing_information": []}
+        base = {"repro_tasks": [{"task_id": "t1", "figure_or_claim": "Figure 1", "target": "BER"}]}
+        client = _GapTaskLLM()
+        pipe = ReviewPipeline(client=client)
+        with TemporaryDirectory() as d:
+            (Path(d) / "audit").mkdir()
+            pipe._augment_tasks_with_gap_finder(
+                tasks=base, facts=facts, paper_context="", output_dir=Path(d), audit_dir=Path(d) / "audit",
+                resume=False, max_attempts=2, max_rounds=3, tasks_timeout=120.0,
+            )
+        self.assertEqual(client.calls, 0)  # already covered -> no LLM call
+
+
+class _OtherMetricGapLLM:
+    """Returns a task for the uncovered Fig.7 but with metric=other -> the gate must reject it."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def complete(self, prompt: str, *, system=None, response_format=None) -> str:
+        self.calls += 1
+        return json.dumps({"repro_tasks": [{
+            "task_id": "reproduce_fig_7",
+            "target": "sum rate vs power",
+            "metric": "other",  # non-reproducible signal -> deterministic gate rejects
+            "metric_formula": "n/a",
+            "figure_or_claim": "Fig. 7",
+            "expected_artifacts": ["outputs/results.csv", "outputs/x.png", "outputs/summary.json"],
+            "output_columns": ["x"],
+            "expected_trend": {"x_axis": "p", "y_axis": "r", "direction": "increasing", "reason": "r"},
+            "comparison": {"baselines": ["ZF"], "curve_groups": ["A"], "tolerance": "qualitative"},
+            "required_facts": [{"type": "figure_claim", "name": "Figure 7: average sum rate versus transmit power"}],
+            "assumptions": [],
+            "risk_if_unreproducible": "x",
+        }]})
+
+
+class TaskGapMetricGateTests(unittest.TestCase):
+    def test_metric_other_gap_task_is_rejected(self) -> None:
+        facts = {"paper_domain": "communication", "paper_repro_type": "signal_chain", "engineering_facts": [
+            _fclaim("Figure 4: Empirical CDF of sum rate"),
+            _fclaim("Figure 7: average sum rate versus transmit power"),
+        ], "missing_information": []}
+        base = {"repro_tasks": [{
+            "task_id": "reproduce_fig_4", "target": "CDF", "metric": "spectral_efficiency",
+            "metric_formula": "se = log2(1+SINR)", "figure_or_claim": "Fig. 4",
+            "expected_artifacts": ["outputs/results.csv", "outputs/f.png", "outputs/summary.json"],
+            "output_columns": ["sum_rate"],
+            "expected_trend": {"x_axis": "sum_rate", "y_axis": "cdf", "direction": "increasing", "reason": "cdf"},
+            "comparison": {"baselines": ["ZF"], "curve_groups": ["UPA"], "tolerance": "qualitative"},
+            "required_facts": [{"type": "figure_claim", "name": "Figure 4: Empirical CDF of sum rate"}],
+            "assumptions": [], "risk_if_unreproducible": "core",
+        }]}
+        with TemporaryDirectory() as d:
+            (Path(d) / "audit").mkdir()
+            client = _OtherMetricGapLLM()
+            pipe = ReviewPipeline(client=client)
+            result = pipe._augment_tasks_with_gap_finder(
+                tasks=base, facts=facts, paper_context="ctx",
+                output_dir=Path(d), audit_dir=Path(d) / "audit",
+                resume=False, max_attempts=2, max_rounds=3, tasks_timeout=120.0,
+            )
+            figs = {t["figure_or_claim"] for t in result["repro_tasks"]}
+            self.assertEqual(figs, {"Fig. 4"})  # the metric=other Fig.7 task was rejected, not added
+            self.assertTrue((Path(d) / "audit" / "tasks_gap_round_1_rejected.json").exists())
 
 
 if __name__ == "__main__":

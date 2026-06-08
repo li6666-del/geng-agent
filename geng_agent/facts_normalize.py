@@ -373,12 +373,76 @@ def select_valid_engineering_facts(
     return kept, dropped
 
 
+# --- "宁可少也不要错": deterministically DROP fact categories we know are perception-
+# unreliable, rather than keep a possibly-wrong fact that contaminates downstream. Every
+# drop is recorded in _meta so the report stays transparent (not a silent deletion).
+# Targets exactly the error signatures, leaving the reliable text facts untouched:
+#   1) figure point-value reads  -- a number read off a curve (esp. log-scale) -> often wrong
+#   2) appendix/proof transcriptions + transcribed bound formulas -- dense math, easy to mis-copy
+#   3) name vs figure_ref cite DIFFERENT figure numbers -- self-contradiction, untrustworthy
+_FIG_POINT_READ = re.compile(r"≈|约|大约|近似|approximately|about|~\s*\d|\d\s*→\s*\d")
+_APPENDIX_SECTION = re.compile(r"appendix|proof of|证明", re.IGNORECASE)
+_BOUND_NAME = re.compile(r"bound|上界|下界", re.IGNORECASE)
+_FORMULA_HINT = re.compile(r"[=√^λΣ∑∏≥≤]|log|\)\s*/|!")
+_FIG_NUM_RE = re.compile(r"fig(?:ure)?s?\.?\s*(\d{1,2})|图\s*(\d{1,2})", re.IGNORECASE)
+
+
+def _fig_num(text: str) -> str | None:
+    match = _FIG_NUM_RE.search(text or "")
+    if not match:
+        return None
+    return match.group(1) or match.group(2)
+
+
+def _value_text(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def unreliable_fact_reason(fact: dict[str, Any]) -> str | None:
+    """Return a drop reason for an error-prone fact, or ``None`` to keep it."""
+    if not isinstance(fact, dict):
+        return None
+    source = fact.get("source") if isinstance(fact.get("source"), dict) else {}
+    name = str(fact.get("name", ""))
+    value_text = _value_text(fact.get("value"))
+    if source.get("source_kind") == "figure" and _FIG_POINT_READ.search(f"{name} {value_text}"):
+        return "figure_point_value_read"
+    if _APPENDIX_SECTION.search(str(source.get("section", ""))):
+        return "appendix_or_proof_transcription"
+    if _BOUND_NAME.search(name) and _FORMULA_HINT.search(value_text):
+        return "transcribed_bound_formula"
+    name_fig = _fig_num(name)
+    ref_fig = _fig_num(str(source.get("figure_ref", "")))
+    if name_fig and ref_fig and name_fig != ref_fig:
+        return "figure_number_name_ref_mismatch"
+    return None
+
+
+def drop_unreliable_facts(
+    facts: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split facts into (kept, dropped-as-unreliable). Pure; the caller logs the drops."""
+    kept: list[dict[str, Any]] = []
+    dropped: list[dict[str, Any]] = []
+    for fact in facts:
+        reason = unreliable_fact_reason(fact) if isinstance(fact, dict) else None
+        if reason is None:
+            kept.append(fact)
+        else:
+            dropped.append({"name": fact.get("name"), "type": fact.get("type"), "reason": reason})
+    return kept, dropped
+
+
 def finalize_engineering_facts(
     data: Any, valid_chunk_ids: set[str] | None, valid_pages: set[int] | None = None
 ) -> dict[str, Any]:
     """Normalize, drop irreparable facts, and assemble a strict-schema-clean document."""
     normalized, coercions = normalize_engineering_facts_candidate(data)
     kept, dropped = select_valid_engineering_facts(normalized, valid_chunk_ids, valid_pages)
+    kept, dropped_unreliable = drop_unreliable_facts(kept)
 
     doc: dict[str, Any] = {
         "paper_domain": "communication",
@@ -397,6 +461,10 @@ def finalize_engineering_facts(
         meta["dropped_fact_count"] = len(dropped)
         meta["kept_fact_count"] = len(kept)
         meta["dropped_facts"] = dropped[:50]
+    if dropped_unreliable:
+        meta["unreliable_dropped_used"] = True
+        meta["unreliable_dropped_count"] = len(dropped_unreliable)
+        meta["unreliable_dropped"] = dropped_unreliable[:50]
     if meta:
         doc["_meta"] = meta
     return doc

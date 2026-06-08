@@ -169,3 +169,124 @@ def merge_engineering_facts(
     merged["missing_information"] = base_missing
 
     return merged, added
+
+
+# --- round-2 task coverage: every reproducible experiment (a figure_claim fact) needs a
+# repro task, else that figure/result is silently never reproduced ----------------------
+
+# A figure counts as a reproducible EXPERIMENT only on positive evidence that it plots a
+# measurable result (a metric on its axes). Ambiguous figures default to NOT-experiment so we
+# never fabricate a task for a concept/geometry/system diagram ("宁可少也不要错"); the primary
+# task LLM still covers the obvious result figures on its own.
+_RESULT_KW = re.compile(
+    r"\b(ber|ser|bler|fer|cdf|pdf|snr|throughput|capacity|outage|eigenvalue|achievable|"
+    r"spectral\s+efficiency|energy\s+efficiency|sum[\s-]?rate|bit\s+error|symbol\s+error|"
+    r"error\s+rate|mse|nmse|gain|accuracy|rate)\b"
+    r"|heat\s?map|热图|和速率|误码率|误符号率|吞吐|频谱效率|增益",
+    re.IGNORECASE,
+)
+_DIAGRAM_KW = re.compile(
+    r"\b(system\s+model|architecture|framework|diagram|illustration|interpretation|"
+    r"flowchart|schematic|scenario|overview|topology|block|concept|geometr)\b"
+    r"|示意|概念|框图|几何|结构图",
+    re.IGNORECASE,
+)
+
+
+def _is_experiment_blob(blob: str) -> bool:
+    """Positive-evidence classifier: a figure is a reproducible experiment only if it shows a
+    measurable result (a metric keyword) AND is not a clear concept/system diagram. Ambiguous
+    (no positive result evidence) -> NOT an experiment, so we never fabricate a task for it.
+    The primary task pass (a free LLM judgement) still covers obvious results regardless."""
+    if _DIAGRAM_KW.search(blob):
+        return False
+    return bool(_RESULT_KW.search(blob))
+
+
+def is_concrete_experiment_task(task: dict[str, Any]) -> bool:
+    """A real reproduction experiment computes a SPECIFIC measurable metric with concrete
+    numeric output columns. metric='other' (or empty) with no real columns is the tell of a
+    non-reproducible figure (e.g. a concept/system diagram). Used as a deterministic gate on
+    gap-finder tasks -- it catches a misjudged figure regardless of how the figure was worded."""
+    if not isinstance(task, dict):
+        return False
+    metric = str(task.get("metric", "")).strip().lower()
+    if metric in ("", "other"):
+        return False
+    cols = task.get("output_columns")
+    return isinstance(cols, list) and any(str(c).strip() for c in cols)
+
+
+def experiment_anchors_from_facts(facts: list[dict[str, Any]] | None) -> dict[str, set[str]]:
+    """Figures/tables that figure_claim facts present as reproducible results."""
+    figures: set[str] = set()
+    tables: set[str] = set()
+    for fact in facts or []:
+        if not isinstance(fact, dict) or fact.get("type") != "figure_claim":
+            continue
+        blob = _fact_text_blob(fact)
+        if not _is_experiment_blob(blob):
+            continue
+        figures |= _scan_anchors(blob, _FIG_TOKEN)
+        tables |= _scan_anchors(blob, _TABLE_TOKEN)
+    return {"figures": figures, "tables": tables}
+
+
+def _task_anchors(tasks: list[dict[str, Any]] | None) -> dict[str, set[str]]:
+    figures: set[str] = set()
+    tables: set[str] = set()
+    for task in tasks or []:
+        if not isinstance(task, dict):
+            continue
+        blob = " ".join(str(task.get(k, "")) for k in ("figure_or_claim", "target"))
+        figures |= _scan_anchors(blob, _FIG_TOKEN)
+        tables |= _scan_anchors(blob, _TABLE_TOKEN)
+    return {"figures": figures, "tables": tables}
+
+
+def compute_task_coverage(facts: dict[str, Any] | None, tasks: dict[str, Any] | None) -> dict[str, Any]:
+    """Which reproducible experiments (figure_claim facts) are NOT yet covered by a repro
+    task. A missing task = that figure/result never gets reproduced downstream."""
+    fact_list = facts.get("engineering_facts") if isinstance(facts, dict) else None
+    task_list = tasks.get("repro_tasks") if isinstance(tasks, dict) else None
+    exp = experiment_anchors_from_facts(fact_list if isinstance(fact_list, list) else [])
+    cov = _task_anchors(task_list if isinstance(task_list, list) else [])
+    uncovered_figures = _sorted_anchors(exp["figures"] - cov["figures"])
+    uncovered_tables = _sorted_anchors(exp["tables"] - cov["tables"])
+    return {
+        "experiment_figures": _sorted_anchors(exp["figures"]),
+        "experiment_tables": _sorted_anchors(exp["tables"]),
+        "task_figures": _sorted_anchors(cov["figures"]),
+        "uncovered_figures": uncovered_figures,
+        "uncovered_tables": uncovered_tables,
+        "fully_covered": not uncovered_figures and not uncovered_tables,
+    }
+
+
+def merge_repro_tasks(base: dict[str, Any], addition: dict[str, Any]) -> tuple[dict[str, Any], int]:
+    """Append non-duplicate tasks from ``addition``. Dedup by task_id OR normalized
+    figure_or_claim, so the same experiment is never scheduled to reproduce twice."""
+    merged = dict(base) if isinstance(base, dict) else {}
+    base_tasks_raw = merged.get("repro_tasks")
+    base_tasks = list(base_tasks_raw) if isinstance(base_tasks_raw, list) else []
+    seen_ids = {_norm_name(t.get("task_id", "")) for t in base_tasks if isinstance(t, dict) and t.get("task_id")}
+    seen_figs = {_norm_name(t.get("figure_or_claim", "")) for t in base_tasks if isinstance(t, dict) and t.get("figure_or_claim")}
+    added = 0
+    add_tasks = addition.get("repro_tasks") if isinstance(addition, dict) else None
+    for task in add_tasks if isinstance(add_tasks, list) else []:
+        if not isinstance(task, dict):
+            continue
+        tid = _norm_name(task.get("task_id", ""))
+        fig = _norm_name(task.get("figure_or_claim", ""))
+        if tid and tid in seen_ids:
+            continue
+        if fig and fig in seen_figs:
+            continue
+        if tid:
+            seen_ids.add(tid)
+        if fig:
+            seen_figs.add(fig)
+        base_tasks.append(task)
+        added += 1
+    merged["repro_tasks"] = base_tasks
+    return merged, added

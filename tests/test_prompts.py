@@ -12,6 +12,9 @@ class PromptTests(unittest.TestCase):
         self.assertIn("requirements.txt", policy)
         self.assertIn("当前环境已安装且允许使用", policy)
         self.assertIn("numpy", policy)
+        # steer codegen to prefer whitelisted comms libraries over hand-rolling primitives
+        self.assertIn("commpy", policy)
+        self.assertIn("优先调", policy)
 
     def test_project_and_repair_prompts_include_dependency_policy(self) -> None:
         book = PromptBook()

@@ -247,6 +247,7 @@ def dependency_policy_prompt_text() -> str:
         "3. 只要 Python 代码里出现第三方 import，就必须在 requirements.txt 里写对应包名，一行一个包名。",
         "4. requirements.txt 只写纯包名，不写版本号、URL、本地路径、VCS 地址、安装参数或解释性文字。",
         "5. 不要用 broad try/except 包住第三方 import 来静默降级；缺库时应避免使用该库，而不是隐藏错误。",
+        "6. 标准通信原语优先调库、不要手搓：调制/解调、标准信道（AWGN/瑞利/莱斯）、信道编码与译码（卷积/Turbo/LDPC/RS/BCH）、滤波/重采样等成熟原语，优先调用下面“已安装且允许使用”清单中的库，不要从零手写——手搓 QAM 星座、LDPC 译码、信道实现极易出微妙的数学/物理错（星座不对称、功率未归一、概率越界等）。典型映射（仅在对应库可用时）：调制·标准信道·卷积/Turbo/LDPC → commpy；有限域·BCH·RS·LDPC 校验矩阵 → galois，纯 RS → reedsolo；滤波·FFT·窗 → scipy.signal / numpy.fft；预编码·SVD·特征值·pinv → numpy.linalg / scipy.linalg。仅当（a）论文方法与库实现确有差异、或（b）清单中无对应库时才手写，并在 assumptions 注明；绝不要为了“用上库”而把论文真正的自定义算法替换成库的标准版本。",
         "当前环境已安装且允许使用：",
     ]
     lines.extend(f"- {item}" for item in available)

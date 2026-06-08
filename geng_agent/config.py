@@ -108,3 +108,35 @@ def build_code_review_client(
         thinking=thinking,
         reasoning_effort=reasoning_effort,
     )
+
+
+def build_secondary_extraction_client(
+    *,
+    temperature: float = 0.1,
+    timeout: float = 120.0,
+) -> OpenAICompatibleClient | None:
+    """Optional second (heterogeneous, multimodal) extraction model for the round-1
+    cross-model fact ensemble.
+
+    Reads ``GENG_LLM2_API_KEY`` / ``GENG_LLM2_BASE_URL`` / ``GENG_LLM2_MODEL`` and returns
+    ``None`` when any is unset -- an unconfigured environment keeps single-model behavior
+    unchanged. The model MUST be multimodal: round-1 sends rendered page images alongside
+    the prompt, and a text-only second model would silently miss every figure-sourced fact.
+    """
+    model = get_config_value("GENG_LLM2_MODEL")
+    api_key = get_config_value("GENG_LLM2_API_KEY")
+    base_url = get_config_value("GENG_LLM2_BASE_URL")
+    if not (model and api_key and base_url):
+        return None
+    # Always run the second model WITHOUT reasoning/thinking for speed: MiniMax-M3 honors
+    # {"thinking": {"type": "disabled"}} on the OpenAI-compatible endpoint (fast mode). A full
+    # thinking pass on a paper took ~7.5 min; disabled is far faster at no accuracy cost for
+    # straight fact extraction. (M2.x can't disable thinking; use M3.)
+    return OpenAICompatibleClient(
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        temperature=temperature,
+        timeout=timeout,
+        thinking="disabled",
+    )

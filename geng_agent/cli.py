@@ -65,6 +65,7 @@ def _add_common_review_args(parser: argparse.ArgumentParser, *, include_resume: 
     parser.add_argument("--code-review-model", default=None, help="代码忠实度审查使用的模型（异构审查者）；默认取 GENG_CODE_REVIEW_MODEL，未设则与主模型相同。")
     parser.add_argument("--code-review-timeout", type=float, default=1200.0, help="代码忠实度审查单次 LLM 请求超时时间，单位秒，默认 1200（整项目审查较慢，给足时间避免超时）。")
     parser.add_argument("--facts-gap-rounds", type=int, default=3, help="第一轮事实抽取后的“查漏补缺”追加轮数（确定性覆盖校验图/表锚点 + 定向补抽遗漏事实），循环到一轮无新增为止；默认 3，设 0 关闭。")
+    parser.add_argument("--tasks-gap-rounds", type=int, default=3, help="第二轮复现任务设计后的“查漏补缺”追加轮数（确定性校验每个可复现实验是否都有任务 + 为遗漏实验补任务），循环到全覆盖或无新增为止；默认 3，设 0 关闭。")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -80,11 +81,19 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "review":
         _warn_if_environment_incomplete()
+        from .config import build_secondary_extraction_client
         from .pipeline import ReviewPipeline
 
         client = _build_client_or_error(args, parser)
         code_review_client = _build_code_review_client_or_error(args, parser) if args.code_review else None
-        result = ReviewPipeline(client=client, code_review_client=code_review_client).run(
+        # Optional second multimodal extraction model (GENG_LLM2_*) for the round-1 ensemble;
+        # None when unconfigured -> single-model behavior.
+        extraction_client_2 = build_secondary_extraction_client(temperature=args.temperature, timeout=args.timeout)
+        result = ReviewPipeline(
+            client=client,
+            code_review_client=code_review_client,
+            extraction_client_2=extraction_client_2,
+        ).run(
             paper_path=args.paper,
             output_dir=args.out,
             max_pages=args.max_pages,
@@ -103,6 +112,7 @@ def main(argv: list[str] | None = None) -> int:
             code_review=args.code_review,
             code_review_attempts=args.code_review_attempts,
             facts_gap_rounds=args.facts_gap_rounds,
+            tasks_gap_rounds=args.tasks_gap_rounds,
         )
         print(f"审查完成：{result.output_dir}")
         print(f"报告：{result.review_path}")
