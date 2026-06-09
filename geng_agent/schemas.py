@@ -22,7 +22,9 @@ class ValidationIssue:
         return {"path": self.path, "message": self.message}
 
 
-def validate_stage(stage: str, data: dict[str, Any]) -> list[ValidationIssue]:
+def validate_stage(
+    stage: str, data: dict[str, Any], required_files: set[str] | None = None
+) -> list[ValidationIssue]:
     model = model_for_stage(stage)
     issues: list[ValidationIssue] = []
     try:
@@ -33,7 +35,11 @@ def validate_stage(stage: str, data: dict[str, Any]) -> list[ValidationIssue]:
         issues.extend(_issues_from_pydantic(exc))
 
     if stage == "repro_project_manifest":
-        issues.extend(validate_manifest_business_rules(data, require_all=True, require_repair_meta=False))
+        issues.extend(
+            validate_manifest_business_rules(
+                data, require_all=True, require_repair_meta=False, required_files=required_files
+            )
+        )
     elif stage == "repair_manifest":
         issues.extend(validate_manifest_business_rules(data, require_all=False, require_repair_meta=True))
 
@@ -101,6 +107,7 @@ def validate_manifest_business_rules(
     data: dict[str, Any],
     require_all: bool,
     require_repair_meta: bool,
+    required_files: set[str] | None = None,
 ) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
     files = data.get("files")
@@ -129,7 +136,8 @@ def validate_manifest_business_rules(
         manifest_paths.append(normalized)
 
     if require_all:
-        missing = sorted(REQUIRED_REPRO_FILES - seen_paths)
+        expected = required_files if required_files is not None else REQUIRED_REPRO_FILES
+        missing = sorted(expected - seen_paths)
         for path in missing:
             issues.append(ValidationIssue("$.files", f"missing required file: {path}"))
 

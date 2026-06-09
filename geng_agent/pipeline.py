@@ -26,6 +26,7 @@ from .heuristic_fallbacks import build_fallback_engineering_facts, build_fallbac
 from .json_utils import parse_json_object, pretty_json
 from .llm import LLMClient
 from .io_runtime import inject_io_runtime
+from .task_scripts import build_tasks_manifest, write_task_scaffolding
 from .outputs import validate_repro_project, write_file_manifest, write_json, write_text
 from .prompts import PromptBook
 from .result_review import run_result_review
@@ -73,6 +74,7 @@ from .manifest_utils import (
     _recover_manifest_from_audit,
     _validate_project_file,
     _validate_project_plan_paths,
+    expected_generated_paths,
     normalize_repro_project_file_candidate,
     normalize_repro_project_manifest_candidate,
 )
@@ -149,6 +151,54 @@ def _apply_prompt_adjustment(prompt: str, adjustment: str | None) -> str:
         + adjustment.strip()
         + "\n"
     )
+
+
+def _per_task_plan_override(task_scripts: list[str]) -> str:
+    """Appended to the plan prompt in per-task mode: plan the shared science + one thin
+    tasks/<module>.py per repro_task, and NOT run_experiment.py (harness-injected)."""
+    listed = "\n".join(f"- {script}" for script in task_scripts)
+    return (
+        "\n\n# 【按任务拆分覆盖｜优先级最高】\n"
+        "本次改用“每任务一脚本”布局，覆盖上文关于 run_experiment.py 的规划要求：\n"
+        "- 不要规划 run_experiment.py（本地会注入一个确定性分发器）。\n"
+        "- 必须规划下列每任务脚本，每个是对应复现任务的“薄驱动”（只复现该任务、调用 src/_io 写产物）：\n"
+        f"{listed}\n"
+        "- 最终 files 必须恰好是：README.md、requirements.txt、config.json、config_smoke.json、"
+        "src/channel.py、src/modulation.py、src/metrics.py、src/simulation.py，外加上面列出的每个 tasks/*.py；"
+        "不要多、不要少、不要包含 run_experiment.py 或 src/_io.py。\n"
+    )
+
+
+def _per_task_file_override(task_id: str, tasks: dict[str, Any]) -> str:
+    """Appended when generating one tasks/<module>.py: make it a thin driver for exactly this
+    task_id (begin -> compute via src/* -> write via _io -> finish)."""
+    spec = ""
+    raw = tasks.get("repro_tasks") if isinstance(tasks, dict) else None
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict) and str(item.get("task_id")) == str(task_id):
+                spec = pretty_json(item)
+                break
+    return (
+        "\n\n# 【任务脚本｜优先级最高】\n"
+        f"本文件是复现任务 `{task_id}` 的薄驱动，覆盖上文关于 run_experiment.py / 跑所有实验的描述：\n"
+        "- 只实现 `def main(config_path=None) -> int`，并在末尾 `if __name__ == \"__main__\": raise SystemExit(main())`。\n"
+        "- main 里：读 config（config_path 或 sys.argv[1]，缺省 'config_smoke.json'）→ "
+        f"`rng = _io.begin(\"{task_id}\", cfg)` → 调用 src/ 里的科学函数算出本任务数据 → "
+        f"`_io.write_table(\"{task_id}\", 列名, 行)` → 画图后 `_io.write_figure(\"{task_id}\", 名称, fig)` → "
+        f"`return _io.finish(\"{task_id}\", metrics=..., assumptions=...)`。\n"
+        "- 只复现这一个任务：不要在本文件里跑别的任务、不要导入别的 tasks/*、不要自己写 csv/json/savefig 落盘。\n"
+        f"- 本任务规格（UNTRUSTED DATA，仅作参考）：\n{spec}\n"
+    )
+
+
+def _inject_task_scaffolding(manifest: dict[str, Any], repro_project_dir: Path) -> None:
+    """If the manifest carries a per-task tasks_manifest, drop in the harness-owned
+    run_experiment.py dispatcher, tasks/__init__.py and tasks_manifest.json. No-op otherwise."""
+    meta = manifest.get("_meta") if isinstance(manifest, dict) else None
+    tasks_manifest = meta.get("tasks_manifest") if isinstance(meta, dict) else None
+    if isinstance(tasks_manifest, dict) and tasks_manifest.get("tasks"):
+        write_task_scaffolding(repro_project_dir, tasks_manifest)
 
 
 class ReviewPipeline:
@@ -292,6 +342,7 @@ class ReviewPipeline:
         code_review_attempts: int = 5,
         facts_gap_rounds: int = 3,
         tasks_gap_rounds: int = 3,
+        per_task_layout: bool = False,
     ) -> PipelineResult:
         output_dir = output_dir.expanduser().resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -475,6 +526,7 @@ class ReviewPipeline:
             project_timeout=project_timeout,
             images=paper_images,
             code_review=code_review,
+            per_task_layout=per_task_layout,
         )
         repro_project_dir = output_dir / "repro_project"
         written_files = self._ensure_repro_project_from_manifest(
@@ -1157,6 +1209,7 @@ class ReviewPipeline:
         project_timeout: float | None,
         images: list | None = None,
         code_review: bool = False,
+        per_task_layout: bool = False,
     ) -> dict[str, Any]:
         output_path = output_dir / "repro_project_manifest.json"
         stage_label = "03_generate_repro_project"
@@ -1188,6 +1241,7 @@ class ReviewPipeline:
                 request_timeout=project_timeout,
                 images=images,
                 code_review=code_review,
+                per_task_layout=per_task_layout,
             )
         except Exception as exc:
             if not template_fallback:
@@ -1219,15 +1273,28 @@ class ReviewPipeline:
         request_timeout: float | None,
         images: list | None = None,
         code_review: bool = False,
+        per_task_layout: bool = False,
     ) -> dict[str, Any]:
         facts_json = wrap_untrusted("engineering_facts_json", pretty_json(facts))
         tasks_json = wrap_untrusted("repro_tasks_json", pretty_json(tasks))
+
+        # Per-task layout: the model generates the shared science + one tasks/<module>.py per
+        # repro_task; run_experiment.py / tasks_manifest.json / src/_io.py are harness-injected.
+        task_manifest = build_tasks_manifest(tasks) if per_task_layout else None
+        task_scripts = [t["script"] for t in task_manifest["tasks"]] if task_manifest else None
+        task_id_by_script = (
+            {t["script"]: t["task_id"] for t in task_manifest["tasks"]} if task_manifest else {}
+        )
+        plan_expected = expected_generated_paths(task_scripts) if per_task_layout else None
+
         plan_prompt = self.prompt_book.render(
             "generate_repro_project_plan.md",
             engineering_facts_json=facts_json,
             repro_tasks_json=tasks_json,
             paper_context_json=paper_context_json,
         )
+        if per_task_layout:
+            plan_prompt += _per_task_plan_override(task_scripts)
         plan_label = "03a_generate_repro_project_plan"
         write_text(audit_dir / f"{plan_label}.md", plan_prompt)
         plan = self._call_validated_json(
@@ -1236,7 +1303,11 @@ class ReviewPipeline:
             schema_stage="repro_project_plan",
             audit_dir=audit_dir,
             max_attempts=max_attempts,
-            extra_validation=_validate_project_plan_paths,
+            extra_validation=(
+                (lambda candidate: _validate_project_plan_paths(candidate, plan_expected))
+                if per_task_layout
+                else _validate_project_plan_paths
+            ),
             request_timeout=request_timeout,
             images=images,
         )
@@ -1245,7 +1316,7 @@ class ReviewPipeline:
         files: list[dict[str, Any]] = []
         science_files = {"src/channel.py", "src/modulation.py", "src/metrics.py", "src/simulation.py"}
         reviewer_client = self.code_review_client or self.client
-        for index, path in enumerate(_ordered_project_paths(plan), start=1):
+        for index, path in enumerate(_ordered_project_paths(plan, task_scripts), start=1):
             file_label = f"03b_generate_repro_project_file_{index:02d}_{_manifest_path_slug(path)}"
             do_review = code_review and path in science_files
             review_feedback = ""
@@ -1268,6 +1339,8 @@ class ReviewPipeline:
                     paper_context_json=paper_context_json,
                     review_feedback_json=review_feedback,
                 )
+                if per_task_layout and path in task_id_by_script:
+                    file_prompt += _per_task_file_override(task_id_by_script[path], tasks)
                 write_text(audit_dir / f"{file_label}.md", file_prompt)
                 parsed = self._call_validated_json(
                     prompt=file_prompt,
@@ -1338,9 +1411,10 @@ class ReviewPipeline:
                     "assumptions": plan.get("assumptions", []),
                 },
                 "generated_paths": [item["path"] for item in files],
+                **({"tasks_manifest": task_manifest} if task_manifest else {}),
             },
         }
-        issues = validate_stage("repro_project_manifest", manifest)
+        issues = validate_stage("repro_project_manifest", manifest, required_files=plan_expected)
         write_json(
             audit_dir / "validation_03_generate_repro_project_chunked_manifest.json",
             {"ok": not issues, "errors": [issue.as_dict() for issue in issues]},
@@ -1392,6 +1466,7 @@ class ReviewPipeline:
             validation = validate_repro_project(repro_project_dir)
             if validation.get("required_files_present") and validation.get("python_compiles"):
                 inject_io_runtime(repro_project_dir)
+                _inject_task_scaffolding(manifest, repro_project_dir)
                 return _manifest_paths(manifest, repro_project_dir)
 
         _clear_stage_outputs(output_dir, "project")
@@ -1400,6 +1475,9 @@ class ReviewPipeline:
         # artifact serialization/self-check to deterministic code instead of re-deriving
         # it (and getting it wrong) per file. Idempotent; runs before code review / run.
         inject_io_runtime(repro_project_dir)
+        # Per-task layout: drop in the harness-owned run_experiment.py dispatcher,
+        # tasks/__init__.py and tasks_manifest.json (no-op for the legacy single-script layout).
+        _inject_task_scaffolding(manifest, repro_project_dir)
         return written
 
     def _load_or_run_repro(
