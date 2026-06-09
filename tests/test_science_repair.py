@@ -3,6 +3,7 @@ import unittest
 from geng_agent.science_repair import (
     build_science_directive,
     collect_science_mismatches,
+    diagnose_csv_symptoms,
     is_improvement,
     is_regression,
     review_score,
@@ -56,6 +57,45 @@ class PureHelperTests(unittest.TestCase):
         lost_coverage = {"coverage_passed": 1, "coverage_total": 2, "mismatch_count": 0}
         self.assertTrue(is_regression(before, lost_coverage))     # fixed science but broke a task
         self.assertFalse(is_improvement(before, lost_coverage))
+
+
+class SymptomDiagnosisTests(unittest.TestCase):
+    def test_all_zero_column_flags_signal_zeroed(self) -> None:
+        # the recurring all-zero bug (v7 fig_4: sum rates ~2e-11)
+        tips = diagnose_csv_symptoms({"sum_rate": {"min": 0.0, "max": 2e-11}})
+        joined = " ".join(tips)
+        self.assertIn("整列≈0", joined)
+        self.assertIn("SNR", joined)
+
+    def test_one_curve_zero_others_vary_flags_that_method(self) -> None:
+        # v7 fig_7: STAB+SDS identically 0 while ZF/power vary -> point at that method only
+        tips = diagnose_csv_symptoms({
+            "stab_sds": {"min": 0.0, "max": 0.0},
+            "zf": {"min": 5.0, "max": 40.0},
+            "power": {"min": 40.0, "max": 64.0},
+        })
+        self.assertIn("那几条对应的方法", " ".join(tips))
+
+    def test_constant_column_flagged(self) -> None:
+        self.assertIn("几乎是常数", " ".join(diagnose_csv_symptoms({"rate": {"min": 12.0, "max": 12.0}})))
+
+    def test_blowup_magnitude_flagged(self) -> None:
+        self.assertIn("量级", " ".join(diagnose_csv_symptoms({"x": {"min": -3e8, "max": 5e7}})))
+
+    def test_healthy_columns_produce_no_false_alarm(self) -> None:
+        tips = diagnose_csv_symptoms({
+            "snr_db": {"min": 0.0, "max": 20.0},
+            "ber": {"min": 1e-4, "max": 0.1},
+        })
+        self.assertEqual(tips, [])
+
+    def test_directive_includes_symptom_leads(self) -> None:
+        mismatches = collect_science_mismatches(_doc("does_not_support_paper_claim"))
+        directive = build_science_directive(
+            mismatches, {"t0": ["列 ['sum_rate'] 整列≈0 → 信号被清零：查 SNR/噪声方差归一化。"]}
+        )
+        self.assertIn("本地数值症状 → 排查方向", directive)
+        self.assertIn("整列≈0", directive)
 
 
 class _Harness:

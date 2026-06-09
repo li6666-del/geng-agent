@@ -43,7 +43,62 @@ def collect_science_mismatches(result_review_doc: dict[str, Any] | None) -> list
     return mismatches
 
 
-def build_science_directive(mismatches: list[dict[str, Any]]) -> str:
+def diagnose_csv_symptoms(numeric_columns: dict[str, Any]) -> list[str]:
+    """Paper-AGNOSTIC numeric-symptom checks on a results.csv's per-column stats (min/max).
+    Turns observed output pathologies into concrete "where to look" hypotheses, driven only by
+    the numbers (no paper-specific formula), so the repair gets a symptom->cause lead instead of
+    only "the ordering is wrong". Empty when nothing looks off.
+
+    ``numeric_columns`` is the {col: {min,max,...}} map that summarize_csv_file emits.
+    """
+    if not isinstance(numeric_columns, dict) or not numeric_columns:
+        return []
+    zero_cols: list[str] = []
+    const_cols: list[str] = []
+    varying_cols: list[str] = []
+    extreme_cols: list[str] = []
+    for col, stats in numeric_columns.items():
+        if not isinstance(stats, dict):
+            continue
+        lo, hi = stats.get("min"), stats.get("max")
+        if not isinstance(lo, (int, float)) or not isinstance(hi, (int, float)):
+            continue
+        amax = max(abs(lo), abs(hi))
+        span = abs(hi - lo)
+        if amax < 1e-9:
+            zero_cols.append(col)
+        elif span < 1e-9 * max(1.0, amax):
+            const_cols.append(col)
+        else:
+            varying_cols.append(col)
+        if amax > 1e6:
+            extreme_cols.append(f"{col}∈[{lo:.3g},{hi:.3g}]")
+    tips: list[str] = []
+    if zero_cols:
+        tips.append(
+            f"列 {zero_cols} 整列≈0 → 信号被清零：查 SNR/噪声方差归一化（是否误用绝对链路预算×热噪声使 SINR≈0）、"
+            "有无 `if v<eps: return 0` 或条件数阈值硬清零、预编码/等效信道矩阵是否退化为 0。"
+        )
+    if zero_cols and varying_cols:
+        tips.append(
+            f"部分列（{zero_cols}）≈0 而另一些（{varying_cols}）正常 → 那几条对应的方法/分支没算对，"
+            "单独查它们各自的实现函数（选择/合并/预编码），不要动正常的那些。"
+        )
+    if const_cols:
+        tips.append(
+            f"列 {const_cols} 几乎是常数 → 该量没随自变量变化：查循环里是否复用了同一结果、自变量是否真正进入计算。"
+        )
+    if extreme_cols:
+        tips.append(
+            f"列量级/符号异常（{', '.join(extreme_cols)}） → 查单位与缩放、是否漏取实部 np.real、"
+            "分母接近 0 被放大、是否未做归一化。"
+        )
+    return tips
+
+
+def build_science_directive(
+    mismatches: list[dict[str, Any]], symptoms_by_task: dict[str, list[str]] | None = None
+) -> str:
     """A Chinese repair brief built from the review's diagnosis: WHAT came out wrong (paper vs
     local), the specific differences/causes, and a standing instruction to fix the MODEL rather
     than tune numbers to match. Shared src/ files get the union of all mismatch briefs (a
@@ -68,6 +123,8 @@ def build_science_directive(mismatches: list[dict[str, Any]]) -> str:
             lines.append(f"- baseline 对比维度发现：{mismatch['baseline_finding']}")
         if mismatch["reproduction_logic_finding"]:
             lines.append(f"- 复现逻辑维度发现：{mismatch['reproduction_logic_finding']}")
+        for symptom in (symptoms_by_task or {}).get(mismatch["task_id"], [])[:4]:
+            lines.append(f"- 本地数值症状 → 排查方向：{symptom}")
         blocks.append("\n".join(lines))
     blocks.append(
         "\n修正要求：定位让方法排序/趋势出错的**建模环节**（信道/等效信道构造、预编码、SINR 与和速率定义、"

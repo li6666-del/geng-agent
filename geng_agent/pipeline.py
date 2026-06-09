@@ -14,7 +14,7 @@ from .code_review import (
     review_single_generated_file,
     run_code_faithfulness_review,
 )
-from .science_repair import build_science_directive, run_science_repair
+from .science_repair import build_science_directive, diagnose_csv_symptoms, run_science_repair
 from .documents import load_paper
 from .experiment_index import build_local_experiment_index
 from .facts_coverage import (
@@ -36,7 +36,7 @@ from .io_runtime import inject_io_runtime
 from .task_scripts import build_tasks_manifest, write_task_scaffolding
 from .outputs import validate_repro_project, write_file_manifest, write_json, write_text
 from .prompts import PromptBook
-from .result_review import run_result_review
+from .result_review import run_result_review, summarize_csv_file
 from .runner import build_json_retry_prompt, run_repro_with_repair
 from .schema_models import response_format_for_stage
 from .schemas import (
@@ -2127,9 +2127,27 @@ class ReviewPipeline:
             if script and (repro_project_dir / script).exists() and script not in task_targets:
                 task_targets.append(script)
 
-        shared_directive = build_science_directive(mismatches)
+        # Symptom-driven repair (general, paper-agnostic): read each mismatch task's output CSV
+        # and turn observed numeric pathologies (all-zero, one-curve-zero, constant, anomalous
+        # scale) into concrete "where to look" leads for the rewrite -- not just "ordering wrong".
+        subdir_by_task = {
+            t["task_id"]: (t.get("output_subdir") or t["task_id"]) for t in manifest_tasks if t.get("task_id")
+        }
+        symptoms_by_task: dict[str, list[str]] = {}
+        for mismatch in mismatches:
+            subdir = subdir_by_task.get(mismatch["task_id"], mismatch["task_id"])
+            tips: list[str] = []
+            for csv_path in sorted((repro_project_dir / "outputs" / subdir).glob("*.csv")):
+                try:
+                    tips.extend(diagnose_csv_symptoms(summarize_csv_file(csv_path).get("numeric_columns", {})))
+                except Exception:
+                    continue
+            if tips:
+                symptoms_by_task[mismatch["task_id"]] = tips
+
+        shared_directive = build_science_directive(mismatches, symptoms_by_task)
         directive_by_script = {
-            script_by_task_id[m["task_id"]]: build_science_directive([m])
+            script_by_task_id[m["task_id"]]: build_science_directive([m], symptoms_by_task)
             for m in mismatches
             if m["task_id"] in script_by_task_id
         }
