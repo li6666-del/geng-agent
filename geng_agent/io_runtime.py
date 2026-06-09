@@ -19,6 +19,17 @@ import re
 from pathlib import Path
 
 
+def io_slug(value: object) -> str:
+    """Filesystem-safe slug for a task id, IDENTICAL to ``_slug`` inside IO_RUNTIME_PY.
+
+    The harness uses this to know which ``outputs/<slug>/`` folder ``_io`` will write a
+    task's artifacts into, so the per-task artifact gate looks in the right place. Kept
+    byte-for-byte in sync with the runtime by ``test_io_runtime`` (any drift fails)."""
+    text = str(value).strip() or "task"
+    safe = "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in text)
+    return safe.strip("._-") or "task"
+
+
 # ---------------------------------------------------------------------------
 # The verbatim content of src/_io.py inside every generated project.
 # ---------------------------------------------------------------------------

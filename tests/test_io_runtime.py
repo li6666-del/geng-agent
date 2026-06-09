@@ -16,6 +16,7 @@ from geng_agent.io_runtime import (
     IO_RUNTIME_PY,
     ensure_runtime_requirements,
     inject_io_runtime,
+    io_slug,
 )
 from geng_agent.outputs import _valid_csv, _valid_png, _valid_summary_json
 from geng_agent.security import static_scan_repro_project
@@ -43,6 +44,13 @@ class IoRuntimeStaticTests(unittest.TestCase):
     def test_api_doc_mentions_each_helper(self) -> None:
         for token in ("_io.begin", "_io.write_table", "_io.write_figure", "_io.finish"):
             self.assertIn(token, IO_RUNTIME_API_DOC)
+
+    def test_io_slug_matches_runtime_slug(self) -> None:
+        # The harness's io_slug must produce the SAME folder name as the runtime's _slug,
+        # or the per-task artifact gate would look in the wrong outputs/<slug>/ directory.
+        runtime_slug = _load_runtime()["_slug"]
+        for value in ("reproduce_fig_7", "Fig. 6-heatmap", "  ", "a/b\\c", "4_cdf", "", "图_4"):
+            self.assertEqual(io_slug(value), runtime_slug(value), msg=f"slug mismatch for {value!r}")
 
 
 class IoRuntimeBehaviourTests(unittest.TestCase):
