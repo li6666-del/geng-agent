@@ -5,6 +5,10 @@ import unittest
 
 from geng_agent.pipeline import ReviewPipeline, _thesis_anchor_text
 from geng_agent.prompts import PromptBook
+from geng_agent.result_review import (
+    thesis_comparisons_for_task,
+    thesis_ordering_anchor_for_task,
+)
 from geng_agent.schemas import validate_stage
 
 
@@ -88,6 +92,53 @@ class ThesisAnchorTests(unittest.TestCase):
         anchor = _thesis_anchor_text({**GOOD_THESIS, "comparisons": []})
         self.assertIn(GOOD_THESIS["mechanism"], anchor)
         self.assertNotIn("论文断言的方法排序", anchor)  # no ordering block when no comparisons
+
+
+class ThesisOrderingMatchTests(unittest.TestCase):
+    THESIS_FIG4 = {
+        "comparisons": [
+            {
+                "claim_id": "c1",
+                "methods_best_to_worst": ["STAB", "ZF"],
+                "expected_ordering": "STAB > ZF",
+                "metric": "sum rate",
+                "regime": "用户密集",
+                "figure_ref": "Fig.4",
+                "mechanism_note": "条件数优势",
+            }
+        ]
+    }
+
+    def test_matches_task_by_figure_number(self) -> None:
+        task = {"task_id": "reproduce_fig_4", "figure_or_claim": "Fig. 4 sum rate vs power",
+                "metric": "spectral_efficiency", "target": "x", "output_columns": ["power", "sum_rate"]}
+        matched = thesis_comparisons_for_task(self.THESIS_FIG4, task)
+        self.assertEqual(len(matched), 1)
+        anchor = thesis_ordering_anchor_for_task(self.THESIS_FIG4, task)
+        self.assertIn("STAB > ZF", anchor)
+        self.assertIn("baseline_comparison", anchor)
+        self.assertIn("不要据此判 mismatch", anchor)  # the smoke-regime guard
+
+    def test_no_match_for_different_figure(self) -> None:
+        task = {"task_id": "reproduce_fig_9", "figure_or_claim": "Fig. 9 BER vs SNR",
+                "metric": "bit_error_rate", "target": "x", "output_columns": ["snr_db", "ber"]}
+        self.assertEqual(thesis_comparisons_for_task(self.THESIS_FIG4, task), [])
+        self.assertEqual(thesis_ordering_anchor_for_task(self.THESIS_FIG4, task), "")
+
+    def test_metric_word_fallback_when_comparison_has_no_figure(self) -> None:
+        thesis = {"comparisons": [{
+            "claim_id": "c2", "methods_best_to_worst": ["A", "B"], "expected_ordering": "A > B",
+            "metric": "average sum rate", "regime": "", "figure_ref": "", "mechanism_note": "",
+        }]}
+        task = {"task_id": "t", "figure_or_claim": "throughput claim", "metric": "spectral_efficiency",
+                "target": "sum rate study", "output_columns": ["power", "sum_rate"]}
+        self.assertEqual(len(thesis_comparisons_for_task(thesis, task)), 1)
+
+    def test_no_thesis_yields_no_match(self) -> None:
+        task = {"task_id": "reproduce_fig_4", "figure_or_claim": "Fig. 4", "metric": "x",
+                "target": "x", "output_columns": []}
+        self.assertEqual(thesis_comparisons_for_task(None, task), [])
+        self.assertEqual(thesis_ordering_anchor_for_task(None, task), "")
 
 
 class _ThesisFake:

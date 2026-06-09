@@ -65,6 +65,7 @@ def run_result_review(
     output_dir: Path,
     audit_dir: Path,
     max_attempts: int,
+    paper_thesis: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     evidence, images = collect_result_review_inputs(
         paper_path=paper_path,
@@ -117,6 +118,7 @@ def run_result_review(
             audit_dir=audit_dir,
             index=index,
             max_attempts=max_attempts,
+            paper_thesis=paper_thesis,
         )
         experiment_reviews.append(review)
         experiment_statuses.append(status)
@@ -159,6 +161,7 @@ def call_experiment_result_review(
     audit_dir: Path,
     index: int,
     max_attempts: int,
+    paper_thesis: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     task_id = str(task.get("task_id") or f"task_{index}")
     stage_label = f"04a_review_reproduction_experiment_{index:02d}_{safe_label(task_id)}"
@@ -169,6 +172,11 @@ def call_experiment_result_review(
         paper_context_json=paper_context_for_task(paper=paper, facts=facts, task=task),
         result_evidence_json=wrap_untrusted("result_evidence_json", pretty_json(task_evidence)),
     )
+    # Science loop: anchor the review to the paper's asserted ordering for THIS figure, so the
+    # baseline_comparison/verdict judge against the claim instead of guessing. "" when no thesis
+    # or no matching comparison -> prompt unchanged.
+    ordering_anchor = thesis_ordering_anchor_for_task(paper_thesis, task)
+    prompt += ordering_anchor
     write_text(audit_dir / f"{stage_label}.md", prompt)
 
     current_prompt = prompt
@@ -209,6 +217,7 @@ def call_experiment_result_review(
                 "attempts": attempt,
                 "images_sent": [{"label": image.label, "mime_type": image.mime_type} for image in task_images],
                 "paper_pages_sent": task_evidence.get("selected_paper_pages", []),
+                "expected_ordering_checked": bool(ordering_anchor),
             }
 
         last_errors = format_issues(issues)
@@ -537,6 +546,70 @@ def task_match_tokens(task: dict[str, Any]) -> set[str]:
     tokens = set(re.findall(r"[a-z0-9_]+", " ".join(text_parts).lower()))
     tokens.update(_extract_figure_numbers(str(task.get("figure_or_claim", ""))))
     return {token for token in tokens if len(token) >= 2}
+
+
+def thesis_comparisons_for_task(paper_thesis: dict[str, Any] | None, task: dict[str, Any]) -> list[dict[str, Any]]:
+    """The thesis comparisons relevant to ONE repro task, matched by figure number (task's
+    figure_or_claim vs comparison.figure_ref) or by metric token. Empty when no thesis, no
+    comparisons, or nothing matches -- so a task only ever sees the orderings about its figure."""
+    if not isinstance(paper_thesis, dict):
+        return []
+    comparisons = paper_thesis.get("comparisons")
+    if not isinstance(comparisons, list) or not comparisons:
+        return []
+    task_figs = _extract_figure_numbers(str(task.get("figure_or_claim", "")))
+    task_words: set[str] = set()
+    for token in task_match_tokens(task):
+        task_words.update(re.findall(r"[a-z0-9]+", token))
+    matched: list[dict[str, Any]] = []
+    for comparison in comparisons:
+        if not isinstance(comparison, dict):
+            continue
+        if not str(comparison.get("expected_ordering") or "").strip():
+            continue
+        comparison_figs = _extract_figure_numbers(str(comparison.get("figure_ref", "")))
+        if comparison_figs:
+            # A figure-anchored ordering only attaches to the task about that same figure.
+            if task_figs & comparison_figs:
+                matched.append(comparison)
+            continue
+        # No figure cited -> fall back to metric-word overlap (best effort).
+        metric_words = set(re.findall(r"[a-z0-9]+", str(comparison.get("metric", "")).lower()))
+        if metric_words & task_words:
+            matched.append(comparison)
+    return matched
+
+
+def thesis_ordering_anchor_for_task(paper_thesis: dict[str, Any] | None, task: dict[str, Any]) -> str:
+    """Appended to a per-experiment review prompt: the method ordering the paper asserts for
+    THIS figure, framed as a check basis. Reversed/inconsistent ordering -> baseline_comparison
+    weak + does_not_support. Includes a regime guard so a smoke-scale run outside the paper's
+    regime is flagged as a limitation, not miscounted as a contradiction. "" when nothing matches."""
+    matched = thesis_comparisons_for_task(paper_thesis, task)
+    if not matched:
+        return ""
+    lines = []
+    for comparison in matched:
+        segment = f"  - {str(comparison.get('expected_ordering')).strip()}"
+        regime = str(comparison.get("regime") or "").strip()
+        if regime:
+            segment += f"（成立条件：{regime}）"
+        note = str(comparison.get("mechanism_note") or "").strip()
+        if note:
+            segment += f"；机制：{note}"
+        lines.append(segment)
+    return (
+        "\n\n# 【论文断言的方法排序·重点核对｜优先级最高】\n"
+        "针对本图，论文主张的方法相对高低如下：\n"
+        + "\n".join(lines)
+        + "\n请把它当作核对基准：\n"
+        "- 本地曲线/数值的相对高低（谁在上、谁在下）是否与上面一致？\n"
+        "- 若相反或明显不一致：baseline_comparison 维度判 weak 或 missing，scientific_verdict 倾向 "
+        "does_not_support_paper_claim；并在 differences 写清“论文应是谁在上、本地实际谁在上”，"
+        "在 possible_causes 给出最可能的建模原因（例如空时/多普勒维度没建出条件数优势）。\n"
+        "- regime 区分：若本地跑的是 smoke / 缩规模配置、并不落在该排序成立的区间，请在 limitations 注明，"
+        "**不要据此判 mismatch**。\n"
+    )
 
 
 def normalize_experiment_review_candidate(parsed: dict[str, Any], *, expected_task_id: str) -> dict[str, Any]:

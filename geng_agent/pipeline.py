@@ -794,6 +794,7 @@ class ReviewPipeline:
             audit_dir=audit_dir,
             max_attempts=json_repair_attempts + 1,
             resume=resume,
+            paper_thesis=paper_thesis,
         )
         _mark("result_review")
 
@@ -1834,6 +1835,7 @@ class ReviewPipeline:
         audit_dir: Path,
         max_attempts: int,
         resume: bool,
+        paper_thesis: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not run_repro:
             return {"enabled": False, "passed": None, "reason": "skipped because --run-repro was not requested"}
@@ -1877,6 +1879,7 @@ class ReviewPipeline:
                 output_dir=output_dir,
                 audit_dir=audit_dir,
                 max_attempts=max_attempts,
+                paper_thesis=paper_thesis,
             )
         except Exception as exc:
             result = {
