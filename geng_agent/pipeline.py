@@ -397,6 +397,7 @@ class ReviewPipeline:
         facts_gap_rounds: int = 3,
         tasks_gap_rounds: int = 3,
         per_task_layout: bool = False,
+        science_loop: bool = False,
     ) -> PipelineResult:
         output_dir = output_dir.expanduser().resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -511,6 +512,25 @@ class ReviewPipeline:
         )
 
         _mark("facts")
+
+        # Round-1.5 (science loop): distill the paper's THESIS -- central claim, the mechanism
+        # that makes the proposed method work, and the head-to-head orderings it asserts. This
+        # is the anchor the downstream codegen and result-review check against, so a
+        # reproduction targets the paper's conclusion (e.g. "STAB beats ZF in a dense regime,
+        # because the space-time channel is better conditioned") rather than transcribing
+        # formulas blind. Non-fatal + opt-in (--science-loop); None when disabled or on failure.
+        paper_thesis = None
+        if science_loop:
+            paper_thesis = self._load_or_create_paper_thesis(
+                output_dir=output_dir,
+                audit_dir=audit_dir,
+                facts=facts,
+                paper_context=paper_context,
+                paper_images=paper_images,
+                resume=resume,
+                max_attempts=json_repair_attempts + 1,
+            )
+            _mark("thesis")
 
         prompt_2 = self.prompt_book.render(
             "build_repro_tasks.md",
@@ -798,6 +818,7 @@ class ReviewPipeline:
                 "validation": validation,
                 "runtime_result": runtime_result,
                 "scientific_check": scientific_check,
+                "paper_thesis": paper_thesis,
                 "experiment_index": experiment_index,
                 "manifest_meta": manifest.get("_meta", {}),
                 "code_review": code_review_result,
@@ -921,6 +942,47 @@ class ReviewPipeline:
             )
         write_json(output_path, parsed)
         return parsed
+
+    def _load_or_create_paper_thesis(
+        self,
+        *,
+        output_dir: Path,
+        audit_dir: Path,
+        facts: dict[str, Any],
+        paper_context: str,
+        paper_images: list,
+        resume: bool,
+        max_attempts: int,
+    ) -> dict[str, Any] | None:
+        """Distill the paper's central thesis: claim + mechanism + the head-to-head method
+        orderings it asserts. Multimodal (the main result figure carries the headline shape).
+        Non-fatal: any failure logs and returns None, so the rest of the pipeline runs exactly
+        as before -- the thesis only ever ADDS an anchor for codegen and the result-review."""
+        prompt = self.prompt_book.render(
+            "extract_paper_thesis.md",
+            engineering_facts_json=wrap_untrusted("engineering_facts_json", pretty_json(facts)),
+            paper_chunks_json=paper_context,
+        )
+        try:
+            return self._load_or_create_stage_json(
+                output_path=output_dir / "paper_thesis.json",
+                output_dir=output_dir,
+                audit_dir=audit_dir,
+                prompt=prompt,
+                stage_label="01c_extract_paper_thesis",
+                cleanup_stage="paper_thesis",  # unknown stage -> clears nothing (keeps facts)
+                schema_stage="paper_thesis",
+                max_attempts=max_attempts,
+                resume=resume,
+                images=paper_images,
+                fallback_factory=None,
+            )
+        except Exception as exc:
+            write_json(
+                audit_dir / "paper_thesis_error.json",
+                {"ok": False, "error": f"{type(exc).__name__}: {exc}"},
+            )
+            return None
 
     def _extract_facts_ensemble(
         self,

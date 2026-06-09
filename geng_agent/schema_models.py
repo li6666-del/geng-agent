@@ -175,6 +175,33 @@ class ReproTasksDocument(StrictModel):
     repro_tasks: list[ReproTask] = Field(min_length=1)
 
 
+class ThesisComparison(StrictModel):
+    # One head-to-head the paper makes. The ORDER of methods_best_to_worst is the checkable
+    # core: it encodes "who should beat who" so a reproduction whose curves come out in the
+    # wrong order is caught (e.g. ZF>STAB when the paper claims STAB>ZF in a dense regime).
+    claim_id: NonEmptyStr
+    methods_best_to_worst: list[str]
+    expected_ordering: NonEmptyStr
+    metric: str
+    regime: str
+    figure_ref: str
+    mechanism_note: str
+
+
+class PaperThesisDocument(StrictModel):
+    # The paper's "思路": its central claim, the protagonist method, WHY it works (mechanism,
+    # in prose -- not a transcribed bound), the head-to-head orderings it asserts, and the
+    # regime boundaries where the claim flips. This is the anchor downstream codegen and the
+    # result-review check against, so a reproduction targets the paper's CONCLUSION rather
+    # than just transcribing formulas.
+    central_claim: NonEmptyStr
+    proposed_method: NonEmptyStr
+    mechanism: NonEmptyStr
+    comparisons: list[ThesisComparison]
+    headline_shape: str
+    caveats: list[str]
+
+
 class ExperimentIndexItem(StrictModel):
     experiment_id: NonEmptyStr
     title: NonEmptyStr
@@ -361,6 +388,7 @@ class CodeFaithfulnessReviewDocument(StrictModel):
 SCHEMA_MODELS: dict[str, type[BaseModel]] = {
     "engineering_facts": EngineeringFactsDocument,
     "repro_tasks": ReproTasksDocument,
+    "paper_thesis": PaperThesisDocument,
     "experiment_index": ExperimentIndexDocument,
     "repro_project_manifest": ReproProjectManifest,
     "repro_project_plan": ReproProjectPlan,
@@ -377,6 +405,7 @@ SCHEMA_MODELS: dict[str, type[BaseModel]] = {
 SCHEMA_FILENAMES: dict[str, str] = {
     "engineering_facts": "engineering_facts.schema.json",
     "repro_tasks": "repro_tasks.schema.json",
+    "paper_thesis": "paper_thesis.schema.json",
     "experiment_index": "experiment_index.schema.json",
     "repro_project_manifest": "repro_project_manifest.schema.json",
     "repro_project_plan": "repro_project_plan.schema.json",

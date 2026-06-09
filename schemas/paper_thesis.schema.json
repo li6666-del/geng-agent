@@ -1,0 +1,99 @@
+{
+  "$defs": {
+    "ThesisComparison": {
+      "additionalProperties": false,
+      "properties": {
+        "claim_id": {
+          "minLength": 1,
+          "title": "Claim Id",
+          "type": "string"
+        },
+        "methods_best_to_worst": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Methods Best To Worst",
+          "type": "array"
+        },
+        "expected_ordering": {
+          "minLength": 1,
+          "title": "Expected Ordering",
+          "type": "string"
+        },
+        "metric": {
+          "title": "Metric",
+          "type": "string"
+        },
+        "regime": {
+          "title": "Regime",
+          "type": "string"
+        },
+        "figure_ref": {
+          "title": "Figure Ref",
+          "type": "string"
+        },
+        "mechanism_note": {
+          "title": "Mechanism Note",
+          "type": "string"
+        }
+      },
+      "required": [
+        "claim_id",
+        "methods_best_to_worst",
+        "expected_ordering",
+        "metric",
+        "regime",
+        "figure_ref",
+        "mechanism_note"
+      ],
+      "title": "ThesisComparison",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "central_claim": {
+      "minLength": 1,
+      "title": "Central Claim",
+      "type": "string"
+    },
+    "proposed_method": {
+      "minLength": 1,
+      "title": "Proposed Method",
+      "type": "string"
+    },
+    "mechanism": {
+      "minLength": 1,
+      "title": "Mechanism",
+      "type": "string"
+    },
+    "comparisons": {
+      "items": {
+        "$ref": "#/$defs/ThesisComparison"
+      },
+      "title": "Comparisons",
+      "type": "array"
+    },
+    "headline_shape": {
+      "title": "Headline Shape",
+      "type": "string"
+    },
+    "caveats": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Caveats",
+      "type": "array"
+    }
+  },
+  "required": [
+    "central_claim",
+    "proposed_method",
+    "mechanism",
+    "comparisons",
+    "headline_shape",
+    "caveats"
+  ],
+  "title": "PaperThesisDocument",
+  "type": "object"
+}

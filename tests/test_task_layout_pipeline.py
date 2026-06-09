@@ -61,11 +61,36 @@ PER_TASK_FILES = {
 }
 
 
+PAPER_THESIS = {
+    "central_claim": "在密集场景下 STAB 的和速率高于 ZF。",
+    "proposed_method": "STAB",
+    "mechanism": "空时维度去相关用户，使等效信道更良态，压过预对数损失。",
+    "comparisons": [
+        {
+            "claim_id": "stab_beats_zf",
+            "methods_best_to_worst": ["STAB", "ZF"],
+            "expected_ordering": "密集区 STAB > ZF",
+            "metric": "sum rate",
+            "regime": "用户密集",
+            "figure_ref": "Fig.1",
+            "mechanism_note": "空时去相关带来条件数优势",
+        }
+    ],
+    "headline_shape": "和速率随功率上升，STAB 在最上方。",
+    "caveats": ["稀疏用户时优势消失。"],
+}
+
+
 class PerTaskFakeLLM:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
     def complete(self, prompt: str, *, system=None, response_format=None) -> str:
+        # The optional science-loop thesis call is dispatched by schema name and intentionally
+        # does NOT consume a positional slot, so facts (call 1) / tasks (call 2) stay aligned
+        # whether or not --science-loop is on.
+        if _schema_name(response_format) == "paper_thesis":
+            return json.dumps(PAPER_THESIS)
         self.calls.append(prompt)
         if len(self.calls) == 1:
             return json.dumps(
@@ -163,6 +188,40 @@ class PerTaskLayoutPipelineTests(unittest.TestCase):
             manifest = json.loads((result.output_dir / "repro_project_manifest.json").read_text(encoding="utf-8"))
             self.assertIn("tasks_manifest", manifest["_meta"])
             self.assertFalse(manifest["_meta"].get("template_fallback_used"))
+            # science-loop is OFF by default -> no thesis stage runs, path unchanged.
+            self.assertFalse((result.output_dir / "paper_thesis.json").exists())
+
+    def test_science_loop_distills_paper_thesis_anchor(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            paper = temp / "paper.md"
+            paper.write_text("Simulation Results\nAWGN channel, BER vs SNR.", encoding="utf-8")
+
+            fake = PerTaskFakeLLM()
+            result = ReviewPipeline(client=fake).run(
+                paper,
+                temp / "case",
+                run_repro=True,
+                run_timeout=60,
+                repair_attempts=0,
+                result_review=False,
+                facts_gap_rounds=0,
+                tasks_gap_rounds=0,
+                per_task_layout=True,
+                science_loop=True,
+            )
+
+            # --science-loop emits the thesis anchor and threads it into generated_files.json.
+            thesis = json.loads((result.output_dir / "paper_thesis.json").read_text(encoding="utf-8"))
+            self.assertEqual(thesis["proposed_method"], "STAB")
+            self.assertEqual(thesis["comparisons"][0]["methods_best_to_worst"], ["STAB", "ZF"])
+            generated = json.loads((result.output_dir / "generated_files.json").read_text(encoding="utf-8"))
+            self.assertEqual(generated["paper_thesis"]["central_claim"], thesis["central_claim"])
+            # the thesis stage must not disturb the per-task flow: still a real run, not a fallback.
+            self.assertTrue(result.runtime_passed)
+            self.assertFalse(json.loads(
+                (result.output_dir / "repro_project_manifest.json").read_text(encoding="utf-8")
+            )["_meta"].get("template_fallback_used"))
 
 
 class SrcSymbolContractTests(unittest.TestCase):
