@@ -143,6 +143,27 @@ class PromptTests(unittest.TestCase):
         self.assertIn("谎报", repair_prompt)
         self.assertIn("无条件", repair_prompt)
 
+    def test_generation_prompt_guards_snr_convention_and_zeroing_guards(self) -> None:
+        # The 2603 LEO paper produced an all-zero figure because the generated code used a raw
+        # absolute link budget (Friis x thermal noise -> -7 dB) AND an absolute-threshold guard
+        # (1/trace(inv(G)) < 1e-12 -> return zeros) that hard-zeroed the SINR. The codegen prompt
+        # must steer away from BOTH, and flag all-zero output as a failure signal.
+        file_prompt = PromptBook().render(
+            "generate_repro_project_file.md",
+            target_path="src/metrics.py",
+            project_plan_json="{}",
+            generated_files_context_json="[]",
+            engineering_facts_json="{}",
+            repro_tasks_json="{}",
+            paper_context_json="[]",
+            review_feedback_json="",
+        )
+        self.assertIn("SNR 约定", file_prompt)      # use the paper's normalized SNR convention
+        self.assertIn("归一化", file_prompt)
+        self.assertIn("链路预算", file_prompt)        # not a raw absolute link budget
+        self.assertIn("条件数", file_prompt)          # relative guard, not absolute-threshold zeroing
+        self.assertIn("全 0", file_prompt)            # all-zero is a failure signal
+
     def test_result_review_prompts_require_chinese_report_text(self) -> None:
         book = PromptBook()
 
