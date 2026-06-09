@@ -10,7 +10,12 @@ from typing import Any
 
 from .json_utils import parse_json_object, pretty_json
 from .llm import LLMClient
-from .openhands_repair import OpenHandsInvoker, run_openhands_repair_candidate
+from .openhands_repair import (
+    OpenHandsInvoker,
+    changed_project_files,
+    copy_candidate_changes,
+    run_openhands_repair_candidate,
+)
 from .outputs import inspect_output_artifacts, validate_repro_project, write_file_manifest, write_json, write_text
 from .prompts import PromptBook
 from .runner_types import RepairBackend, normalize_repair_backend
@@ -52,8 +57,11 @@ def run_repro_with_repair(
         return run_tasks_with_repair(
             repro_project_dir=repro_project_dir,
             manifest=tasks_manifest,
+            client=client,
+            prompt_book=prompt_book,
+            system_message=system_message,
+            max_repair_attempts=max_repair_attempts,
             backend=backend,
-            timeout_seconds=timeout_seconds,
         )
 
     phases = repro_run_phases(repro_project_dir)
@@ -612,6 +620,10 @@ def run_tasks_with_repair(
     *,
     repro_project_dir: Path,
     manifest: dict[str, Any],
+    client: Any = None,
+    prompt_book: Any = None,
+    system_message: str = "",
+    max_repair_attempts: int = 0,
     backend: RepairBackend = RepairBackend.LLM,
     timeout_seconds: float = 120.0,
 ) -> dict[str, Any]:
@@ -620,13 +632,24 @@ def run_tasks_with_repair(
     task's artifacts (the hard isolation a single-process try/except cannot give). Partial
     success is first-class: the full phase keeps whatever passed rather than zeroing out.
 
-    (Per-task LLM/OpenHands repair localization is layered on next; this is the isolation +
-    partial-success core. Gated on tasks_manifest.json so legacy projects are unaffected.)"""
+    Repair is LOCALIZED: a failing task is repaired on its own script (verified by re-running
+    only that task), and any change that touches a SHARED src/ file must not regress the tasks
+    that already passed. Gated on tasks_manifest.json so legacy projects are unaffected."""
     logs_dir = repro_project_dir / "repair_logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     phase_results: list[dict[str, Any]] = []
     for phase in repro_run_phases(repro_project_dir):
-        result = run_tasks_once(repro_project_dir, manifest, phase=phase, logs_dir=logs_dir)
+        result = run_tasks_phase_with_repair(
+            repro_project_dir,
+            manifest,
+            phase=phase,
+            logs_dir=logs_dir,
+            client=client,
+            prompt_book=prompt_book,
+            system_message=system_message,
+            max_repair_attempts=max_repair_attempts,
+            backend=backend,
+        )
         write_json(logs_dir / f"tasks_{phase}_run.json", redact_data(result))
         phase_results.append(result)
         # Smoke is tiny, so it must fully pass; a smoke failure signals a systemic problem and
@@ -772,3 +795,186 @@ def run_task_once(
             "stdout": "",
             "stderr": f"task timed out after {timeout:.0f}s (its own per-task budget)",
         }
+
+
+def run_tasks_phase_with_repair(
+    repro_project_dir: Path,
+    manifest: dict[str, Any],
+    *,
+    phase: str,
+    logs_dir: Path,
+    client: Any = None,
+    prompt_book: Any = None,
+    system_message: str = "",
+    max_repair_attempts: int = 0,
+    backend: RepairBackend = RepairBackend.LLM,
+) -> dict[str, Any]:
+    """One profile: gate + clear once, then run each task (with localized repair). Tasks that
+    pass become the regression baseline for any repair that touches a shared src/ file."""
+    config_name = (
+        "config_smoke.json"
+        if phase == "smoke" and (repro_project_dir / "config_smoke.json").exists()
+        else "config.json"
+    )
+    requirements_issues = validate_requirements(repro_project_dir)
+    security_issues = static_scan_repro_project(repro_project_dir)
+    if requirements_issues or security_issues:
+        return {
+            "run_profile": phase,
+            "config": config_name,
+            "blocked_by_security": True,
+            "requirements_issues": requirements_issues,
+            "security_issues": security_issues,
+            "tasks_total": 0,
+            "tasks_passed": 0,
+            "all_passed": False,
+            "coverage": "0/0",
+            "per_task": [],
+            "artifacts": inspect_output_artifacts(repro_project_dir),
+        }
+
+    archive_outputs(repro_project_dir, logs_dir, f"tasks_{phase}")
+    tasks = [task for task in manifest.get("tasks", []) if isinstance(task, dict) and task.get("module")]
+    per_task: list[dict[str, Any]] = []
+    passed_tasks: list[dict[str, Any]] = []
+    for task in tasks:
+        result = run_task_with_repair(
+            repro_project_dir,
+            task,
+            phase=phase,
+            config_name=config_name,
+            logs_dir=logs_dir,
+            client=client,
+            prompt_book=prompt_book,
+            system_message=system_message,
+            max_repair_attempts=max_repair_attempts,
+            backend=backend,
+            passed_tasks=passed_tasks,
+        )
+        per_task.append(result)
+        if result["passed"]:
+            passed_tasks.append(task)
+    passed = len(passed_tasks)
+    total = len(per_task)
+    return {
+        "run_profile": phase,
+        "config": config_name,
+        "tasks_total": total,
+        "tasks_passed": passed,
+        "all_passed": total > 0 and passed == total,
+        "coverage": f"{passed}/{total}",
+        "per_task": per_task,
+        "artifacts": inspect_output_artifacts(repro_project_dir),
+        "requirements_issues": [],
+        "security_issues": [],
+    }
+
+
+def run_task_with_repair(
+    repro_project_dir: Path,
+    task: dict[str, Any],
+    *,
+    phase: str,
+    config_name: str,
+    logs_dir: Path,
+    client: Any = None,
+    prompt_book: Any = None,
+    system_message: str = "",
+    max_repair_attempts: int = 0,
+    backend: RepairBackend = RepairBackend.LLM,
+    passed_tasks: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Run one task, and on failure repair JUST its script (verified by re-running only this
+    task), rejecting any repair that regresses an already-passing task through a shared src/
+    edit. With no client/prompt_book (or max_repair_attempts=0) this is a plain single run."""
+    label = f"{phase}_{task.get('module')}"
+    repair_attempts: list[dict[str, Any]] = []
+    result: dict[str, Any] = {}
+    for attempt in range(max_repair_attempts + 1):
+        started = time.time()
+        result = run_task_once(repro_project_dir, task, phase=phase, config_name=config_name, since=started)
+        if result["passed"] or attempt >= max_repair_attempts or client is None or prompt_book is None:
+            break
+        combined_log = "\n".join([result.get("stdout", ""), result.get("stderr", "")])
+        code_context = collect_error_code_context(repro_project_dir, combined_log)
+        repair_prompt = prompt_book.render(
+            "repair_repro_project.md",
+            command=pretty_json(result["command"]),
+            returncode=str(result["returncode"]),
+            stdout=wrap_untrusted("stdout", result.get("stdout", "")),
+            stderr=wrap_untrusted("stderr", result.get("stderr", "")),
+            code_context=wrap_untrusted("code_context", code_context),
+            validation_json=wrap_untrusted("validation_json", pretty_json(validate_repro_project(repro_project_dir))),
+        )
+        try:
+            repair_manifest = call_validated_repair_manifest(
+                client=client,
+                prompt=repair_prompt,
+                system_message=system_message,
+                logs_dir=logs_dir,
+                attempt_label=f"{label}_attempt_{attempt + 1:02d}",
+            )
+        except Exception as exc:
+            repair_attempts.append({"attempt": attempt + 1, "stage": "repair_manifest_validation", "message": str(exc)})
+            continue
+        accepted = _try_task_repair_candidate(
+            repro_project_dir,
+            task,
+            repair_manifest,
+            phase=phase,
+            config_name=config_name,
+            logs_dir=logs_dir,
+            attempt_index=attempt + 1,
+            label=label,
+            passed_tasks=passed_tasks or [],
+        )
+        repair_attempts.append(
+            {"attempt": attempt + 1, "accepted": accepted, "touched_files": repair_manifest.get("touched_files", [])}
+        )
+        # Accepted patch is now in the real project; the loop re-runs the task to confirm.
+    result["repair_attempts"] = repair_attempts
+    result["repair_attempts_used"] = sum(1 for item in repair_attempts if item.get("accepted"))
+    return result
+
+
+def _try_task_repair_candidate(
+    repro_project_dir: Path,
+    task: dict[str, Any],
+    repair_manifest: dict[str, Any],
+    *,
+    phase: str,
+    config_name: str,
+    logs_dir: Path,
+    attempt_index: int,
+    label: str,
+    passed_tasks: list[dict[str, Any]],
+) -> bool:
+    """Apply a repair manifest to a throwaway copy; accept only if THIS task now passes and
+    (when a shared src/ file changed) every already-passing task still passes. On accept, copy
+    just the changed files back into the real project."""
+    candidate_dir = logs_dir / f"task_{label}_attempt_{attempt_index:02d}_candidate"
+    if candidate_dir.exists():
+        ensure_inside(logs_dir, candidate_dir)
+        shutil.rmtree(candidate_dir)
+    shutil.copytree(
+        repro_project_dir,
+        candidate_dir,
+        ignore=shutil.ignore_patterns("repair_logs", "outputs", "__pycache__", "*.pyc"),
+    )
+    write_file_manifest(repair_manifest, candidate_dir)
+
+    started = time.time()
+    candidate_result = run_task_once(candidate_dir, task, phase=phase, config_name=config_name, since=started)
+    if not candidate_result["passed"]:
+        return False
+
+    changed = changed_project_files(repro_project_dir, candidate_dir)
+    touches_shared_src = any(path.startswith("src/") and path != "src/_io.py" for path in changed)
+    if touches_shared_src:
+        for prior in passed_tasks:
+            prior_started = time.time()
+            if not run_task_once(candidate_dir, prior, phase=phase, config_name=config_name, since=prior_started)["passed"]:
+                return False  # regression: reject this repair
+
+    copy_candidate_changes(repro_project_dir, candidate_dir, changed)
+    return True

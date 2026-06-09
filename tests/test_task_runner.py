@@ -5,7 +5,8 @@ import unittest
 
 from geng_agent.io_runtime import inject_io_runtime
 from geng_agent.outputs import _valid_csv, _valid_png, _valid_summary_json
-from geng_agent.runner import run_repro_with_repair, run_tasks_once
+from geng_agent.prompts import PromptBook
+from geng_agent.runner import run_repro_with_repair, run_tasks_once, run_tasks_with_repair
 from geng_agent.task_scripts import build_tasks_manifest, write_task_scaffolding
 
 
@@ -59,6 +60,58 @@ def _build_project(root: Path, specs: list[tuple[str, str]]) -> dict:
     for name in ("config.json", "config_smoke.json"):
         (root / name).write_text(json.dumps({"seed": 1}), encoding="utf-8")
     return manifest
+
+
+BROKEN_TASK = (
+    "from src import _io\n"
+    "def main(config_path=None):\n"
+    "    _io.begin('demo_task', {})\n"
+    "    return this_symbol_is_undefined()\n"  # NameError at runtime, valid syntax
+    "if __name__ == '__main__':\n"
+    "    raise SystemExit(main())\n"
+)
+
+
+class RepairFakeLLM:
+    """Returns a repair_manifest that replaces the failing task script with a working one."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def complete(self, prompt, *, system=None, response_format=None) -> str:
+        self.calls += 1
+        return json.dumps(
+            {
+                "reason": "fix the NameError and write artifacts via _io",
+                "touched_files": ["tasks/demo_task.py"],
+                "scientific_changes": [],
+                "files": [{"path": "tasks/demo_task.py", "content_lines": _good_task("demo_task").splitlines()}],
+            }
+        )
+
+
+class TaskRepairTests(unittest.TestCase):
+    def test_failing_task_is_repaired_on_its_own_script(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            manifest = _build_project(root, [("demo_task", BROKEN_TASK)])
+            client = RepairFakeLLM()
+
+            result = run_tasks_with_repair(
+                repro_project_dir=root,
+                manifest=manifest,
+                client=client,
+                prompt_book=PromptBook(),
+                system_message="system",
+                max_repair_attempts=1,
+            )
+
+            self.assertTrue(result["passed"])
+            self.assertEqual(result["coverage"], "1/1")
+            self.assertGreaterEqual(client.calls, 1)  # repair was actually invoked
+            # The fix landed on the real project's task script, and it now produces artifacts.
+            self.assertIn("_io.finish", (root / "tasks" / "demo_task.py").read_text(encoding="utf-8"))
+            self.assertTrue(_valid_csv(root / "outputs" / "demo_task" / "results.csv"))
 
 
 class TaskRunnerIsolationTests(unittest.TestCase):
