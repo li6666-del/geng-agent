@@ -355,7 +355,11 @@ class PipelineTests(unittest.TestCase):
             paper.write_text("Simulation Results\nAWGN channel, BER vs SNR.", encoding="utf-8")
 
             fake = FakeLLM()
-            result = ReviewPipeline(client=fake).run(paper, temp / "case", run_repro=False)
+            # This test pins the pre-gap-finder call sequence; gap-finder rounds add LLM calls
+            # and are exercised separately, so disable them here to assert the core bundle flow.
+            result = ReviewPipeline(client=fake).run(
+                paper, temp / "case", run_repro=False, facts_gap_rounds=0, tasks_gap_rounds=0
+            )
 
             self.assertTrue(result.review_path.exists())
             self.assertIsNotNone(result.review_docx_path)
@@ -797,7 +801,11 @@ class PipelineTests(unittest.TestCase):
             paper.write_text("Simulation Results\nAWGN channel, BER vs SNR.", encoding="utf-8")
 
             fake = ResultReviewLLM()
-            result = ReviewPipeline(client=fake).run(paper, temp / "case", run_repro=True, run_timeout=10)
+            # Disable gap-finder rounds: their extra LLM calls aren't mocked here and would
+            # trip a local-fallback artifact that inflates risk and caps the verdict.
+            result = ReviewPipeline(client=fake).run(
+                paper, temp / "case", run_repro=True, run_timeout=10, facts_gap_rounds=0, tasks_gap_rounds=0
+            )
 
             self.assertTrue(result.runtime_passed)
             self.assertTrue(result.result_review_passed)
