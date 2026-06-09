@@ -68,6 +68,7 @@ def _add_common_review_args(parser: argparse.ArgumentParser, *, include_resume: 
     parser.add_argument("--tasks-gap-rounds", type=int, default=3, help="第二轮复现任务设计后的“查漏补缺”追加轮数（确定性校验每个可复现实验是否都有任务 + 为遗漏实验补任务），循环到全覆盖或无新增为止；默认 3，设 0 关闭。")
     parser.add_argument("--per-task-layout", action="store_true", help="第三轮按“每任务一脚本”布局生成：LLM 只生成共享 src + 每个复现任务一个 tasks/<module>.py（薄驱动调 _io），run_experiment.py 由本地注入分发器；运行时每个任务起独立子进程+独立超时+部分成功+按脚本返修（硬隔离）。默认关闭（单脚本布局）。")
     parser.add_argument("--science-loop", action="store_true", help="开启“论文思路”闭环：第一轮后额外提炼论文核心主张/机制/方法预期排序（paper_thesis），锚进生成与结果审查，并按预期排序对复现做一致性校验+回喂科学返修。建议与 --per-task-layout 同用（按任务隔离才能定位返修）。默认关闭。")
+    parser.add_argument("--science-repair-rounds", type=int, default=1, help="论文思路闭环里“科学返修”的最大轮数：当结果审查判定某实验未支持论文结论（多为方法排序与论文相反）时，按诊断回喂、定向重写涉事 src/ 与任务脚本并重跑+复审；每轮可逆，仅在错配严格减少且不丢覆盖时保留，否则回滚。默认 1，设 0 关闭（仅锚定+审查、不自动返修）。仅在 --science-loop + --per-task-layout 下生效。")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -117,6 +118,7 @@ def main(argv: list[str] | None = None) -> int:
             tasks_gap_rounds=args.tasks_gap_rounds,
             per_task_layout=args.per_task_layout,
             science_loop=args.science_loop,
+            science_repair_rounds=args.science_repair_rounds,
         )
         print(f"审查完成：{result.output_dir}")
         print(f"报告：{result.review_path}")

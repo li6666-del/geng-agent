@@ -233,6 +233,109 @@ class PerTaskLayoutPipelineTests(unittest.TestCase):
             )["_meta"].get("template_fallback_used"))
 
 
+class ScienceRepairIntegrationTests(unittest.TestCase):
+    def test_science_repair_regenerates_offending_files_and_keeps_a_fix(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            paper = temp / "paper.md"
+            paper.write_text("Simulation Results\nAWGN channel, BER vs SNR.", encoding="utf-8")
+
+            pipeline = ReviewPipeline(client=PerTaskFakeLLM())
+            result = pipeline.run(
+                paper, temp / "case", run_repro=True, run_timeout=60, repair_attempts=0,
+                result_review=False, facts_gap_rounds=0, tasks_gap_rounds=0,
+                per_task_layout=True, science_loop=True, science_repair_rounds=1,
+            )
+            out = result.output_dir
+            manifest = json.loads((out / "repro_project_manifest.json").read_text(encoding="utf-8"))
+            facts = json.loads((out / "engineering_facts.json").read_text(encoding="utf-8"))
+            tasks = json.loads((out / "repro_tasks.json").read_text(encoding="utf-8"))
+            paper_doc = json.loads((out / "paper_chunks.json").read_text(encoding="utf-8"))
+
+            # The review judged the one task does_not_support -> the loop should repair it.
+            (out / "result_review.json").write_text(json.dumps({"experiment_reviews": [{
+                "task_id": "reproduce_fig_1", "scientific_verdict": "does_not_support_paper_claim",
+                "paper_result_summary": "论文：STAB 在上", "local_result_summary": "本地：ZF 在上",
+                "differences": ["排序相反"], "possible_causes": ["等效信道构造错"],
+                "dimension_reviews": [{"dimension": "baseline_comparison", "rating": "weak",
+                                       "finding": "曲线相对高低与论文相反", "evidence": ["x"]}],
+            }]}), encoding="utf-8")
+
+            # Inject the rerun+rereview step: after regeneration the task now supports the claim.
+            def fake_evaluate():
+                return (
+                    {"coverage": "1/1"},
+                    {"passed": True, "mode": "stub"},
+                    {"experiment_reviews": [{"task_id": "reproduce_fig_1",
+                                             "scientific_verdict": "supports_paper_claim",
+                                             "dimension_reviews": []}]},
+                )
+
+            new_runtime, new_review = pipeline._run_science_repair(
+                output_dir=out, audit_dir=out / "audit", repro_project_dir=result.repro_project_dir,
+                manifest=manifest, facts=facts, tasks=tasks, paper=paper_doc, paper_path=paper,
+                paper_context_json="[]",
+                paper_thesis={"central_claim": "c", "proposed_method": "STAB", "mechanism": "m",
+                              "comparisons": [], "headline_shape": "", "caveats": []},
+                runtime_result={"coverage": "1/1"}, result_review_result={"passed": True},
+                science_repair_rounds=1, repair_attempts=0, run_timeout=60, repair_backend="hybrid",
+                openhands_timeout=10, openhands_max_iterations=1, max_attempts=2, project_timeout=60,
+                evaluate=fake_evaluate,
+            )
+
+            summary = json.loads((out / "science_repair.json").read_text(encoding="utf-8"))
+            self.assertTrue(summary["applied"])
+            self.assertTrue(summary["kept"])
+            self.assertEqual(summary["rounds"][0]["decision"], "kept")
+            # the live regeneration actually rewrote the shared src + the offending task script.
+            regenerated = json.loads((out / "audit" / "science_repair_regenerated.json").read_text(encoding="utf-8"))
+            self.assertIn("tasks/reproduce_fig_1.py", regenerated["files"])
+            self.assertIn("src/modulation.py", regenerated["files"])
+            self.assertTrue(new_review.get("passed"))
+            self.assertTrue((result.repro_project_dir / "tasks" / "reproduce_fig_1.py").exists())
+
+    def test_science_repair_is_noop_without_mismatch(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            paper = temp / "paper.md"
+            paper.write_text("Simulation Results\nAWGN channel, BER vs SNR.", encoding="utf-8")
+            pipeline = ReviewPipeline(client=PerTaskFakeLLM())
+            result = pipeline.run(
+                paper, temp / "case", run_repro=True, run_timeout=60, repair_attempts=0,
+                result_review=False, facts_gap_rounds=0, tasks_gap_rounds=0,
+                per_task_layout=True, science_loop=True, science_repair_rounds=1,
+            )
+            out = result.output_dir
+            manifest = json.loads((out / "repro_project_manifest.json").read_text(encoding="utf-8"))
+            (out / "result_review.json").write_text(json.dumps({"experiment_reviews": [{
+                "task_id": "reproduce_fig_1", "scientific_verdict": "supports_paper_claim",
+                "dimension_reviews": [],
+            }]}), encoding="utf-8")
+
+            called = {"evaluate": 0}
+
+            def fake_evaluate():
+                called["evaluate"] += 1
+                return ({"coverage": "1/1"}, {"passed": True}, {})
+
+            runtime_in = {"coverage": "1/1"}
+            review_in = {"passed": True}
+            new_runtime, new_review = pipeline._run_science_repair(
+                output_dir=out, audit_dir=out / "audit", repro_project_dir=result.repro_project_dir,
+                manifest=manifest, facts={}, tasks={}, paper={}, paper_path=paper,
+                paper_context_json="[]", paper_thesis=None,
+                runtime_result=runtime_in, result_review_result=review_in,
+                science_repair_rounds=1, repair_attempts=0, run_timeout=60, repair_backend="hybrid",
+                openhands_timeout=10, openhands_max_iterations=1, max_attempts=2, project_timeout=60,
+                evaluate=fake_evaluate,
+            )
+            self.assertEqual(called["evaluate"], 0)  # nothing to repair -> no rerun
+            self.assertIs(new_runtime, runtime_in)
+            self.assertIs(new_review, review_in)
+            summary = json.loads((out / "science_repair.json").read_text(encoding="utf-8"))
+            self.assertFalse(summary["applied"])
+
+
 class SrcSymbolContractTests(unittest.TestCase):
     def test_extracts_real_symbols_and_excludes_io_and_dunder(self) -> None:
         files = [
