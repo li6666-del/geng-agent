@@ -59,7 +59,7 @@ def _add_common_review_args(parser: argparse.ArgumentParser, *, include_resume: 
     parser.add_argument("--openhands-timeout", type=float, default=900.0, help="OpenHands 候选修复和验收运行超时时间，单位秒。")
     parser.add_argument("--openhands-max-iterations", type=int, default=25, help="OpenHands 候选修复最大迭代步数。")
     parser.add_argument("--run-timeout", type=float, default=120.0, help="单次复现运行超时时间，单位秒。")
-    parser.add_argument("--json-repair-attempts", type=int, default=3, help="每轮 JSON 结构审查失败后的返修次数。")
+    parser.add_argument("--json-repair-attempts", type=int, default=5, help="每轮 JSON 结构审查失败后的返修次数（默认 5：实跑发现最难的科学文件 src/modulation.py 偶发语法/结构错，3 次重试不够会拖垮整个逐任务项目→兜底；只在失败时才追加重试，文件一次过则无额外开销）。")
     parser.add_argument("--code-review", action="store_true", help="生成复现项目后运行代码忠实度审查（对照已抽取的事实/任务做内容审查并按需返修）；默认关闭。")
     parser.add_argument("--code-review-attempts", type=int, default=5, help="代码忠实度审查发现 blocking 问题后的返修轮数；默认 5（每轮含一次修复+一次复审，慢模型会更耗时）。")
     parser.add_argument("--code-review-model", default=None, help="代码忠实度审查使用的模型（异构审查者）；默认取 GENG_CODE_REVIEW_MODEL，未设则与主模型相同。")
