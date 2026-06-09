@@ -40,6 +40,22 @@ REPRO_PROJECT_FILE_LIMITS = {
 }
 
 
+# Per-task layout: the model generates the shared science + configs + docs, plus ONE
+# tasks/<module>.py per repro_task. It does NOT generate run_experiment.py (the harness
+# injects a deterministic dispatcher), tasks_manifest.json, or src/_io.py (both injected).
+SHARED_GENERATED_FILES = REQUIRED_REPRO_FILES - {"run_experiment.py"}
+# Generate shared science modules before the rest so per-task scripts (appended after) and
+# the dispatcher see the real src/ interfaces.
+SHARED_GENERATION_ORDER = [path for path in REPRO_PROJECT_FILE_ORDER if path != "run_experiment.py"]
+
+
+def expected_generated_paths(task_scripts: list[str] | None) -> set[str]:
+    """Full set of MODEL-generated paths for a per-task project: shared files + one
+    tasks/<module>.py per repro_task. run_experiment.py / tasks_manifest.json / src/_io.py
+    are harness-injected (not generated), so they are intentionally absent here."""
+    return set(SHARED_GENERATED_FILES) | set(task_scripts or [])
+
+
 def _manifest_paths(manifest: dict[str, Any], repro_project_dir: Path) -> list[Path]:
     files = manifest.get("files", [])
     if not isinstance(files, list):
@@ -55,16 +71,25 @@ def _manifest_paths(manifest: dict[str, Any], repro_project_dir: Path) -> list[P
     return paths
 
 
-def _ordered_project_paths(plan: dict[str, Any]) -> list[str]:
+def _ordered_project_paths(plan: dict[str, Any], task_scripts: list[str] | None = None) -> list[str]:
     planned = {
         _normalize_manifest_path_for_pipeline(item.get("path"))
         for item in plan.get("files", [])
         if isinstance(item, dict)
     }
-    return [path for path in REPRO_PROJECT_FILE_ORDER if path in planned]
+    if task_scripts is None:
+        # Legacy single-script layout.
+        return [path for path in REPRO_PROJECT_FILE_ORDER if path in planned]
+    # Per-task layout: shared science/configs/docs first, then each tasks/<module>.py.
+    ordered = [path for path in SHARED_GENERATION_ORDER if path in planned]
+    ordered += [script for script in task_scripts if script in planned]
+    return ordered
 
 
-def _validate_project_plan_paths(plan: dict[str, Any]) -> list[ValidationIssue]:
+def _validate_project_plan_paths(
+    plan: dict[str, Any], expected_paths: set[str] | None = None
+) -> list[ValidationIssue]:
+    expected = set(expected_paths) if expected_paths is not None else REQUIRED_REPRO_FILES
     issues: list[ValidationIssue] = []
     files = plan.get("files")
     if not isinstance(files, list):
@@ -80,8 +105,8 @@ def _validate_project_plan_paths(plan: dict[str, Any]) -> list[ValidationIssue]:
         if normalized in seen:
             issues.append(ValidationIssue(f"$.files[{index}].path", "duplicate path"))
         seen.add(normalized)
-    missing = sorted(REQUIRED_REPRO_FILES - seen)
-    extra = sorted(seen - REQUIRED_REPRO_FILES)
+    missing = sorted(expected - seen)
+    extra = sorted(seen - expected)
     for path in missing:
         issues.append(ValidationIssue("$.files", f"missing required file: {path}"))
     for path in extra:
