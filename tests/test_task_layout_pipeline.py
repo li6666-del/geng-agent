@@ -3,7 +3,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from geng_agent.pipeline import ReviewPipeline
+from geng_agent.pipeline import ReviewPipeline, _available_src_symbols, _per_task_file_override
 
 
 def _schema_name(response_format) -> str | None:
@@ -158,6 +158,25 @@ class PerTaskLayoutPipelineTests(unittest.TestCase):
             manifest = json.loads((result.output_dir / "repro_project_manifest.json").read_text(encoding="utf-8"))
             self.assertIn("tasks_manifest", manifest["_meta"])
             self.assertFalse(manifest["_meta"].get("template_fallback_used"))
+
+
+class SrcSymbolContractTests(unittest.TestCase):
+    def test_extracts_real_symbols_and_excludes_io_and_dunder(self) -> None:
+        files = [
+            {"path": "src/modulation.py", "content_lines": ["def qpsk_mod(bits):", "    return bits", "class Demapper:", "    pass", "BITS_PER_SYM = 2", "def _helper():", "    return 1"]},
+            {"path": "src/_io.py", "content_lines": ["def begin():", "    return None"]},  # trusted runtime: excluded
+            {"path": "README.md", "content_lines": ["docs"]},  # non-src: excluded
+        ]
+        symbols = _available_src_symbols(files)
+        self.assertEqual(symbols, {"src.modulation": ["qpsk_mod", "Demapper", "BITS_PER_SYM"]})  # no _helper, no _io
+
+    def test_override_pins_imports_to_real_symbols(self) -> None:
+        symbols = {"src.modulation": ["qpsk_mod"], "src.channel": ["awgn"]}
+        override = _per_task_file_override("reproduce_fig_1", {"repro_tasks": [{"task_id": "reproduce_fig_1"}]}, symbols)
+        self.assertIn("import 白名单", override)
+        self.assertIn("src.modulation: qpsk_mod", override)
+        self.assertIn("src.channel: awgn", override)
+        self.assertIn("绝不要 import 不存在的名字", override)
 
 
 if __name__ == "__main__":

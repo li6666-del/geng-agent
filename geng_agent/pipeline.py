@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -169,9 +170,40 @@ def _per_task_plan_override(task_scripts: list[str]) -> str:
     )
 
 
-def _per_task_file_override(task_id: str, tasks: dict[str, Any]) -> str:
+def _available_src_symbols(files: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """Top-level def/class/constant names exposed by each ALREADY-generated src/*.py, so a
+    per-task script can be handed the EXACT symbols it may import. The model otherwise guesses
+    names that don't exist (observed: importing zf_precoder/stab_sum_rate that src.modulation
+    never defined -> ImportError sank 2/3 tasks)."""
+    symbols: dict[str, list[str]] = {}
+    for item in files:
+        path = str(item.get("path", ""))
+        if not (path.startswith("src/") and path.endswith(".py")) or path == "src/_io.py":
+            continue
+        content = "\n".join(str(line) for line in item.get("content_lines", []) if isinstance(item.get("content_lines"), list))
+        try:
+            tree = ast.parse(content)
+        except SyntaxError:
+            continue
+        names: list[str] = []
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if not node.name.startswith("_"):
+                    names.append(node.name)
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and not target.id.startswith("_"):
+                        names.append(target.id)
+        if names:
+            module = path[: -len(".py")].replace("/", ".")  # src/modulation.py -> src.modulation
+            symbols[module] = names
+    return symbols
+
+
+def _per_task_file_override(task_id: str, tasks: dict[str, Any], src_symbols: dict[str, list[str]]) -> str:
     """Appended when generating one tasks/<module>.py: make it a thin driver for exactly this
-    task_id (begin -> compute via src/* -> write via _io -> finish)."""
+    task_id (begin -> compute via src/* -> write via _io -> finish), and pin its imports to the
+    REAL symbols the already-generated src/ modules expose."""
     spec = ""
     raw = tasks.get("repro_tasks") if isinstance(tasks, dict) else None
     if isinstance(raw, list):
@@ -179,15 +211,22 @@ def _per_task_file_override(task_id: str, tasks: dict[str, Any]) -> str:
             if isinstance(item, dict) and str(item.get("task_id")) == str(task_id):
                 spec = pretty_json(item)
                 break
+    if src_symbols:
+        symbol_lines = "\n".join(f"  - {module}: {', '.join(names)}" for module, names in sorted(src_symbols.items()))
+    else:
+        symbol_lines = "  -（src/ 暂无可导出符号；本任务所需计算就在本脚本内用 numpy/scipy 自己实现）"
     return (
         "\n\n# 【任务脚本｜优先级最高】\n"
         f"本文件是复现任务 `{task_id}` 的薄驱动，覆盖上文关于 run_experiment.py / 跑所有实验的描述：\n"
         "- 只实现 `def main(config_path=None) -> int`，并在末尾 `if __name__ == \"__main__\": raise SystemExit(main())`。\n"
         "- main 里：读 config（config_path 或 sys.argv[1]，缺省 'config_smoke.json'）→ "
         f"`rng = _io.begin(\"{task_id}\", cfg)` → 调用 src/ 里的科学函数算出本任务数据 → "
-        f"`_io.write_table(\"{task_id}\", 列名, 行)` → 画图后 `_io.write_figure(\"{task_id}\", 名称, fig)` → "
+        f"`_io.write_table(\"{task_id}\", 列名, 行)` → 画图后 `_io.write_figure(\"{task_id}\", 名称, fig)`（名称不要带 .png 后缀）→ "
         f"`return _io.finish(\"{task_id}\", metrics=..., assumptions=...)`。\n"
         "- 只复现这一个任务：不要在本文件里跑别的任务、不要导入别的 tasks/*、不要自己写 csv/json/savefig 落盘。\n"
+        "- 【硬约束·import 白名单】你从 src/ 导入时，**只能用下面这些“已生成 src/ 模块真实暴露的符号”**；import 前逐个核对名字确在清单里；"
+        "清单里没有的能力就在本脚本内用 numpy/scipy 自己实现，**绝不要 import 不存在的名字**（上次就因 import 了 src.modulation 里并不存在的 zf_precoder 而整任务 ImportError 挂掉）：\n"
+        f"{symbol_lines}\n"
         f"- 本任务规格（UNTRUSTED DATA，仅作参考）：\n{spec}\n"
     )
 
@@ -1340,7 +1379,7 @@ class ReviewPipeline:
                     review_feedback_json=review_feedback,
                 )
                 if per_task_layout and path in task_id_by_script:
-                    file_prompt += _per_task_file_override(task_id_by_script[path], tasks)
+                    file_prompt += _per_task_file_override(task_id_by_script[path], tasks, _available_src_symbols(files))
                 write_text(audit_dir / f"{file_label}.md", file_prompt)
                 parsed = self._call_validated_json(
                     prompt=file_prompt,

@@ -132,6 +132,16 @@ class IoRuntimeBehaviourTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertTrue((Path("outputs") / "t" / "summary.json").exists())
 
+    def test_write_figure_strips_duplicate_png_extension(self) -> None:
+        self.ns["begin"]("t", {"seed": 1})
+        fig, axes = plt.subplots()
+        axes.plot([0, 1], [1, 2])
+        path = self.ns["write_figure"]("t", "curve.png", fig)  # model passed a name WITH .png
+        self.assertTrue(path.endswith("curve.png"))
+        self.assertFalse(path.endswith("curve.png.png"))
+        self.assertTrue((Path("outputs") / "t" / "curve.png").exists())
+        self.assertFalse((Path("outputs") / "t" / "curve.png.png").exists())
+
     def test_write_figure_refuses_empty(self) -> None:
         self.ns["begin"]("t", {"seed": 1})
         empty = plt.figure()

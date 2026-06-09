@@ -175,7 +175,10 @@ def write_figure(task_id, name, fig=None):
     if not _figure_has_content(figure):
         plt.close(figure)
         raise ValueError("write_figure refused to save an empty figure")
-    path = outputs_dir(task_id) / (_slug(name) + ".png")
+    stem = _slug(name)
+    if stem.lower().endswith(".png"):
+        stem = stem[:-4] or "figure"
+    path = outputs_dir(task_id) / (stem + ".png")
     figure.savefig(path, dpi=150)
     plt.close(figure)
     return str(path)

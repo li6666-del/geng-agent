@@ -238,15 +238,45 @@ def collect_result_review_inputs(
     if not outputs_dir.exists():
         raise RuntimeError(f"outputs directory does not exist: {outputs_dir}")
 
-    csv_summaries = [summarize_csv_file(path) for path in sorted(outputs_dir.glob("*.csv"))]
-    summary_jsons = [summarize_summary_json(path) for path in sorted(outputs_dir.glob("summary*.json"))]
+    # Scan top-level outputs/ AND one level of per-task subdirs (outputs/<task_id>/...), with
+    # names RELATIVE to outputs/ so a per-task artifact reads "reproduce_fig_7/results.csv" and
+    # is associated with its task via task_match_tokens. Without this the per-task split's
+    # outputs/<task>/ artifacts were invisible to the review -- even a passing task came back
+    # "cannot_assess" because the reviewer never saw its real CSV/PNG/summary.
+    def _collect_outputs(pattern: str) -> list[Path]:
+        found = sorted(outputs_dir.glob(pattern)) + sorted(outputs_dir.glob("*/" + pattern))
+        seen: set[Path] = set()
+        unique: list[Path] = []
+        for candidate in found:
+            if candidate not in seen:
+                seen.add(candidate)
+                unique.append(candidate)
+        return unique
+
+    def _rel_name(path: Path) -> str:
+        try:
+            return path.relative_to(outputs_dir).as_posix()
+        except ValueError:
+            return path.name
+
+    csv_summaries = []
+    for path in _collect_outputs("*.csv"):
+        summary = summarize_csv_file(path)
+        summary["file"] = _rel_name(path)
+        csv_summaries.append(summary)
+    summary_jsons = []
+    for path in _collect_outputs("summary*.json"):
+        summary = summarize_summary_json(path)
+        summary["file"] = _rel_name(path)
+        summary_jsons.append(summary)
 
     images: list[LLMImage] = []
     output_images = []
-    for path in sorted(outputs_dir.glob("*.png")):
-        image = encode_png_for_llm(path, label=f"local_output:{path.name}")
+    for path in _collect_outputs("*.png"):
+        rel = _rel_name(path)
+        image = encode_png_for_llm(path, label=f"local_output:{rel}")
         images.append(image)
-        output_images.append({"label": image.label, "file": path.name, "mime_type": image.mime_type})
+        output_images.append({"label": image.label, "file": rel, "mime_type": image.mime_type})
 
     selected_pages = select_paper_pages(paper=paper, facts=facts, tasks=tasks)
     paper_images = []
