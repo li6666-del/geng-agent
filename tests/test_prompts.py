@@ -159,6 +159,11 @@ class PromptTests(unittest.TestCase):
             self.assertIn("所有自然语言字段必须使用中文", prompt)
             self.assertIn("最终 Markdown 和 Word 报告", prompt)
             self.assertIn("不要输出英文说明句", prompt)
+            self.assertIn("复现逻辑", prompt)
+            self.assertIn("趋势走向", prompt)
+            self.assertIn("baseline 排序", prompt)
+            self.assertIn("结论支持度", prompt)
+            self.assertIn("dimension_reviews", prompt)
 
 
 if __name__ == "__main__":

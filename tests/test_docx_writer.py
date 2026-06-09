@@ -75,13 +75,31 @@ class DocxWriterTests(unittest.TestCase):
                     "overall_result_credibility": "medium",
                     "overall_alignment": "partial_match",
                     "experiment_reviews": [
-                        {
-                            "task_id": "reproduce_fig_1",
-                            "local_result_credibility": "medium",
-                            "paper_alignment": "partial_match",
-                            "paper_result_summary": "Paper reports BER decreasing with SNR.",
-                            "local_result_summary": "Local CSV shows BER decreasing.",
-                            "differences": ["Only smoke-scale data were generated."],
+                            {
+                                "task_id": "reproduce_fig_1",
+                                "local_result_credibility": "medium",
+                                "paper_alignment": "partial_match",
+                                "scientific_verdict": "partially_supports_paper_claim",
+                                "dimension_reviews": [
+                                    {
+                                        "dimension": dimension,
+                                        "rating": "acceptable",
+                                        "finding": f"{dimension} 维度有基础证据。",
+                                        "evidence": ["outputs/results.csv"],
+                                    }
+                                    for dimension in [
+                                        "artifact_coverage",
+                                        "reproduction_logic",
+                                        "trend_shape",
+                                        "metric_axis_scale",
+                                        "baseline_comparison",
+                                        "statistical_reliability",
+                                        "conclusion_support",
+                                    ]
+                                ],
+                                "paper_result_summary": "Paper reports BER decreasing with SNR.",
+                                "local_result_summary": "Local CSV shows BER decreasing.",
+                                "differences": ["Only smoke-scale data were generated."],
                             "possible_causes": ["Fewer samples than the paper."],
                             "evidence": ["outputs/results.csv"],
                             "limitations": ["No precise figure digitization."],
@@ -103,7 +121,8 @@ class DocxWriterTests(unittest.TestCase):
             text = "\n".join(paragraph.text for paragraph in document.paragraphs)
             self.assertIn("复现结果二次审查报告", text)
             self.assertIn("reproduce_fig_1", text)
-            self.assertGreaterEqual(len(document.tables), 2)
+            self.assertIn("多维审查", text)
+            self.assertGreaterEqual(len(document.tables), 3)
 
 
 if __name__ == "__main__":

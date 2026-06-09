@@ -35,6 +35,31 @@ ALIGNMENT_LABELS = {
     "inconclusive": "无法判断",
 }
 
+SCIENTIFIC_VERDICT_LABELS = {
+    "supports_paper_claim": "支持论文主张",
+    "partially_supports_paper_claim": "部分支持论文主张",
+    "does_not_support_paper_claim": "不支持论文主张",
+    "cannot_assess": "无法评估",
+}
+
+DIMENSION_RATING_LABELS = {
+    "strong": "强",
+    "acceptable": "可接受",
+    "weak": "弱",
+    "missing": "缺失",
+    "unknown": "未知",
+}
+
+RESULT_REVIEW_DIMENSION_LABELS = {
+    "artifact_coverage": "产物覆盖",
+    "reproduction_logic": "复现逻辑",
+    "trend_shape": "趋势走向",
+    "metric_axis_scale": "指标与坐标轴",
+    "baseline_comparison": "baseline 对比",
+    "statistical_reliability": "统计可靠性",
+    "conclusion_support": "结论支持度",
+}
+
 
 def write_review_docx(
     path: Path,
@@ -286,11 +311,26 @@ def write_result_review_docx(
                 [
                     ["本地复现可信度", _label_with_raw(review.get("local_result_credibility"), RISK_LABELS)],
                     ["论文贴合度", _label_with_raw(review.get("paper_alignment"), ALIGNMENT_LABELS)],
+                    ["科学结论支持", _label_with_raw(review.get("scientific_verdict"), SCIENTIFIC_VERDICT_LABELS)],
                     ["判断置信度", _label_with_raw(review.get("confidence"), RISK_LABELS)],
                     ["原论文结果摘要", review.get("paper_result_summary")],
                     ["本地结果摘要", review.get("local_result_summary")],
                 ],
             )
+            dimension_rows = []
+            for dimension_review in _ordered_dimension_reviews(review):
+                dimension = str(dimension_review.get("dimension", ""))
+                dimension_rows.append(
+                    [
+                        _label_with_raw(dimension, RESULT_REVIEW_DIMENSION_LABELS),
+                        _label_with_raw(dimension_review.get("rating"), DIMENSION_RATING_LABELS),
+                        dimension_review.get("finding"),
+                        _join_items(dimension_review.get("evidence")),
+                    ]
+                )
+            if dimension_rows:
+                _add_heading(document, "多维审查", 3)
+                _add_table(document, ["维度", "评级", "判断", "证据"], dimension_rows)
             _add_labelled_bullets(document, "主要差异", review.get("differences"))
             _add_labelled_bullets(document, "可能原因", review.get("possible_causes"))
             _add_labelled_bullets(document, "证据", review.get("evidence"))
@@ -504,6 +544,12 @@ def _join_named_files(value: Any) -> str:
         else:
             names.append(_safe_text(item))
     return _join_items(names)
+
+
+def _ordered_dimension_reviews(review: dict[str, Any]) -> list[dict[str, Any]]:
+    dimension_reviews = [item for item in review.get("dimension_reviews", []) if isinstance(item, dict)]
+    order = {dimension: index for index, dimension in enumerate(RESULT_REVIEW_DIMENSION_LABELS)}
+    return sorted(dimension_reviews, key=lambda item: order.get(str(item.get("dimension", "")), len(order)))
 
 
 def _join_items(value: Any) -> str:

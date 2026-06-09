@@ -61,6 +61,22 @@ TrendDirection = Literal["decreasing", "increasing", "flat", "unknown"]
 AssumptionRisk = Literal["low", "medium", "high"]
 ResultCredibility = Literal["high", "medium", "low", "unknown"]
 ResultAlignment = Literal["match", "partial_match", "mismatch", "inconclusive"]
+ReviewDimension = Literal[
+    "artifact_coverage",
+    "reproduction_logic",
+    "trend_shape",
+    "metric_axis_scale",
+    "baseline_comparison",
+    "statistical_reliability",
+    "conclusion_support",
+]
+DimensionRating = Literal["strong", "acceptable", "weak", "missing", "unknown"]
+ScientificVerdict = Literal[
+    "supports_paper_claim",
+    "partially_supports_paper_claim",
+    "does_not_support_paper_claim",
+    "cannot_assess",
+]
 SupervisorAction = Literal["continue", "retry_stage", "use_fallback", "repair_code", "ask_human", "stop"]
 SupervisorRiskLevel = Literal["low", "medium", "high"]
 CodeReviewVerdict = Literal["pass", "revise"]
@@ -251,10 +267,30 @@ class RepairManifest(StrictModel):
     files: list[ManifestFile] = Field(min_length=1, max_length=MAX_MANIFEST_FILES)
 
 
+REQUIRED_RESULT_REVIEW_DIMENSIONS = {
+    "artifact_coverage",
+    "reproduction_logic",
+    "trend_shape",
+    "metric_axis_scale",
+    "baseline_comparison",
+    "statistical_reliability",
+    "conclusion_support",
+}
+
+
+class DimensionReview(StrictModel):
+    dimension: ReviewDimension
+    rating: DimensionRating
+    finding: NonEmptyStr
+    evidence: list[NonEmptyStr] = Field(min_length=1)
+
+
 class ExperimentResultReview(StrictModel):
     task_id: NonEmptyStr
     local_result_credibility: ResultCredibility
     paper_alignment: ResultAlignment
+    scientific_verdict: ScientificVerdict
+    dimension_reviews: list[DimensionReview] = Field(min_length=len(REQUIRED_RESULT_REVIEW_DIMENSIONS))
     paper_result_summary: NonEmptyStr
     local_result_summary: NonEmptyStr
     differences: list[str]
@@ -262,6 +298,19 @@ class ExperimentResultReview(StrictModel):
     evidence: list[NonEmptyStr]
     limitations: list[str]
     confidence: Confidence
+
+    @field_validator("dimension_reviews")
+    @classmethod
+    def dimension_reviews_cover_required_rubric(cls, value: list[DimensionReview]) -> list[DimensionReview]:
+        dimensions = [item.dimension for item in value]
+        dimension_set = set(dimensions)
+        missing = sorted(REQUIRED_RESULT_REVIEW_DIMENSIONS - dimension_set)
+        extra_duplicates = sorted({dimension for dimension in dimensions if dimensions.count(dimension) > 1})
+        if missing:
+            raise ValueError(f"must include all required dimensions; missing: {', '.join(missing)}")
+        if extra_duplicates:
+            raise ValueError(f"must not repeat dimensions: {', '.join(extra_duplicates)}")
+        return value
 
 
 class ResultReviewDocument(StrictModel):

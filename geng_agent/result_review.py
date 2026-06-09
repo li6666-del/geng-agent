@@ -39,6 +39,16 @@ RESULT_KEYWORDS = (
     "snr",
     "baseline",
 )
+RESULT_REVIEW_DIMENSION_LABELS = {
+    "artifact_coverage": "产物覆盖",
+    "reproduction_logic": "复现逻辑",
+    "trend_shape": "趋势走向",
+    "metric_axis_scale": "指标与坐标轴",
+    "baseline_comparison": "baseline 对比",
+    "statistical_reliability": "统计可靠性",
+    "conclusion_support": "结论支持度",
+}
+RESULT_REVIEW_DIMENSION_ORDER = tuple(RESULT_REVIEW_DIMENSION_LABELS)
 
 
 def run_result_review(
@@ -521,6 +531,7 @@ def aggregate_result_reviews(experiment_reviews: list[dict[str, Any]], *, eviden
     credibilities = [str(review.get("local_result_credibility", "unknown")) for review in experiment_reviews]
     mismatch_count = sum(1 for alignment in alignments if alignment in {"mismatch", "inconclusive"})
     low_count = sum(1 for credibility in credibilities if credibility in {"low", "unknown"})
+    dimension_findings = summarize_dimension_weaknesses(experiment_reviews)
     return {
         "overall_result_credibility": weakest_label(credibilities, ["unknown", "low", "medium", "high"], default="unknown"),
         "overall_alignment": weakest_label(alignments, ["inconclusive", "mismatch", "partial_match", "match"], default="inconclusive"),
@@ -529,6 +540,7 @@ def aggregate_result_reviews(experiment_reviews: list[dict[str, Any]], *, eviden
             "第四轮采用按实验拆分的多模态审查；每个实验单独发送相关本地图像和论文页面图。",
             f"本次共审查 {len(experiment_reviews)} 个实验任务，其中 {mismatch_count} 个实验贴合度为 mismatch/inconclusive。",
             f"本次共有 {low_count} 个实验的本地结果可信度为 low/unknown。",
+            *dimension_findings,
         ],
         "recommended_human_checks": [
             "人工核对论文图表关键点与本地 CSV/PNG 的坐标轴、数量级和曲线趋势。",
@@ -540,6 +552,32 @@ def aggregate_result_reviews(experiment_reviews: list[dict[str, Any]], *, eviden
             "不直接判定论文造假。"
         ),
     }
+
+
+def summarize_dimension_weaknesses(experiment_reviews: list[dict[str, Any]]) -> list[str]:
+    weak_counts = {dimension: 0 for dimension in RESULT_REVIEW_DIMENSION_ORDER}
+    total_counts = {dimension: 0 for dimension in RESULT_REVIEW_DIMENSION_ORDER}
+    for review in experiment_reviews:
+        if not isinstance(review, dict):
+            continue
+        for dimension_review in review.get("dimension_reviews", []):
+            if not isinstance(dimension_review, dict):
+                continue
+            dimension = str(dimension_review.get("dimension", ""))
+            if dimension not in weak_counts:
+                continue
+            total_counts[dimension] += 1
+            if dimension_review.get("rating") in {"weak", "missing", "unknown"}:
+                weak_counts[dimension] += 1
+
+    findings = []
+    for dimension in RESULT_REVIEW_DIMENSION_ORDER:
+        weak_count = weak_counts[dimension]
+        total_count = total_counts[dimension]
+        if weak_count:
+            label = RESULT_REVIEW_DIMENSION_LABELS[dimension]
+            findings.append(f"{label}维度有 {weak_count}/{total_count} 个实验为 weak/missing/unknown，建议优先复核该类证据。")
+    return findings
 
 
 def weakest_label(values: list[str], order: list[str], *, default: str) -> str:
@@ -767,9 +805,26 @@ def render_result_review_markdown(result: dict[str, Any], *, evidence: dict[str,
                 "",
                 f"- 本地复现可信度：`{review.get('local_result_credibility')}`",
                 f"- 论文贴合度：`{review.get('paper_alignment')}`",
+                f"- 科学结论支持：`{review.get('scientific_verdict')}`",
                 f"- 判断置信度：`{review.get('confidence')}`",
                 f"- 原论文结果摘要：{review.get('paper_result_summary')}",
                 f"- 本地结果摘要：{review.get('local_result_summary')}",
+                "",
+                "**多维审查**",
+                "",
+            ]
+        )
+        for dimension_review in ordered_dimension_reviews(review):
+            dimension = str(dimension_review.get("dimension", ""))
+            label = RESULT_REVIEW_DIMENSION_LABELS.get(dimension, dimension or "未知维度")
+            rating = dimension_review.get("rating", "unknown")
+            finding = dimension_review.get("finding", "未列出")
+            lines.append(f"- {label}（`{dimension}`）：`{rating}`；{finding}")
+            evidence_items = dimension_review.get("evidence", [])
+            if isinstance(evidence_items, list) and evidence_items:
+                lines.extend(f"  - 证据：{item}" for item in evidence_items)
+        lines.extend(
+            [
                 "",
                 "**主要差异**",
                 "",
@@ -790,6 +845,12 @@ def render_result_review_markdown(result: dict[str, Any], *, evidence: dict[str,
     lines.extend(f"- {item}" for item in result.get("recommended_human_checks", []) or ["未列出"])
     lines.extend(["", "## 说明", "", str(result.get("note", "")), ""])
     return "\n".join(lines)
+
+
+def ordered_dimension_reviews(review: dict[str, Any]) -> list[dict[str, Any]]:
+    dimension_reviews = [item for item in review.get("dimension_reviews", []) if isinstance(item, dict)]
+    order = {dimension: index for index, dimension in enumerate(RESULT_REVIEW_DIMENSION_ORDER)}
+    return sorted(dimension_reviews, key=lambda item: order.get(str(item.get("dimension", "")), len(order)))
 
 
 def build_result_json_retry_prompt(
@@ -813,7 +874,8 @@ END UNTRUSTED DATA: bad_output
 Regenerate a complete JSON object that follows the requested {schema_label} schema.
 Output JSON only, with no Markdown fences or explanation.
 All natural-language values in the regenerated JSON must be written in Chinese.
-Keep formulas, file names, task IDs, field names, model names, and necessary technical terms in their original form when needed, but write explanations, summaries, differences, causes, evidence, limitations, and notes in Chinese.
+Keep formulas, file names, task IDs, field names, model names, enum labels, and necessary technical terms in their original form when needed, but write explanations, summaries, dimension findings, differences, causes, evidence, limitations, and notes in Chinese.
+Every experiment review must include scientific_verdict and all seven dimension_reviews: artifact_coverage, reproduction_logic, trend_shape, metric_axis_scale, baseline_comparison, statistical_reliability, conclusion_support.
 
 Original task:
 {original_prompt[-12000:]}

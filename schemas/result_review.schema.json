@@ -1,5 +1,56 @@
 {
   "$defs": {
+    "DimensionReview": {
+      "additionalProperties": false,
+      "properties": {
+        "dimension": {
+          "enum": [
+            "artifact_coverage",
+            "reproduction_logic",
+            "trend_shape",
+            "metric_axis_scale",
+            "baseline_comparison",
+            "statistical_reliability",
+            "conclusion_support"
+          ],
+          "title": "Dimension",
+          "type": "string"
+        },
+        "rating": {
+          "enum": [
+            "strong",
+            "acceptable",
+            "weak",
+            "missing",
+            "unknown"
+          ],
+          "title": "Rating",
+          "type": "string"
+        },
+        "finding": {
+          "minLength": 1,
+          "title": "Finding",
+          "type": "string"
+        },
+        "evidence": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Evidence",
+          "type": "array"
+        }
+      },
+      "required": [
+        "dimension",
+        "rating",
+        "finding",
+        "evidence"
+      ],
+      "title": "DimensionReview",
+      "type": "object"
+    },
     "ExperimentResultReview": {
       "additionalProperties": false,
       "properties": {
@@ -27,6 +78,24 @@
           ],
           "title": "Paper Alignment",
           "type": "string"
+        },
+        "scientific_verdict": {
+          "enum": [
+            "supports_paper_claim",
+            "partially_supports_paper_claim",
+            "does_not_support_paper_claim",
+            "cannot_assess"
+          ],
+          "title": "Scientific Verdict",
+          "type": "string"
+        },
+        "dimension_reviews": {
+          "items": {
+            "$ref": "#/$defs/DimensionReview"
+          },
+          "minItems": 7,
+          "title": "Dimension Reviews",
+          "type": "array"
         },
         "paper_result_summary": {
           "minLength": 1,
@@ -81,6 +150,8 @@
         "task_id",
         "local_result_credibility",
         "paper_alignment",
+        "scientific_verdict",
+        "dimension_reviews",
         "paper_result_summary",
         "local_result_summary",
         "differences",

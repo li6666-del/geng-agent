@@ -7,6 +7,29 @@ from geng_agent.schema_models import SCHEMA_FILENAMES, SCHEMA_MODELS, response_f
 from geng_agent.schemas import validate_stage, validate_task_fact_refs
 
 
+REVIEW_DIMENSIONS = [
+    "artifact_coverage",
+    "reproduction_logic",
+    "trend_shape",
+    "metric_axis_scale",
+    "baseline_comparison",
+    "statistical_reliability",
+    "conclusion_support",
+]
+
+
+def dimension_reviews() -> list[dict]:
+    return [
+        {
+            "dimension": dimension,
+            "rating": "acceptable",
+            "finding": f"{dimension} 维度有基础证据。",
+            "evidence": ["outputs/results.csv"],
+        }
+        for dimension in REVIEW_DIMENSIONS
+    ]
+
+
 class SchemaTests(unittest.TestCase):
     def test_repro_project_manifest_requires_smoke_config(self) -> None:
         manifest = {
@@ -108,6 +131,36 @@ class SchemaTests(unittest.TestCase):
         issues = validate_stage("repro_tasks", tasks)
 
         self.assertTrue(any("metric_formula" in issue.path for issue in issues))
+
+    def test_result_review_experiment_requires_all_scientific_dimensions(self) -> None:
+        reviews = dimension_reviews()
+        reviews[-1] = {
+            "dimension": "artifact_coverage",
+            "rating": "acceptable",
+            "finding": "重复产物覆盖维度。",
+            "evidence": ["outputs/results.csv"],
+        }
+        issues = validate_stage(
+            "result_review_experiment",
+            {
+                "task_id": "reproduce_fig_1",
+                "local_result_credibility": "medium",
+                "paper_alignment": "partial_match",
+                "scientific_verdict": "partially_supports_paper_claim",
+                "dimension_reviews": reviews,
+                "paper_result_summary": "论文显示 BER 随 SNR 下降。",
+                "local_result_summary": "本地 CSV 显示 BER 下降。",
+                "differences": ["趋势一致但样本少。"],
+                "possible_causes": ["smoke 配置样本量较小。"],
+                "evidence": ["outputs/results.csv"],
+                "limitations": ["未精确读图。"],
+                "confidence": "medium",
+            },
+        )
+
+        issue_text = "\n".join(f"{issue.path}: {issue.message}" for issue in issues)
+        self.assertIn("dimension_reviews", issue_text)
+        self.assertIn("conclusion_support", issue_text)
 
     def test_exported_json_schemas_match_pydantic_models(self) -> None:
         schema_dir = Path(__file__).resolve().parents[1] / "schemas"

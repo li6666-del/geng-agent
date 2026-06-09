@@ -758,6 +758,24 @@ class PipelineTests(unittest.TestCase):
                                 "task_id": "reproduce_fig_1",
                                 "local_result_credibility": "medium",
                                 "paper_alignment": "partial_match",
+                                "scientific_verdict": "partially_supports_paper_claim",
+                                "dimension_reviews": [
+                                    {
+                                        "dimension": dimension,
+                                        "rating": "acceptable",
+                                        "finding": f"{dimension} 维度在 smoke-scale 输出中有基础证据。",
+                                        "evidence": ["outputs/results.csv", "local_output:ber_vs_snr.png"],
+                                    }
+                                    for dimension in [
+                                        "artifact_coverage",
+                                        "reproduction_logic",
+                                        "trend_shape",
+                                        "metric_axis_scale",
+                                        "baseline_comparison",
+                                        "statistical_reliability",
+                                        "conclusion_support",
+                                    ]
+                                ],
                                 "paper_result_summary": "Paper reports BER decreasing with SNR.",
                                 "local_result_summary": "Local CSV shows BER decreasing from 0.1 to 0.05.",
                                 "differences": ["Only smoke-scale points were generated."],

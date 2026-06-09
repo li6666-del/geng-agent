@@ -10,6 +10,7 @@ from geng_agent.llm import LLMImage, OpenAICompatibleClient
 from geng_agent.result_review import (
     build_result_json_retry_prompt,
     encode_png_for_llm,
+    render_result_review_markdown,
     select_paper_pages,
     select_paper_pages_for_task,
     summarize_csv_file,
@@ -18,6 +19,27 @@ from geng_agent.schemas import validate_stage
 
 
 PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+REVIEW_DIMENSIONS = [
+    "artifact_coverage",
+    "reproduction_logic",
+    "trend_shape",
+    "metric_axis_scale",
+    "baseline_comparison",
+    "statistical_reliability",
+    "conclusion_support",
+]
+
+
+def scientific_dimension_reviews(rating: str = "acceptable") -> list[dict]:
+    return [
+        {
+            "dimension": dimension,
+            "rating": rating,
+            "finding": f"{dimension} 维度有基础证据。",
+            "evidence": ["outputs/results.csv"],
+        }
+        for dimension in REVIEW_DIMENSIONS
+    ]
 
 
 class ResultReviewUnitTests(unittest.TestCase):
@@ -125,6 +147,91 @@ class ResultReviewUnitTests(unittest.TestCase):
 
         self.assertTrue(issues)
 
+    def test_result_review_schema_requires_scientific_rubric(self) -> None:
+        issues = validate_stage(
+            "result_review_experiment",
+            {
+                "task_id": "reproduce_fig_1",
+                "local_result_credibility": "medium",
+                "paper_alignment": "partial_match",
+                "paper_result_summary": "论文显示 BER 随 SNR 下降。",
+                "local_result_summary": "本地 CSV 显示 BER 下降。",
+                "differences": ["仅生成 smoke-scale 数据。"],
+                "possible_causes": ["样本量少于论文。"],
+                "evidence": ["outputs/results.csv"],
+                "limitations": ["未精确读图。"],
+                "confidence": "medium",
+            },
+        )
+
+        issue_text = "\n".join(f"{issue.path}: {issue.message}" for issue in issues)
+        self.assertIn("scientific_verdict", issue_text)
+        self.assertIn("dimension_reviews", issue_text)
+
+    def test_result_review_schema_rejects_invalid_dimension_and_rating(self) -> None:
+        bad_dimensions = scientific_dimension_reviews()
+        bad_dimensions[0] = {
+            "dimension": "numeric_only",
+            "rating": "great",
+            "finding": "错误维度。",
+            "evidence": ["outputs/results.csv"],
+        }
+
+        issues = validate_stage(
+            "result_review_experiment",
+            {
+                "task_id": "reproduce_fig_1",
+                "local_result_credibility": "medium",
+                "paper_alignment": "partial_match",
+                "scientific_verdict": "partially_supports_paper_claim",
+                "dimension_reviews": bad_dimensions,
+                "paper_result_summary": "论文显示 BER 随 SNR 下降。",
+                "local_result_summary": "本地 CSV 显示 BER 下降。",
+                "differences": ["趋势一致但样本少。"],
+                "possible_causes": ["smoke 配置样本量较小。"],
+                "evidence": ["outputs/results.csv"],
+                "limitations": ["未精确读图。"],
+                "confidence": "medium",
+            },
+        )
+
+        issue_text = "\n".join(f"{issue.path}: {issue.message}" for issue in issues)
+        self.assertIn("dimension_reviews[0].dimension", issue_text)
+        self.assertIn("dimension_reviews[0].rating", issue_text)
+
+    def test_render_result_review_markdown_includes_dimension_reviews(self) -> None:
+        markdown = render_result_review_markdown(
+            {
+                "overall_result_credibility": "medium",
+                "overall_alignment": "partial_match",
+                "experiment_reviews": [
+                    {
+                        "task_id": "reproduce_fig_1",
+                        "local_result_credibility": "medium",
+                        "paper_alignment": "partial_match",
+                        "scientific_verdict": "partially_supports_paper_claim",
+                        "dimension_reviews": scientific_dimension_reviews(),
+                        "paper_result_summary": "论文显示 BER 随 SNR 下降。",
+                        "local_result_summary": "本地 CSV 显示 BER 下降。",
+                        "differences": ["只有 smoke-scale 数据。"],
+                        "possible_causes": ["样本量较少。"],
+                        "evidence": ["outputs/results.csv"],
+                        "limitations": ["未精确读图。"],
+                        "confidence": "medium",
+                    }
+                ],
+                "cross_experiment_findings": ["趋势基本存在。"],
+                "recommended_human_checks": ["运行完整配置。"],
+                "note": "仅评估复现风险。",
+            },
+            evidence={"output_images": [], "paper_images": []},
+        )
+
+        self.assertIn("**多维审查**", markdown)
+        self.assertIn("复现逻辑", markdown)
+        self.assertIn("趋势走向", markdown)
+        self.assertIn("partially_supports_paper_claim", markdown)
+
     def test_result_review_retry_prompt_keeps_chinese_language_contract(self) -> None:
         prompt = build_result_json_retry_prompt(
             "原始任务：输出中文审查。",
@@ -134,7 +241,9 @@ class ResultReviewUnitTests(unittest.TestCase):
         )
 
         self.assertIn("must be written in Chinese", prompt)
-        self.assertIn("summaries, differences, causes, evidence, limitations, and notes in Chinese", prompt)
+        self.assertIn("dimension findings", prompt)
+        self.assertIn("differences, causes, evidence, limitations, and notes in Chinese", prompt)
+        self.assertIn("all seven dimension_reviews", prompt)
 
 
 class LLMClientMultimodalTests(unittest.TestCase):
