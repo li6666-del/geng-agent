@@ -143,14 +143,19 @@ def build_generation_client(
     )
     if not resolved_key:
         raise ValueError("缺少生成模型 API key：请设置 GENG_GEN_API_KEY（或回退用 GENG_LLM_API_KEY）。")
+    # The coder can carry its OWN reasoning config (so "max reasoning" lands on the strong coder
+    # without forcing it on the multimodal main client's many extraction/review calls). The
+    # explicit CLI arg wins; otherwise fall back to GENG_GEN_* env. Unset -> no reasoning field.
+    resolved_thinking = thinking or get_config_value("GENG_GEN_THINKING")
+    resolved_reasoning = reasoning_effort or get_config_value("GENG_GEN_REASONING_EFFORT")
     return OpenAICompatibleClient(
         api_key=resolved_key,
         base_url=resolved_base,
         model=resolved_model,
         temperature=temperature,
         timeout=timeout,
-        thinking=thinking,
-        reasoning_effort=reasoning_effort,
+        thinking=resolved_thinking,
+        reasoning_effort=resolved_reasoning,
     )
 
 
