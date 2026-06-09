@@ -146,8 +146,10 @@ def _is_auxiliary_generated_path(path: Path, root: Path) -> bool:
     return "__pycache__" in parts or "repair_logs" in parts
 
 
-def inspect_output_artifacts(root: Path, *, since: float | None = None) -> dict[str, Any]:
+def inspect_output_artifacts(root: Path, *, since: float | None = None, subdir: str | None = None) -> dict[str, Any]:
     outputs = root / "outputs"
+    if subdir:
+        outputs = outputs / subdir
     if not outputs.exists():
         return {
             "outputs_dir_exists": False,
@@ -160,27 +162,45 @@ def inspect_output_artifacts(root: Path, *, since: float | None = None) -> dict[
             "has_summary_json": False,
         }
 
+    # Scan top-level outputs/ AND one level of per-task subdirs (outputs/<task_id>/...),
+    # so projects that isolate each task's artifacts under their own folder still satisfy
+    # the aggregate gate. Names are reported relative to outputs/ so a top-level
+    # results.csv stays "results.csv" while a per-task one becomes "<task_id>/results.csv".
+    deep = not subdir
+
+    def _collect(pattern: str) -> list[Path]:
+        found = list(outputs.glob(pattern))
+        if deep:
+            found += list(outputs.glob("*/" + pattern))
+        return sorted(set(found))
+
+    def _rel(path: Path) -> str:
+        try:
+            return path.relative_to(outputs).as_posix()
+        except ValueError:
+            return path.name
+
     invalid_files: list[dict[str, str]] = []
     csv_files = []
-    for path in sorted(outputs.glob("*.csv")):
+    for path in _collect("*.csv"):
         if _is_fresh(path, since) and _valid_csv(path):
-            csv_files.append(path.name)
+            csv_files.append(_rel(path))
         else:
-            invalid_files.append({"file": path.name, "reason": "csv is stale, empty, or invalid"})
+            invalid_files.append({"file": _rel(path), "reason": "csv is stale, empty, or invalid"})
 
     png_files = []
-    for path in sorted(outputs.glob("*.png")):
+    for path in _collect("*.png"):
         if _is_fresh(path, since) and _valid_png(path):
-            png_files.append(path.name)
+            png_files.append(_rel(path))
         else:
-            invalid_files.append({"file": path.name, "reason": "png is stale or invalid"})
+            invalid_files.append({"file": _rel(path), "reason": "png is stale or invalid"})
 
     summary_json_files = []
-    for path in sorted(outputs.glob("summary*.json")):
+    for path in _collect("summary*.json"):
         if _is_fresh(path, since) and _valid_summary_json(path):
-            summary_json_files.append(path.name)
+            summary_json_files.append(_rel(path))
         else:
-            invalid_files.append({"file": path.name, "reason": "summary json is stale or invalid"})
+            invalid_files.append({"file": _rel(path), "reason": "summary json is stale or invalid"})
     return {
         "outputs_dir_exists": True,
         "csv_files": csv_files,

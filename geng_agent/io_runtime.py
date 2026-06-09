@@ -1,0 +1,271 @@
+"""Trusted reproduction-project IO runtime, injected verbatim into every project.
+
+`IO_RUNTIME_PY` is written to ``src/_io.py`` of every generated reproduction
+project. Generated task scripts MUST call its helpers (``begin`` / ``write_table``
+/ ``write_figure`` / ``finish``) for ALL artifact writing instead of hand-rolling
+CSV / JSON / figure serialization and self-checks. It is NOT produced by the model
+and MUST NOT be edited during repair -- it is the deterministic ``p≈1`` layer that
+guarantees the artifact-correctness rules the model used to re-derive (and get
+wrong) on every file.
+
+The string is authored once, here, and is identical for every paper because it
+only does paper-independent plumbing (seed, write CSV/PNG/summary, scrub
+NaN/Inf/complex/numpy, self-check, honest exit code). It is deliberately written
+to pass this project's own ``static_scan_repro_project`` (no forbidden imports,
+calls, dynamic builtins, env access, or absolute-path literals)."""
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# The verbatim content of src/_io.py inside every generated project.
+# ---------------------------------------------------------------------------
+IO_RUNTIME_PY = r'''"""Trusted IO runtime for this reproduction project (injected by geng-agent).
+
+DO NOT EDIT. Generated task scripts import and call these helpers for every
+artifact they write. They make the artifact-correctness guarantees deterministic
+so generated code cannot get them wrong:
+
+- begin(task_id, config)  -> seeds numpy + random from config["seed"], records the
+  seed, creates outputs/<task_id>/, and returns a numpy Generator.
+- write_table(task_id, columns, rows) -> outputs/<task_id>/results.csv with a
+  header and >=1 row; every cell coerced to a finite real scalar (complex -> real
+  part, arrays -> mean, NaN/Inf -> blank).
+- write_figure(task_id, name, fig) -> outputs/<task_id>/<name>.png; refuses to
+  save an empty figure.
+- finish(task_id, metrics, assumptions) -> outputs/<task_id>/summary.json, coerced
+  to JSON-safe builtin types (numpy -> builtin, NaN/Inf -> null), re-read to
+  self-check, returning an honest exit code (0 only on success).
+"""
+from __future__ import annotations
+
+import csv
+import json
+import math
+import random
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+
+__all__ = ["begin", "write_table", "write_figure", "finish", "outputs_dir"]
+
+_OUTPUTS = Path("outputs")
+_SEEDS = {}
+
+
+def _slug(value):
+    text = str(value).strip() or "task"
+    safe = "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in text)
+    return safe.strip("._-") or "task"
+
+
+def outputs_dir(task_id):
+    path = _OUTPUTS / _slug(task_id)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _to_int(value, default):
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def begin(task_id, config):
+    """Seed RNGs deterministically, create outputs/<task_id>/, return a Generator."""
+    seed = 12345
+    if isinstance(config, dict):
+        seed = _to_int(config.get("seed"), 12345)
+    np.random.seed(seed)
+    random.seed(seed)
+    _SEEDS[_slug(task_id)] = seed
+    outputs_dir(task_id)
+    return np.random.default_rng(seed)
+
+
+def _real_scalar(value):
+    """Best-effort convert any value to a finite Python float, else None."""
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return number if math.isfinite(number) else None
+    if isinstance(value, complex):
+        number = float(value.real)
+        return number if math.isfinite(number) else None
+    if isinstance(value, np.generic):
+        return _real_scalar(value.item())
+    if isinstance(value, np.ndarray):
+        flat = np.asarray(value).reshape(-1)
+        if flat.size == 0:
+            return None
+        return _real_scalar(flat.mean())
+    return None
+
+
+def _cell(value):
+    """A CSV cell: real strings pass through, numbers -> finite real text, else blank."""
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    number = _real_scalar(value)
+    return repr(number) if number is not None else ""
+
+
+def write_table(task_id, columns, rows):
+    """Write outputs/<task_id>/results.csv with a header and >=1 coerced data row."""
+    columns = [str(col) for col in (columns or [])]
+    if not columns:
+        raise ValueError("write_table requires at least one column name")
+    norm_rows = []
+    for row in rows or []:
+        if isinstance(row, dict):
+            norm_rows.append([_cell(row.get(col)) for col in columns])
+        elif isinstance(row, (list, tuple)):
+            values = list(row) + [""] * (len(columns) - len(row))
+            norm_rows.append([_cell(value) for value in values[: len(columns)]])
+        else:
+            norm_rows.append([_cell(row)] + [""] * (len(columns) - 1))
+    if not norm_rows:
+        raise ValueError("write_table requires at least one data row")
+    path = outputs_dir(task_id) / "results.csv"
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(columns)
+        writer.writerows(norm_rows)
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        check = list(csv.reader(handle))
+    if len(check) < 2:
+        raise ValueError("results.csv self-check failed: missing data rows")
+    return str(path)
+
+
+def _figure_has_content(fig):
+    for axes in fig.get_axes():
+        if axes.lines or axes.patches or axes.collections or axes.images:
+            return True
+    return False
+
+
+def write_figure(task_id, name, fig=None):
+    """Save a non-empty matplotlib figure to outputs/<task_id>/<name>.png, then close it."""
+    figure = fig if fig is not None else plt.gcf()
+    if not _figure_has_content(figure):
+        plt.close(figure)
+        raise ValueError("write_figure refused to save an empty figure")
+    path = outputs_dir(task_id) / (_slug(name) + ".png")
+    figure.savefig(path, dpi=150)
+    plt.close(figure)
+    return str(path)
+
+
+def _json_safe(value):
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, str) or value is None:
+        return value
+    if isinstance(value, complex):
+        number = float(value.real)
+        return number if math.isfinite(number) else None
+    if isinstance(value, np.generic):
+        return _json_safe(value.item())
+    if isinstance(value, np.ndarray):
+        return _json_safe(value.tolist())
+    return str(value)
+
+
+def finish(task_id, metrics=None, assumptions=None, extra=None, ok=True):
+    """Write outputs/<task_id>/summary.json (JSON-safe + self-checked). Return exit code."""
+    metrics_safe = _json_safe(metrics if metrics is not None else {})
+    if not isinstance(metrics_safe, (dict, list)):
+        metrics_safe = {"value": metrics_safe}
+    assumptions_safe = _json_safe(assumptions if assumptions is not None else [])
+    if not isinstance(assumptions_safe, list):
+        assumptions_safe = [assumptions_safe]
+    summary = {
+        "task_id": str(task_id),
+        "seed": _SEEDS.get(_slug(task_id)),
+        "ok": bool(ok),
+        "metrics": metrics_safe,
+        "assumptions": assumptions_safe,
+    }
+    if isinstance(extra, dict):
+        for key, item in extra.items():
+            summary[str(key)] = _json_safe(item)
+    path = outputs_dir(task_id) / "summary.json"
+    path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    reread = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(reread, dict) or "task_id" not in reread:
+        raise ValueError("summary.json self-check failed")
+    return 0 if ok else 1
+'''
+
+
+# A short, static description of the runtime API, embedded into the codegen prompts
+# so the model knows how to CALL src/_io.py without ever seeing or editing its body.
+IO_RUNTIME_API_DOC = """\
+src/_io.py 是本地已提供的“受信任运行时”，已经在项目里，禁止生成或修改它，只能 `from src import _io` 调用。
+所有 CSV / PNG / summary.json 必须通过它写出，不要自己写 csv/json/savefig 的序列化或写后自检逻辑：
+- `rng = _io.begin(task_id, config)`：按 config["seed"] 播种 numpy+random、建 outputs/<task_id>/、返回 numpy Generator。
+- `_io.write_table(task_id, columns, rows)`：写 outputs/<task_id>/results.csv（带表头、≥1 行；每格自动转有限实数，复数取实部、数组取均值、NaN/Inf 留空）。rows 可为 list[dict] 或 list[list]。
+- `_io.write_figure(task_id, name, fig)`：把非空 matplotlib figure 存成 outputs/<task_id>/<name>.png（空图会报错）。
+- `return _io.finish(task_id, metrics=..., assumptions=...)`：写 outputs/<task_id>/summary.json（自动转 JSON 安全类型、刷 NaN/Inf、写后复读自检）并返回诚实退出码；放在 main() 末尾 `raise SystemExit(_io.finish(...))`。
+"""
+
+
+def inject_io_runtime(project_dir: Path) -> Path:
+    """Write the trusted src/_io.py (and src/__init__.py) into a project, and make
+    sure numpy + matplotlib are declared so its imports pass the consistency gate.
+    Idempotent: safe to call on a fresh project or an existing/candidate copy."""
+    project_dir = Path(project_dir)
+    src_dir = project_dir / "src"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    (src_dir / "_io.py").write_text(IO_RUNTIME_PY, encoding="utf-8", newline="\n")
+    init_path = src_dir / "__init__.py"
+    if not init_path.exists():
+        init_path.write_text("", encoding="utf-8", newline="\n")
+    ensure_runtime_requirements(project_dir)
+    return src_dir / "_io.py"
+
+
+def ensure_runtime_requirements(project_dir: Path) -> list[str]:
+    """Guarantee numpy + matplotlib (which src/_io.py imports) are in requirements.txt.
+    Returns the package names that had to be added (empty if nothing changed)."""
+    req_path = Path(project_dir) / "requirements.txt"
+    needed = ["numpy", "matplotlib"]
+    existing_lines: list[str] = []
+    declared: set[str] = set()
+    if req_path.exists():
+        for raw in req_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            existing_lines.append(raw)
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            package = re.split(r"[<>=!~\[]", line, maxsplit=1)[0].strip().lower().replace("_", "-")
+            declared.add(package)
+    additions = [package for package in needed if package not in declared]
+    if not additions:
+        return []
+    lines = [line for line in existing_lines if line.strip()]
+    lines.extend(additions)
+    req_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return additions

@@ -123,15 +123,21 @@ class PromptTests(unittest.TestCase):
             code_context="",
         )
 
-        # complex -> real, plain-type/JSON-safe serialization, write-then-verify, no false success
-        self.assertIn("np.real", file_prompt)
-        self.assertIn(".tolist()", file_prompt)
+        # Serialization / NaN-Inf scrubbing / write-then-verify are now delegated to the
+        # trusted src/_io runtime (deterministic p≈1), not re-derived per generated file:
+        # assert the prompt steers codegen to CALL it rather than hand-roll the plumbing.
+        self.assertIn("_io.begin", file_prompt)
+        self.assertIn("_io.write_table", file_prompt)
+        self.assertIn("_io.finish", file_prompt)
+        self.assertIn("受信任", file_prompt)
+        self.assertIn("json.load", file_prompt)  # described as _io's self-check
         self.assertIn("Inf", file_prompt)
-        self.assertIn("json.load", file_prompt)
-        self.assertIn("谎报", file_prompt)
-        # rerun2 fixes: forbid float(array), and summary.json must be written unconditionally
+        # science-side numeric correctness the model must still get right before calling _io
+        self.assertIn("np.real", file_prompt)
         self.assertIn("length-1", file_prompt)
+        # honest-failure discipline preserved: summary written unconditionally, no faked success
         self.assertIn("无条件", file_prompt)
+        self.assertIn("粉饰", file_prompt)
         # the runtime-repair prompt carries the same discipline
         self.assertIn("np.real", repair_prompt)
         self.assertIn("谎报", repair_prompt)

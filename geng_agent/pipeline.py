@@ -25,6 +25,7 @@ from .facts_normalize import (
 from .heuristic_fallbacks import build_fallback_engineering_facts, build_fallback_repro_tasks
 from .json_utils import parse_json_object, pretty_json
 from .llm import LLMClient
+from .io_runtime import inject_io_runtime
 from .outputs import validate_repro_project, write_file_manifest, write_json, write_text
 from .prompts import PromptBook
 from .result_review import run_result_review
@@ -1376,6 +1377,7 @@ class ReviewPipeline:
         # making the manifest, the disk, and template_fallback_used mutually inconsistent.
         _clear_project_code_files(repro_project_dir)
         written_files = write_file_manifest(manifest, repro_project_dir)
+        inject_io_runtime(repro_project_dir)
         return manifest, written_files
 
     def _ensure_repro_project_from_manifest(
@@ -1389,10 +1391,16 @@ class ReviewPipeline:
         if resume and repro_project_dir.exists():
             validation = validate_repro_project(repro_project_dir)
             if validation.get("required_files_present") and validation.get("python_compiles"):
+                inject_io_runtime(repro_project_dir)
                 return _manifest_paths(manifest, repro_project_dir)
 
         _clear_stage_outputs(output_dir, "project")
-        return write_file_manifest(manifest, repro_project_dir)
+        written = write_file_manifest(manifest, repro_project_dir)
+        # Drop the trusted src/_io.py runtime in so generated code can delegate all
+        # artifact serialization/self-check to deterministic code instead of re-deriving
+        # it (and getting it wrong) per file. Idempotent; runs before code review / run.
+        inject_io_runtime(repro_project_dir)
+        return written
 
     def _load_or_run_repro(
         self,
