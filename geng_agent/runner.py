@@ -14,6 +14,7 @@ from .openhands_repair import OpenHandsInvoker, run_openhands_repair_candidate
 from .outputs import inspect_output_artifacts, validate_repro_project, write_file_manifest, write_json, write_text
 from .prompts import PromptBook
 from .runner_types import RepairBackend, normalize_repair_backend
+from .task_scripts import load_tasks_manifest
 from .schema_models import response_format_for_stage
 from .schemas import format_issues, validate_stage
 from .security import (
@@ -41,6 +42,20 @@ def run_repro_with_repair(
     backend = normalize_repair_backend(repair_backend)
     logs_dir = repro_project_dir / "repair_logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
+
+    # Per-task split: when the project ships a tasks_manifest.json, run each task as its own
+    # subprocess with its own timeout (hard, process-level isolation) instead of one giant
+    # run_experiment.py. Absent a manifest, fall back to the legacy single-script path below,
+    # so existing projects are unaffected.
+    tasks_manifest = load_tasks_manifest(repro_project_dir)
+    if tasks_manifest is not None:
+        return run_tasks_with_repair(
+            repro_project_dir=repro_project_dir,
+            manifest=tasks_manifest,
+            backend=backend,
+            timeout_seconds=timeout_seconds,
+        )
+
     phases = repro_run_phases(repro_project_dir)
     phase_results: list[dict[str, Any]] = []
     all_attempts: list[dict[str, Any]] = []
@@ -591,3 +606,169 @@ def ensure_inside(root: Path, target: Path) -> None:
 
 def wrap_untrusted(label: str, text: str) -> str:
     return f"BEGIN UNTRUSTED DATA: {label}\n{text}\nEND UNTRUSTED DATA: {label}"
+
+
+def run_tasks_with_repair(
+    *,
+    repro_project_dir: Path,
+    manifest: dict[str, Any],
+    backend: RepairBackend = RepairBackend.LLM,
+    timeout_seconds: float = 120.0,
+) -> dict[str, Any]:
+    """Task-aware orchestration: run each task as its OWN subprocess with its OWN timeout, so
+    a hang / segfault / OOM in one task only fails that task instead of sinking every other
+    task's artifacts (the hard isolation a single-process try/except cannot give). Partial
+    success is first-class: the full phase keeps whatever passed rather than zeroing out.
+
+    (Per-task LLM/OpenHands repair localization is layered on next; this is the isolation +
+    partial-success core. Gated on tasks_manifest.json so legacy projects are unaffected.)"""
+    logs_dir = repro_project_dir / "repair_logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    phase_results: list[dict[str, Any]] = []
+    for phase in repro_run_phases(repro_project_dir):
+        result = run_tasks_once(repro_project_dir, manifest, phase=phase, logs_dir=logs_dir)
+        write_json(logs_dir / f"tasks_{phase}_run.json", redact_data(result))
+        phase_results.append(result)
+        # Smoke is tiny, so it must fully pass; a smoke failure signals a systemic problem and
+        # we stop before spending the full budget. The full phase tolerates partial success.
+        if phase == "smoke" and not result["all_passed"]:
+            break
+
+    final = phase_results[-1]
+    return {
+        "enabled": True,
+        "passed": bool(final["all_passed"]),
+        "per_task_orchestration": True,
+        "repair_backend": backend.value,
+        "run_profile": final["run_profile"],
+        "tasks_total": final["tasks_total"],
+        "tasks_passed": final["tasks_passed"],
+        "coverage": final["coverage"],
+        "per_task": final["per_task"],
+        "artifacts": final["artifacts"],
+        "phase_results": phase_results,
+        "attempts": [],
+        "logs_dir": str(logs_dir),
+        "requirements_issues": final.get("requirements_issues", []),
+        "security_issues": final.get("security_issues", []),
+    }
+
+
+def run_tasks_once(
+    repro_project_dir: Path,
+    manifest: dict[str, Any],
+    *,
+    phase: str = "smoke",
+    logs_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Run every task in the manifest once for one profile, each in its own subprocess. The
+    security/requirements gate runs once for the whole project; outputs/ is cleared once and
+    each task writes its own outputs/<output_subdir>/ folder."""
+    config_name = (
+        "config_smoke.json"
+        if phase == "smoke" and (repro_project_dir / "config_smoke.json").exists()
+        else "config.json"
+    )
+    requirements_issues = validate_requirements(repro_project_dir)
+    security_issues = static_scan_repro_project(repro_project_dir)
+    if requirements_issues or security_issues:
+        return {
+            "run_profile": phase,
+            "config": config_name,
+            "blocked_by_security": True,
+            "requirements_issues": requirements_issues,
+            "security_issues": security_issues,
+            "tasks_total": 0,
+            "tasks_passed": 0,
+            "all_passed": False,
+            "coverage": "0/0",
+            "per_task": [],
+            "artifacts": inspect_output_artifacts(repro_project_dir),
+        }
+
+    if logs_dir is not None:
+        archive_outputs(repro_project_dir, logs_dir, f"tasks_{phase}")
+    else:
+        clear_outputs(repro_project_dir)
+    started_at = time.time()
+    tasks = [task for task in manifest.get("tasks", []) if isinstance(task, dict) and task.get("module")]
+    per_task = [
+        run_task_once(repro_project_dir, task, phase=phase, config_name=config_name, since=started_at)
+        for task in tasks
+    ]
+    passed = sum(1 for item in per_task if item["passed"])
+    total = len(per_task)
+    return {
+        "run_profile": phase,
+        "config": config_name,
+        "tasks_total": total,
+        "tasks_passed": passed,
+        "all_passed": total > 0 and passed == total,
+        "coverage": f"{passed}/{total}",
+        "per_task": per_task,
+        "artifacts": inspect_output_artifacts(repro_project_dir, since=started_at),
+        "requirements_issues": [],
+        "security_issues": [],
+    }
+
+
+def run_task_once(
+    repro_project_dir: Path,
+    task: dict[str, Any],
+    *,
+    phase: str,
+    config_name: str,
+    since: float,
+) -> dict[str, Any]:
+    """Run a single task script as `python -m tasks.<module> <config>` from the project root
+    (so `from src import _io` resolves), with that task's OWN timeout. A non-zero exit, a
+    timeout, or missing/invalid artifacts in its outputs/<output_subdir>/ folder all fail just
+    this task; everything is reported, nothing else is touched."""
+    module = str(task.get("module") or "")
+    output_subdir = str(task.get("output_subdir") or task.get("task_id") or "")
+    default_timeout = 60.0 if phase == "smoke" else 600.0
+    timeout = float(task.get(f"timeout_{phase}_s") or default_timeout)
+    command = [sys.executable, "-m", f"tasks.{module}", config_name]
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=repro_project_dir,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            env=build_safe_env(),
+        )
+        artifacts = inspect_output_artifacts(repro_project_dir, since=since, subdir=output_subdir)
+        passed = (
+            completed.returncode == 0
+            and artifacts["has_csv"]
+            and artifacts["has_png"]
+            and artifacts["has_summary_json"]
+            and not artifacts.get("invalid_files")
+        )
+        return {
+            "task_id": task.get("task_id"),
+            "module": module,
+            "output_subdir": output_subdir,
+            "command": command,
+            "returncode": completed.returncode,
+            "timed_out": False,
+            "passed": passed,
+            "artifacts": artifacts,
+            "stdout": redact_text(completed.stdout)[-4000:],
+            "stderr": redact_text(completed.stderr)[-4000:],
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "task_id": task.get("task_id"),
+            "module": module,
+            "output_subdir": output_subdir,
+            "command": command,
+            "returncode": None,
+            "timed_out": True,
+            "passed": False,
+            "artifacts": inspect_output_artifacts(repro_project_dir, since=since, subdir=output_subdir),
+            "stdout": "",
+            "stderr": f"task timed out after {timeout:.0f}s (its own per-task budget)",
+        }
