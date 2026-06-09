@@ -246,6 +246,55 @@ def _per_task_src_override() -> str:
     )
 
 
+def _thesis_anchor_text(paper_thesis: dict[str, Any] | None) -> str:
+    """Compact codegen anchor built from the distilled paper thesis: the conclusion the code
+    must REPRODUCE (claim + mechanism + the method orderings the paper asserts), not just the
+    formulas to transcribe. Appended to science-file prompts so a generated implementation has
+    a target to self-check against ("if my method ordering comes out reversed, my channel model
+    is wrong"). Returns "" when no usable thesis is available -> prompts stay unchanged."""
+    if not isinstance(paper_thesis, dict):
+        return ""
+    claim = str(paper_thesis.get("central_claim") or "").strip()
+    mechanism = str(paper_thesis.get("mechanism") or "").strip()
+    if not claim and not mechanism:
+        return ""
+    ordering_lines: list[str] = []
+    comparisons = paper_thesis.get("comparisons")
+    if isinstance(comparisons, list):
+        for item in comparisons:
+            if not isinstance(item, dict):
+                continue
+            ordering = str(item.get("expected_ordering") or "").strip()
+            if not ordering:
+                continue
+            regime = str(item.get("regime") or "").strip()
+            note = str(item.get("mechanism_note") or "").strip()
+            segment = f"  - {ordering}"
+            if regime:
+                segment += f"（成立条件：{regime}）"
+            if note:
+                segment += f"；之所以是这个排序，是因为{note}"
+            ordering_lines.append(segment)
+    ordering_block = (
+        "\n论文断言的方法排序（复现必须命中；命不中几乎一定是你的信道/模型构造错了）：\n"
+        + "\n".join(ordering_lines)
+        if ordering_lines
+        else ""
+    )
+    return (
+        "\n\n# 【论文思路·复现靶子｜优先级最高】\n"
+        "你要复现的不是公式，而是下面这个结论。把它当作实现的自检靶：\n"
+        f"- 核心主张：{claim}\n"
+        f"- 起作用的机制：{mechanism}\n"
+        f"{ordering_block}\n"
+        "硬约束：\n"
+        "- 实现要让上述机制**真实成立**（例如优势若来自空时/多普勒维度的去相关与条件数改善，就必须把该维度如实建出来），"
+        "不要只把闭式公式抄上去就交差。\n"
+        "- 若你的实现会让方法排序与论文相反，先怀疑是信道/模型构造错了，回头检查，**不要硬凑参数**去对齐。\n"
+        "- 全 0 / 全常数 / 方法排序反 都是失败信号，不是“也能跑”。\n"
+    )
+
+
 def _inject_task_scaffolding(manifest: dict[str, Any], repro_project_dir: Path) -> None:
     """If the manifest carries a per-task tasks_manifest, drop in the harness-owned
     run_experiment.py dispatcher, tasks/__init__.py and tasks_manifest.json. No-op otherwise."""
@@ -601,6 +650,7 @@ class ReviewPipeline:
             images=paper_images,
             code_review=code_review,
             per_task_layout=per_task_layout,
+            paper_thesis=paper_thesis,
         )
         repro_project_dir = output_dir / "repro_project"
         written_files = self._ensure_repro_project_from_manifest(
@@ -1326,6 +1376,7 @@ class ReviewPipeline:
         images: list | None = None,
         code_review: bool = False,
         per_task_layout: bool = False,
+        paper_thesis: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         output_path = output_dir / "repro_project_manifest.json"
         stage_label = "03_generate_repro_project"
@@ -1358,6 +1409,7 @@ class ReviewPipeline:
                 images=images,
                 code_review=code_review,
                 per_task_layout=per_task_layout,
+                paper_thesis=paper_thesis,
             )
         except Exception as exc:
             if not template_fallback:
@@ -1390,9 +1442,11 @@ class ReviewPipeline:
         images: list | None = None,
         code_review: bool = False,
         per_task_layout: bool = False,
+        paper_thesis: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         facts_json = wrap_untrusted("engineering_facts_json", pretty_json(facts))
         tasks_json = wrap_untrusted("repro_tasks_json", pretty_json(tasks))
+        thesis_anchor = _thesis_anchor_text(paper_thesis)  # "" unless --science-loop yielded a thesis
 
         # Per-task layout: the model generates the shared science + one tasks/<module>.py per
         # repro_task; run_experiment.py / tasks_manifest.json / src/_io.py are harness-injected.
@@ -1411,6 +1465,7 @@ class ReviewPipeline:
         )
         if per_task_layout:
             plan_prompt += _per_task_plan_override(task_scripts)
+        plan_prompt += thesis_anchor  # reproduce the paper's CONCLUSION, not just its formulas
         plan_label = "03a_generate_repro_project_plan"
         write_text(audit_dir / f"{plan_label}.md", plan_prompt)
         plan = self._call_validated_json(
@@ -1459,6 +1514,10 @@ class ReviewPipeline:
                     file_prompt += _per_task_file_override(task_id_by_script[path], tasks, _available_src_symbols(files))
                 elif per_task_layout and path.startswith("src/") and path.endswith(".py"):
                     file_prompt += _per_task_src_override()
+                # Anchor every science-bearing file (src/*, tasks/*, run_experiment.py) to the
+                # paper's thesis: the conclusion to reproduce, not just the formula to copy.
+                if path.endswith(".py") and path != "src/_io.py":
+                    file_prompt += thesis_anchor
                 write_text(audit_dir / f"{file_label}.md", file_prompt)
                 parsed = self._call_validated_json(
                     prompt=file_prompt,

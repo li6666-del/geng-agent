@@ -217,6 +217,15 @@ class PerTaskLayoutPipelineTests(unittest.TestCase):
             self.assertEqual(thesis["comparisons"][0]["methods_best_to_worst"], ["STAB", "ZF"])
             generated = json.loads((result.output_dir / "generated_files.json").read_text(encoding="utf-8"))
             self.assertEqual(generated["paper_thesis"]["central_claim"], thesis["central_claim"])
+            # the thesis anchor must actually reach codegen: the plan prompt and the science-file
+            # prompts carry the "复现靶子" block; non-.py files (README) do not.
+            audit = result.output_dir / "audit"
+            plan_prompt = (audit / "03a_generate_repro_project_plan.md").read_text(encoding="utf-8")
+            self.assertIn("论文思路·复现靶子", plan_prompt)
+            self.assertIn("密集区 STAB > ZF", plan_prompt)
+            task_prompts = list(audit.glob("03b_generate_repro_project_file_*reproduce_fig_1*.md"))
+            self.assertTrue(task_prompts)
+            self.assertIn("论文思路·复现靶子", task_prompts[0].read_text(encoding="utf-8"))
             # the thesis stage must not disturb the per-task flow: still a real run, not a fallback.
             self.assertTrue(result.runtime_passed)
             self.assertFalse(json.loads(
