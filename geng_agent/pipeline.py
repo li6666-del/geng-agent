@@ -318,12 +318,17 @@ class ReviewPipeline:
         prompt_book: PromptBook | None = None,
         code_review_client: LLMClient | None = None,
         extraction_client_2: LLMClient | None = None,
+        generation_client: LLMClient | None = None,
     ) -> None:
         self.client = client
         self.prompt_book = prompt_book or PromptBook()
         # Optional heterogeneous reviewer for the code-faithfulness stage; falls back to
         # the main generator client when not provided.
         self.code_review_client = code_review_client
+        # Optional separate (possibly text-only) coder for round-3 per-file generation and
+        # Phase-D science repair. None -> the main client does codegen too (unchanged). The
+        # plan/facts/thesis/review stay on the multimodal main client.
+        self.generation_client = generation_client
         # Optional second multimodal extraction model for the round-1 cross-model fact
         # ensemble; None -> single-model extraction (behavior unchanged).
         self.extraction_client_2 = extraction_client_2
@@ -331,7 +336,7 @@ class ReviewPipeline:
     def _llm_clients(self) -> list[Any]:
         """The distinct LLM clients whose token usage should roll up into run_cost.json."""
         clients: list[Any] = [self.client]
-        for extra in (self.code_review_client, self.extraction_client_2):
+        for extra in (self.code_review_client, self.extraction_client_2, self.generation_client):
             if extra is not None and all(extra is not existing for existing in clients):
                 clients.append(extra)
         return clients
@@ -1577,7 +1582,9 @@ class ReviewPipeline:
                     extra_validation=lambda candidate, expected=path: _validate_project_file(candidate, expected),
                     candidate_normalizer=normalize_repro_project_file_candidate,
                     request_timeout=request_timeout,
-                    # Page images go to the plan (03a) only, not to every per-file call.
+                    # Per-file code generation goes to the (possibly text-only) generation
+                    # client when configured; no images here (they go to the plan 03a only).
+                    client=self.generation_client or self.client,
                 )
                 if not do_review:
                     best_parsed = parsed
@@ -2165,6 +2172,7 @@ class ReviewPipeline:
                 extra_validation=lambda candidate, expected=path: _validate_project_file(candidate, expected),
                 candidate_normalizer=normalize_repro_project_file_candidate,
                 request_timeout=request_timeout,
+                client=self.generation_client or self.client,  # stronger coder fixes the science
             )
             content = "\n".join(str(line) for line in parsed["content_lines"])
             target = repro_project_dir / path

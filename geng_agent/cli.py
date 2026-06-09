@@ -63,6 +63,7 @@ def _add_common_review_args(parser: argparse.ArgumentParser, *, include_resume: 
     parser.add_argument("--code-review", action="store_true", help="生成复现项目后运行代码忠实度审查（对照已抽取的事实/任务做内容审查并按需返修）；默认关闭。")
     parser.add_argument("--code-review-attempts", type=int, default=5, help="代码忠实度审查发现 blocking 问题后的返修轮数；默认 5（每轮含一次修复+一次复审，慢模型会更耗时）。")
     parser.add_argument("--code-review-model", default=None, help="代码忠实度审查使用的模型（异构审查者）；默认取 GENG_CODE_REVIEW_MODEL，未设则与主模型相同。")
+    parser.add_argument("--generation-model", default=None, help="仅用于第三轮逐文件代码生成 + Phase-D 科学返修的“专用 coder”模型（默认取 GENG_GEN_MODEL，未设则与主模型相同）。主模型须保留多模态（事实/思路/plan/结果审查都用图），但逐文件代码生成不用图——可在此指向更强、哪怕无多模态的代码模型（如 mimo-v2.5-pro）去啃最难的 src/modulation.py 并真正修对科学建模。Key/base 缺省回退 GENG_LLM_*（同端点变体只填模型名即可）。")
     parser.add_argument("--code-review-timeout", type=float, default=1200.0, help="代码忠实度审查单次 LLM 请求超时时间，单位秒，默认 1200（整项目审查较慢，给足时间避免超时）。")
     parser.add_argument("--facts-gap-rounds", type=int, default=3, help="第一轮事实抽取后的“查漏补缺”追加轮数（确定性覆盖校验图/表锚点 + 定向补抽遗漏事实），循环到一轮无新增为止；默认 3，设 0 关闭。")
     parser.add_argument("--tasks-gap-rounds", type=int, default=3, help="第二轮复现任务设计后的“查漏补缺”追加轮数（确定性校验每个可复现实验是否都有任务 + 为遗漏实验补任务），循环到全覆盖或无新增为止；默认 3，设 0 关闭。")
@@ -84,7 +85,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "review":
         _warn_if_environment_incomplete()
-        from .config import build_secondary_extraction_client
+        from .config import build_generation_client, build_secondary_extraction_client
         from .pipeline import ReviewPipeline
 
         client = _build_client_or_error(args, parser)
@@ -92,10 +93,20 @@ def main(argv: list[str] | None = None) -> int:
         # Optional second multimodal extraction model (GENG_LLM2_*) for the round-1 ensemble;
         # None when unconfigured -> single-model behavior.
         extraction_client_2 = build_secondary_extraction_client(temperature=args.temperature, timeout=args.timeout)
+        # Optional separate coder for round-3 codegen + Phase-D repair (e.g. mimo-v2.5-pro,
+        # which has no multimodal -> can't be the main client). None -> main client codes.
+        generation_client = build_generation_client(
+            model=args.generation_model,
+            temperature=args.temperature,
+            timeout=args.timeout,
+            thinking=args.thinking,
+            reasoning_effort=args.reasoning_effort,
+        )
         result = ReviewPipeline(
             client=client,
             code_review_client=code_review_client,
             extraction_client_2=extraction_client_2,
+            generation_client=generation_client,
         ).run(
             paper_path=args.paper,
             output_dir=args.out,

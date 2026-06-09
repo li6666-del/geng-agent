@@ -110,6 +110,50 @@ def build_code_review_client(
     )
 
 
+def build_generation_client(
+    *,
+    model: str | None = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    temperature: float = 0.1,
+    timeout: float = 120.0,
+    thinking: str | None = None,
+    reasoning_effort: str | None = None,
+) -> OpenAICompatibleClient | None:
+    """Optional separate client for round-3 CODE generation + Phase-D science repair only.
+
+    The main client must stay multimodal (round-4 result review hard-requires
+    complete_multimodal, and facts/thesis/plan read page images), but per-file code
+    generation needs no images -- so a stronger, possibly text-only coder (e.g.
+    mimo-v2.5-pro) can be pointed here to write the hard science files while the
+    multimodal model keeps doing extraction/review. Returns ``None`` when unconfigured
+    (-> generation falls back to the main client; behavior unchanged). Key/base-url fall
+    back to the main ``GENG_LLM_*`` values, so same-endpoint variants (pro) just need the
+    model name.
+    """
+    resolved_model = model or get_config_value("GENG_GEN_MODEL")
+    if not resolved_model:
+        return None
+    resolved_key = api_key or get_config_value("GENG_GEN_API_KEY") or get_config_value("GENG_LLM_API_KEY")
+    resolved_base = (
+        base_url
+        or get_config_value("GENG_GEN_BASE_URL")
+        or get_config_value("GENG_LLM_BASE_URL")
+        or "https://api.openai.com/v1"
+    )
+    if not resolved_key:
+        raise ValueError("缺少生成模型 API key：请设置 GENG_GEN_API_KEY（或回退用 GENG_LLM_API_KEY）。")
+    return OpenAICompatibleClient(
+        api_key=resolved_key,
+        base_url=resolved_base,
+        model=resolved_model,
+        temperature=temperature,
+        timeout=timeout,
+        thinking=thinking,
+        reasoning_effort=reasoning_effort,
+    )
+
+
 def build_secondary_extraction_client(
     *,
     temperature: float = 0.1,
