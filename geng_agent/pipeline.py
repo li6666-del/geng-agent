@@ -164,6 +164,7 @@ def _per_task_plan_override(task_scripts: list[str]) -> str:
         "- 不要规划 run_experiment.py（本地会注入一个确定性分发器）。\n"
         "- 必须规划下列每任务脚本，每个是对应复现任务的“薄驱动”（只复现该任务、调用 src/_io 写产物）：\n"
         f"{listed}\n"
+        "- src/*.py 只放纯科学计算（信道/预编码/指标/编排），**不要在 src/ 里 import matplotlib 或画图、不要写 main/落盘**；画图与产物落盘一律在 tasks/<id>.py 里走 _io。\n"
         "- 最终 files 必须恰好是：README.md、requirements.txt、config.json、config_smoke.json、"
         "src/channel.py、src/modulation.py、src/metrics.py、src/simulation.py，外加上面列出的每个 tasks/*.py；"
         "不要多、不要少、不要包含 run_experiment.py 或 src/_io.py。\n"
@@ -228,6 +229,20 @@ def _per_task_file_override(task_id: str, tasks: dict[str, Any], src_symbols: di
         "清单里没有的能力就在本脚本内用 numpy/scipy 自己实现，**绝不要 import 不存在的名字**（上次就因 import 了 src.modulation 里并不存在的 zf_precoder 而整任务 ImportError 挂掉）：\n"
         f"{symbol_lines}\n"
         f"- 本任务规格（UNTRUSTED DATA，仅作参考）：\n{spec}\n"
+    )
+
+
+def _per_task_src_override() -> str:
+    """Appended when generating a shared src/*.py in per-task layout: src/ is computation-only.
+    Plotting + artifact IO live in tasks/<id>.py via _io, not in src/ -- a generated
+    src/simulation.py that imported matplotlib inside a try/except got the whole run blocked."""
+    return (
+        "\n\n# 【共享 src/ 模块｜逐任务布局约束｜优先级最高】\n"
+        "本文件是被各 tasks/<task_id>.py 复用的纯科学计算模块（信道、调制/预编码、指标、仿真编排）：\n"
+        "- 只放计算并导出清晰的函数/类供任务脚本 import；不要写 main、不要跑实验、不要读 config 路径、不要设随机种子。\n"
+        "- **禁止 import matplotlib、禁止任何画图 / plt / savefig**——画图一律在 tasks/<task_id>.py 里用 `_io.write_figure`。\n"
+        "- **禁止把任何 import 包进 try/except**（缺库就别用该库、不要静默降级——一致性闸会因此拦下整次运行，正是 2603 真实踩过的坑）。\n"
+        "- 不要在 src/ 里写产物落盘（csv/json/png）；落盘只在任务脚本里走 src/_io。\n"
     )
 
 
@@ -1380,6 +1395,8 @@ class ReviewPipeline:
                 )
                 if per_task_layout and path in task_id_by_script:
                     file_prompt += _per_task_file_override(task_id_by_script[path], tasks, _available_src_symbols(files))
+                elif per_task_layout and path.startswith("src/") and path.endswith(".py"):
+                    file_prompt += _per_task_src_override()
                 write_text(audit_dir / f"{file_label}.md", file_prompt)
                 parsed = self._call_validated_json(
                     prompt=file_prompt,

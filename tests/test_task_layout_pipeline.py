@@ -3,7 +3,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from geng_agent.pipeline import ReviewPipeline, _available_src_symbols, _per_task_file_override
+from geng_agent.pipeline import (
+    ReviewPipeline,
+    _available_src_symbols,
+    _per_task_file_override,
+    _per_task_src_override,
+)
 
 
 def _schema_name(response_format) -> str | None:
@@ -177,6 +182,14 @@ class SrcSymbolContractTests(unittest.TestCase):
         self.assertIn("src.modulation: qpsk_mod", override)
         self.assertIn("src.channel: awgn", override)
         self.assertIn("绝不要 import 不存在的名字", override)
+
+    def test_src_override_forbids_plotting_and_guarded_imports(self) -> None:
+        # v3 fell back to template because src/simulation.py imported matplotlib inside a
+        # try/except -> consistency gate blocked the run. src/ must be computation-only.
+        override = _per_task_src_override()
+        self.assertIn("禁止 import matplotlib", override)
+        self.assertIn("_io.write_figure", override)
+        self.assertIn("禁止把任何 import 包进 try/except", override)
 
 
 if __name__ == "__main__":
