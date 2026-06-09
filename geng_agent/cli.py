@@ -66,6 +66,7 @@ def _add_common_review_args(parser: argparse.ArgumentParser, *, include_resume: 
     parser.add_argument("--code-review-timeout", type=float, default=1200.0, help="代码忠实度审查单次 LLM 请求超时时间，单位秒，默认 1200（整项目审查较慢，给足时间避免超时）。")
     parser.add_argument("--facts-gap-rounds", type=int, default=3, help="第一轮事实抽取后的“查漏补缺”追加轮数（确定性覆盖校验图/表锚点 + 定向补抽遗漏事实），循环到一轮无新增为止；默认 3，设 0 关闭。")
     parser.add_argument("--tasks-gap-rounds", type=int, default=3, help="第二轮复现任务设计后的“查漏补缺”追加轮数（确定性校验每个可复现实验是否都有任务 + 为遗漏实验补任务），循环到全覆盖或无新增为止；默认 3，设 0 关闭。")
+    parser.add_argument("--per-task-layout", action="store_true", help="第三轮按“每任务一脚本”布局生成：LLM 只生成共享 src + 每个复现任务一个 tasks/<module>.py（薄驱动调 _io），run_experiment.py 由本地注入分发器；运行时每个任务起独立子进程+独立超时+部分成功+按脚本返修（硬隔离）。默认关闭（单脚本布局）。")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -113,6 +114,7 @@ def main(argv: list[str] | None = None) -> int:
             code_review_attempts=args.code_review_attempts,
             facts_gap_rounds=args.facts_gap_rounds,
             tasks_gap_rounds=args.tasks_gap_rounds,
+            per_task_layout=args.per_task_layout,
         )
         print(f"审查完成：{result.output_dir}")
         print(f"报告：{result.review_path}")
