@@ -309,26 +309,8 @@ class PipelineTests(unittest.TestCase):
         self.assertGreater(len(ctx[0]["content"]), 1500)
         self.assertIn("UNIQUE_TAIL_MARKER", ctx[0]["content"])
 
-    def test_per_file_review_grounding_keeps_only_target_file_findings(self) -> None:
-        from geng_agent.code_review import _ground_findings_against
-
-        facts = {"engineering_facts": [{"value": "ber equals q function of sqrt two ebn0"}]}
-        tasks = {"repro_tasks": []}
-        code = "def ber(x):\n    return special_q_function(x)\n"
-        grounded = {"spec_ref": "ber", "evidence_spec": "ber equals q function", "evidence_code": "special_q_function", "severity": "blocking"}
-        ungrounded = {"spec_ref": "ber", "evidence_spec": "ber equals q function", "evidence_code": "absent_symbol_xyz", "severity": "blocking"}
-        kept, dropped = _ground_findings_against([grounded, ungrounded], facts, tasks, code)
-        self.assertEqual(len(kept), 1)
-        self.assertIs(kept[0], grounded)
-        self.assertEqual(len(dropped), 1)
-
-    def test_per_file_revise_rounds_default_is_three(self) -> None:
-        from geng_agent.pipeline import PER_FILE_REVIEW_REVISE_ROUNDS
-
-        self.assertEqual(PER_FILE_REVIEW_REVISE_ROUNDS, 3)
-
-    def test_code_review_snapshot_restore_roundtrip(self) -> None:
-        from geng_agent.code_review import _restore_project, _snapshot_project
+    def test_project_snapshot_restore_roundtrip(self) -> None:
+        from geng_agent.project_snapshot import _restore_project, _snapshot_project
 
         with TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
@@ -611,32 +593,6 @@ class PipelineTests(unittest.TestCase):
 
             manifest = json.loads((output_dir / "repro_project_manifest.json").read_text(encoding="utf-8"))
             self.assertTrue(manifest["_meta"]["template_fallback_used"])
-
-    def test_code_review_is_skipped_on_template_fallback(self) -> None:
-        # Bug C: a template fallback must not be reviewed/revised by the whole-project code
-        # review (doing so regenerates code over the template and desyncs disk/manifest/flag).
-        class GenerateProjectTimeoutLLM(FakeLLM):
-            def complete(self, prompt: str, *, system: str | None = None, response_format: dict | None = None) -> str:
-                if len(self.calls) < 2:
-                    return super().complete(prompt, system=system, response_format=response_format)
-                self.calls.append(prompt)
-                raise RuntimeError("LLM request failed: TimeoutError: The read operation timed out")
-
-        with TemporaryDirectory() as temp_dir:
-            temp = Path(temp_dir)
-            paper = temp / "paper.md"
-            paper.write_text("Simulation Results\nAWGN channel, BER vs SNR.", encoding="utf-8")
-            output_dir = temp / "case"
-
-            ReviewPipeline(client=GenerateProjectTimeoutLLM()).run(
-                paper, output_dir, run_repro=False, code_review=True
-            )
-
-            manifest = json.loads((output_dir / "repro_project_manifest.json").read_text(encoding="utf-8"))
-            self.assertTrue(manifest["_meta"]["template_fallback_used"])
-            code_review = json.loads((output_dir / "code_review.json").read_text(encoding="utf-8"))
-            self.assertFalse(code_review["enabled"])
-            self.assertIn("template fallback", code_review["reason"])
 
     def test_pipeline_uses_template_fallback_when_runtime_repairs_fail(self) -> None:
         class BrokenProjectLLM(FakeLLM):

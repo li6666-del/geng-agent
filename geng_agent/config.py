@@ -69,47 +69,6 @@ def build_llm_client(
     )
 
 
-def build_code_review_client(
-    *,
-    model: str | None = None,
-    api_key: str | None = None,
-    base_url: str | None = None,
-    temperature: float = 0.1,
-    timeout: float = 120.0,
-    thinking: str | None = None,
-    reasoning_effort: str | None = None,
-) -> OpenAICompatibleClient | None:
-    """Build a separate (heterogeneous) reviewer client for the code-faithfulness stage.
-
-    Returns ``None`` when no review model is configured, so the caller falls back to the
-    main generator client (same-model review). Key/base-url fall back to the main
-    ``GENG_LLM_*`` values only when the ``GENG_CODE_REVIEW_*`` ones are unset -- so a
-    cross-provider reviewer (e.g. deepseek-v4-pro on api.deepseek.com) must set its own
-    ``GENG_CODE_REVIEW_API_KEY`` and ``GENG_CODE_REVIEW_BASE_URL``.
-    """
-    resolved_model = model or get_config_value("GENG_CODE_REVIEW_MODEL")
-    if not resolved_model:
-        return None
-    resolved_key = api_key or get_config_value("GENG_CODE_REVIEW_API_KEY") or get_config_value("GENG_LLM_API_KEY")
-    resolved_base = (
-        base_url
-        or get_config_value("GENG_CODE_REVIEW_BASE_URL")
-        or get_config_value("GENG_LLM_BASE_URL")
-        or "https://api.openai.com/v1"
-    )
-    if not resolved_key:
-        raise ValueError("缺少代码审查 API key：请设置 GENG_CODE_REVIEW_API_KEY（或回退用 GENG_LLM_API_KEY）。")
-    return OpenAICompatibleClient(
-        api_key=resolved_key,
-        base_url=resolved_base,
-        model=resolved_model,
-        temperature=temperature,
-        timeout=timeout,
-        thinking=thinking,
-        reasoning_effort=reasoning_effort,
-    )
-
-
 def build_generation_client(
     *,
     model: str | None = None,

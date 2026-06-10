@@ -79,9 +79,6 @@ ScientificVerdict = Literal[
 ]
 SupervisorAction = Literal["continue", "retry_stage", "use_fallback", "repair_code", "ask_human", "stop"]
 SupervisorRiskLevel = Literal["low", "medium", "high"]
-CodeReviewVerdict = Literal["pass", "revise"]
-ReviewSeverity = Literal["blocking", "minor"]
-SpecRefKind = Literal["fact", "task"]
 ExperimentIndexStatus = Literal["ready", "ready_with_limitations", "blocked"]
 ReproducibilityVerdict = Literal[
     "fully_reproduced",
@@ -367,22 +364,6 @@ class ReproducibilityVerdictDocument(StrictModel):
     recommended_action: NonEmptyStr
 
 
-class CodeReviewFinding(StrictModel):
-    spec_kind: SpecRefKind
-    spec_ref: NonEmptyStr
-    evidence_spec: NonEmptyStr
-    code_location: NonEmptyStr
-    evidence_code: NonEmptyStr
-    severity: ReviewSeverity
-    issue: NonEmptyStr
-    suggested_fix: NonEmptyStr
-
-
-class CodeFaithfulnessReviewDocument(StrictModel):
-    verdict: CodeReviewVerdict
-    findings: list[CodeReviewFinding]
-    unverifiable: list[str]
-    note: NonEmptyStr
 
 
 SCHEMA_MODELS: dict[str, type[BaseModel]] = {
@@ -398,7 +379,6 @@ SCHEMA_MODELS: dict[str, type[BaseModel]] = {
     "result_review": ResultReviewDocument,
     "supervisor_decision": SupervisorDecisionDocument,
     "reproducibility_verdict": ReproducibilityVerdictDocument,
-    "code_faithfulness_review": CodeFaithfulnessReviewDocument,
 }
 
 
@@ -415,7 +395,6 @@ SCHEMA_FILENAMES: dict[str, str] = {
     "result_review": "result_review.schema.json",
     "supervisor_decision": "supervisor_decision.schema.json",
     "reproducibility_verdict": "reproducibility_verdict.schema.json",
-    "code_faithfulness_review": "code_faithfulness_review.schema.json",
 }
 
 

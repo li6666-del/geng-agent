@@ -8,13 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from .code_review import (
-    _restore_project,
-    _snapshot_project,
-    review_single_generated_file,
-    run_code_faithfulness_review,
-)
 from .agentic_repair import run_agentic_science_repair
+from .project_snapshot import _restore_project, _snapshot_project
 from .science_repair import build_science_directive, diagnose_csv_symptoms, run_science_repair
 from .documents import load_paper
 from .experiment_index import build_local_experiment_index
@@ -115,11 +110,6 @@ from .review_markdown import (
     _write_docx_error,
     render_review_markdown,
 )
-
-# Max single-file review-driven regenerations for a science file before keeping the
-# best-reviewed (fewest-blocking) compilable version. Only applies when --code-review is on.
-PER_FILE_REVIEW_REVISE_ROUNDS = 3
-
 
 SYSTEM_MESSAGE = (
     "你是耿同学agent，一个通信领域论文工程复现审查助手。"
@@ -317,15 +307,11 @@ class ReviewPipeline:
         self,
         client: LLMClient,
         prompt_book: PromptBook | None = None,
-        code_review_client: LLMClient | None = None,
         extraction_client_2: LLMClient | None = None,
         generation_client: LLMClient | None = None,
     ) -> None:
         self.client = client
         self.prompt_book = prompt_book or PromptBook()
-        # Optional heterogeneous reviewer for the code-faithfulness stage; falls back to
-        # the main generator client when not provided.
-        self.code_review_client = code_review_client
         # Optional separate (possibly text-only) coder for round-3 per-file generation and
         # Phase-D science repair. None -> the main client does codegen too (unchanged). The
         # plan/facts/thesis/review stay on the multimodal main client.
@@ -337,7 +323,7 @@ class ReviewPipeline:
     def _llm_clients(self) -> list[Any]:
         """The distinct LLM clients whose token usage should roll up into run_cost.json."""
         clients: list[Any] = [self.client]
-        for extra in (self.code_review_client, self.extraction_client_2, self.generation_client):
+        for extra in (self.extraction_client_2, self.generation_client):
             if extra is not None and all(extra is not existing for existing in clients):
                 clients.append(extra)
         return clients
@@ -390,8 +376,6 @@ class ReviewPipeline:
         result_review: bool = True,
         template_fallback: bool = True,
         prompt_adjustments: dict[str, str] | None = None,
-        code_review: bool = False,
-        code_review_attempts: int = 5,
         facts_gap_rounds: int = 3,
         tasks_gap_rounds: int = 3,
     ) -> PipelineResult:
@@ -430,8 +414,6 @@ class ReviewPipeline:
             resume=True,
             template_fallback=template_fallback,
             prompt_adjustments=prompt_adjustments,
-            code_review=code_review,
-            code_review_attempts=code_review_attempts,
             facts_gap_rounds=facts_gap_rounds,
             tasks_gap_rounds=tasks_gap_rounds,
         )
@@ -454,8 +436,6 @@ class ReviewPipeline:
         resume: bool = True,
         template_fallback: bool = True,
         prompt_adjustments: dict[str, str] | None = None,
-        code_review: bool = False,
-        code_review_attempts: int = 5,
         facts_gap_rounds: int = 3,
         tasks_gap_rounds: int = 3,
         per_task_layout: bool = False,
@@ -664,7 +644,6 @@ class ReviewPipeline:
             template_fallback=template_fallback,
             project_timeout=project_timeout,
             images=paper_images,
-            code_review=code_review,
             per_task_layout=per_task_layout,
             paper_thesis=paper_thesis,
         )
@@ -690,43 +669,13 @@ class ReviewPipeline:
         template_fallback_now = bool((manifest.get("_meta") or {}).get("template_fallback_used"))
         _mark("generation")
 
-        code_review_result = None
-        if code_review and template_fallback_now:
-            # Bug C: never review/revise a template fallback. code_review's revise loop would
-            # regenerate paper-facing code over the generic template, leaving the on-disk
-            # project, the manifest, and template_fallback_used mutually inconsistent (and can
-            # strand a non-compiling project on disk). A template fallback is already a
-            # failure -- report it as such rather than half-rewriting it.
-            code_review_result = {
-                "enabled": False,
-                "passed": None,
-                "reason": "skipped because the project is a template fallback; a faithfulness review of a generic template is not meaningful",
-            }
-            write_json(output_dir / "code_review.json", code_review_result)
-        elif code_review:
-            code_review_result = run_code_faithfulness_review(
-                client=self.code_review_client or self.client,
-                prompt_book=self.prompt_book,
-                repro_project_dir=repro_project_dir,
-                audit_dir=audit_dir,
-                facts=facts,
-                tasks=tasks,
-                paper_context=paper_context,
-                system_message=SYSTEM_MESSAGE,
-                max_revise_attempts=code_review_attempts,
-            )
-            write_json(output_dir / "code_review.json", code_review_result)
-            if code_review_result.get("revised"):
-                validation = validate_repro_project(repro_project_dir)
-
         # Bug A: keep requirements.txt consistent with the whitelisted+installed imports the
-        # generated/revised code actually uses, so a forgotten declaration (e.g. code imports
+        # generated code actually uses, so a forgotten declaration (e.g. code imports
         # scipy.linalg but omits scipy) is not refused by the runner's dependency-consistency
         # gate. Only whitelisted+installed packages are added; anything else stays blocked.
         reconciled = reconcile_whitelisted_requirements(repro_project_dir)
         if reconciled:
             write_json(audit_dir / "requirements_reconciled.json", {"added": reconciled})
-        _mark("code_review")
 
         if run_repro:
             runtime_result = self._load_or_run_repro(
@@ -774,15 +723,6 @@ class ReviewPipeline:
                     )
                     runtime_result["template_fallback_used"] = True
                     write_json(output_dir / "runtime_result.json", runtime_result)
-                    # The reviewed generated project was just replaced by a template, so any
-                    # earlier code-review result no longer describes what is on disk (Bug C).
-                    if code_review_result is not None:
-                        code_review_result = {
-                            "enabled": False,
-                            "passed": None,
-                            "reason": "skipped because the generated project was replaced by a template fallback after guarded execution failed",
-                        }
-                        write_json(output_dir / "code_review.json", code_review_result)
         else:
             runtime_result = {
                 "enabled": False,
@@ -868,16 +808,6 @@ class ReviewPipeline:
             paper_format=paper.get("format") if isinstance(paper, dict) else None,
         )
         risk_report["experiment_index"] = experiment_index
-        if code_review_result is not None:
-            risk_report["code_review"] = code_review_result
-            if code_review_result.get("passed") is False:
-                risk_report.setdefault("findings", []).append(
-                    {
-                        "type": "code_faithfulness_unresolved",
-                        "count": len(code_review_result.get("unresolved_findings", [])),
-                        "findings": code_review_result.get("unresolved_findings", []),
-                    }
-                )
         for nd_finding in detect_nondeterminism_findings(repro_project_dir):
             risk_report.setdefault("findings", []).append(nd_finding)
         result_review_document = _load_result_review_document(output_dir, result_review_result)
@@ -930,7 +860,6 @@ class ReviewPipeline:
                 "paper_thesis": paper_thesis,
                 "experiment_index": experiment_index,
                 "manifest_meta": manifest.get("_meta", {}),
-                "code_review": code_review_result,
                 "result_review": result_review_result,
                 "reproducibility_verdict": reproducibility_verdict,
                 "docx_generation": docx_generation,
@@ -1433,7 +1362,6 @@ class ReviewPipeline:
         template_fallback: bool,
         project_timeout: float | None,
         images: list | None = None,
-        code_review: bool = False,
         per_task_layout: bool = False,
         paper_thesis: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -1477,7 +1405,6 @@ class ReviewPipeline:
                 max_attempts=max_attempts,
                 request_timeout=project_timeout,
                 images=images,
-                code_review=code_review,
                 per_task_layout=per_task_layout,
                 paper_thesis=paper_thesis,
             )
@@ -1510,7 +1437,6 @@ class ReviewPipeline:
         max_attempts: int,
         request_timeout: float | None,
         images: list | None = None,
-        code_review: bool = False,
         per_task_layout: bool = False,
         paper_thesis: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -1555,97 +1481,47 @@ class ReviewPipeline:
         write_json(audit_dir / "03a_generate_repro_project_plan.json", plan)
 
         files: list[dict[str, Any]] = []
-        science_files = {"src/channel.py", "src/modulation.py", "src/metrics.py", "src/simulation.py"}
-        reviewer_client = self.code_review_client or self.client
         for index, path in enumerate(_ordered_project_paths(plan, task_scripts), start=1):
             file_label = f"03b_generate_repro_project_file_{index:02d}_{_manifest_path_slug(path)}"
-            do_review = code_review and path in science_files
-            review_feedback = ""
-            # Every candidate returned by _call_validated_json already compiles (ast-checked
-            # in _validate_project_file). When the single-file review can't be fully cleared
-            # within the revise budget, keep the candidate with the FEWEST blocking findings
-            # ("best-of") -- never discard a compilable file or fall back just because review
-            # didn't reach zero blocking.
-            best_parsed: dict[str, Any] | None = None
-            best_blocking: int | None = None
-            # round 0 = initial generation; rounds 1..N = regenerations driven by review feedback.
-            for review_round in range(PER_FILE_REVIEW_REVISE_ROUNDS + 1 if do_review else 1):
-                file_prompt = self.prompt_book.render(
-                    "generate_repro_project_file.md",
-                    target_path=path,
-                    project_plan_json=wrap_untrusted("project_plan_json", pretty_json(plan)),
-                    generated_files_context_json=wrap_untrusted("generated_files_context_json", _generated_files_context(files)),
-                    engineering_facts_json=facts_json,
-                    repro_tasks_json=tasks_json,
-                    paper_context_json=paper_context_json,
-                    review_feedback_json=review_feedback,
-                )
-                if per_task_layout and path in task_id_by_script:
-                    file_prompt += _per_task_file_override(task_id_by_script[path], tasks, _available_src_symbols(files))
-                elif per_task_layout and path.startswith("src/") and path.endswith(".py"):
-                    file_prompt += _per_task_src_override()
-                # Anchor every science-bearing file (src/*, tasks/*, run_experiment.py) to the
-                # paper's thesis: the conclusion to reproduce, not just the formula to copy.
-                if path.endswith(".py") and path != "src/_io.py":
-                    file_prompt += thesis_anchor
-                write_text(audit_dir / f"{file_label}.md", file_prompt)
-                parsed = self._call_validated_json(
-                    prompt=file_prompt,
-                    stage_label=file_label,
-                    schema_stage="repro_project_file",
-                    audit_dir=audit_dir,
-                    max_attempts=max_attempts,
-                    extra_validation=lambda candidate, expected=path: _validate_project_file(candidate, expected),
-                    candidate_normalizer=normalize_repro_project_file_candidate,
-                    request_timeout=request_timeout,
-                    # Per-file code generation goes to the (possibly text-only) generation
-                    # client when configured; no images here (they go to the plan 03a only).
-                    client=self.generation_client or self.client,
-                )
-                if not do_review:
-                    best_parsed = parsed
-                    break
-                review = review_single_generated_file(
-                    client=reviewer_client,
-                    prompt_book=self.prompt_book,
-                    target_path=path,
-                    content="\n".join(str(line) for line in parsed.get("content_lines", [])),
-                    facts=facts,
-                    tasks=tasks,
-                    paper_context=paper_context_json,
-                    prior_files_context=_generated_files_context(files),
-                    system_message=SYSTEM_MESSAGE,
-                    audit_dir=audit_dir,
-                    label=f"{file_label}_review_{review_round + 1:02d}",
-                )
-                n_blocking = len(review.get("blocking", []))
-                write_json(
-                    audit_dir / f"{file_label}_review_{review_round + 1:02d}.json",
-                    {
-                        "verdict": review.get("verdict"),
-                        "blocking": n_blocking,
-                        "minor": len(review.get("minor", [])),
-                        "dropped_ungrounded": review.get("dropped"),
-                        "error": review.get("error"),
-                        "findings": review.get("blocking", []),
-                    },
-                )
-                if best_blocking is None or n_blocking < best_blocking:
-                    best_parsed, best_blocking = parsed, n_blocking
-                if n_blocking == 0 or review_round >= PER_FILE_REVIEW_REVISE_ROUNDS:
-                    break
-                # regenerate just this file, feeding the blocking findings back as guidance.
-                review_feedback = wrap_untrusted("review_feedback_json", pretty_json(review["blocking"]))
-            parsed = best_parsed if best_parsed is not None else parsed
-            file_item = {"path": parsed["path"], "content_lines": parsed["content_lines"]}
-            files.append(file_item)
+            file_prompt = self.prompt_book.render(
+                "generate_repro_project_file.md",
+                target_path=path,
+                project_plan_json=wrap_untrusted("project_plan_json", pretty_json(plan)),
+                generated_files_context_json=wrap_untrusted("generated_files_context_json", _generated_files_context(files)),
+                engineering_facts_json=facts_json,
+                repro_tasks_json=tasks_json,
+                paper_context_json=paper_context_json,
+                review_feedback_json="",
+            )
+            if per_task_layout and path in task_id_by_script:
+                file_prompt += _per_task_file_override(task_id_by_script[path], tasks, _available_src_symbols(files))
+            elif per_task_layout and path.startswith("src/") and path.endswith(".py"):
+                file_prompt += _per_task_src_override()
+            # Anchor every science-bearing file (src/*, tasks/*, run_experiment.py) to the
+            # paper's thesis: the conclusion to reproduce, not just the formula to copy.
+            if path.endswith(".py") and path != "src/_io.py":
+                file_prompt += thesis_anchor
+            write_text(audit_dir / f"{file_label}.md", file_prompt)
+            parsed = self._call_validated_json(
+                prompt=file_prompt,
+                stage_label=file_label,
+                schema_stage="repro_project_file",
+                audit_dir=audit_dir,
+                max_attempts=max_attempts,
+                extra_validation=lambda candidate, expected=path: _validate_project_file(candidate, expected),
+                candidate_normalizer=normalize_repro_project_file_candidate,
+                request_timeout=request_timeout,
+                # Per-file code generation goes to the (possibly text-only) generation
+                # client when configured; no images here (they go to the plan 03a only).
+                client=self.generation_client or self.client,
+            )
+            files.append({"path": parsed["path"], "content_lines": parsed["content_lines"]})
             write_json(
                 audit_dir / f"partial_{file_label}.json",
                 {
                     "ok": True,
                     "path": parsed["path"],
                     "line_count": len(parsed.get("content_lines", [])),
-                    "kept_blocking_findings": best_blocking,
                     "generated_files": [item["path"] for item in files],
                 },
             )

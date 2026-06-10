@@ -60,11 +60,7 @@ def _add_common_review_args(parser: argparse.ArgumentParser, *, include_resume: 
     parser.add_argument("--openhands-max-iterations", type=int, default=25, help="OpenHands 候选修复最大迭代步数。")
     parser.add_argument("--run-timeout", type=float, default=120.0, help="单次复现运行超时时间，单位秒。")
     parser.add_argument("--json-repair-attempts", type=int, default=5, help="每轮 JSON 结构审查失败后的返修次数（默认 5：实跑发现最难的科学文件 src/modulation.py 偶发语法/结构错，3 次重试不够会拖垮整个逐任务项目→兜底；只在失败时才追加重试，文件一次过则无额外开销）。")
-    parser.add_argument("--code-review", action="store_true", help="生成复现项目后运行代码忠实度审查（对照已抽取的事实/任务做内容审查并按需返修）；默认关闭。")
-    parser.add_argument("--code-review-attempts", type=int, default=5, help="代码忠实度审查发现 blocking 问题后的返修轮数；默认 5（每轮含一次修复+一次复审，慢模型会更耗时）。")
-    parser.add_argument("--code-review-model", default=None, help="代码忠实度审查使用的模型（异构审查者）；默认取 GENG_CODE_REVIEW_MODEL，未设则与主模型相同。")
     parser.add_argument("--generation-model", default=None, help="仅用于第三轮逐文件代码生成 + Phase-D 科学返修的“专用 coder”模型（默认取 GENG_GEN_MODEL，未设则与主模型相同）。主模型须保留多模态（事实/思路/plan/结果审查都用图），但逐文件代码生成不用图——可在此指向更强、哪怕无多模态的代码模型（如 mimo-v2.5-pro）去啃最难的 src/modulation.py 并真正修对科学建模。Key/base 缺省回退 GENG_LLM_*（同端点变体只填模型名即可）。")
-    parser.add_argument("--code-review-timeout", type=float, default=1200.0, help="代码忠实度审查单次 LLM 请求超时时间，单位秒，默认 1200（整项目审查较慢，给足时间避免超时）。")
     parser.add_argument("--facts-gap-rounds", type=int, default=3, help="第一轮事实抽取后的“查漏补缺”追加轮数（确定性覆盖校验图/表锚点 + 定向补抽遗漏事实），循环到一轮无新增为止；默认 3，设 0 关闭。")
     parser.add_argument("--tasks-gap-rounds", type=int, default=3, help="第二轮复现任务设计后的“查漏补缺”追加轮数（确定性校验每个可复现实验是否都有任务 + 为遗漏实验补任务），循环到全覆盖或无新增为止；默认 3，设 0 关闭。")
     parser.add_argument("--per-task-layout", action="store_true", help="第三轮按“每任务一脚本”布局生成：LLM 只生成共享 src + 每个复现任务一个 tasks/<module>.py（薄驱动调 _io），run_experiment.py 由本地注入分发器；运行时每个任务起独立子进程+独立超时+部分成功+按脚本返修（硬隔离）。默认关闭（单脚本布局）。")
@@ -91,7 +87,6 @@ def main(argv: list[str] | None = None) -> int:
         from .pipeline import ReviewPipeline
 
         client = _build_client_or_error(args, parser)
-        code_review_client = _build_code_review_client_or_error(args, parser) if args.code_review else None
         # Optional second multimodal extraction model (GENG_LLM2_*) for the round-1 ensemble;
         # None when unconfigured -> single-model behavior.
         extraction_client_2 = build_secondary_extraction_client(temperature=args.temperature, timeout=args.timeout)
@@ -106,7 +101,6 @@ def main(argv: list[str] | None = None) -> int:
         )
         result = ReviewPipeline(
             client=client,
-            code_review_client=code_review_client,
             extraction_client_2=extraction_client_2,
             generation_client=generation_client,
         ).run(
@@ -125,8 +119,6 @@ def main(argv: list[str] | None = None) -> int:
             result_review=not args.no_result_review,
             resume=not args.no_resume,
             template_fallback=not args.no_template_fallback,
-            code_review=args.code_review,
-            code_review_attempts=args.code_review_attempts,
             facts_gap_rounds=args.facts_gap_rounds,
             tasks_gap_rounds=args.tasks_gap_rounds,
             per_task_layout=args.per_task_layout,
@@ -186,35 +178,3 @@ def _build_client_or_error(args: argparse.Namespace, parser: argparse.ArgumentPa
         parser.error(str(exc))
 
 
-def _build_code_review_client_or_error(args: argparse.Namespace, parser: argparse.ArgumentParser):
-    """Client for the code-faithfulness review. Uses the heterogeneous reviewer model
-    when GENG_CODE_REVIEW_MODEL / --code-review-model is set; otherwise reviews with the
-    main model. Either way the review gets its own (longer) --code-review-timeout so a slow
-    model does not time out mid-review."""
-    from .config import build_code_review_client, build_llm_client, get_config_value
-
-    try:
-        client = build_code_review_client(
-            model=args.code_review_model,
-            temperature=args.temperature,
-            timeout=args.code_review_timeout,
-            thinking=args.thinking,
-            reasoning_effort=args.reasoning_effort,
-        )
-        if client is not None:
-            return client
-        return build_llm_client(
-            api_key=args.api_key or get_config_value("GENG_LLM_API_KEY"),
-            base_url=args.base_url or get_config_value("GENG_LLM_BASE_URL"),
-            model=args.model or get_config_value("GENG_LLM_MODEL"),
-            temperature=args.temperature,
-            timeout=args.code_review_timeout,
-            thinking=args.thinking,
-            reasoning_effort=args.reasoning_effort,
-        )
-    except ValueError as exc:
-        parser.error(str(exc))
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

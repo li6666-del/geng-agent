@@ -50,31 +50,6 @@ class PromptTests(unittest.TestCase):
             self.assertIn("只要 Python 代码里出现第三方 import", prompt)
             self.assertIn("requirements.txt 里写对应包名", prompt)
 
-    def test_code_review_prompts_carry_whitelist_awareness(self) -> None:
-        book = PromptBook()
-
-        review_prompt = book.render(
-            "review_repro_project_code.md",
-            engineering_facts_json="{}",
-            repro_tasks_json="{}",
-            project_files="[]",
-            paper_context_json="[]",
-        )
-        revise_prompt = book.render(
-            "repair_repro_project_for_review.md",
-            review_findings_json="[]",
-            engineering_facts_json="{}",
-            repro_tasks_json="{}",
-            project_files="[]",
-        )
-
-        for prompt in (review_prompt, revise_prompt):
-            self.assertIn("第三方库只能从", prompt)  # dependency policy is injected
-            self.assertIn("白名单", prompt)
-        # the revise step is where the reviewer LLM actually adds code/libraries, so it must
-        # be explicit that any new third-party import has to be declared in requirements.txt.
-        self.assertIn("requirements.txt", revise_prompt)
-
     def test_generation_prompts_require_random_seed(self) -> None:
         book = PromptBook()
 

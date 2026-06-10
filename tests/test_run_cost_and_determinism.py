@@ -131,7 +131,7 @@ class UsageRollupTests(unittest.TestCase):
                 {"model": "rev"},  # provider omitted usage -> counts as a call, 0 tokens
             ],
         )
-        pipe = ReviewPipeline(main, code_review_client=reviewer)
+        pipe = ReviewPipeline(main, generation_client=reviewer)
 
         cum = pipe._cumulative_usage()
         self.assertEqual(cum["llm_calls"], 3)
@@ -142,9 +142,9 @@ class UsageRollupTests(unittest.TestCase):
         self.assertEqual(by_model["rev"]["total_tokens"], 10)
         self.assertEqual(by_model["main"]["total_tokens"], 15)
 
-    def test_same_client_for_review_is_not_double_counted(self) -> None:
+    def test_same_client_for_generation_is_not_double_counted(self) -> None:
         main = _UsageClient("main", [{"model": "main", "total_tokens": 15}])
-        pipe = ReviewPipeline(main, code_review_client=main)
+        pipe = ReviewPipeline(main, generation_client=main)
         self.assertEqual(pipe._cumulative_usage()["llm_calls"], 1)
 
 
