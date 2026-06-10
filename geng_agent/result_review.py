@@ -106,20 +106,40 @@ def run_result_review(
             task=task,
             selected_images=task_images,
         )
-        review, status = call_experiment_result_review(
-            client=client,
-            prompt_book=prompt_book,
-            system_message=system_message,
-            paper=paper,
-            facts=facts,
-            task=task,
-            task_evidence=task_evidence,
-            task_images=task_images,
-            audit_dir=audit_dir,
-            index=index,
-            max_attempts=max_attempts,
-            paper_thesis=paper_thesis,
-        )
+        task_id = str(task.get("task_id") or f"task_{index}")
+        try:
+            review, status = call_experiment_result_review(
+                client=client,
+                prompt_book=prompt_book,
+                system_message=system_message,
+                paper=paper,
+                facts=facts,
+                task=task,
+                task_evidence=task_evidence,
+                task_images=task_images,
+                audit_dir=audit_dir,
+                index=index,
+                max_attempts=max_attempts,
+                paper_thesis=paper_thesis,
+            )
+        except Exception as exc:
+            # One experiment's review failure must not sink the whole round-4 stage (observed
+            # live: one experiment kept emitting structured `differences` -> 6 failed attempts
+            # -> NO result_review.json at all -> science repair never fired for the OTHER
+            # experiments that were judged fine). Degrade just this experiment to a
+            # schema-valid cannot_assess review and keep going — partial review beats none.
+            review = build_unassessable_experiment_review(task_id=task_id, reason=str(exc))
+            status = {
+                "task_id": task_id,
+                "stage_label": f"04a_review_reproduction_experiment_{index:02d}_{safe_label(task_id)}",
+                "attempts": max_attempts,
+                "review_failed": True,
+                "error": redact_text(str(exc))[:500],
+            }
+            write_json(
+                audit_dir / f"review_failed_{index:02d}_{safe_label(task_id)}.json",
+                {"ok": False, "fallback": "cannot_assess", "error": status["error"]},
+            )
         experiment_reviews.append(review)
         experiment_statuses.append(status)
         total_attempts += int(status.get("attempts", 0))
@@ -612,21 +632,80 @@ def thesis_ordering_anchor_for_task(paper_thesis: dict[str, Any] | None, task: d
     )
 
 
+def build_unassessable_experiment_review(*, task_id: str, reason: str) -> dict[str, Any]:
+    """A schema-valid cannot_assess review for an experiment whose LLM review failed outright.
+    Honest degradation: the failure is stated as the finding, nothing is scored, and the
+    cannot_assess verdict never triggers science repair (we don't repair what we couldn't
+    assess) — while the OTHER experiments' reviews proceed normally."""
+    reason_text = redact_text(reason).strip()[:300] or "review failed"
+    return {
+        "task_id": task_id,
+        "local_result_credibility": "unknown",
+        "paper_alignment": "inconclusive",
+        "scientific_verdict": "cannot_assess",
+        "dimension_reviews": [
+            {
+                "dimension": dimension,
+                "rating": "unknown",
+                "finding": "该实验的结果级审查未能产出通过校验的结论，无法给出该维度评估。",
+                "evidence": [f"review_error: {reason_text}"],
+            }
+            for dimension in RESULT_REVIEW_DIMENSION_ORDER
+        ],
+        "paper_result_summary": "审查未完成：未能提取论文侧结论。",
+        "local_result_summary": "审查未完成：该实验的审查输出多次未通过 JSON 校验，按 cannot_assess 处理。",
+        "differences": [],
+        "possible_causes": ["审查模型输出格式问题或证据不足，导致该实验审查失败。"],
+        "evidence": [f"review_error: {reason_text}"],
+        "limitations": ["该实验审查失败，仅此实验降级为 cannot_assess；其余实验的审查不受影响。"],
+        "confidence": "low",
+    }
+
+
+def _coerce_str_list(value: Any) -> Any:
+    """Coerce a list's items to plain strings (dict/list -> compact JSON). The review model
+    sometimes structures `differences` as objects -- schema-invalid but content-fine; coercion
+    saves the attempt instead of burning all retries on a shape mistake."""
+    if not isinstance(value, list):
+        return value
+    coerced: list[str] = []
+    for item in value:
+        if isinstance(item, str):
+            coerced.append(item)
+        elif isinstance(item, (dict, list)):
+            coerced.append(json.dumps(item, ensure_ascii=False))
+        elif item is not None:
+            coerced.append(str(item))
+    return coerced
+
+
 def normalize_experiment_review_candidate(parsed: dict[str, Any], *, expected_task_id: str) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         return parsed
+    review: dict[str, Any] = parsed
     reviews = parsed.get("experiment_reviews")
     if isinstance(reviews, list) and reviews:
-        for review in reviews:
-            if isinstance(review, dict) and str(review.get("task_id")) == expected_task_id:
-                return dict(review)
-        first = reviews[0]
-        if isinstance(first, dict):
-            return dict(first)
-    review = parsed.get("experiment_review")
-    if isinstance(review, dict):
-        return dict(review)
-    return parsed
+        for candidate in reviews:
+            if isinstance(candidate, dict) and str(candidate.get("task_id")) == expected_task_id:
+                review = dict(candidate)
+                break
+        else:
+            if isinstance(reviews[0], dict):
+                review = dict(reviews[0])
+    elif isinstance(parsed.get("experiment_review"), dict):
+        review = dict(parsed["experiment_review"])
+    else:
+        review = dict(parsed)
+
+    for key in ("differences", "possible_causes", "evidence", "limitations"):
+        if key in review:
+            review[key] = _coerce_str_list(review[key])
+    dimension_reviews = review.get("dimension_reviews")
+    if isinstance(dimension_reviews, list):
+        for item in dimension_reviews:
+            if isinstance(item, dict) and "evidence" in item:
+                item["evidence"] = _coerce_str_list(item["evidence"])
+    return review
 
 
 def aggregate_result_reviews(experiment_reviews: list[dict[str, Any]], *, evidence: dict[str, Any]) -> dict[str, Any]:
