@@ -366,6 +366,85 @@ class ScienceRepairIntegrationTests(unittest.TestCase):
             self.assertTrue(new_review.get("passed"))
             self.assertTrue((result.repro_project_dir / "tasks" / "reproduce_fig_1.py").exists())
 
+    def test_codex_backend_routes_regenerate_to_agent_and_gate_still_decides(self) -> None:
+        # Same harness as the LLM-backend test, but regenerate goes through a mock codex CLI:
+        # the agent's edit lands, the trusted dispatcher survives, and the keep/revert gate
+        # still owns the final decision.
+        import os
+        import sys
+        import textwrap
+        with TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            paper = temp / "paper.md"
+            paper.write_text("Simulation Results\nAWGN channel, BER vs SNR.", encoding="utf-8")
+
+            pipeline = ReviewPipeline(client=PerTaskFakeLLM())
+            result = pipeline.run(
+                paper, temp / "case", run_repro=True, run_timeout=60, repair_attempts=0,
+                result_review=False, facts_gap_rounds=0, tasks_gap_rounds=0,
+                per_task_layout=True, science_loop=True, science_repair_rounds=1,
+            )
+            out = result.output_dir
+            manifest = json.loads((out / "repro_project_manifest.json").read_text(encoding="utf-8"))
+            (out / "result_review.json").write_text(json.dumps({"experiment_reviews": [{
+                "task_id": "reproduce_fig_1", "scientific_verdict": "does_not_support_paper_claim",
+                "paper_result_summary": "论文：下降", "local_result_summary": "本地：全0",
+                "differences": ["全0"], "possible_causes": ["归一化"],
+                "dimension_reviews": [],
+            }]}), encoding="utf-8")
+
+            mock = temp / "mock_codex.py"
+            mock.write_text(textwrap.dedent(
+                """
+                import sys
+                from pathlib import Path
+                args = sys.argv[1:]
+                proj = None
+                for i, a in enumerate(args):
+                    if a == "--cd":
+                        proj = Path(args[i + 1])
+                mod = proj / "src" / "modulation.py"
+                mod.write_text(mod.read_text(encoding="utf-8") + "\\n# agent-fixed\\n", encoding="utf-8")
+                print("mock agent ok")
+                """
+            ), encoding="utf-8")
+
+            def fake_evaluate():
+                return (
+                    {"coverage": "1/1"},
+                    {"passed": True, "mode": "stub"},
+                    {"experiment_reviews": [{"task_id": "reproduce_fig_1",
+                                             "scientific_verdict": "supports_paper_claim",
+                                             "dimension_reviews": []}]},
+                )
+
+            import unittest.mock as um
+            with um.patch.dict(os.environ, {"GENG_CODEX_CMD": f'"{sys.executable}" "{mock}"'}):
+                new_runtime, new_review = pipeline._run_science_repair(
+                    output_dir=out, audit_dir=out / "audit", repro_project_dir=result.repro_project_dir,
+                    manifest=manifest, facts={}, tasks={}, paper={}, paper_path=paper,
+                    paper_context_json="[]", paper_thesis=None,
+                    runtime_result={"coverage": "1/1"}, result_review_result={"passed": True},
+                    science_repair_rounds=1, repair_attempts=0, run_timeout=60, repair_backend="hybrid",
+                    openhands_timeout=10, openhands_max_iterations=1, max_attempts=2, project_timeout=60,
+                    science_repair_backend="codex", science_repair_timeout=60,
+                    evaluate=fake_evaluate,
+                )
+
+            summary = json.loads((out / "science_repair.json").read_text(encoding="utf-8"))
+            self.assertTrue(summary["applied"])
+            self.assertTrue(summary["kept"])  # gate decided, exactly as with the LLM backend
+            agent_status = json.loads(
+                (out / "audit" / "06_agentic_repair_codex_round_01.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(agent_status["ok"])
+            self.assertIn(
+                "agent-fixed",
+                (result.repro_project_dir / "src" / "modulation.py").read_text(encoding="utf-8"),
+            )
+            dispatcher = (result.repro_project_dir / "run_experiment.py").read_text(encoding="utf-8")
+            self.assertIn("from tasks import reproduce_fig_1", dispatcher)  # trusted file intact
+
     def test_science_repair_is_noop_without_mismatch(self) -> None:
         with TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)

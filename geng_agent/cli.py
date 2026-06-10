@@ -70,6 +70,8 @@ def _add_common_review_args(parser: argparse.ArgumentParser, *, include_resume: 
     parser.add_argument("--per-task-layout", action="store_true", help="第三轮按“每任务一脚本”布局生成：LLM 只生成共享 src + 每个复现任务一个 tasks/<module>.py（薄驱动调 _io），run_experiment.py 由本地注入分发器；运行时每个任务起独立子进程+独立超时+部分成功+按脚本返修（硬隔离）。默认关闭（单脚本布局）。")
     parser.add_argument("--science-loop", action="store_true", help="开启“论文思路”闭环：第一轮后额外提炼论文核心主张/机制/方法预期排序（paper_thesis），锚进生成与结果审查，并按预期排序对复现做一致性校验+回喂科学返修。建议与 --per-task-layout 同用（按任务隔离才能定位返修）。默认关闭。")
     parser.add_argument("--science-repair-rounds", type=int, default=1, help="论文思路闭环里“科学返修”的最大轮数：当结果审查判定某实验未支持论文结论（多为方法排序与论文相反）时，按诊断回喂、定向重写涉事 src/ 与任务脚本并重跑+复审；每轮可逆，仅在错配严格减少且不丢覆盖时保留，否则回滚。默认 1，设 0 关闭（仅锚定+审查、不自动返修）。仅在 --science-loop + --per-task-layout 下生效。")
+    parser.add_argument("--science-repair-backend", choices=("llm", "codex"), default="llm", help="科学返修的执行后端。llm（默认）=一把式逐文件重写；codex=把项目交给无头 Codex CLI 会话迭代调试（复跑任务、打印中间量、定位再改），适合“公式抄对了但建模没建对”的深层问题。codex 后端要求本机已装 Codex CLI 并登录（或设 GENG_CODEX_CMD 指定命令）；受信任文件（_io.py/分发器/manifest/requirements）即使被改也会被确定性还原，最终留不留仍由“错配严格减少且不丢覆盖”的闸裁决。")
+    parser.add_argument("--science-repair-timeout", type=float, default=1800.0, help="codex 科学返修单轮会话的超时时间，单位秒，默认 1800（半小时；agent 要反复跑仿真验证，给足时间）。")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -130,6 +132,8 @@ def main(argv: list[str] | None = None) -> int:
             per_task_layout=args.per_task_layout,
             science_loop=args.science_loop,
             science_repair_rounds=args.science_repair_rounds,
+            science_repair_backend=args.science_repair_backend,
+            science_repair_timeout=args.science_repair_timeout,
         )
         print(f"审查完成：{result.output_dir}")
         print(f"报告：{result.review_path}")

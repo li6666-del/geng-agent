@@ -14,6 +14,7 @@ from .code_review import (
     review_single_generated_file,
     run_code_faithfulness_review,
 )
+from .agentic_repair import run_agentic_science_repair
 from .science_repair import build_science_directive, diagnose_csv_symptoms, run_science_repair
 from .documents import load_paper
 from .experiment_index import build_local_experiment_index
@@ -460,6 +461,8 @@ class ReviewPipeline:
         per_task_layout: bool = False,
         science_loop: bool = False,
         science_repair_rounds: int = 1,
+        science_repair_backend: str = "llm",
+        science_repair_timeout: float = 1800.0,
     ) -> PipelineResult:
         output_dir = output_dir.expanduser().resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -841,6 +844,8 @@ class ReviewPipeline:
                 runtime_result=runtime_result,
                 result_review_result=result_review_result,
                 science_repair_rounds=science_repair_rounds,
+                science_repair_backend=science_repair_backend,
+                science_repair_timeout=science_repair_timeout,
                 repair_attempts=repair_attempts,
                 run_timeout=run_timeout,
                 repair_backend=repair_backend,
@@ -1980,6 +1985,8 @@ class ReviewPipeline:
         openhands_max_iterations: int,
         max_attempts: int,
         project_timeout: float | None,
+        science_repair_backend: str = "llm",
+        science_repair_timeout: float = 1800.0,
         evaluate: Callable[[], tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Drive the bounded, reversible science-repair loop (geng_agent.science_repair) with
@@ -2015,7 +2022,25 @@ class ReviewPipeline:
             _copy(saved_dir / "runtime_result.json", runtime_json)
             _copy(saved_dir / "result_review.json", review_json)
 
+        # Backend selection: "llm" = one-shot per-file regeneration (default, unchanged);
+        # "codex" = hand the project to a headless coding agent that can iterate (run a task,
+        # print intermediates, fix, re-run). Either way the gate/evaluate/snapshot/restore
+        # safety properties below are identical — only the regenerate effect differs.
+        agentic_round = {"n": 0}
+
         def regenerate(mismatches: list[dict[str, Any]]) -> None:
+            if science_repair_backend == "codex":
+                agentic_round["n"] += 1
+                run_agentic_science_repair(
+                    repro_project_dir=repro_project_dir,
+                    mismatches=mismatches,
+                    tasks_manifest=tasks_manifest,
+                    thesis_anchor=_thesis_anchor_text(paper_thesis),
+                    audit_dir=audit_dir,
+                    timeout=science_repair_timeout,
+                    round_no=agentic_round["n"],
+                )
+                return
             self._regenerate_science_files(
                 mismatches=mismatches,
                 manifest=manifest,
