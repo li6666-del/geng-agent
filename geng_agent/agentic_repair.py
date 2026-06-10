@@ -154,8 +154,17 @@ def run_agentic_science_repair(
     write_text(audit_dir / f"{label}_brief.md", brief)
 
     # Snapshot trusted-file bytes so we can both DETECT a touch (audit) and RESTORE it.
+    # NON-offending task scripts are protected the same way: the contract forbids editing
+    # tasks that passed review, and the gate alone can't tell a benign-looking edit from
+    # drift — so any change to them is byte-reverted (offending scripts stay editable).
+    offending = set(offending_scripts)
+    protected = list(TRUSTED_PROJECT_FILES) + [
+        str(t.get("script"))
+        for t in tasks_manifest.get("tasks", [])
+        if isinstance(t, dict) and t.get("script") and str(t.get("script")) not in offending
+    ]
     trusted_before: dict[str, bytes | None] = {}
-    for rel in TRUSTED_PROJECT_FILES:
+    for rel in protected:
         path = repro_project_dir / rel
         trusted_before[rel] = path.read_bytes() if path.exists() else None
 
@@ -236,10 +245,9 @@ def run_agentic_science_repair(
         after = path.read_bytes() if path.exists() else None
         if after != before:
             status["touched_trusted"].append(rel)
-    if status["touched_trusted"]:
-        requirements_before = trusted_before.get("requirements.txt")
-        if requirements_before is not None:
-            (repro_project_dir / "requirements.txt").write_bytes(requirements_before)
+            if before is not None:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(before)  # byte-revert (covers requirements + protected tasks)
     inject_io_runtime(repro_project_dir)
     if tasks_manifest.get("tasks"):
         write_task_scaffolding(repro_project_dir, tasks_manifest)

@@ -38,9 +38,13 @@ def _make_project(temp: Path) -> tuple[Path, dict]:
     out.mkdir(parents=True)
     # an all-zero column -> the symptom detector must produce a lead for the brief
     out.joinpath("results.csv").write_text("x,sum_rate\n1,0\n2,0\n", encoding="utf-8")
-    manifest = build_tasks_manifest({"repro_tasks": [{"task_id": "reproduce_fig_5"}]})
+    # two tasks: fig_5 is the offending one (editable), fig_4 passed review (protected)
+    manifest = build_tasks_manifest(
+        {"repro_tasks": [{"task_id": "reproduce_fig_5"}, {"task_id": "reproduce_fig_4"}]}
+    )
     (proj / "tasks").mkdir()
     (proj / "tasks" / "reproduce_fig_5.py").write_text("def main(config_path=None):\n    return 0\n", encoding="utf-8")
+    (proj / "tasks" / "reproduce_fig_4.py").write_text("def main(config_path=None):\n    return 4\n", encoding="utf-8")
     inject_io_runtime(proj)
     write_task_scaffolding(proj, manifest)
     return proj, manifest
@@ -102,11 +106,15 @@ class AgenticRepairEffectTests(unittest.TestCase):
             temp = Path(temp_dir)
             proj, manifest = _make_project(temp)
             io_before = (proj / "src" / "_io.py").read_text(encoding="utf-8")
+            fig4_before = (proj / "tasks" / "reproduce_fig_4.py").read_text(encoding="utf-8")
             cmd = _write_mock_codex(
                 temp,
                 """
                 mod = proj / "src" / "modulation.py"
                 mod.write_text(mod.read_text(encoding="utf-8") + "\\n# fixed-by-mock\\n", encoding="utf-8")
+                fig5 = proj / "tasks" / "reproduce_fig_5.py"
+                fig5.write_text(fig5.read_text(encoding="utf-8") + "\\n# fig5-edit\\n", encoding="utf-8")
+                (proj / "tasks" / "reproduce_fig_4.py").write_text("HIJACKED", encoding="utf-8")
                 (proj / "src" / "_io.py").write_text("SABOTAGED", encoding="utf-8")
                 (proj / "tasks_manifest.json").write_text("{}", encoding="utf-8")
                 (proj / "requirements.txt").write_text("evil-package\\n", encoding="utf-8")
@@ -124,9 +132,12 @@ class AgenticRepairEffectTests(unittest.TestCase):
             )
             self.assertTrue(status["ok"])
             self.assertEqual(status["returncode"], 0)
-            # the agent's science edit survives…
+            # the agent's edits to ALLOWED files survive…
             self.assertIn("fixed-by-mock", (proj / "src" / "modulation.py").read_text(encoding="utf-8"))
-            # …but every trusted file is back to canonical content.
+            self.assertIn("fig5-edit", (proj / "tasks" / "reproduce_fig_5.py").read_text(encoding="utf-8"))
+            # …but every protected file is back to canonical content — including the
+            # NON-offending task script the contract forbade touching.
+            self.assertEqual((proj / "tasks" / "reproduce_fig_4.py").read_text(encoding="utf-8"), fig4_before)
             self.assertEqual((proj / "src" / "_io.py").read_text(encoding="utf-8"), io_before)
             restored_manifest = json.loads((proj / "tasks_manifest.json").read_text(encoding="utf-8"))
             self.assertTrue(restored_manifest.get("tasks"))
@@ -137,7 +148,7 @@ class AgenticRepairEffectTests(unittest.TestCase):
             self.assertIn("numpy", requirements)
             self.assertEqual(
                 sorted(status["touched_trusted"]),
-                ["requirements.txt", "src/_io.py", "tasks_manifest.json"],
+                ["requirements.txt", "src/_io.py", "tasks/reproduce_fig_4.py", "tasks_manifest.json"],
             )
             # transcript + brief persisted for audit
             transcript = Path(status["transcript"]).read_text(encoding="utf-8")
