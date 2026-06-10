@@ -140,6 +140,39 @@ class PartialReviewSurvivalTests(unittest.TestCase):
             self.assertEqual(len(failed), 1)
             self.assertTrue((root / "audit" / "review_failed_02_t2.json").exists())
 
+    def test_all_experiments_failing_still_fails_the_stage(self) -> None:
+        # Degradation is per-experiment only: if EVERY review fails (e.g. no multimodal at
+        # all), an "all cannot_assess" pass would be noise — the stage must fail loudly.
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            task_dir = root / "repro_project" / "outputs" / "t1"
+            task_dir.mkdir(parents=True)
+            (task_dir / "results.csv").write_text("x,y\n1,2\n", encoding="utf-8")
+            (task_dir / "p.png").write_bytes(base64.b64decode(PNG_B64))
+            paper_path = root / "paper.md"
+            paper_path.write_text("x", encoding="utf-8")
+            (root / "audit").mkdir()
+
+            def always_fail(**kwargs):
+                raise RuntimeError("multimodal endpoint down")
+
+            with um.patch("geng_agent.result_review.call_experiment_result_review", side_effect=always_fail):
+                with self.assertRaises(RuntimeError):
+                    run_result_review(
+                        client=object(),
+                        prompt_book=um.MagicMock(render=um.MagicMock(return_value="p")),
+                        system_message="s",
+                        paper_path=paper_path,
+                        paper={},
+                        facts={},
+                        tasks={"repro_tasks": [{"task_id": "t1"}, {"task_id": "t2"}]},
+                        paper_context_json="[]",
+                        repro_project_dir=root / "repro_project",
+                        output_dir=root,
+                        audit_dir=root / "audit",
+                        max_attempts=2,
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()

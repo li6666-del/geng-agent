@@ -144,6 +144,16 @@ def run_result_review(
         experiment_statuses.append(status)
         total_attempts += int(status.get("attempts", 0))
 
+    # Degradation is per-experiment; a TOTAL wipeout (every review failed, e.g. the client
+    # has no working multimodal at all) still fails the stage — an "all cannot_assess"
+    # passing review would be pure noise dressed up as a result.
+    failed_statuses = [s for s in experiment_statuses if s.get("review_failed")]
+    if failed_statuses and len(failed_statuses) == len(task_items):
+        raise RuntimeError(
+            f"result review failed for all {len(failed_statuses)} experiments; first error: "
+            f"{failed_statuses[0].get('error')}"
+        )
+
     parsed = aggregate_result_reviews(experiment_reviews, evidence=evidence)
     issues = validate_stage("result_review", parsed)
     if issues:
