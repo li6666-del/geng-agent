@@ -42,6 +42,7 @@ def _load_valid_stage_cache(
     stage_label: str,
     schema_stage: str,
     extra_validation: Callable[[dict[str, Any]], list[ValidationIssue]] | None = None,
+    required_files: set[str] | None = None,
 ) -> dict[str, Any] | None:
     try:
         cached = _read_json_file(path)
@@ -52,7 +53,10 @@ def _load_valid_stage_cache(
         )
         return None
 
-    issues = validate_stage(schema_stage, cached)
+    # required_files: per-task manifests have a different required set (no run_experiment.py,
+    # plus tasks/*.py) — without this override a cached per-task manifest always fails the
+    # default-set validation and the whole codegen silently re-runs on resume.
+    issues = validate_stage(schema_stage, cached, required_files=required_files)
     if extra_validation is not None:
         issues.extend(extra_validation(cached))
     if issues:

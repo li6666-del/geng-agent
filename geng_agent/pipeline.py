@@ -1435,11 +1435,22 @@ class ReviewPipeline:
         output_path = output_dir / "repro_project_manifest.json"
         stage_label = "03_generate_repro_project"
         if resume and output_path.exists():
+            # Per-task manifests have a different required-file set (no run_experiment.py, plus
+            # tasks/*.py). Validate the cache against the SAME set the generation path uses —
+            # otherwise a valid per-task manifest always fails resume validation and the whole
+            # (expensive) codegen silently re-runs in the same output dir.
+            cache_required: set[str] | None = None
+            if per_task_layout:
+                cached_manifest_tasks = build_tasks_manifest(tasks)
+                cache_required = expected_generated_paths(
+                    [t["script"] for t in cached_manifest_tasks["tasks"]]
+                )
             cached = _load_valid_stage_cache(
                 path=output_path,
                 audit_dir=audit_dir,
                 stage_label=stage_label,
                 schema_stage="repro_project_manifest",
+                required_files=cache_required,
             )
             if cached is not None:
                 return cached

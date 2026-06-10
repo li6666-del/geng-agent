@@ -233,6 +233,41 @@ class PerTaskLayoutPipelineTests(unittest.TestCase):
             )["_meta"].get("template_fallback_used"))
 
 
+class _ExplodingLLM:
+    """A client that must never be called: any call means resume failed to reuse a cache."""
+
+    def complete(self, prompt: str, *, system=None, response_format=None) -> str:
+        raise AssertionError(f"resume re-ran an LLM stage (schema={_schema_name(response_format)})")
+
+
+class PerTaskResumeTests(unittest.TestCase):
+    def test_resume_reuses_per_task_manifest_without_regenerating(self) -> None:
+        # The cached per-task manifest has no run_experiment.py in files (harness-injected),
+        # so validating it against the DEFAULT required set always failed -> the whole codegen
+        # silently re-ran on same-dir resume (observed live: a resumed run re-burned the full
+        # generation budget). The cache must validate against the per-task required set.
+        with TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            paper = temp / "paper.md"
+            paper.write_text("Simulation Results\nAWGN channel, BER vs SNR.", encoding="utf-8")
+            first = ReviewPipeline(client=PerTaskFakeLLM()).run(
+                paper, temp / "case", run_repro=True, run_timeout=60, repair_attempts=0,
+                result_review=False, facts_gap_rounds=0, tasks_gap_rounds=0, per_task_layout=True,
+            )
+            self.assertTrue(first.runtime_passed)
+
+            # Second run on the SAME output dir with resume (default): every stage must come
+            # from cache — the exploding client proves codegen (and everything else) never re-ran.
+            second = ReviewPipeline(client=_ExplodingLLM()).run(
+                paper, temp / "case", run_repro=True, run_timeout=60, repair_attempts=0,
+                result_review=False, facts_gap_rounds=0, tasks_gap_rounds=0, per_task_layout=True,
+            )
+            self.assertTrue(second.runtime_passed)
+            audit = temp / "case" / "audit"
+            self.assertTrue((audit / "resume_used_03_generate_repro_project.json").exists())
+            self.assertFalse((audit / "resume_invalid_03_generate_repro_project.json").exists())
+
+
 class _GenerationOnlyFake:
     """A coder client that may ONLY receive per-file code-generation calls. If it ever sees a
     facts/thesis/plan/review call, routing is wrong and it raises."""
