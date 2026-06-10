@@ -179,7 +179,19 @@ def run_agentic_science_repair(
         write_json(audit_dir / f"{label}.json", status)
         return status
 
-    command = [resolved, *argv[1:], "exec", "--sandbox", "workspace-write", "--cd", str(repro_project_dir), brief]
+    # --skip-git-repo-check: the repro project is intentionally NOT a git repo, and codex
+    # refuses untrusted non-repo dirs otherwise (observed live on codex-cli 0.133).
+    command = [
+        resolved,
+        *argv[1:],
+        "exec",
+        "--skip-git-repo-check",
+        "--sandbox",
+        "workspace-write",
+        "--cd",
+        str(repro_project_dir),
+        brief,
+    ]
     status["command"] = command[:-1] + ["<brief omitted>"]
     started = time.monotonic()
     try:
@@ -192,6 +204,9 @@ def run_agentic_science_repair(
             errors="replace",
             timeout=timeout,
             check=False,
+            # codex reads "additional input" from stdin when it is not a tty; DEVNULL gives it
+            # an immediate EOF instead of a hang in headless runs.
+            stdin=subprocess.DEVNULL,
         )
         status["returncode"] = completed.returncode
         status["ok"] = completed.returncode == 0
