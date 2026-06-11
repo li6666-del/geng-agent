@@ -5,6 +5,7 @@ import unittest
 
 from geng_agent.security import (
     FORBIDDEN_BUILTINS,
+    codex_safe_env,
     reconcile_whitelisted_requirements,
     static_scan_repro_project,
     validate_requirements,
@@ -159,6 +160,24 @@ class ReconcileRequirementsTests(unittest.TestCase):
             with patch("geng_agent.security.importlib.util.find_spec", return_value=object()):
                 self.assertEqual(reconcile_whitelisted_requirements(root), ["torch"])
             self.assertIn("torch", (root / "requirements.txt").read_text(encoding="utf-8"))
+
+
+class CodexSafeEnvTests(unittest.TestCase):
+    def test_strips_geng_secrets_but_keeps_codex_creds(self) -> None:
+        fake = {
+            "GENG_LLM_API_KEY": "geng-secret",
+            "GENG_LLM2_API_KEY": "geng-secret-2",
+            "OPENAI_API_KEY": "codex-needs-this",
+            "PATH": "/usr/bin",
+        }
+        with patch.dict("os.environ", fake, clear=True):
+            env = codex_safe_env()
+        # geng's own keys are not something codex needs -> drop them
+        self.assertNotIn("GENG_LLM_API_KEY", env)
+        self.assertNotIn("GENG_LLM2_API_KEY", env)
+        # codex authenticates with its own creds and needs PATH -> these must survive
+        self.assertEqual(env["OPENAI_API_KEY"], "codex-needs-this")
+        self.assertEqual(env["PATH"], "/usr/bin")
 
 
 if __name__ == "__main__":

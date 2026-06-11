@@ -33,7 +33,7 @@ from .io_runtime import inject_io_runtime
 from .outputs import write_json, write_text
 from .result_review import summarize_csv_file
 from .science_repair import build_science_directive, diagnose_csv_symptoms
-from .security import redact_text
+from .security import codex_safe_env, redact_text
 from .task_scripts import write_task_scaffolding
 
 
@@ -207,6 +207,7 @@ def run_agentic_science_repair(
         completed = subprocess.run(
             command,
             cwd=repro_project_dir,
+            env=codex_safe_env(),
             capture_output=True,
             text=True,
             encoding="utf-8",

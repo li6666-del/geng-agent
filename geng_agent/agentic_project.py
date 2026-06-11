@@ -34,7 +34,7 @@ from .result_review import (
 from .runner import run_repro_with_repair
 from .schemas import format_issues, validate_stage
 from .science_repair import collect_actionable_review_feedback, review_score
-from .security import dependency_policy_prompt_text, reconcile_whitelisted_requirements, redact_text
+from .security import codex_safe_env, dependency_policy_prompt_text, reconcile_whitelisted_requirements, redact_text
 from .stage_cleanup import _clear_project_code_files, _clear_stage_outputs
 from .task_scripts import build_tasks_manifest, write_task_scaffolding
 
@@ -435,6 +435,7 @@ def _run_codex(
         completed = subprocess.run(
             command,
             cwd=work_dir,
+            env=codex_safe_env(),
             capture_output=True,
             text=True,
             encoding="utf-8",

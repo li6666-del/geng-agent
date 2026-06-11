@@ -188,6 +188,18 @@ def build_safe_env() -> dict[str, str]:
     return safe_env
 
 
+def codex_safe_env() -> dict[str, str]:
+    """Environment for a Codex subprocess: the inherited parent env MINUS geng's own LLM
+    secrets, which codex never needs (it authenticates with its own credentials). Unlike
+    :func:`build_safe_env` -- which strips the env to a minimal allowlist for running
+    UNTRUSTED generated code -- codex is a trusted external tool needing a normal env (PATH,
+    HOME, its own auth), so keep everything except the GENG_* keys it has no reason to read."""
+    env = dict(os.environ)
+    for key in ("GENG_LLM_API_KEY", "GENG_LLM2_API_KEY"):
+        env.pop(key, None)
+    return env
+
+
 def redact_text(text: str) -> str:
     redacted = text
     for pattern in SECRET_PATTERNS:
