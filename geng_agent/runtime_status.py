@@ -17,6 +17,9 @@ def _load_result_review_document(output_dir: Path, result_review_result: dict[st
         return {}
     path = output_dir / "result_review.json"
     if not path.exists():
+        md_path = output_dir / "result_review.md"
+        if md_path.exists():
+            return {"_meta": {"markdown_review": True}, "markdown_path": str(md_path)}
         return {}
     try:
         return _read_json_file(path)
@@ -122,23 +125,28 @@ def _assess_partial_success(runtime_result: dict[str, Any]) -> dict[str, Any]:
 def _load_cached_result_review_status(output_dir: Path) -> dict[str, Any] | None:
     result_json_path = output_dir / "result_review.json"
     result_md_path = output_dir / "result_review.md"
-    if not result_json_path.exists() or not result_md_path.exists():
+    if not result_md_path.exists():
         return None
-    try:
-        parsed = _read_json_file(result_json_path)
-    except Exception:
+    error_path = output_dir / "result_review_error.json"
+    if error_path.exists() and error_path.stat().st_mtime >= result_md_path.stat().st_mtime:
         return None
-    if validate_stage("result_review", parsed):
-        return None
+    if result_json_path.exists():
+        try:
+            parsed = _read_json_file(result_json_path)
+        except Exception:
+            return None
+        if validate_stage("result_review", parsed):
+            return None
 
     status = {
         "enabled": True,
         "passed": True,
-        "result_review_path": str(result_json_path),
         "result_review_markdown_path": str(result_md_path),
         "attempts": 0,
-        "reason": "reused cached result_review.json",
+        "reason": "reused cached result_review.md",
     }
+    if result_json_path.exists():
+        status["result_review_path"] = str(result_json_path)
     generated_files_path = output_dir / "generated_files.json"
     if generated_files_path.exists():
         try:

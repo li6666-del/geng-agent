@@ -833,7 +833,8 @@ class ReviewPipeline:
             ),
         )
 
-        result_review_path = output_dir / "result_review.json"
+        result_review_json_path = output_dir / "result_review.json"
+        result_review_markdown_path = output_dir / "result_review.md"
         review_docx_path = output_dir / "review.docx"
         result_review_docx_path = output_dir / "result_review.docx"
         return PipelineResult(
@@ -843,7 +844,13 @@ class ReviewPipeline:
             risk_report_path=risk_report_path,
             runtime_passed=runtime_result.get("passed"),
             experiment_index_path=(output_dir / "experiment_index.json") if (output_dir / "experiment_index.json").exists() else None,
-            result_review_path=result_review_path if result_review_path.exists() else None,
+            result_review_path=(
+                result_review_json_path
+                if result_review_json_path.exists()
+                else result_review_markdown_path
+                if result_review_markdown_path.exists()
+                else None
+            ),
             result_review_passed=result_review_result.get("passed"),
             reproducibility_verdict=reproducibility_verdict,
             review_docx_path=review_docx_path if review_docx_path.exists() else None,
@@ -1802,11 +1809,11 @@ class ReviewPipeline:
         errors: list[dict[str, str]] = []
         result: dict[str, Any] = {
             "review_docx": {"passed": False, "path": None},
-            "result_review_docx": {"passed": None, "path": None, "reason": "result_review.json was not generated"},
+            "result_review_docx": {"passed": None, "path": None, "reason": "result_review.md was not generated"},
         }
 
         try:
-            from .docx_writer import write_result_review_docx, write_review_docx
+            from .docx_writer import write_result_review_docx, write_result_review_markdown_docx, write_review_docx
         except Exception as exc:
             error = _docx_error("import_docx_writer", exc)
             errors.append(error)
@@ -1834,14 +1841,22 @@ class ReviewPipeline:
             result["review_docx"] = {"passed": False, "path": None, "error": error["error"]}
 
         result_json_path = output_dir / "result_review.json"
-        if result_review_result.get("passed") and result_json_path.exists():
+        result_md_path = output_dir / "result_review.md"
+        if result_review_result.get("passed") and result_md_path.exists():
             try:
-                result_review_json = json.loads(result_json_path.read_text(encoding="utf-8"))
-                result_review_docx_path = write_result_review_docx(
-                    output_dir / "result_review.docx",
-                    result_review=result_review_json,
-                    status=result_review_result,
-                )
+                if result_json_path.exists():
+                    result_review_json = json.loads(result_json_path.read_text(encoding="utf-8"))
+                    result_review_docx_path = write_result_review_docx(
+                        output_dir / "result_review.docx",
+                        result_review=result_review_json,
+                        status=result_review_result,
+                    )
+                else:
+                    result_review_docx_path = write_result_review_markdown_docx(
+                        output_dir / "result_review.docx",
+                        markdown_text=result_md_path.read_text(encoding="utf-8", errors="replace"),
+                        status=result_review_result,
+                    )
                 result["result_review_docx"] = {"passed": True, "path": str(result_review_docx_path)}
             except Exception as exc:
                 error = _docx_error("result_review.docx", exc)

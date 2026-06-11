@@ -191,7 +191,7 @@ def _format_result_review_status(result_review_result: dict[str, Any]) -> str:
     if not result_review_result.get("enabled"):
         return f"未运行（{result_review_result.get('reason', 'unknown reason')}）"
     if result_review_result.get("passed"):
-        return "通过，已生成 result_review.json 和 result_review.md"
+        return "通过，已生成 result_review.md"
     return f"失败（{result_review_result.get('error', 'unknown error')}）"
 
 

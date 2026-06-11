@@ -16,7 +16,7 @@ STAGES = [
     ("repro_project_manifest", "repro_project_manifest.json", "repro_project_manifest"),
     ("repro_project", "repro_project", None),
     ("runtime", "runtime_result.json", None),
-    ("result_review", "result_review.json", "result_review"),
+    ("result_review", "result_review.md", None),
     ("review", "review.md", None),
     ("review_docx", "review.docx", None),
     ("result_review_docx", "result_review.docx", None),
@@ -104,6 +104,22 @@ def inspect_stage(output_dir: Path, name: str, rel_path: str, schema_stage: str 
             return {"stage": name, "ok": ok, "path": str(path), "passed": data.get("passed"), "reason": "passed" if ok else "not passed"}
         except Exception as exc:
             return {"stage": name, "ok": False, "path": str(path), "reason": f"invalid json: {exc}"}
+
+    if name == "result_review":
+        error_path = output_dir / "result_review_error.json"
+        if error_path.exists() and error_path.stat().st_mtime >= path.stat().st_mtime:
+            try:
+                error_data = read_json(error_path)
+                reason = error_data.get("reason") or error_data.get("error") or "result review failed"
+            except Exception:
+                reason = "result review failed"
+            return {
+                "stage": name,
+                "ok": False,
+                "path": str(path),
+                "reason": str(reason),
+                "error_path": str(error_path),
+            }
 
     if schema_stage:
         try:

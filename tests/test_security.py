@@ -1,6 +1,7 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
+import os
 import unittest
 
 from geng_agent.security import (
@@ -178,6 +179,70 @@ class CodexSafeEnvTests(unittest.TestCase):
         # codex authenticates with its own creds and needs PATH -> these must survive
         self.assertEqual(env["OPENAI_API_KEY"], "codex-needs-this")
         self.assertEqual(env["PATH"], "/usr/bin")
+
+    def test_geng_python_is_preferred_for_codex_shell_python(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            python_path = Path(temp_dir) / "miniconda3" / "envs" / "torch" / "python.exe"
+            python_path.parent.mkdir(parents=True)
+            python_path.write_text("", encoding="utf-8")
+            python_dir = python_path.parent
+            fake = {
+                "GENG_PYTHON": f'"{python_path}"',
+                "PATH": os.pathsep.join(["/usr/bin", str(python_dir)]),
+            }
+            with patch.dict("os.environ", fake, clear=True):
+                env = codex_safe_env()
+
+        path_parts = env["PATH"].split(os.pathsep)
+        self.assertEqual(
+            path_parts[:3],
+            [
+                str(python_dir),
+                str(python_dir / "Scripts"),
+                str(python_dir / "Library" / "bin"),
+            ],
+        )
+        self.assertEqual(path_parts.count(str(python_dir)), 1)
+        self.assertEqual(env["PYTHON"], str(python_path))
+        self.assertEqual(env["GENG_PYTHON"], str(python_path))
+        self.assertEqual(env["CONDA_PREFIX"], str(python_dir))
+
+    def test_invalid_geng_python_falls_back_to_default_torch_env(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir)
+            default_python = home / "miniconda3" / "envs" / "torch" / ("python.exe" if os.name == "nt" else "bin/python")
+            default_python.parent.mkdir(parents=True)
+            default_python.write_text("", encoding="utf-8")
+            fake = {
+                "USERPROFILE": str(home),
+                "GENG_PYTHON": str(home / "missing" / "python.exe"),
+                "PATH": "/usr/bin",
+            }
+            with patch.dict("os.environ", fake, clear=True):
+                env = codex_safe_env()
+
+        self.assertEqual(env["GENG_PYTHON"], str(default_python))
+        self.assertEqual(env["PYTHON"], str(default_python))
+
+    def test_default_torch_env_is_used_for_codex_when_geng_python_is_absent(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir)
+            if os.name == "nt":
+                python_path = home / "miniconda3" / "envs" / "torch" / "python.exe"
+            else:
+                python_path = home / "miniconda3" / "envs" / "torch" / "bin" / "python"
+            python_path.parent.mkdir(parents=True)
+            python_path.write_text("", encoding="utf-8")
+            fake = {
+                "USERPROFILE": str(home),
+                "PATH": "/usr/bin",
+            }
+            with patch.dict("os.environ", fake, clear=True):
+                env = codex_safe_env()
+
+        self.assertEqual(env["GENG_PYTHON"], str(python_path))
+        self.assertEqual(env["PYTHON"], str(python_path))
+        self.assertTrue(env["PATH"].split(os.pathsep)[0].endswith(str(python_path.parent)))
 
 
 if __name__ == "__main__":

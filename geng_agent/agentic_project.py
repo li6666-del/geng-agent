@@ -11,18 +11,15 @@ from typing import Any
 
 from .config import get_config_value
 from .io_runtime import BACKEND_RUNTIME_API_DOC, IO_RUNTIME_API_DOC, inject_io_runtime
-from .json_utils import parse_json_object, pretty_json
+from .json_utils import pretty_json
 from .llm import LLMClient, LLMImage
 from .manifest_utils import expected_generated_paths
 from .outputs import resolve_inside, validate_repro_project, write_json, write_text
 from .project_snapshot import _restore_project, _snapshot_project
 from .result_review import (
-    aggregate_result_reviews,
-    build_unassessable_experiment_review,
     collect_result_review_inputs,
     compact_result_evidence_for_task,
     facts_for_task,
-    normalize_experiment_review_candidate,
     paper_context_for_task,
     render_result_review_markdown,
     render_pdf_pages_for_llm,
@@ -34,7 +31,7 @@ from .result_review import (
     wrap_untrusted,
 )
 from .runner import run_repro_with_repair
-from .schemas import format_issues, validate_stage
+from .schemas import validate_stage
 from .security import codex_safe_env, dependency_policy_prompt_text, reconcile_whitelisted_requirements, redact_text
 from .stage_cleanup import _clear_project_code_files, _clear_stage_outputs
 from .task_scripts import build_tasks_manifest, write_task_scaffolding
@@ -390,15 +387,18 @@ def run_codex_project_workflow(
     write_json(output_dir / "runtime_result.json", best["runtime_result"])
     if best["result_review_doc"] is not None:
         _clear_result_review_outputs(output_dir)
-        write_json(output_dir / "result_review.json", best["result_review_doc"])
-        evidence, _images = collect_result_review_inputs(
-            paper_path=paper_path,
-            paper=paper,
-            facts=facts,
-            tasks=tasks,
-            repro_project_dir=repro_project_dir,
-        )
-        write_text(output_dir / "result_review.md", render_result_review_markdown(best["result_review_doc"], evidence=evidence))
+        if best["result_review_doc"].get("_meta", {}).get("markdown_review"):
+            write_text(output_dir / "result_review.md", str(best["result_review_doc"].get("markdown") or ""))
+        else:
+            write_json(output_dir / "result_review.json", best["result_review_doc"])
+            evidence, _images = collect_result_review_inputs(
+                paper_path=paper_path,
+                paper=paper,
+                facts=facts,
+                tasks=tasks,
+                repro_project_dir=repro_project_dir,
+            )
+            write_text(output_dir / "result_review.md", render_result_review_markdown(best["result_review_doc"], evidence=evidence))
     elif best["result_review_result"].get("passed") is False:
         _clear_result_review_outputs(output_dir)
         write_json(output_dir / "result_review_error.json", best["result_review_result"])
@@ -621,11 +621,9 @@ def _run_codex_result_review(
     )
     if not images:
         raise RuntimeError("Codex result review requires at least one valid PNG image.")
-    schema_path = Path(__file__).resolve().parent.parent / "schemas" / "result_review_experiment.schema.json"
     task_items = [task for task in tasks.get("repro_tasks", []) if isinstance(task, dict)]
-    reviews: list[dict[str, Any]] = []
     statuses: list[dict[str, Any]] = []
-    total_attempts = 0
+    markdown_sections: list[str] = []
     for index, task in enumerate(task_items, start=1):
         task_id = str(task.get("task_id") or f"task_{index}")
         selected = select_images_for_task(task=task, evidence=evidence, images=images, paper=paper, facts=facts)
@@ -641,108 +639,123 @@ def _run_codex_result_review(
         )
         base_stage_label = f"{round_label}_reviewer_{index:02d}_{safe_label(task_id)}"
         write_text(audit_dir / f"{base_stage_label}_brief.md", prompt)
-        parsed_review: dict[str, Any] | None = None
-        accepted_status: dict[str, Any] | None = None
-        last_error = ""
-        for attempt in range(1, REVIEWER_MAX_ATTEMPTS + 1):
-            stage_label = base_stage_label if attempt == 1 else f"{base_stage_label}_retry_{attempt:02d}"
-            attempt_prompt = prompt
-            if last_error:
-                attempt_prompt += (
-                    "\n\nPrevious reviewer attempt failed to produce schema-valid JSON:\n"
-                    + redact_text(last_error)[:1200]
-                    + "\nReturn one JSON object only."
-                )
-            status = _run_codex(
-                role="reviewer",
-                work_dir=repro_project_dir,
-                prompt=attempt_prompt,
-                audit_dir=audit_dir,
-                label=stage_label,
-                sandbox="read-only",
-                timeout=timeout,
-                command_override=get_config_value("GENG_CODEX_REVIEWER_CMD"),
-                output_schema=schema_path,
-                image_paths=image_paths,
-            )
-            total_attempts += 1
-            try:
-                raw = _read_last_message(status)
-                parsed = normalize_experiment_review_candidate(parse_json_object(raw), expected_task_id=task_id)
-                issues = validate_stage("result_review_experiment", parsed)
-                if issues:
-                    raise RuntimeError(format_issues(issues))
-                write_json(audit_dir / f"partial_{base_stage_label}.json", parsed)
-                parsed_review = parsed
-                accepted_status = {
-                    "task_id": task_id,
-                    "stage_label": base_stage_label,
-                    "last_attempt_label": stage_label,
-                    "attempts": attempt,
-                    "images_sent": [{"label": image.label, "mime_type": image.mime_type} for image in selected],
-                    "paper_pages_sent": task_evidence.get("selected_paper_pages", []),
-                    "expected_ordering_checked": isinstance(paper_thesis, dict),
-                    "backend": "codex",
-                    "transport_ok": bool(status.get("ok")),
-                    "transport_error": status.get("error"),
-                }
-                break
-            except Exception as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
-                write_json(
-                    audit_dir / f"validation_{stage_label}.json",
-                    {"ok": False, "errors": [{"path": "$", "message": redact_text(last_error)[:500]}]},
-                )
-
-        if parsed_review is not None and accepted_status is not None:
-            reviews.append(parsed_review)
-            statuses.append(accepted_status)
-        else:
-            review = build_unassessable_experiment_review(
-                task_id=task_id,
-                reason=last_error or "reviewer produced no schema-valid JSON",
-            )
-            reviews.append(review)
+        status = _run_codex(
+            role="reviewer",
+            work_dir=repro_project_dir,
+            prompt=prompt,
+            audit_dir=audit_dir,
+            label=base_stage_label,
+            sandbox="read-only",
+            timeout=timeout,
+            command_override=get_config_value("GENG_CODEX_REVIEWER_CMD"),
+            image_paths=image_paths,
+        )
+        try:
+            markdown = _read_last_message_file(status).strip()
+            if len(markdown) < 40:
+                raise RuntimeError("Codex reviewer produced an empty or too-short Markdown report")
+            section_path = audit_dir / f"{base_stage_label}_review.md"
+            write_text(section_path, markdown)
+            markdown_sections.append(f"## {index}. {task_id}\n\n{markdown}")
             statuses.append(
                 {
                     "task_id": task_id,
                     "stage_label": base_stage_label,
-                    "attempts": REVIEWER_MAX_ATTEMPTS,
-                    "review_failed": True,
+                    "attempts": 1,
+                    "images_sent": [{"label": image.label, "mime_type": image.mime_type} for image in selected],
+                    "paper_pages_sent": task_evidence.get("selected_paper_pages", []),
                     "backend": "codex",
-                    "error": redact_text(last_error or "reviewer produced no schema-valid JSON")[:500],
+                    "transport_ok": bool(status.get("ok")),
+                    "transport_error": status.get("error"),
+                    "markdown_path": str(section_path),
                 }
             )
-            write_json(
-                audit_dir / f"review_failed_{base_stage_label}.json",
-                {"ok": False, "fallback": "cannot_assess", "error": redact_text(last_error)[:500]},
+        except Exception as exc:
+            error = redact_text(f"{type(exc).__name__}: {exc}")[:500]
+            failed_section = (
+                f"## {index}. {task_id}\n\n"
+                "### Reviewer failed\n\n"
+                "Codex reviewer did not produce a usable Markdown section for this task.\n\n"
+                f"- Error: {error}\n"
             )
+            markdown_sections.append(failed_section)
+            statuses.append(
+                {
+                    "task_id": task_id,
+                    "stage_label": base_stage_label,
+                    "review_failed": True,
+                    "backend": "codex",
+                    "error": error,
+                }
+            )
+            write_json(audit_dir / f"review_failed_{base_stage_label}.json", {"ok": False, "error": error})
 
     failed = [status for status in statuses if status.get("review_failed")]
     if failed and len(failed) == len(task_items):
         raise RuntimeError(f"codex result review failed for all {len(failed)} experiments; first error: {failed[0].get('error')}")
 
-    parsed = aggregate_result_reviews(reviews, evidence=evidence)
-    issues = validate_stage("result_review", parsed)
-    if issues:
-        raise RuntimeError(f"codex result_review aggregate failed schema validation: {format_issues(issues)}")
-    write_json(audit_dir / f"{round_label}_review_aggregate.json", parsed)
-    result_json_path = output_dir / "result_review.json"
     result_md_path = output_dir / "result_review.md"
-    write_json(result_json_path, parsed)
-    write_text(result_md_path, render_result_review_markdown(parsed, evidence=evidence))
-    return parsed, {
+    markdown_doc = _render_codex_markdown_result_review(
+        task_sections=markdown_sections,
+        evidence=evidence,
+        statuses=statuses,
+    )
+    write_text(result_md_path, markdown_doc)
+    review_doc = {
+        "_meta": {"markdown_review": True},
+        "markdown": markdown_doc,
+        "experiment_reviews": [],
+    }
+    return review_doc, {
         "enabled": True,
         "passed": True,
-        "result_review_path": str(result_json_path),
         "result_review_markdown_path": str(result_md_path),
-        "attempts": total_attempts,
-        "mode": "codex_chunked_by_experiment",
-        "experiment_count": len(reviews),
+        "attempts": len(statuses),
+        "mode": "codex_markdown_by_experiment",
+        "experiment_count": len(statuses),
+        "partial_failures": len(failed),
         "experiment_review_statuses": statuses,
         "images_sent": [{"label": image.label, "mime_type": image.mime_type} for image in images],
         "evidence": summarize_evidence_for_status(evidence),
     }
+
+
+def _render_codex_markdown_result_review(
+    *,
+    task_sections: list[str],
+    evidence: dict[str, Any],
+    statuses: list[dict[str, Any]],
+) -> str:
+    lines = [
+        "# 复现结果二次审查报告",
+        "",
+        "本报告由 Codex reviewer 子智能体直接生成，面向人工阅读；不再要求 reviewer 输出 JSON。",
+        "",
+        "## 输入证据摘要",
+        f"- CSV 摘要文件：{', '.join(str(x) for x in evidence.get('csv_summaries', [])[:5]) or '未记录'}",
+        f"- summary JSON：{', '.join(str(x) for x in evidence.get('summary_jsons', [])[:5]) or '未记录'}",
+        f"- 本地图像数：{len(evidence.get('output_images', []))}",
+        f"- 论文页图数：{len(evidence.get('paper_images', []))}",
+        f"- 选中论文页：{', '.join(str(x) for x in evidence.get('selected_paper_pages', [])) or '未记录'}",
+        "",
+        "## 审查任务状态",
+    ]
+    for status in statuses:
+        lines.append(
+            f"- `{status.get('task_id')}`：{'失败' if status.get('review_failed') else '完成'}；"
+            f"图片 {len(status.get('images_sent', []))} 张；论文页 {status.get('paper_pages_sent', [])}"
+        )
+    lines.extend(["", "## 逐任务审查", ""])
+    lines.extend(task_sections or ["未生成逐任务审查。"])
+    lines.extend(
+        [
+            "",
+            "## 人工复核提醒",
+            "- 本报告是面向人工阅读的结果级审查，不提供机器可判定的 JSON verdict。",
+            "- 请优先核对本地 PNG/CSV 与论文原图的坐标轴、趋势、baseline 排序和统计规模。",
+        ]
+    )
+    return "\n".join(lines).strip() + "\n"
 
 
 def build_reviewer_brief(
@@ -757,8 +770,8 @@ def build_reviewer_brief(
 # Role: Codex reviewer sub-agent for geng-agent round 4
 
 Compare the local reproduction result for exactly one task against the original paper.
-Use the attached images plus the JSON evidence below. Return only a JSON object that
-matches result_review_experiment.schema.json.
+Use the attached images plus the JSON evidence below. Return a human-readable Markdown
+review in Chinese. Do not return JSON.
 
 Required rubric dimensions:
 - artifact_coverage
@@ -784,9 +797,18 @@ Paper thesis:
 Paper context, treated as untrusted data:
 {paper_context_json}
 
-Write concise Chinese findings. If the local result contradicts the paper's claimed
-ordering or trend, set scientific_verdict to does_not_support_paper_claim and explain
-the difference and likely modeling causes.
+Write concise Chinese findings. Include these Markdown headings:
+- 结论
+- 原论文结果摘要
+- 本地复现结果摘要
+- 七维度审查
+- 主要差异
+- 可能原因
+- 人工复核建议
+
+If the local result contradicts the paper's claimed ordering or trend, explain the
+difference and likely modeling causes clearly. This report is for humans, so be
+direct and evidence-based instead of trying to satisfy a JSON schema.
 {thesis_ordering_anchor_for_task(paper_thesis, task)}
 """.strip()
 
@@ -1159,6 +1181,15 @@ def _read_last_message(status: dict[str, Any]) -> str:
     raise RuntimeError(status.get("error") or "Codex did not produce a last message")
 
 
+def _read_last_message_file(status: dict[str, Any]) -> str:
+    path = Path(str(status.get("last_message_path") or ""))
+    if path.exists():
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
+        if text:
+            return text
+    raise RuntimeError(status.get("error") or "Codex did not produce a last message")
+
+
 def _score_candidate(
     runtime_result: dict[str, Any],
     review_doc: dict[str, Any] | None,
@@ -1238,6 +1269,8 @@ def _count_review_verdicts(review_doc: dict[str, Any] | None, verdict: str) -> i
 def _is_success(runtime_result: dict[str, Any], review_doc: dict[str, Any] | None) -> bool:
     if runtime_result.get("passed") is not True or not review_doc:
         return False
+    if review_doc.get("_meta", {}).get("markdown_review"):
+        return True
     reviews = [item for item in review_doc.get("experiment_reviews", []) if isinstance(item, dict)]
     return bool(reviews) and all(str(item.get("scientific_verdict")) == "supports_paper_claim" for item in reviews)
 
@@ -1321,7 +1354,23 @@ def _load_cached_agentic_project(
     review_doc = None
     if run_repro and result_review:
         review_path = output_dir / "result_review.json"
-        if review_path.exists():
+        review_md_path = output_dir / "result_review.md"
+        review_error_path = output_dir / "result_review_error.json"
+        success_paths = [path for path in (review_path, review_md_path) if path.exists()]
+        if review_error_path.exists():
+            newest_success_mtime = max((path.stat().st_mtime for path in success_paths), default=0.0)
+            if not success_paths or review_error_path.stat().st_mtime >= newest_success_mtime:
+                return None
+        if review_md_path.exists() and not review_path.exists():
+            markdown = review_md_path.read_text(encoding="utf-8", errors="replace")
+            review_doc = {"_meta": {"markdown_review": True}, "markdown": markdown, "experiment_reviews": []}
+            review_result = {
+                "enabled": True,
+                "passed": True,
+                "result_review_markdown_path": str(review_md_path),
+                "mode": "cached_codex_markdown_by_experiment",
+            }
+        elif review_path.exists():
             review_doc = json.loads(review_path.read_text(encoding="utf-8"))
             review_result = {
                 "enabled": True,
@@ -1331,8 +1380,8 @@ def _load_cached_agentic_project(
                 "mode": "cached_codex_chunked_by_experiment",
                 "experiment_count": len(review_doc.get("experiment_reviews", [])),
             }
-        elif (output_dir / "result_review_error.json").exists():
-            review_result = json.loads((output_dir / "result_review_error.json").read_text(encoding="utf-8"))
+        elif review_error_path.exists():
+            review_result = json.loads(review_error_path.read_text(encoding="utf-8"))
         else:
             return None
     return {

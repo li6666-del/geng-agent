@@ -351,6 +351,59 @@ def write_result_review_docx(
     return _save(document, path)
 
 
+def write_result_review_markdown_docx(
+    path: Path,
+    *,
+    markdown_text: str,
+    status: dict[str, Any] | None = None,
+) -> Path:
+    """Create the human-readable result review Word report from Markdown."""
+
+    document = Document()
+    _setup_document(document)
+    _add_title(
+        document,
+        "复现结果二次审查报告",
+        "由 Codex reviewer 直接生成的人工阅读版结果对比报告",
+    )
+
+    status = status or {}
+    _add_heading(document, "报告状态", 1)
+    _add_kv_table(
+        document,
+        [
+            ("是否通过", "是" if status.get("passed") else "否"),
+            ("审查模式", status.get("mode", "未记录")),
+            ("Markdown 报告", status.get("result_review_markdown_path", "未记录")),
+            ("说明", status.get("reason") or status.get("error") or "无"),
+        ],
+    )
+
+    _add_heading(document, "审查正文", 1)
+    _add_markdown_body(document, markdown_text)
+    _add_disclaimer(document)
+    return _save(document, path)
+
+
+def _add_markdown_body(document: DocumentObject, markdown_text: str) -> None:
+    for raw_line in markdown_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("### "):
+            _add_heading(document, line[4:].strip(), 3)
+        elif line.startswith("## "):
+            _add_heading(document, line[3:].strip(), 2)
+        elif line.startswith("# "):
+            _add_heading(document, line[2:].strip(), 1)
+        elif line.startswith(("- ", "* ")):
+            _add_bullets(document, [line[2:].strip()])
+        elif line.startswith("```"):
+            continue
+        else:
+            document.add_paragraph(_safe_text(line))
+
+
 def _setup_document(document: DocumentObject) -> None:
     section = document.sections[0]
     section.top_margin = Inches(0.8)

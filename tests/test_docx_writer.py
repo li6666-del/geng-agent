@@ -6,7 +6,7 @@ import unittest
 
 from docx import Document
 
-from geng_agent.docx_writer import write_result_review_docx, write_review_docx
+from geng_agent.docx_writer import write_result_review_docx, write_result_review_markdown_docx, write_review_docx
 
 
 class DocxWriterTests(unittest.TestCase):
@@ -123,6 +123,27 @@ class DocxWriterTests(unittest.TestCase):
             self.assertIn("reproduce_fig_1", text)
             self.assertIn("多维审查", text)
             self.assertGreaterEqual(len(document.tables), 3)
+
+    def test_write_result_review_markdown_docx_creates_openable_report(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            path = root / "result_review.docx"
+
+            write_result_review_markdown_docx(
+                path,
+                markdown_text="# 复现结果二次审查报告\n\n## 结论\n\n- 本地曲线趋势一致。\n",
+                status={
+                    "passed": True,
+                    "mode": "codex_markdown_by_experiment",
+                    "result_review_markdown_path": str(root / "result_review.md"),
+                },
+            )
+
+            document = Document(path)
+            text = "\n".join(paragraph.text for paragraph in document.paragraphs)
+            self.assertIn("复现结果二次审查报告", text)
+            self.assertIn("本地曲线趋势一致", text)
+            self.assertGreaterEqual(len(document.tables), 1)
 
 
 if __name__ == "__main__":

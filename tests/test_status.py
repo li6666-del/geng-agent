@@ -155,6 +155,17 @@ class StatusTests(unittest.TestCase):
             self.assertFalse(stage["ok"])
             self.assertIn("Codex result reviewer failed", stage["reason"])
 
+    def test_status_accepts_markdown_result_review(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            case = Path(temp_dir) / "case"
+            case.mkdir()
+            (case / "result_review.md").write_text("# result review\n\nhuman readable report\n", encoding="utf-8")
+
+            stage = next(item for item in inspect_case_status(case)["stages"] if item["stage"] == "result_review")
+
+            self.assertTrue(stage["ok"], stage)
+            self.assertEqual(stage["reason"], "present")
+
 
 if __name__ == "__main__":
     unittest.main()

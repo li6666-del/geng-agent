@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import textwrap
 import unittest
@@ -8,6 +9,7 @@ from tempfile import TemporaryDirectory
 from geng_agent.agentic_project import (
     _feedback_from_results,
     _is_better_score,
+    _load_cached_agentic_project,
     _score_candidate,
     build_writer_brief,
     run_codex_project_workflow,
@@ -168,6 +170,35 @@ def _write_mock_writer(temp: Path) -> str:
                 ]),
                 encoding="utf-8",
             )
+            (proj / "tasks" / "reproduce_fig_2.py").write_text(
+                "\n".join([
+                    "from __future__ import annotations",
+                    "import json",
+                    "import matplotlib.pyplot as plt",
+                    "from src import _io",
+                    "from src.simulation import run_curve",
+                    "",
+                    "def main(config_path=None) -> int:",
+                    "    cfg_path = config_path or 'config_smoke.json'",
+                    "    with open(cfg_path, 'r', encoding='utf-8') as handle:",
+                    "        cfg = json.load(handle)",
+                    "    task_id = 'reproduce_fig_2'",
+                    "    _io.begin(task_id, cfg)",
+                    "    rows = run_curve()",
+                    "    _io.write_table(task_id, ['snr', 'rate'], rows)",
+                    "    fig, ax = plt.subplots()",
+                    "    ax.plot([x for x, _ in rows], [y for _, y in rows])",
+                    "    ax.set_xlabel('snr')",
+                    "    ax.set_ylabel('rate')",
+                    "    _io.write_figure(task_id, 'fig2', fig)",
+                    "    return _io.finish(task_id, metrics={'backend': 'cpu', 'points': len(rows)}, assumptions=['mock'])",
+                    "",
+                    "if __name__ == '__main__':",
+                    "    raise SystemExit(main())",
+                    "",
+                ]),
+                encoding="utf-8",
+            )
             (proj / "src" / "_io.py").write_text("SABOTAGED\n", encoding="utf-8")
             (proj / "run_experiment.py").write_text("SABOTAGED\n", encoding="utf-8")
             (proj / "unexpected.py").write_text("print('bad')\n", encoding="utf-8")
@@ -200,36 +231,11 @@ def _write_failing_after_first_reviewer(temp: Path) -> str:
             n = int(counter.read_text(encoding="utf-8")) if counter.exists() else 0
             counter.write_text(str(n + 1), encoding="utf-8")
             if n > 0:
-                print("not json")
+                print("reviewer failed on the second task")
                 raise SystemExit(1)
-            dims = [
-                "artifact_coverage",
-                "reproduction_logic",
-                "trend_shape",
-                "metric_axis_scale",
-                "baseline_comparison",
-                "statistical_reliability",
-                "conclusion_support",
-            ]
-            review = {
-                "task_id": "reproduce_fig_1",
-                "local_result_credibility": "high",
-                "paper_alignment": "mismatch",
-                "scientific_verdict": "does_not_support_paper_claim",
-                "dimension_reviews": [
-                    {"dimension": dim, "rating": "strong", "finding": dim + " ok", "evidence": ["mock evidence"]}
-                    for dim in dims
-                ],
-                "paper_result_summary": "paper says curve should increase",
-                "local_result_summary": "local curve decreases",
-                "differences": ["first round has a real mismatch"],
-                "possible_causes": ["mock modeling issue"],
-                "evidence": ["mock evidence"],
-                "limitations": ["mock reviewer"],
-                "confidence": "high",
-            }
-            out.write_text(json.dumps(review, ensure_ascii=False), encoding="utf-8")
-            print(json.dumps(review, ensure_ascii=False))
+            markdown = "# Mock review\n\nThe first task has enough detail to be accepted as a Markdown review."
+            out.write_text(markdown, encoding="utf-8")
+            print(markdown)
             '''
         ),
         encoding="utf-8",
@@ -242,7 +248,6 @@ def _write_mock_reviewer(temp: Path) -> str:
     script.write_text(
         textwrap.dedent(
             r'''
-            import json
             import sys
             from pathlib import Path
 
@@ -251,38 +256,39 @@ def _write_mock_reviewer(temp: Path) -> str:
             counter = Path(__file__).with_name("review_count.txt")
             n = int(counter.read_text(encoding="utf-8")) if counter.exists() else 0
             counter.write_text(str(n + 1), encoding="utf-8")
-            verdict = "does_not_support_paper_claim" if n == 0 else "supports_paper_claim"
-            alignment = "mismatch" if n == 0 else "match"
-            differences = ["paper ordering is not matched yet"] if n == 0 else []
-            causes = ["mock modeling issue"] if n == 0 else []
-            dims = [
-                "artifact_coverage",
-                "reproduction_logic",
-                "trend_shape",
-                "metric_axis_scale",
-                "baseline_comparison",
-                "statistical_reliability",
-                "conclusion_support",
-            ]
-            review = {
-                "task_id": "reproduce_fig_1",
-                "local_result_credibility": "high",
-                "paper_alignment": alignment,
-                "scientific_verdict": verdict,
-                "dimension_reviews": [
-                    {"dimension": dim, "rating": "strong", "finding": dim + " ok", "evidence": ["mock evidence"]}
-                    for dim in dims
-                ],
-                "paper_result_summary": "paper says curve should increase",
-                "local_result_summary": "local curve increases",
-                "differences": differences,
-                "possible_causes": causes,
-                "evidence": ["mock evidence"],
-                "limitations": ["mock reviewer"],
-                "confidence": "high",
-            }
-            out.write_text(json.dumps(review, ensure_ascii=False), encoding="utf-8")
-            print(json.dumps(review, ensure_ascii=False))
+            markdown = "\n".join([
+                "# reproduce_fig_1",
+                "",
+                "## 结论",
+                "本地曲线与论文趋势一致，建议人工复核数值量级。",
+                "",
+                "## 原论文结果摘要",
+                "paper says curve should increase",
+                "",
+                "## 本地复现结果摘要",
+                "local curve increases",
+                "",
+                "## 七维度审查",
+                "- artifact_coverage: mock evidence",
+                "- reproduction_logic: mock evidence",
+                "- trend_shape: mock evidence",
+                "- metric_axis_scale: mock evidence",
+                "- baseline_comparison: mock evidence",
+                "- statistical_reliability: mock evidence",
+                "- conclusion_support: mock evidence",
+                "",
+                "## 主要差异",
+                "无明显差异。",
+                "",
+                "## 可能原因",
+                "mock modeling issue 已被修正。",
+                "",
+                "## 人工复核建议",
+                "请核对 CSV 和 PNG。",
+                "",
+            ])
+            out.write_text(markdown, encoding="utf-8")
+            print(markdown)
             '''
         ),
         encoding="utf-8",
@@ -405,7 +411,12 @@ class AgenticProjectWorkflowTests(unittest.TestCase):
             try:
                 result = run_codex_project_workflow(
                     facts={"engineering_facts": []},
-                    tasks={"repro_tasks": [{"task_id": "reproduce_fig_1", "expected_artifacts": ["fig1.png"]}]},
+                    tasks={
+                        "repro_tasks": [
+                            {"task_id": "reproduce_fig_1", "expected_artifacts": ["fig1.png"]},
+                            {"task_id": "reproduce_fig_2", "expected_artifacts": ["fig2.png"]},
+                        ]
+                    },
                     experiment_index={"experiments": []},
                     paper={"format": "markdown", "chunks": []},
                     paper_path=paper,
@@ -436,7 +447,7 @@ class AgenticProjectWorkflowTests(unittest.TestCase):
 
             self.assertTrue(result["runtime_result"]["passed"])
             self.assertTrue(result["result_review_result"]["passed"])
-            self.assertEqual(result["status"]["best_round"], 2)
+            self.assertEqual(result["status"]["best_round"], 1)
             self.assertIn("def begin", (out / "repro_project" / "src" / "_io.py").read_text(encoding="utf-8"))
             self.assertIn("Auto-generated run-all dispatcher", (out / "repro_project" / "run_experiment.py").read_text(encoding="utf-8"))
             self.assertFalse((out / "repro_project" / "unexpected.py").exists())
@@ -448,13 +459,14 @@ class AgenticProjectWorkflowTests(unittest.TestCase):
             self.assertTrue(evidence_index["paper_source"]["copied"])
             task_evidence_rel = evidence_index["tasks"][0]["task_evidence_json"]
             self.assertTrue((out / "repro_project" / task_evidence_rel).exists())
-            self.assertTrue((out / "result_review.json").exists())
+            self.assertFalse((out / "result_review.json").exists())
+            self.assertTrue((out / "result_review.md").exists())
             round1_brief = (audit / "03c_agentic_project_round_01_writer_brief.md").read_text(encoding="utf-8")
             self.assertIn("Task-level paper evidence bundle", round1_brief)
             self.assertIn(task_evidence_rel, round1_brief)
-            round2_brief = (audit / "03c_agentic_project_round_02_writer_brief.md").read_text(encoding="utf-8")
-            self.assertIn("paper ordering is not matched yet", round2_brief)
-            self.assertIn("mock modeling issue", round2_brief)
+            result_review_md = (out / "result_review.md").read_text(encoding="utf-8")
+            self.assertIn("复现结果二次审查报告", result_review_md)
+            self.assertIn("本地曲线与论文趋势一致", result_review_md)
 
     def test_failed_reviewer_round_cannot_win_best_round_or_leave_stale_error(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -475,7 +487,12 @@ class AgenticProjectWorkflowTests(unittest.TestCase):
             try:
                 result = run_codex_project_workflow(
                     facts={"engineering_facts": []},
-                    tasks={"repro_tasks": [{"task_id": "reproduce_fig_1", "expected_artifacts": ["fig1.png"]}]},
+                    tasks={
+                        "repro_tasks": [
+                            {"task_id": "reproduce_fig_1", "expected_artifacts": ["fig1.png"]},
+                            {"task_id": "reproduce_fig_2", "expected_artifacts": ["fig2.png"]},
+                        ]
+                    },
                     experiment_index={"experiments": []},
                     paper={"format": "markdown", "chunks": []},
                     paper_path=paper,
@@ -505,10 +522,72 @@ class AgenticProjectWorkflowTests(unittest.TestCase):
                     os.environ["GENG_CODEX_REVIEWER_CMD"] = old_reviewer
 
             self.assertEqual(result["status"]["best_round"], 1)
-            self.assertTrue((out / "result_review.json").exists())
+            self.assertTrue(result["result_review_result"]["passed"])
+            self.assertEqual(result["result_review_result"]["partial_failures"], 1)
+            self.assertTrue((out / "result_review.md").exists())
             self.assertFalse((out / "result_review_error.json").exists())
-            final_review = json.loads((out / "result_review.json").read_text(encoding="utf-8"))
-            self.assertEqual(final_review["experiment_reviews"][0]["scientific_verdict"], "does_not_support_paper_claim")
+            review_md = (out / "result_review.md").read_text(encoding="utf-8")
+            self.assertIn("Mock review", review_md)
+            self.assertIn("Reviewer failed", review_md)
+
+    def test_cached_markdown_review_ignored_when_newer_error_exists(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            out = temp / "case"
+            audit = out / "audit"
+            paper = temp / "paper.md"
+            paper.write_text("Figure 1 shows rate increasing with SNR.", encoding="utf-8")
+
+            old_writer = os.environ.get("GENG_CODEX_WRITER_CMD")
+            old_reviewer = os.environ.get("GENG_CODEX_REVIEWER_CMD")
+            os.environ["GENG_CODEX_WRITER_CMD"] = _write_mock_writer(temp)
+            os.environ["GENG_CODEX_REVIEWER_CMD"] = _write_mock_reviewer(temp)
+            try:
+                run_codex_project_workflow(
+                    facts={"engineering_facts": []},
+                    tasks={"repro_tasks": [{"task_id": "reproduce_fig_1", "expected_artifacts": ["fig1.png"]}]},
+                    experiment_index={"experiments": []},
+                    paper={"format": "markdown", "chunks": []},
+                    paper_path=paper,
+                    paper_context_json="Figure 1 shows rate increasing with SNR.",
+                    paper_thesis=None,
+                    output_dir=out,
+                    audit_dir=audit,
+                    repro_project_dir=out / "repro_project",
+                    client=DummyLLM(),
+                    prompt_book=PromptBook(),
+                    system_message="system",
+                    run_repro=True,
+                    result_review=True,
+                    rounds=1,
+                    timeout=30,
+                    run_timeout=30,
+                    resume=False,
+                )
+            finally:
+                if old_writer is None:
+                    os.environ.pop("GENG_CODEX_WRITER_CMD", None)
+                else:
+                    os.environ["GENG_CODEX_WRITER_CMD"] = old_writer
+                if old_reviewer is None:
+                    os.environ.pop("GENG_CODEX_REVIEWER_CMD", None)
+                else:
+                    os.environ["GENG_CODEX_REVIEWER_CMD"] = old_reviewer
+
+            review_md = out / "result_review.md"
+            self.assertTrue(review_md.exists())
+            error_path = out / "result_review_error.json"
+            error_path.write_text(json.dumps({"enabled": True, "passed": False, "error": "newer failure"}), encoding="utf-8")
+            os.utime(review_md, (1, 1))
+            os.utime(error_path, (2, 2))
+
+            cached = _load_cached_agentic_project(
+                output_dir=out,
+                repro_project_dir=out / "repro_project",
+                run_repro=True,
+                result_review=True,
+            )
+            self.assertIsNone(cached)
 
     def test_writer_brief_includes_dependency_snapshot_and_backend_runtime_api(self) -> None:
         with TemporaryDirectory() as temp_dir:

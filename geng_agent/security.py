@@ -197,7 +197,70 @@ def codex_safe_env() -> dict[str, str]:
     env = dict(os.environ)
     for key in ("GENG_LLM_API_KEY", "GENG_LLM2_API_KEY"):
         env.pop(key, None)
+    _prefer_geng_python_for_codex(env)
     return env
+
+
+def _prefer_geng_python_for_codex(env: dict[str, str]) -> None:
+    raw_python = _select_geng_python(env.get("GENG_PYTHON"))
+    if not raw_python:
+        return
+    python_path = Path(raw_python)
+    python_dir = python_path.parent
+    prefix = [
+        python_dir,
+        python_dir / "Scripts",
+        python_dir / "Library" / "bin",
+    ]
+    existing = env.get("PATH") or env.get("Path") or ""
+    seen: set[str] = set()
+    path_parts: list[str] = []
+    for item in [str(path) for path in prefix if path] + existing.split(os.pathsep):
+        if not item:
+            continue
+        key = item.lower() if sys.platform == "win32" else item
+        if key in seen:
+            continue
+        seen.add(key)
+        path_parts.append(item)
+    env["PATH"] = os.pathsep.join(path_parts)
+    if sys.platform == "win32":
+        env["Path"] = env["PATH"]
+    env["PYTHON"] = str(python_path)
+    env["GENG_PYTHON"] = str(python_path)
+    if python_dir.parent.name == "envs":
+        env.setdefault("CONDA_PREFIX", str(python_dir))
+
+
+def _select_geng_python(explicit_python: str | None) -> str:
+    for raw_python in (explicit_python, _default_geng_python()):
+        python_path = _valid_python_path(raw_python)
+        if python_path is not None:
+            return str(python_path)
+    return ""
+
+
+def _valid_python_path(raw_python: str | None) -> Path | None:
+    raw = (raw_python or "").strip().strip('"')
+    if not raw:
+        return None
+    python_path = Path(raw).expanduser()
+    if python_path.name.lower() not in {"python.exe", "python"}:
+        return None
+    if not python_path.exists() or not python_path.is_file():
+        return None
+    return python_path
+
+
+def _default_geng_python() -> str:
+    homes = [os.environ.get("USERPROFILE"), os.environ.get("HOME")]
+    for home in homes:
+        if not home:
+            continue
+        candidate = Path(home) / "miniconda3" / "envs" / "torch" / ("python.exe" if sys.platform == "win32" else "bin/python")
+        if candidate.exists():
+            return str(candidate)
+    return ""
 
 
 def redact_text(text: str) -> str:
