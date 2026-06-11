@@ -1,11 +1,13 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 import unittest
 
 from geng_agent.security import (
     FORBIDDEN_BUILTINS,
     reconcile_whitelisted_requirements,
     static_scan_repro_project,
+    validate_requirements,
 )
 
 
@@ -98,6 +100,30 @@ class ReconcileRequirementsTests(unittest.TestCase):
                 tmp, requirements="numpy\nscipy\n", sim_source="import numpy as np\nimport scipy.linalg\n"
             )
             self.assertEqual(reconcile_whitelisted_requirements(root), [])
+
+    def test_trusted_backend_torch_call_requires_requirement(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = self._project(
+                tmp,
+                requirements="numpy\n",
+                sim_source="from src import _backend\n\ndef f():\n    return _backend.torch()\n",
+            )
+            issues = validate_requirements(root)
+            self.assertIn(
+                "trusted torch backend is used but requirements.txt does not declare torch",
+                messages(issues),
+            )
+
+    def test_reconcile_adds_torch_for_trusted_backend_when_installed(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = self._project(
+                tmp,
+                requirements="numpy\n",
+                sim_source="from src import _backend\n\ndef f():\n    return _backend.torch()\n",
+            )
+            with patch("geng_agent.security.importlib.util.find_spec", return_value=object()):
+                self.assertEqual(reconcile_whitelisted_requirements(root), ["torch"])
+            self.assertIn("torch", (root / "requirements.txt").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

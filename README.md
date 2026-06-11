@@ -4,7 +4,7 @@
 
 ## 快速开始（新用户）
 
-在自己的机器上从零跑通（Windows / PowerShell；用你自己的 Python，不是仓库里写死的 `D:\python`）：
+在自己的机器上从零跑通（Windows / PowerShell；用你自己的 Python；本机启动器默认使用 `%USERPROFILE%\miniconda3\envs\torch\python.exe`）：
 
 ```powershell
 # 1. 拉代码
@@ -24,8 +24,8 @@ $env:GENG_LLM_MODEL="gpt-4o"          # 需支持图像，结果级审查才跑�
 # $env:GENG_LLM_BASE_URL="https://api.deepseek.com"
 
 # 5. 拿仓库自带的示例论文跑一遍“全流程”
-#    = LLM 代码忠实度审查 + 运行复现 + 结果级多模态审查（结果级审查与兜底默认开）
-python -m geng_agent review sample_papers\rayleigh_error_probability_2406.16548.pdf --out case_001 --run-repro --code-review
+#    = 受限运行复现 + 结果级多模态审查（结果级审查与兜底默认开）
+python -m geng_agent review sample_papers\rayleigh_error_probability_2406.16548.pdf --out case_001 --run-repro
 ```
 
 跑完看 `case_001\` 下的 `review.md`（主报告）、`repro_project\`（生成的复现项目）、`result_review.md`（结果级审查）。
@@ -58,15 +58,15 @@ python -m geng_agent review sample_papers\rayleigh_error_probability_2406.16548.
 
 ## 安装与部署（输入 PDF 前必看）
 
-换任何机器，本质只要满足两条，**与盘符无关**——`D:\python` 只是本机路径，别的机器换成它自己的 Python 即可：
+换任何机器，本质只要满足两条，**与盘符无关**——本机默认的 torch 环境路径只是本机路径，别的机器换成它自己的 Python 即可：
 
 **① Python 版本 ≥ 3.11**（开发使用 3.13）。
 
 **② 该装的库全装**——一条命令同时装齐两类缺一不可的依赖：
 
 ```bash
-# 把 D:\python\python.exe 换成目标机器上你要用的那个 Python（在 C 盘、或已加入 PATH 时直接写 python 都行）
-D:\python\python.exe -m pip install -e ".[repro]"
+# 把下面路径换成目标机器上你要用的那个 Python（在 C 盘、或已加入 PATH 时直接写 python 都行）
+C:\Users\84475\miniconda3\envs\torch\python.exe -m pip install -e ".[repro]"
 ```
 
 | 这条命令装的两类 | 包 | 缺了会怎样 |
@@ -79,7 +79,7 @@ D:\python\python.exe -m pip install -e ".[repro]"
 装完，**喂 PDF 之前先自检一次**：
 
 ```powershell
-.\run.ps1 doctor          # 或：D:\python\python.exe -m geng_agent doctor
+.\run.ps1 doctor          # 或：C:\Users\84475\miniconda3\envs\torch\python.exe -m geng_agent doctor
 ```
 
 `doctor` 回显它实际使用的解释器路径、Python 版本是否达标、每个库装没装：**全绿才喂 PDF**；缺什么它直接给出修复命令（致命缺失退出码 1、可用 0）。因为它报的是真实解释器路径，能当场看出有没有指错 Python——所以那条路径本身不用记死，让 `doctor` 替你确认。
@@ -90,7 +90,7 @@ D:\python\python.exe -m pip install -e ".[repro]"
 
 复现项目（`run_experiment.py`）需要 numpy/scipy/matplotlib。本机默认的 `python`（harness 自带 venv）**没有**这些包，用它跑会让每一篇用到 numpy 的论文都退本地模板兜底。
 
-本项目固定使用一个完整解释器：**`D:\python\python.exe`**（Python 3.13，已装 numpy/scipy/matplotlib 及全部依赖）。直接用仓库里的启动器，它会用正确的解释器调用 geng-agent，并自动切到项目目录：
+本项目固定使用一个完整解释器：**`C:\Users\84475\miniconda3\envs\torch\python.exe`**（Python 3.11，已装 numpy/scipy/matplotlib/torch/CUDA 及全部依赖）。直接用仓库里的启动器，它会用正确的解释器调用 geng-agent，并自动切到项目目录：
 
 ```powershell
 # PowerShell
@@ -103,10 +103,10 @@ powershell -ExecutionPolicy Bypass -File run.ps1 review paper.pdf --out case_001
 也可以直接显式调用解释器：
 
 ```powershell
-D:\python\python.exe -m geng_agent review paper.pdf --out case_001 --run-repro
+C:\Users\84475\miniconda3\envs\torch\python.exe -m geng_agent review paper.pdf --out case_001 --run-repro
 ```
 
-> 解释器路径变了，就改 `run.ps1` / `run.cmd` 顶部的 `$GengPython` / `GENG_PYTHON` 一行。下文示例里的 `python` 一律指这个解释器（建议用 `.\run.ps1` 代替 `python -m geng_agent`）。
+> 解释器路径变了，可以设置 `GENG_PYTHON` 临时覆盖，或改 `run.ps1` / `run.cmd` 顶部的默认路径。下文示例里的 `python` 一律指这个解释器（建议用 `.\run.ps1` 代替 `python -m geng_agent`）。
 
 ## 配置模型
 
@@ -128,17 +128,25 @@ $env:GENG_LLM_MODEL="deepseek-v4-flash"
 
 结果级二次审查要求模型/API 支持 OpenAI-compatible 多模态 `image_url` 输入。若不支持，系统不会退回纯文本替代审查，而是写入 `result_review_error.json`。
 
-### 异构代码审查者（可选）
+### Codex writer/reviewer（第三轮默认）
 
-`--code-review` 默认用主模型做"代码忠实度审查"。若想换一个**不同的模型**当审查者（独立视角更易发现内容错误），设置 `GENG_CODE_REVIEW_MODEL`；跨服务商时还需给它单独的 key 与 base URL（未设则回退到主 `GENG_LLM_*`，可能指向错误的服务商）：
+第三轮代码生成、运行反馈修复，以及运行结果与论文结果对比，默认交给 Codex CLI 子进程。主模型仍用于论文事实抽取、任务拆解和可选的论文思路锚点。
 
 ```powershell
-$env:GENG_CODE_REVIEW_MODEL="deepseek-v4-pro"
-$env:GENG_CODE_REVIEW_BASE_URL="https://api.deepseek.com"
-$env:GENG_CODE_REVIEW_API_KEY="你的 DeepSeek API Key"
+$env:GENG_CODEX_CMD="codex"            # 默认命令
+$env:GENG_CODEX_WRITER_CMD="codex"     # 可选：单独指定写代码子智能体
+$env:GENG_CODEX_REVIEWER_CMD="codex"   # 可选：单独指定结果审查子智能体
 ```
 
-然后：`python -m geng_agent review paper.pdf --out case_001 --code-review`。也可用 `--code-review-model deepseek-v4-pro` 临时覆盖模型名。未配置审查模型时，`--code-review` 仍可用，只是审查者与生成者同模型。
+### 第二事实抽取模型（可选）
+
+第一轮事实抽取支持第二个多模态模型做 ensemble，减少图表和公式漏抽。三项都设置时启用；缺任意一项则保持单模型行为。
+
+```powershell
+$env:GENG_LLM2_MODEL="你的第二模型名"
+$env:GENG_LLM2_BASE_URL="https://api.example.com/v1"
+$env:GENG_LLM2_API_KEY="你的第二模型 API Key"
+```
 
 ## 极简 Web（实时阶段进度）
 
@@ -173,6 +181,24 @@ python -m geng_agent review paper.pdf --out case_001 --run-repro
 
 ```bash
 python -m geng_agent review paper.pdf --out case_001 --run-repro --no-result-review
+```
+
+Round-3 project generation now defaults to the Codex CLI moderator workflow:
+
+```bash
+python -m geng_agent review paper.pdf --out case_001 --run-repro
+```
+
+In that default mode, Codex writer/reviewer subprocesses own generated code and
+paper-vs-output feedback.
+
+Optional Codex controls:
+
+```bash
+python -m geng_agent review paper.pdf --out case_001 --run-repro --codex-agent-rounds 3 --codex-agent-timeout 1800
+set GENG_CODEX_CMD=codex
+set GENG_CODEX_WRITER_CMD=codex
+set GENG_CODEX_REVIEWER_CMD=codex
 ```
 
 常用参数：

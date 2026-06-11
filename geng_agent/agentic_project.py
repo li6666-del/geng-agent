@@ -1,0 +1,1010 @@
+from __future__ import annotations
+
+import base64
+import json
+import shlex
+import shutil
+import subprocess
+import time
+from pathlib import Path
+from typing import Any
+
+from .config import get_config_value
+from .io_runtime import BACKEND_RUNTIME_API_DOC, IO_RUNTIME_API_DOC, inject_io_runtime
+from .json_utils import parse_json_object, pretty_json
+from .llm import LLMClient, LLMImage
+from .manifest_utils import expected_generated_paths
+from .outputs import resolve_inside, validate_repro_project, write_json, write_text
+from .project_snapshot import _restore_project, _snapshot_project
+from .result_review import (
+    aggregate_result_reviews,
+    build_unassessable_experiment_review,
+    collect_result_review_inputs,
+    compact_result_evidence_for_task,
+    facts_for_task,
+    normalize_experiment_review_candidate,
+    paper_context_for_task,
+    render_result_review_markdown,
+    safe_label,
+    select_images_for_task,
+    summarize_evidence_for_status,
+    thesis_ordering_anchor_for_task,
+    wrap_untrusted,
+)
+from .runner import run_repro_with_repair
+from .schemas import format_issues, validate_stage
+from .science_repair import collect_actionable_review_feedback, review_score
+from .security import dependency_policy_prompt_text, reconcile_whitelisted_requirements, redact_text
+from .stage_cleanup import _clear_project_code_files, _clear_stage_outputs
+from .task_scripts import build_tasks_manifest, write_task_scaffolding
+
+
+CODEX_PROJECT_BACKEND = "codex"
+MAX_TRANSCRIPT_CHARS = 200_000
+MAX_WRITER_PAPER_CONTEXT_CHARS = 45_000
+REVIEWER_MAX_ATTEMPTS = 2
+
+TRUSTED_PROJECT_FILES = (
+    "src/_io.py",
+    "src/_backend.py",
+    "run_experiment.py",
+    "tasks_manifest.json",
+    "tasks/__init__.py",
+)
+
+SHARED_PROJECT_FILES = (
+    "README.md",
+    "requirements.txt",
+    "config.json",
+    "config_smoke.json",
+    "src/channel.py",
+    "src/modulation.py",
+    "src/metrics.py",
+    "src/simulation.py",
+)
+
+
+def run_codex_project_workflow(
+    *,
+    facts: dict[str, Any],
+    tasks: dict[str, Any],
+    experiment_index: dict[str, Any],
+    paper: dict[str, Any],
+    paper_path: Path,
+    paper_context_json: str,
+    paper_thesis: dict[str, Any] | None,
+    output_dir: Path,
+    audit_dir: Path,
+    repro_project_dir: Path,
+    client: LLMClient,
+    prompt_book: Any,
+    system_message: str,
+    run_repro: bool,
+    result_review: bool,
+    rounds: int = 3,
+    timeout: float = 1800.0,
+    run_timeout: float = 120.0,
+    resume: bool = True,
+) -> dict[str, Any]:
+    """Third-round Codex moderator workflow.
+
+    The ordinary LLM no longer writes or repairs reproduction code on this path.
+    Codex writer mutates the generated repro project, the local guarded runner is
+    the authority for execution, and the Codex reviewer produces the same
+    result_review_experiment objects consumed by the existing report pipeline.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    rounds = max(1, int(rounds or 1))
+    timeout = float(timeout or 1800.0)
+
+    cached = _load_cached_agentic_project(
+        output_dir=output_dir,
+        repro_project_dir=repro_project_dir,
+        run_repro=run_repro,
+        result_review=result_review,
+    )
+    if resume and cached is not None:
+        write_json(audit_dir / "03c_agentic_project_resume.json", {"ok": True, "source": "cached artifacts"})
+        return cached
+
+    _clear_stage_outputs(output_dir, "manifest")
+    task_manifest = build_tasks_manifest(tasks)
+    expected_paths = expected_generated_paths([item["script"] for item in task_manifest.get("tasks", [])])
+    _prepare_project_workspace(repro_project_dir, task_manifest)
+
+    status: dict[str, Any] = {
+        "backend": CODEX_PROJECT_BACKEND,
+        "rounds_requested": rounds,
+        "rounds": [],
+        "expected_paths": sorted(expected_paths),
+    }
+    write_json(audit_dir / "03c_agentic_project_start.json", status)
+
+    best: dict[str, Any] | None = None
+    best_snapshot = audit_dir / "03c_agentic_project_best_snapshot"
+    feedback: list[dict[str, Any]] = []
+
+    for round_no in range(1, rounds + 1):
+        round_label = f"03c_agentic_project_round_{round_no:02d}"
+        brief = build_writer_brief(
+            facts=facts,
+            tasks=tasks,
+            experiment_index=experiment_index,
+            paper_context_json=paper_context_json,
+            paper_thesis=paper_thesis,
+            task_manifest=task_manifest,
+            expected_paths=expected_paths,
+            feedback=feedback,
+            round_no=round_no,
+            max_rounds=rounds,
+        )
+        write_text(audit_dir / f"{round_label}_writer_brief.md", brief)
+
+        writer_status = _run_codex(
+            role="writer",
+            work_dir=repro_project_dir,
+            prompt=brief,
+            audit_dir=audit_dir,
+            label=f"{round_label}_writer",
+            sandbox="workspace-write",
+            timeout=timeout,
+            command_override=get_config_value("GENG_CODEX_WRITER_CMD"),
+        )
+        _restore_trusted_files(repro_project_dir, task_manifest)
+        _prune_unexpected_files(repro_project_dir, expected_paths)
+
+        manifest = _manifest_from_project(
+            repro_project_dir=repro_project_dir,
+            expected_paths=expected_paths,
+            task_manifest=task_manifest,
+            round_no=round_no,
+        )
+        manifest_issues = validate_stage("repro_project_manifest", manifest, required_files=expected_paths)
+        write_json(
+            audit_dir / f"{round_label}_manifest_validation.json",
+            {"ok": not manifest_issues, "errors": [issue.as_dict() for issue in manifest_issues]},
+        )
+        write_json(output_dir / "repro_project_manifest.json", manifest)
+
+        validation = validate_repro_project(repro_project_dir)
+        reconciled = reconcile_whitelisted_requirements(repro_project_dir)
+        if reconciled:
+            write_json(audit_dir / f"{round_label}_requirements_reconciled.json", {"added": reconciled})
+
+        if run_repro:
+            runtime_result = run_repro_with_repair(
+                repro_project_dir=repro_project_dir,
+                client=client,
+                prompt_book=prompt_book,
+                system_message=system_message,
+                max_repair_attempts=0,
+                timeout_seconds=run_timeout,
+            )
+        else:
+            runtime_result = {
+                "enabled": False,
+                "passed": None,
+                "attempts": [],
+                "reason": "automatic execution is disabled by default; pass --run-repro to enable the guarded runner",
+                "repair_backend": "codex",
+            }
+        runtime_result["repair_backend"] = "codex"
+        write_json(output_dir / "runtime_result.json", runtime_result)
+        _annotate_writer_post_run_status(writer_status, validation, runtime_result)
+        write_json(audit_dir / f"{round_label}_writer_post_run.json", writer_status)
+
+        review_doc: dict[str, Any] | None = None
+        review_status = _skipped_review_status(run_repro=run_repro, result_review=result_review, runtime_result=runtime_result)
+        if review_status is None:
+            _clear_result_review_outputs(output_dir)
+            try:
+                review_doc, review_status = _run_codex_result_review(
+                    facts=facts,
+                    tasks=tasks,
+                    paper=paper,
+                    paper_path=paper_path,
+                    paper_context_json=paper_context_json,
+                    paper_thesis=paper_thesis,
+                    repro_project_dir=repro_project_dir,
+                    output_dir=output_dir,
+                    audit_dir=audit_dir,
+                    round_label=round_label,
+                    timeout=timeout,
+                )
+            except Exception as exc:
+                review_status = {
+                    "enabled": True,
+                    "passed": False,
+                    "mode": "codex_reviewer",
+                    "error": redact_text(f"{type(exc).__name__}: {exc}")[:1000],
+                    "reason": "Codex result reviewer failed",
+                }
+                write_json(output_dir / "result_review_error.json", review_status)
+
+        score = _score_candidate(runtime_result, review_doc, review_status, writer_status, validation, manifest_issues)
+        round_record = {
+            "round": round_no,
+            "writer": writer_status,
+            "validation": validation,
+            "manifest_errors": [issue.as_dict() for issue in manifest_issues],
+            "runtime": _compact_runtime(runtime_result),
+            "result_review": _compact_review_status(review_status),
+            "score": score,
+        }
+        write_json(audit_dir / f"{round_label}.json", round_record)
+        status["rounds"].append(round_record)
+
+        candidate = {
+            "round": round_no,
+            "score": score,
+            "manifest": manifest,
+            "runtime_result": runtime_result,
+            "result_review_result": review_status,
+            "result_review_doc": review_doc,
+        }
+        if best is None or _is_better_score(score, best["score"]):
+            best = candidate
+            _snapshot_project(repro_project_dir, best_snapshot)
+            write_json(audit_dir / "03c_agentic_project_best.json", {"round": round_no, "score": score})
+
+        if _is_success(runtime_result, review_doc):
+            status["stopped_reason"] = "runtime passed and every reviewed task supports the paper claim"
+            break
+        feedback = _feedback_from_results(runtime_result, review_doc, review_status)
+
+    if best is None:
+        error = {"enabled": True, "passed": False, "error": "Codex project workflow produced no candidate"}
+        write_json(output_dir / "agentic_project_error.json", error)
+        raise RuntimeError(error["error"])
+
+    if best_snapshot.exists():
+        _restore_project(best_snapshot, repro_project_dir)
+        _restore_trusted_files(repro_project_dir, task_manifest)
+        _prune_unexpected_files(repro_project_dir, expected_paths)
+    write_json(output_dir / "repro_project_manifest.json", best["manifest"])
+    write_json(output_dir / "runtime_result.json", best["runtime_result"])
+    if best["result_review_doc"] is not None:
+        _clear_result_review_outputs(output_dir)
+        write_json(output_dir / "result_review.json", best["result_review_doc"])
+        evidence, _images = collect_result_review_inputs(
+            paper_path=paper_path,
+            paper=paper,
+            facts=facts,
+            tasks=tasks,
+            repro_project_dir=repro_project_dir,
+        )
+        write_text(output_dir / "result_review.md", render_result_review_markdown(best["result_review_doc"], evidence=evidence))
+    elif best["result_review_result"].get("passed") is False:
+        _clear_result_review_outputs(output_dir)
+        write_json(output_dir / "result_review_error.json", best["result_review_result"])
+
+    status["rounds_run"] = len(status["rounds"])
+    status["best_round"] = best["round"]
+    status["best_score"] = best["score"]
+    write_json(audit_dir / "03c_agentic_project_status.json", status)
+    return {
+        "manifest": best["manifest"],
+        "runtime_result": best["runtime_result"],
+        "result_review_result": best["result_review_result"],
+        "result_review_doc": best["result_review_doc"],
+        "written_files": [str(path) for path in _manifest_disk_paths(best["manifest"], repro_project_dir)],
+        "status": status,
+    }
+
+
+def build_writer_brief(
+    *,
+    facts: dict[str, Any],
+    tasks: dict[str, Any],
+    experiment_index: dict[str, Any],
+    paper_context_json: str,
+    paper_thesis: dict[str, Any] | None,
+    task_manifest: dict[str, Any],
+    expected_paths: set[str],
+    feedback: list[dict[str, Any]],
+    round_no: int,
+    max_rounds: int,
+) -> str:
+    if feedback:
+        feedback_block = (
+            "Mandatory moderator feedback. Address every paper_alignment_gap item below; do not merely document "
+            "the limitation. For each affected task, change the model, normalization, sampling, plotting, "
+            "configuration, or baseline implementation so the next reviewer can mark it supports_paper_claim.\n"
+            f"{pretty_json({'items': feedback})}"
+        )
+    else:
+        feedback_block = "No reviewer/runtime feedback yet."
+    thesis = pretty_json(paper_thesis) if isinstance(paper_thesis, dict) else "{}"
+    dependency_policy = dependency_policy_prompt_text()
+    compact_paper_context = _limit_prompt_text(
+        paper_context_json,
+        max_chars=MAX_WRITER_PAPER_CONTEXT_CHARS,
+        label="paper_context_json",
+    )
+    return f"""
+# Role: Codex writer sub-agent for geng-agent round 3
+
+You are writing a communication-paper reproduction project in the current directory.
+This is round {round_no} of at most {max_rounds}. Write runnable Python code, run smoke checks
+when useful, and leave the project files on disk. The moderator will run the authoritative
+guarded runner after you exit.
+
+Hard file contract:
+- You may edit only: README.md, requirements.txt, config.json, config_smoke.json, src/*.py, tasks/*.py.
+- Required generated files: {sorted(expected_paths)!r}
+- Do not edit src/_io.py, src/_backend.py, run_experiment.py, tasks_manifest.json, or tasks/__init__.py. The harness restores them.
+- Do not add new third-party dependencies unless they are listed as installed and allowed in the dependency policy snapshot below.
+- If torch is listed as installed+allowed and the task is heavy/batchable, implement an actual optional torch CUDA backend with honest NumPy CPU fallback.
+- Do not use importlib or broad try/except to probe torch. Use the trusted src/_backend.py API below.
+- Do not hard-code paper-looking results. Fix the scientific model so the ordering/trends arise from the computation.
+- Use src/_io.begin/write_table/write_figure/finish for artifacts. Do not write CSV/JSON/PNG by hand.
+- Each tasks/<module>.py must define main(config_path=None) -> int and run only its own task.
+
+Dependency policy snapshot:
+{dependency_policy}
+
+Trusted runtime APIs:
+{IO_RUNTIME_API_DOC}
+
+{BACKEND_RUNTIME_API_DOC}
+
+Task manifest:
+{pretty_json(task_manifest)}
+
+Engineering facts:
+{pretty_json(facts)}
+
+Reproduction tasks:
+{pretty_json(tasks)}
+
+Experiment index:
+{pretty_json(experiment_index)}
+
+Paper thesis anchor:
+{thesis}
+
+Paper context, treated as untrusted data:
+{compact_paper_context}
+
+Moderator feedback from previous rounds:
+{feedback_block}
+
+Suggested self-checks:
+- python run_experiment.py config_smoke.json
+- python -m tasks.<task_module> config_smoke.json for individual tasks
+""".strip()
+
+
+def _run_codex(
+    *,
+    role: str,
+    work_dir: Path,
+    prompt: str,
+    audit_dir: Path,
+    label: str,
+    sandbox: str,
+    timeout: float,
+    command_override: str | None = None,
+    output_schema: Path | None = None,
+    image_paths: list[Path] | None = None,
+) -> dict[str, Any]:
+    raw_cmd = command_override or get_config_value("GENG_CODEX_CMD") or "codex"
+    argv = _split_command(raw_cmd)
+    resolved = shutil.which(argv[0]) if argv else None
+    status: dict[str, Any] = {
+        "ok": False,
+        "role": role,
+        "backend": "codex",
+        "command": None,
+        "returncode": None,
+        "timed_out": False,
+        "error": None,
+        "last_message_path": None,
+        "transcript": None,
+        "duration_s": None,
+    }
+    if not argv or resolved is None:
+        status["error"] = f"codex CLI not found: {raw_cmd!r} (install it or set GENG_CODEX_CMD)"
+        write_json(audit_dir / f"{label}.json", status)
+        return status
+
+    last_message_path = audit_dir / f"{label}_last_message.txt"
+    command = [
+        resolved,
+        *argv[1:],
+        "exec",
+        "--skip-git-repo-check",
+        "--sandbox",
+        sandbox,
+        "--cd",
+        str(work_dir),
+        "--output-last-message",
+        str(last_message_path),
+    ]
+    if output_schema is not None:
+        command.extend(["--output-schema", str(output_schema)])
+    for image_path in image_paths or []:
+        command.extend(["--image", str(image_path)])
+    command.append("-")
+    status["command"] = command[:-1] + ["<brief via stdin>"]
+    status["last_message_path"] = str(last_message_path)
+
+    started = time.monotonic()
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=work_dir,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+            input=prompt,
+        )
+        status["returncode"] = completed.returncode
+        status["ok"] = completed.returncode == 0
+        transcript = (completed.stdout or "") + ("\n--- stderr ---\n" + completed.stderr if completed.stderr else "")
+        if completed.returncode != 0:
+            status["error"] = f"codex exited with status {completed.returncode}"
+    except subprocess.TimeoutExpired as exc:
+        status["timed_out"] = True
+        status["error"] = f"agent session timed out after {timeout:.0f}s"
+        out = exc.stdout or b""
+        err = exc.stderr or b""
+        transcript = (out.decode("utf-8", "replace") if isinstance(out, bytes) else str(out)) + (
+            "\n--- stderr ---\n" + (err.decode("utf-8", "replace") if isinstance(err, bytes) else str(err))
+        )
+    except Exception as exc:
+        status["error"] = f"{type(exc).__name__}: {exc}"
+        transcript = ""
+    status["duration_s"] = round(time.monotonic() - started, 1)
+    transcript_path = audit_dir / f"{label}_transcript.txt"
+    write_text(transcript_path, redact_text(transcript)[-MAX_TRANSCRIPT_CHARS:])
+    status["transcript"] = str(transcript_path)
+    write_json(audit_dir / f"{label}.json", status)
+    return status
+
+
+def _run_codex_result_review(
+    *,
+    facts: dict[str, Any],
+    tasks: dict[str, Any],
+    paper: dict[str, Any],
+    paper_path: Path,
+    paper_context_json: str,
+    paper_thesis: dict[str, Any] | None,
+    repro_project_dir: Path,
+    output_dir: Path,
+    audit_dir: Path,
+    round_label: str,
+    timeout: float,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    evidence, images = collect_result_review_inputs(
+        paper_path=paper_path,
+        paper=paper,
+        facts=facts,
+        tasks=tasks,
+        repro_project_dir=repro_project_dir,
+    )
+    if not images:
+        raise RuntimeError("Codex result review requires at least one valid PNG image.")
+    schema_path = Path(__file__).resolve().parent.parent / "schemas" / "result_review_experiment.schema.json"
+    task_items = [task for task in tasks.get("repro_tasks", []) if isinstance(task, dict)]
+    reviews: list[dict[str, Any]] = []
+    statuses: list[dict[str, Any]] = []
+    total_attempts = 0
+    for index, task in enumerate(task_items, start=1):
+        task_id = str(task.get("task_id") or f"task_{index}")
+        selected = select_images_for_task(task=task, evidence=evidence, images=images, paper=paper, facts=facts)
+        image_paths = _write_review_images(audit_dir, f"{round_label}_{index:02d}_{safe_label(task_id)}", selected)
+        task_evidence = compact_result_evidence_for_task(evidence=evidence, task=task, selected_images=selected)
+        task_context = paper_context_for_task(paper=paper, facts=facts, task=task)
+        prompt = build_reviewer_brief(
+            task=task,
+            facts=facts_for_task(facts, task),
+            task_evidence=task_evidence,
+            paper_context_json=task_context,
+            paper_thesis=paper_thesis,
+        )
+        base_stage_label = f"{round_label}_reviewer_{index:02d}_{safe_label(task_id)}"
+        write_text(audit_dir / f"{base_stage_label}_brief.md", prompt)
+        parsed_review: dict[str, Any] | None = None
+        accepted_status: dict[str, Any] | None = None
+        last_error = ""
+        for attempt in range(1, REVIEWER_MAX_ATTEMPTS + 1):
+            stage_label = base_stage_label if attempt == 1 else f"{base_stage_label}_retry_{attempt:02d}"
+            attempt_prompt = prompt
+            if last_error:
+                attempt_prompt += (
+                    "\n\nPrevious reviewer attempt failed to produce schema-valid JSON:\n"
+                    + redact_text(last_error)[:1200]
+                    + "\nReturn one JSON object only."
+                )
+            status = _run_codex(
+                role="reviewer",
+                work_dir=repro_project_dir,
+                prompt=attempt_prompt,
+                audit_dir=audit_dir,
+                label=stage_label,
+                sandbox="read-only",
+                timeout=timeout,
+                command_override=get_config_value("GENG_CODEX_REVIEWER_CMD"),
+                output_schema=schema_path,
+                image_paths=image_paths,
+            )
+            total_attempts += 1
+            try:
+                raw = _read_last_message(status)
+                parsed = normalize_experiment_review_candidate(parse_json_object(raw), expected_task_id=task_id)
+                issues = validate_stage("result_review_experiment", parsed)
+                if issues:
+                    raise RuntimeError(format_issues(issues))
+                write_json(audit_dir / f"partial_{base_stage_label}.json", parsed)
+                parsed_review = parsed
+                accepted_status = {
+                    "task_id": task_id,
+                    "stage_label": base_stage_label,
+                    "last_attempt_label": stage_label,
+                    "attempts": attempt,
+                    "images_sent": [{"label": image.label, "mime_type": image.mime_type} for image in selected],
+                    "paper_pages_sent": task_evidence.get("selected_paper_pages", []),
+                    "expected_ordering_checked": isinstance(paper_thesis, dict),
+                    "backend": "codex",
+                    "transport_ok": bool(status.get("ok")),
+                    "transport_error": status.get("error"),
+                }
+                break
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+                write_json(
+                    audit_dir / f"validation_{stage_label}.json",
+                    {"ok": False, "errors": [{"path": "$", "message": redact_text(last_error)[:500]}]},
+                )
+
+        if parsed_review is not None and accepted_status is not None:
+            reviews.append(parsed_review)
+            statuses.append(accepted_status)
+        else:
+            review = build_unassessable_experiment_review(
+                task_id=task_id,
+                reason=last_error or "reviewer produced no schema-valid JSON",
+            )
+            reviews.append(review)
+            statuses.append(
+                {
+                    "task_id": task_id,
+                    "stage_label": base_stage_label,
+                    "attempts": REVIEWER_MAX_ATTEMPTS,
+                    "review_failed": True,
+                    "backend": "codex",
+                    "error": redact_text(last_error or "reviewer produced no schema-valid JSON")[:500],
+                }
+            )
+            write_json(
+                audit_dir / f"review_failed_{base_stage_label}.json",
+                {"ok": False, "fallback": "cannot_assess", "error": redact_text(last_error)[:500]},
+            )
+
+    failed = [status for status in statuses if status.get("review_failed")]
+    if failed and len(failed) == len(task_items):
+        raise RuntimeError(f"codex result review failed for all {len(failed)} experiments; first error: {failed[0].get('error')}")
+
+    parsed = aggregate_result_reviews(reviews, evidence=evidence)
+    issues = validate_stage("result_review", parsed)
+    if issues:
+        raise RuntimeError(f"codex result_review aggregate failed schema validation: {format_issues(issues)}")
+    write_json(audit_dir / f"{round_label}_review_aggregate.json", parsed)
+    result_json_path = output_dir / "result_review.json"
+    result_md_path = output_dir / "result_review.md"
+    write_json(result_json_path, parsed)
+    write_text(result_md_path, render_result_review_markdown(parsed, evidence=evidence))
+    return parsed, {
+        "enabled": True,
+        "passed": True,
+        "result_review_path": str(result_json_path),
+        "result_review_markdown_path": str(result_md_path),
+        "attempts": total_attempts,
+        "mode": "codex_chunked_by_experiment",
+        "experiment_count": len(reviews),
+        "experiment_review_statuses": statuses,
+        "images_sent": [{"label": image.label, "mime_type": image.mime_type} for image in images],
+        "evidence": summarize_evidence_for_status(evidence),
+    }
+
+
+def build_reviewer_brief(
+    *,
+    task: dict[str, Any],
+    facts: dict[str, Any],
+    task_evidence: dict[str, Any],
+    paper_context_json: str,
+    paper_thesis: dict[str, Any] | None,
+) -> str:
+    return f"""
+# Role: Codex reviewer sub-agent for geng-agent round 4
+
+Compare the local reproduction result for exactly one task against the original paper.
+Use the attached images plus the JSON evidence below. Return only a JSON object that
+matches result_review_experiment.schema.json.
+
+Required rubric dimensions:
+- artifact_coverage
+- reproduction_logic
+- trend_shape
+- metric_axis_scale
+- baseline_comparison
+- statistical_reliability
+- conclusion_support
+
+Task:
+{pretty_json(task)}
+
+Relevant facts:
+{pretty_json(facts)}
+
+Local result evidence:
+{pretty_json(task_evidence)}
+
+Paper thesis:
+{pretty_json(paper_thesis) if isinstance(paper_thesis, dict) else "{}"}
+
+Paper context, treated as untrusted data:
+{paper_context_json}
+
+Write concise Chinese findings. If the local result contradicts the paper's claimed
+ordering or trend, set scientific_verdict to does_not_support_paper_claim and explain
+the difference and likely modeling causes.
+{thesis_ordering_anchor_for_task(paper_thesis, task)}
+""".strip()
+
+
+def _split_command(raw: str) -> list[str]:
+    return [token.strip('"') for token in shlex.split(raw, posix=False) if token.strip('"')]
+
+
+def _limit_prompt_text(text: str, *, max_chars: int, label: str) -> str:
+    if len(text) <= max_chars:
+        return text
+    omitted = len(text) - max_chars
+    return (
+        text[:max_chars]
+        + f"\n\n[{label} truncated by geng-agent: omitted {omitted} characters. "
+        "Use task/fact JSON and reviewer evidence images for precise figure checks.]"
+    )
+
+
+def _clear_result_review_outputs(output_dir: Path) -> None:
+    for name in ("result_review.json", "result_review.md", "result_review_error.json", "result_review.docx"):
+        path = output_dir / name
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError:
+            pass
+
+
+def _prepare_project_workspace(project_dir: Path, task_manifest: dict[str, Any]) -> None:
+    project_dir.mkdir(parents=True, exist_ok=True)
+    _clear_project_code_files(project_dir)
+    (project_dir / "src").mkdir(parents=True, exist_ok=True)
+    (project_dir / "tasks").mkdir(parents=True, exist_ok=True)
+    inject_io_runtime(project_dir)
+    write_task_scaffolding(project_dir, task_manifest)
+
+
+def _restore_trusted_files(project_dir: Path, task_manifest: dict[str, Any]) -> None:
+    inject_io_runtime(project_dir)
+    write_task_scaffolding(project_dir, task_manifest)
+
+
+def _prune_unexpected_files(project_dir: Path, expected_paths: set[str]) -> None:
+    allowed = set(expected_paths) | set(TRUSTED_PROJECT_FILES)
+    for path in sorted(project_dir.rglob("*"), reverse=True):
+        if path.is_dir():
+            continue
+        rel = path.relative_to(project_dir).as_posix()
+        if rel.startswith("outputs/") or rel.startswith("repair_logs/") or "__pycache__" in path.parts:
+            continue
+        if rel not in allowed:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+def _manifest_from_project(
+    *,
+    repro_project_dir: Path,
+    expected_paths: set[str],
+    task_manifest: dict[str, Any],
+    round_no: int,
+) -> dict[str, Any]:
+    files: list[dict[str, Any]] = []
+    for rel in _ordered_expected_paths(expected_paths, task_manifest):
+        path = resolve_inside(repro_project_dir, rel)
+        if path.exists() and path.is_file():
+            content_lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        else:
+            content_lines = []
+        files.append({"path": rel, "content_lines": content_lines})
+    return {
+        "files": files,
+        "_meta": {
+            "backend": CODEX_PROJECT_BACKEND,
+            "agentic_project_used": True,
+            "round": round_no,
+            "tasks_manifest": task_manifest,
+            "generated_paths": [item["path"] for item in files],
+        },
+    }
+
+
+def _ordered_expected_paths(expected_paths: set[str], task_manifest: dict[str, Any]) -> list[str]:
+    ordered = [path for path in SHARED_PROJECT_FILES if path in expected_paths]
+    task_scripts = [
+        str(task.get("script"))
+        for task in task_manifest.get("tasks", [])
+        if isinstance(task, dict) and task.get("script")
+    ]
+    ordered.extend(path for path in task_scripts if path in expected_paths and path not in ordered)
+    ordered.extend(sorted(expected_paths - set(ordered)))
+    return ordered
+
+
+def _manifest_disk_paths(manifest: dict[str, Any], project_dir: Path) -> list[Path]:
+    paths: list[Path] = []
+    for item in manifest.get("files", []):
+        if isinstance(item, dict) and isinstance(item.get("path"), str):
+            try:
+                paths.append(resolve_inside(project_dir, item["path"]))
+            except ValueError:
+                continue
+    return paths
+
+
+def _skipped_review_status(*, run_repro: bool, result_review: bool, runtime_result: dict[str, Any]) -> dict[str, Any] | None:
+    if not run_repro:
+        return {"enabled": False, "passed": None, "reason": "skipped because --run-repro was not requested"}
+    if not result_review:
+        return {"enabled": False, "passed": None, "reason": "disabled by --no-result-review"}
+    partial = runtime_result.get("partial_success")
+    has_partial = isinstance(partial, dict) and partial.get("has_partial_output")
+    if not runtime_result.get("passed") and not has_partial:
+        return {"enabled": False, "passed": None, "reason": "skipped because guarded reproduction produced no usable output"}
+    return None
+
+
+def _annotate_writer_post_run_status(
+    writer_status: dict[str, Any],
+    validation: dict[str, Any],
+    runtime_result: dict[str, Any],
+) -> None:
+    if writer_status.get("ok"):
+        writer_status["edits_evaluated_by_guarded_runner"] = True
+        return
+    validation_ok = bool(validation.get("required_files_present") and validation.get("python_compiles"))
+    runtime_passed = runtime_result.get("passed") is True
+    writer_status["edits_evaluated_by_guarded_runner"] = bool(validation_ok)
+    if validation_ok and runtime_passed:
+        writer_status["transport_failed_after_edits"] = True
+        writer_status["transport_failure_note"] = (
+            "Codex writer exited non-zero or timed out after leaving a project that passed "
+            "the guarded runner; treat this as a transport/session failure, not a Python runtime failure."
+        )
+
+
+def _write_review_images(audit_dir: Path, label: str, images: list[LLMImage]) -> list[Path]:
+    image_dir = audit_dir / "03c_reviewer_images" / label
+    image_dir.mkdir(parents=True, exist_ok=True)
+    paths: list[Path] = []
+    for index, image in enumerate(images, start=1):
+        suffix = ".png" if image.mime_type == "image/png" else ".img"
+        path = image_dir / f"{index:02d}_{safe_label(image.label)}{suffix}"
+        try:
+            path.write_bytes(base64.b64decode(image.data_b64))
+        except Exception:
+            continue
+        paths.append(path)
+    return paths
+
+
+def _read_last_message(status: dict[str, Any]) -> str:
+    path = Path(str(status.get("last_message_path") or ""))
+    if path.exists():
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
+        if text:
+            return text
+    transcript = Path(str(status.get("transcript") or ""))
+    if transcript.exists():
+        text = transcript.read_text(encoding="utf-8", errors="replace").strip()
+        if text:
+            return text
+    raise RuntimeError(status.get("error") or "Codex did not produce a last message")
+
+
+def _score_candidate(
+    runtime_result: dict[str, Any],
+    review_doc: dict[str, Any] | None,
+    review_status: dict[str, Any],
+    writer_status: dict[str, Any],
+    validation: dict[str, Any],
+    manifest_issues: list[Any],
+) -> dict[str, int]:
+    score = review_score(review_doc, runtime_result)
+    review_enabled = bool(review_status.get("enabled"))
+    review_passed = review_status.get("passed") is True
+    score["review_passed"] = 1 if review_passed else 0
+    score["review_failed"] = 1 if review_status.get("passed") is False else 0
+    support_count = _count_review_verdicts(review_doc, "supports_paper_claim")
+    partial_count = _count_review_verdicts(review_doc, "partially_supports_paper_claim")
+    cannot_assess = _count_review_verdicts(review_doc, "cannot_assess")
+    score["support_count"] = support_count
+    score["partial_count"] = partial_count
+    score["cannot_assess_count"] = cannot_assess
+    score["scientific_gap_count"] = score.get("mismatch_count", 0) + partial_count + cannot_assess
+    if review_enabled and not review_passed and review_doc is None:
+        score["mismatch_count"] = 9999
+        score["partial_count"] = 9999
+        score["cannot_assess_count"] = 9999
+        score["support_count"] = 0
+        score["scientific_gap_count"] = 9999
+    score["runtime_passed"] = 1 if runtime_result.get("passed") is True else 0
+    score["writer_ok"] = 1 if writer_status.get("ok") else 0
+    score["project_valid"] = 1 if validation.get("required_files_present") and validation.get("python_compiles") and not manifest_issues else 0
+    confidence = 0
+    if review_doc:
+        for review in review_doc.get("experiment_reviews", []):
+            if isinstance(review, dict):
+                confidence += {"high": 3, "medium": 2, "low": 1}.get(str(review.get("confidence")), 0)
+    score["review_confidence"] = confidence
+    return score
+
+
+def _is_better_score(new: dict[str, int], old: dict[str, int]) -> bool:
+    return (
+        new.get("coverage_passed", 0),
+        new.get("runtime_passed", 0),
+        new.get("project_valid", 0),
+        new.get("review_passed", 0),
+        new.get("support_count", 0),
+        -new.get("scientific_gap_count", 9999),
+        -new.get("mismatch_count", 9999),
+        -new.get("cannot_assess_count", 9999),
+        -new.get("partial_count", 9999),
+        new.get("review_confidence", 0),
+        new.get("writer_ok", 0),
+    ) > (
+        old.get("coverage_passed", 0),
+        old.get("runtime_passed", 0),
+        old.get("project_valid", 0),
+        old.get("review_passed", 0),
+        old.get("support_count", 0),
+        -old.get("scientific_gap_count", 9999),
+        -old.get("mismatch_count", 9999),
+        -old.get("cannot_assess_count", 9999),
+        -old.get("partial_count", 9999),
+        old.get("review_confidence", 0),
+        old.get("writer_ok", 0),
+    )
+
+
+def _count_review_verdicts(review_doc: dict[str, Any] | None, verdict: str) -> int:
+    if not isinstance(review_doc, dict):
+        return 0
+    count = 0
+    for review in review_doc.get("experiment_reviews", []):
+        if isinstance(review, dict) and str(review.get("scientific_verdict")) == verdict:
+            count += 1
+    return count
+
+
+def _is_success(runtime_result: dict[str, Any], review_doc: dict[str, Any] | None) -> bool:
+    if runtime_result.get("passed") is not True or not review_doc:
+        return False
+    reviews = [item for item in review_doc.get("experiment_reviews", []) if isinstance(item, dict)]
+    return bool(reviews) and all(str(item.get("scientific_verdict")) == "supports_paper_claim" for item in reviews)
+
+
+def _feedback_from_results(
+    runtime_result: dict[str, Any],
+    review_doc: dict[str, Any] | None,
+    review_status: dict[str, Any],
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    if runtime_result.get("passed") is not True:
+        items.append(
+            {
+                "type": "runtime_failure",
+                "summary": _compact_runtime(runtime_result),
+                "message": "Fix execution/security/dependency failures before optimizing paper alignment.",
+            }
+        )
+    items.extend(collect_actionable_review_feedback(review_doc))
+    if review_status.get("passed") is False:
+        items.append({"type": "reviewer_failure", "message": review_status.get("error") or review_status.get("reason")})
+    return items
+
+
+def _compact_runtime(runtime_result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "enabled": runtime_result.get("enabled"),
+        "passed": runtime_result.get("passed"),
+        "coverage": runtime_result.get("coverage"),
+        "failed_profile": runtime_result.get("failed_profile"),
+        "completed_profiles": runtime_result.get("completed_profiles"),
+        "repair_backend": runtime_result.get("repair_backend"),
+        "attempt_count": len(runtime_result.get("attempts", []) if isinstance(runtime_result.get("attempts"), list) else []),
+    }
+
+
+def _compact_review_status(status: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "enabled": status.get("enabled"),
+        "passed": status.get("passed"),
+        "mode": status.get("mode"),
+        "experiment_count": status.get("experiment_count"),
+        "error": status.get("error"),
+        "reason": status.get("reason"),
+    }
+
+
+def _load_cached_agentic_project(
+    *,
+    output_dir: Path,
+    repro_project_dir: Path,
+    run_repro: bool,
+    result_review: bool,
+) -> dict[str, Any] | None:
+    manifest_path = output_dir / "repro_project_manifest.json"
+    if not manifest_path.exists() or not repro_project_dir.exists():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    meta = manifest.get("_meta") if isinstance(manifest, dict) else {}
+    if not isinstance(meta, dict) or meta.get("backend") != CODEX_PROJECT_BACKEND:
+        return None
+    validation = validate_repro_project(repro_project_dir)
+    if not validation.get("required_files_present") or not validation.get("python_compiles"):
+        return None
+    runtime_result: dict[str, Any] = {
+        "enabled": False,
+        "passed": None,
+        "attempts": [],
+        "reason": "automatic execution is disabled by default; pass --run-repro to enable the guarded runner",
+        "repair_backend": "codex",
+    }
+    if run_repro:
+        runtime_path = output_dir / "runtime_result.json"
+        if not runtime_path.exists():
+            return None
+        runtime_result = json.loads(runtime_path.read_text(encoding="utf-8"))
+    review_result: dict[str, Any] = {"enabled": False, "passed": None, "reason": "not run"}
+    review_doc = None
+    if run_repro and result_review:
+        review_path = output_dir / "result_review.json"
+        if review_path.exists():
+            review_doc = json.loads(review_path.read_text(encoding="utf-8"))
+            review_result = {
+                "enabled": True,
+                "passed": True,
+                "result_review_path": str(review_path),
+                "result_review_markdown_path": str(output_dir / "result_review.md"),
+                "mode": "cached_codex_chunked_by_experiment",
+                "experiment_count": len(review_doc.get("experiment_reviews", [])),
+            }
+        elif (output_dir / "result_review_error.json").exists():
+            review_result = json.loads((output_dir / "result_review_error.json").read_text(encoding="utf-8"))
+        else:
+            return None
+    return {
+        "manifest": manifest,
+        "runtime_result": runtime_result,
+        "result_review_result": review_result,
+        "result_review_doc": review_doc,
+        "written_files": [str(path) for path in _manifest_disk_paths(manifest, repro_project_dir)],
+        "status": {"backend": CODEX_PROJECT_BACKEND, "cached": True},
+    }

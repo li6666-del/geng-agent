@@ -12,6 +12,7 @@ class PromptTests(unittest.TestCase):
         self.assertIn("requirements.txt", policy)
         self.assertIn("当前环境已安装且允许使用", policy)
         self.assertIn("numpy", policy)
+        self.assertIn("torch", policy)
         # steer codegen to prefer whitelisted comms libraries over hand-rolling primitives
         self.assertIn("commpy", policy)
         self.assertIn("优先调", policy)
@@ -74,6 +75,35 @@ class PromptTests(unittest.TestCase):
             self.assertIn("随机种子", prompt)
         self.assertIn("seed", file_prompt)
         self.assertIn("summary.json", file_prompt)
+
+    def test_generation_prompts_plan_accelerator_backend_generically(self) -> None:
+        book = PromptBook()
+
+        plan_prompt = book.render(
+            "generate_repro_project_plan.md",
+            engineering_facts_json="{}",
+            repro_tasks_json="{}",
+            paper_context_json="[]",
+        )
+        file_prompt = book.render(
+            "generate_repro_project_file.md",
+            target_path="src/simulation.py",
+            project_plan_json="{}",
+            generated_files_context_json="[]",
+            engineering_facts_json="{}",
+            repro_tasks_json="{}",
+            paper_context_json="[]",
+            review_feedback_json="",
+        )
+
+        self.assertIn("计算后端规划", plan_prompt)
+        self.assertIn("scale=light/medium/heavy", plan_prompt)
+        self.assertIn("torch_cuda_optional", plan_prompt)
+        self.assertIn("CPU fallback", plan_prompt)
+        self.assertIn("progress jsonl", file_prompt)
+        self.assertIn("batch_size", file_prompt)
+        self.assertIn("不能静默降级后假装用了 GPU", file_prompt)
+        self.assertIn("不得改变论文公式", file_prompt)
 
     def test_generation_and_repair_prompts_guard_serialization_and_false_success(self) -> None:
         book = PromptBook()

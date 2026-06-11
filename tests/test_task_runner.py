@@ -1,13 +1,17 @@
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import time
 import unittest
 
 from geng_agent.io_runtime import inject_io_runtime
 from geng_agent.outputs import _valid_csv, _valid_png, _valid_summary_json
 from geng_agent.prompts import PromptBook
-from geng_agent.runner import run_repro_with_repair, run_tasks_once, run_tasks_with_repair
+from geng_agent.runner import run_repro_with_repair, run_tasks_once, run_tasks_with_repair, task_timeout_seconds
 from geng_agent.task_scripts import build_tasks_manifest, write_task_scaffolding
+
+
+MINIMAL_PNG_BYTES = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + (b"\x00" * 32)
 
 
 def _good_task(task_id: str) -> str:
@@ -28,6 +32,26 @@ def _good_task(task_id: str) -> str:
         "    ax.plot([0, 1, 2], [1, 2, 3])\n"
         f"    _io.write_figure({task_id!r}, 'curve', fig)\n"
         f"    return _io.finish({task_id!r}, metrics={{'rows': 2}}, assumptions=[])\n"
+        "if __name__ == '__main__':\n"
+        "    raise SystemExit(main())\n"
+    )
+
+
+def _minimal_sleep_task(task_id: str, seconds: float) -> str:
+    return (
+        "import json\n"
+        "import time\n"
+        "from pathlib import Path\n"
+        f"PNG_BYTES = {MINIMAL_PNG_BYTES!r}\n"
+        "def main(config_path=None):\n"
+        f"    time.sleep({seconds!r})\n"
+        f"    out = Path('outputs') / {task_id!r}\n"
+        "    out.mkdir(parents=True, exist_ok=True)\n"
+        "    (out / 'results.csv').write_text('x\\n1\\n', encoding='utf-8')\n"
+        "    (out / 'curve.png').write_bytes(PNG_BYTES)\n"
+        f"    summary = {{'task_id': {task_id!r}, 'metrics': {{'rows': 1}}, 'assumptions': []}}\n"
+        "    (out / 'summary.json').write_text(json.dumps(summary), encoding='utf-8')\n"
+        "    return 0\n"
         "if __name__ == '__main__':\n"
         "    raise SystemExit(main())\n"
     )
@@ -115,6 +139,27 @@ class TaskRepairTests(unittest.TestCase):
 
 
 class TaskRunnerIsolationTests(unittest.TestCase):
+    def test_tasks_run_in_parallel_and_keep_manifest_order(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            specs = [(f"slow_task_{index}", _minimal_sleep_task(f"slow_task_{index}", 1.0)) for index in range(4)]
+            manifest = _build_project(root, specs)
+            for task in manifest["tasks"]:
+                task["timeout_smoke_s"] = 10
+
+            started = time.perf_counter()
+            result = run_tasks_once(root, manifest, phase="smoke", logs_dir=None)
+            elapsed = time.perf_counter() - started
+
+            self.assertEqual(result["coverage"], "4/4")
+            self.assertEqual([item["task_id"] for item in result["per_task"]], [task_id for task_id, _ in specs])
+            self.assertLess(elapsed, 3.0)
+
+    def test_task_timeout_is_capped_at_2000_seconds(self) -> None:
+        self.assertEqual(task_timeout_seconds({"timeout_full_s": 9999}, "full"), 2000.0)
+        self.assertEqual(task_timeout_seconds({}, "full"), 2000.0)
+        self.assertEqual(task_timeout_seconds({"timeout_smoke_s": "not-a-number"}, "smoke"), 60.0)
+
     def test_a_crash_and_a_hang_do_not_sink_the_passing_task(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

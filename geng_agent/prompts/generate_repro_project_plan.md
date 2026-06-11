@@ -10,6 +10,16 @@
 
 {{dependency_policy}}
 
+计算后端规划（通用要求）：
+1. 不要默认把所有实验规划成单进程 CPU/Numpy 循环。对每个复现任务先判断计算形态，并把判断写进 implementation_strategy 或相关文件的 purpose/key_interfaces。
+2. 需要识别的重计算信号包括：大规模 Monte Carlo、批量信道实现、SNR/功率/参数网格扫描、FFT/卷积、批量矩阵乘法、SVD/特征值/矩阵求逆、优化搜索、同一公式在许多样本/用户/天线/符号上重复计算。
+3. 对每个任务在计划里写清：scale=light/medium/heavy、parallel_axes（例如 samples、power_grid、users、antennas、subcarriers）、expected_bottleneck、preferred_backend、fallback_backend、progress_strategy、validation_strategy。
+4. heavy 且并行轴清楚的任务，应优先规划批量化后端：若依赖策略的“当前环境已安装且允许使用”清单包含 torch，则 preferred_backend 可写 torch_cuda_optional；否则写 vectorized_numpy/chunked_cpu，不要规划清单外依赖。
+5. GPU 规划必须始终有 CPU fallback；不能因为 GPU 不可用而让复现项目无法运行。计划中要要求 summary.json 记录实际 backend、device/dtype、batch_size、样本数和关键物理参数。
+6. 长任务必须规划进度与部分结果：例如 progress jsonl、partial results CSV、按功率点/网格点/批次逐步落盘；不要设计成全部跑完才写唯一输出。
+7. 性能优化不能改变科学模型。计划要明确：GPU/批量化只改变计算后端和数据布局，不改变论文公式、单位、归一化、baseline、指标定义或随机过程。
+8. 不要为轻量任务强行使用 GPU。若 smoke/full 规模很小、计算瓶颈不在数值循环，优先保持简洁 CPU 实现。
+
 必须规划这些相对路径，不要加 repro_project/ 前缀：
 - README.md
 - requirements.txt

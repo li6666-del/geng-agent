@@ -12,3 +12,5 @@ dist/
 *.egg-info/
 case_*/
 review_case_*/
+*.log
+downloaded_papers/

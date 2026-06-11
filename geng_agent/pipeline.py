@@ -135,22 +135,6 @@ class PipelineResult:
     result_review_docx_path: Path | None = None
 
 
-def _apply_prompt_adjustment(prompt: str, adjustment: str | None) -> str:
-    """Append optional retry guidance to a stage prompt so a retry actually changes the input.
-
-    Returns the prompt unchanged when no adjustment is given, so default runs stay
-    byte-for-byte identical to before.
-    """
-    if not adjustment or not adjustment.strip():
-        return prompt
-    return (
-        prompt
-        + "\n\n# 监督层补充指令（针对本阶段重试，优先级高于论文内容，但不得违反系统规则与输出格式约束）\n"
-        + adjustment.strip()
-        + "\n"
-    )
-
-
 def _per_task_plan_override(task_scripts: list[str]) -> str:
     """Appended to the plan prompt in per-task mode: plan the shared science + one thin
     tasks/<module>.py per repro_task, and NOT run_experiment.py (harness-injected)."""
@@ -308,14 +292,9 @@ class ReviewPipeline:
         client: LLMClient,
         prompt_book: PromptBook | None = None,
         extraction_client_2: LLMClient | None = None,
-        generation_client: LLMClient | None = None,
     ) -> None:
         self.client = client
         self.prompt_book = prompt_book or PromptBook()
-        # Optional separate (possibly text-only) coder for round-3 per-file generation and
-        # Phase-D science repair. None -> the main client does codegen too (unchanged). The
-        # plan/facts/thesis/review stay on the multimodal main client.
-        self.generation_client = generation_client
         # Optional second multimodal extraction model for the round-1 cross-model fact
         # ensemble; None -> single-model extraction (behavior unchanged).
         self.extraction_client_2 = extraction_client_2
@@ -323,7 +302,7 @@ class ReviewPipeline:
     def _llm_clients(self) -> list[Any]:
         """The distinct LLM clients whose token usage should roll up into run_cost.json."""
         clients: list[Any] = [self.client]
-        for extra in (self.extraction_client_2, self.generation_client):
+        for extra in (self.extraction_client_2,):
             if extra is not None and all(extra is not existing for existing in clients):
                 clients.append(extra)
         return clients
@@ -367,17 +346,16 @@ class ReviewPipeline:
         run_repro: bool = False,
         repair_attempts: int = 2,
         run_timeout: float = 120.0,
-        repair_backend: str = "hybrid",
-        openhands_timeout: float = 900.0,
-        openhands_max_iterations: int = 25,
         json_repair_attempts: int = 3,
         tasks_timeout: float = 300.0,
         project_timeout: float = 1200.0,
         result_review: bool = True,
         template_fallback: bool = True,
-        prompt_adjustments: dict[str, str] | None = None,
         facts_gap_rounds: int = 3,
         tasks_gap_rounds: int = 3,
+        project_backend: str = "llm",
+        codex_agent_rounds: int = 3,
+        codex_agent_timeout: float | None = None,
     ) -> PipelineResult:
         stage_cleanup = {
             "facts": "facts",
@@ -404,18 +382,17 @@ class ReviewPipeline:
             run_repro=run_repro,
             repair_attempts=repair_attempts,
             run_timeout=run_timeout,
-            repair_backend=repair_backend,
-            openhands_timeout=openhands_timeout,
-            openhands_max_iterations=openhands_max_iterations,
             json_repair_attempts=json_repair_attempts,
             tasks_timeout=tasks_timeout,
             project_timeout=project_timeout,
             result_review=result_review,
             resume=True,
             template_fallback=template_fallback,
-            prompt_adjustments=prompt_adjustments,
             facts_gap_rounds=facts_gap_rounds,
             tasks_gap_rounds=tasks_gap_rounds,
+            project_backend=project_backend,
+            codex_agent_rounds=codex_agent_rounds,
+            codex_agent_timeout=codex_agent_timeout,
         )
 
     def run(
@@ -426,16 +403,12 @@ class ReviewPipeline:
         run_repro: bool = False,
         repair_attempts: int = 2,
         run_timeout: float = 120.0,
-        repair_backend: str = "hybrid",
-        openhands_timeout: float = 900.0,
-        openhands_max_iterations: int = 25,
         json_repair_attempts: int = 3,
         tasks_timeout: float = 300.0,
         project_timeout: float = 1200.0,
         result_review: bool = True,
         resume: bool = True,
         template_fallback: bool = True,
-        prompt_adjustments: dict[str, str] | None = None,
         facts_gap_rounds: int = 3,
         tasks_gap_rounds: int = 3,
         per_task_layout: bool = False,
@@ -443,6 +416,9 @@ class ReviewPipeline:
         science_repair_rounds: int = 1,
         science_repair_backend: str = "llm",
         science_repair_timeout: float = 1800.0,
+        project_backend: str = "llm",
+        codex_agent_rounds: int = 3,
+        codex_agent_timeout: float | None = None,
     ) -> PipelineResult:
         output_dir = output_dir.expanduser().resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -505,7 +481,6 @@ class ReviewPipeline:
                 schema_stage="engineering_facts",
                 max_attempts=json_repair_attempts + 1,
                 resume=resume,
-                prompt_adjustment=(prompt_adjustments or {}).get("facts"),
                 images=paper_images,
                 extra_validation=lambda parsed: (
                     validate_fact_sources(parsed, valid_chunk_ids, valid_pages)
@@ -537,7 +512,6 @@ class ReviewPipeline:
                 resume=resume,
                 max_attempts=json_repair_attempts + 1,
                 template_fallback=template_fallback,
-                prompt_adjustment=(prompt_adjustments or {}).get("facts"),
             )
 
         # Round-1 recall hardening: deterministically check figure/table coverage and run a
@@ -592,7 +566,6 @@ class ReviewPipeline:
             schema_stage="repro_tasks",
             max_attempts=json_repair_attempts + 1,
             resume=resume,
-            prompt_adjustment=(prompt_adjustments or {}).get("tasks"),
             extra_validation=lambda parsed: validate_task_fact_refs(parsed, facts),
             candidate_normalizer=lambda parsed: finalize_repro_tasks(parsed, facts),
             truncation_recovery=recover_truncated_repro_tasks,
@@ -632,127 +605,160 @@ class ReviewPipeline:
         )
 
         _mark("experiment_index")
-        manifest = self._load_or_create_repro_manifest(
-            output_dir=output_dir,
-            audit_dir=audit_dir,
-            max_attempts=json_repair_attempts + 1,
-            resume=resume,
-            allow_final_loose_manifest=True,
-            facts=facts,
-            tasks=tasks,
-            paper_context_json=paper_context,
-            template_fallback=template_fallback,
-            project_timeout=project_timeout,
-            images=paper_images,
-            per_task_layout=per_task_layout,
-            paper_thesis=paper_thesis,
-        )
         repro_project_dir = output_dir / "repro_project"
-        written_files = self._ensure_repro_project_from_manifest(
-            manifest=manifest,
-            output_dir=output_dir,
-            repro_project_dir=repro_project_dir,
-            resume=resume,
-        )
-        validation = validate_repro_project(repro_project_dir)
-        if template_fallback and (not validation.get("required_files_present") or not validation.get("python_compiles")):
-            manifest, written_files = self._write_template_repro_project(
+        if project_backend not in {"codex", "llm"}:
+            raise ValueError(f"unknown project_backend: {project_backend}")
+
+        if project_backend == "codex":
+            from .agentic_project import run_codex_project_workflow
+
+            per_task_layout = True
+            agentic_result = run_codex_project_workflow(
                 facts=facts,
                 tasks=tasks,
+                experiment_index=experiment_index,
+                paper=paper,
+                paper_path=paper_path,
+                paper_context_json=paper_context,
+                paper_thesis=paper_thesis,
                 output_dir=output_dir,
                 audit_dir=audit_dir,
                 repro_project_dir=repro_project_dir,
-                reason="generated project failed local validation",
-            )
-            validation = validate_repro_project(repro_project_dir)
-        scientific_check = build_scientific_check(tasks)
-        template_fallback_now = bool((manifest.get("_meta") or {}).get("template_fallback_used"))
-        _mark("generation")
-
-        # Bug A: keep requirements.txt consistent with the whitelisted+installed imports the
-        # generated code actually uses, so a forgotten declaration (e.g. code imports
-        # scipy.linalg but omits scipy) is not refused by the runner's dependency-consistency
-        # gate. Only whitelisted+installed packages are added; anything else stays blocked.
-        reconciled = reconcile_whitelisted_requirements(repro_project_dir)
-        if reconciled:
-            write_json(audit_dir / "requirements_reconciled.json", {"added": reconciled})
-
-        if run_repro:
-            runtime_result = self._load_or_run_repro(
-                output_dir=output_dir,
-                repro_project_dir=repro_project_dir,
-                repair_attempts=repair_attempts,
+                client=self.client,
+                prompt_book=self.prompt_book,
+                system_message=SYSTEM_MESSAGE,
+                run_repro=run_repro,
+                result_review=result_review,
+                rounds=codex_agent_rounds,
+                timeout=codex_agent_timeout or project_timeout or 1800.0,
                 run_timeout=run_timeout,
-                repair_backend=repair_backend,
-                openhands_timeout=openhands_timeout,
-                openhands_max_iterations=openhands_max_iterations,
                 resume=resume,
             )
-            manifest_meta = manifest.get("_meta") if isinstance(manifest.get("_meta"), dict) else {}
-            if runtime_result.get("passed") is not True and not manifest_meta.get("template_fallback_used"):
-                partial = _assess_partial_success(runtime_result)
-                if partial["has_partial_output"]:
-                    # A single failed experiment should not sink the whole run: the
-                    # generated project produced usable partial outputs, so keep it (and
-                    # surface the risk) instead of masking everything with a template.
-                    runtime_result["partial_success"] = partial
-                    runtime_result["template_fallback_skipped"] = True
-                    write_json(output_dir / "runtime_result.json", runtime_result)
-                elif template_fallback:
-                    # Preserve the failed generated-project run before the template
-                    # overwrites runtime_result.json and repro_project/.
-                    write_json(output_dir / "runtime_result_pre_fallback.json", runtime_result)
-                    manifest, written_files = self._write_template_repro_project(
-                        facts=facts,
-                        tasks=tasks,
-                        output_dir=output_dir,
-                        audit_dir=audit_dir,
-                        repro_project_dir=repro_project_dir,
-                        reason="generated project did not pass guarded execution after repair attempts",
-                    )
-                    validation = validate_repro_project(repro_project_dir)
-                    runtime_result = self._load_or_run_repro(
-                        output_dir=output_dir,
-                        repro_project_dir=repro_project_dir,
-                        repair_attempts=repair_attempts,
-                        run_timeout=run_timeout,
-                        repair_backend=repair_backend,
-                        openhands_timeout=openhands_timeout,
-                        openhands_max_iterations=openhands_max_iterations,
-                        resume=False,
-                    )
-                    runtime_result["template_fallback_used"] = True
-                    write_json(output_dir / "runtime_result.json", runtime_result)
+            manifest = agentic_result["manifest"]
+            written_files = [Path(path) for path in agentic_result.get("written_files", [])]
+            validation = validate_repro_project(repro_project_dir)
+            scientific_check = build_scientific_check(tasks)
+            template_fallback_now = False
+            runtime_result = agentic_result["runtime_result"]
+            result_review_result = agentic_result["result_review_result"]
+            _mark("generation")
+            _mark("runtime")
+            _mark("result_review")
         else:
-            runtime_result = {
-                "enabled": False,
-                "passed": None,
-                "attempts": [],
-                "reason": "automatic execution is disabled by default; pass --run-repro to enable the guarded runner",
-            }
-        _mark("runtime")
+            manifest = self._load_or_create_repro_manifest(
+                output_dir=output_dir,
+                resume=resume,
+                audit_dir=audit_dir,
+                max_attempts=json_repair_attempts + 1,
+                allow_final_loose_manifest=True,
+                facts=facts,
+                tasks=tasks,
+                paper_context_json=paper_context,
+                template_fallback=template_fallback,
+                project_timeout=project_timeout,
+                images=paper_images,
+                per_task_layout=per_task_layout,
+                paper_thesis=paper_thesis,
+            )
+            written_files = self._ensure_repro_project_from_manifest(
+                manifest=manifest,
+                output_dir=output_dir,
+                repro_project_dir=repro_project_dir,
+                resume=resume,
+            )
+            validation = validate_repro_project(repro_project_dir)
+            if template_fallback and (not validation.get("required_files_present") or not validation.get("python_compiles")):
+                manifest, written_files = self._write_template_repro_project(
+                    facts=facts,
+                    tasks=tasks,
+                    output_dir=output_dir,
+                    audit_dir=audit_dir,
+                    repro_project_dir=repro_project_dir,
+                    reason="generated project failed local validation",
+                )
+                validation = validate_repro_project(repro_project_dir)
+            scientific_check = build_scientific_check(tasks)
+            template_fallback_now = bool((manifest.get("_meta") or {}).get("template_fallback_used"))
+            _mark("generation")
 
-        result_review_result = self._run_result_review_if_ready(
-            enabled=result_review,
-            run_repro=run_repro,
-            runtime_result=runtime_result,
-            template_fallback_used=bool(
-                runtime_result.get("template_fallback_used")
-                or (manifest.get("_meta") or {}).get("template_fallback_used")
-            ),
-            paper_path=paper_path,
-            paper=paper,
-            facts=facts,
-            tasks=tasks,
-            paper_context_json=paper_context,
-            repro_project_dir=repro_project_dir,
-            output_dir=output_dir,
-            audit_dir=audit_dir,
-            max_attempts=json_repair_attempts + 1,
-            resume=resume,
-            paper_thesis=paper_thesis,
-        )
-        _mark("result_review")
+            # Bug A: keep requirements.txt consistent with the whitelisted+installed imports the
+            # generated code actually uses, so a forgotten declaration (e.g. code imports
+            # scipy.linalg but omits scipy) is not refused by the runner's dependency-consistency
+            # gate. Only whitelisted+installed packages are added; anything else stays blocked.
+            reconciled = reconcile_whitelisted_requirements(repro_project_dir)
+            if reconciled:
+                write_json(audit_dir / "requirements_reconciled.json", {"added": reconciled})
+
+            if run_repro:
+                runtime_result = self._load_or_run_repro(
+                    output_dir=output_dir,
+                    repro_project_dir=repro_project_dir,
+                    repair_attempts=repair_attempts,
+                    run_timeout=run_timeout,
+                    resume=resume,
+                )
+                manifest_meta = manifest.get("_meta") if isinstance(manifest.get("_meta"), dict) else {}
+                if runtime_result.get("passed") is not True and not manifest_meta.get("template_fallback_used"):
+                    partial = _assess_partial_success(runtime_result)
+                    if partial["has_partial_output"]:
+                        # A single failed experiment should not sink the whole run: the
+                        # generated project produced usable partial outputs, so keep it (and
+                        # surface the risk) instead of masking everything with a template.
+                        runtime_result["partial_success"] = partial
+                        runtime_result["template_fallback_skipped"] = True
+                        write_json(output_dir / "runtime_result.json", runtime_result)
+                    elif template_fallback:
+                        # Preserve the failed generated-project run before the template
+                        # overwrites runtime_result.json and repro_project/.
+                        write_json(output_dir / "runtime_result_pre_fallback.json", runtime_result)
+                        manifest, written_files = self._write_template_repro_project(
+                            facts=facts,
+                            tasks=tasks,
+                            output_dir=output_dir,
+                            audit_dir=audit_dir,
+                            repro_project_dir=repro_project_dir,
+                            reason="generated project did not pass guarded execution after repair attempts",
+                        )
+                        validation = validate_repro_project(repro_project_dir)
+                        runtime_result = self._load_or_run_repro(
+                            output_dir=output_dir,
+                            repro_project_dir=repro_project_dir,
+                            repair_attempts=repair_attempts,
+                            run_timeout=run_timeout,
+                            resume=False,
+                        )
+                        runtime_result["template_fallback_used"] = True
+                        write_json(output_dir / "runtime_result.json", runtime_result)
+            else:
+                runtime_result = {
+                    "enabled": False,
+                    "passed": None,
+                    "attempts": [],
+                    "reason": "automatic execution is disabled by default; pass --run-repro to enable the guarded runner",
+                }
+            _mark("runtime")
+
+            result_review_result = self._run_result_review_if_ready(
+                enabled=result_review,
+                run_repro=run_repro,
+                runtime_result=runtime_result,
+                template_fallback_used=bool(
+                    runtime_result.get("template_fallback_used")
+                    or (manifest.get("_meta") or {}).get("template_fallback_used")
+                ),
+                paper_path=paper_path,
+                paper=paper,
+                facts=facts,
+                tasks=tasks,
+                paper_context_json=paper_context,
+                repro_project_dir=repro_project_dir,
+                output_dir=output_dir,
+                audit_dir=audit_dir,
+                max_attempts=json_repair_attempts + 1,
+                resume=resume,
+                paper_thesis=paper_thesis,
+            )
+            _mark("result_review")
 
         # Phase D of the science loop: if the review judged any experiment
         # does_not_support_paper_claim, feed that diagnosis back into a bounded, reversible
@@ -764,6 +770,7 @@ class ReviewPipeline:
         )
         if (
             science_loop
+            and project_backend != "codex"
             and per_task_layout
             and run_repro
             and science_repair_rounds > 0
@@ -788,9 +795,6 @@ class ReviewPipeline:
                 science_repair_timeout=science_repair_timeout,
                 repair_attempts=repair_attempts,
                 run_timeout=run_timeout,
-                repair_backend=repair_backend,
-                openhands_timeout=openhands_timeout,
-                openhands_max_iterations=openhands_max_iterations,
                 max_attempts=json_repair_attempts + 1,
                 project_timeout=project_timeout,
             )
@@ -927,7 +931,6 @@ class ReviewPipeline:
         fallback_factory: Callable[[Exception], dict[str, Any] | None] | None = None,
         candidate_normalizer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         truncation_recovery: Callable[[str], dict[str, Any] | None] | None = None,
-        prompt_adjustment: str | None = None,
         images: list | None = None,
         client: Any = None,
     ) -> dict[str, Any]:
@@ -942,7 +945,6 @@ class ReviewPipeline:
             if cached is not None:
                 return cached
 
-        prompt = _apply_prompt_adjustment(prompt, prompt_adjustment)
         _clear_stage_outputs(output_dir, cleanup_stage)
         write_text(audit_dir / f"{stage_label}.md", prompt)
         try:
@@ -1035,7 +1037,6 @@ class ReviewPipeline:
         resume: bool,
         max_attempts: int,
         template_fallback: bool,
-        prompt_adjustment: str | None,
     ) -> dict[str, Any]:
         """Round-1 cross-model ensemble: run the primary and the secondary multimodal model
         on the SAME extraction prompt+images in parallel, then union the two fact sets by
@@ -1059,7 +1060,6 @@ class ReviewPipeline:
                 schema_stage="engineering_facts",
                 max_attempts=max_attempts,
                 resume=resume,
-                prompt_adjustment=prompt_adjustment,
                 images=paper_images,
                 extra_validation=lambda parsed: (
                     validate_fact_sources(parsed, valid_chunk_ids, valid_pages)
@@ -1513,7 +1513,7 @@ class ReviewPipeline:
                 request_timeout=request_timeout,
                 # Per-file code generation goes to the (possibly text-only) generation
                 # client when configured; no images here (they go to the plan 03a only).
-                client=self.generation_client or self.client,
+                client=self.client,
             )
             files.append({"path": parsed["path"], "content_lines": parsed["content_lines"]})
             write_json(
@@ -1612,9 +1612,6 @@ class ReviewPipeline:
         repro_project_dir: Path,
         repair_attempts: int,
         run_timeout: float,
-        repair_backend: str,
-        openhands_timeout: float,
-        openhands_max_iterations: int,
         resume: bool,
     ) -> dict[str, Any]:
         if resume:
@@ -1631,15 +1628,12 @@ class ReviewPipeline:
                 system_message=SYSTEM_MESSAGE,
                 max_repair_attempts=repair_attempts,
                 timeout_seconds=run_timeout,
-                repair_backend=repair_backend,
-                openhands_timeout=openhands_timeout,
-                openhands_max_iterations=openhands_max_iterations,
             )
         except Exception as exc:
             runtime_result = {
                 "enabled": True,
                 "passed": False,
-                "repair_backend": repair_backend,
+                "repair_backend": "llm",
                 "pipeline_error": str(exc),
                 "attempts": [],
                 "artifacts": {},
@@ -1856,9 +1850,6 @@ class ReviewPipeline:
         science_repair_rounds: int,
         repair_attempts: int,
         run_timeout: float,
-        repair_backend: str,
-        openhands_timeout: float,
-        openhands_max_iterations: int,
         max_attempts: int,
         project_timeout: float | None,
         science_repair_backend: str = "llm",
@@ -1937,9 +1928,6 @@ class ReviewPipeline:
                 repro_project_dir=repro_project_dir,
                 repair_attempts=repair_attempts,
                 run_timeout=run_timeout,
-                repair_backend=repair_backend,
-                openhands_timeout=openhands_timeout,
-                openhands_max_iterations=openhands_max_iterations,
                 resume=False,
             )
             new_review_result = self._run_result_review_if_ready(
@@ -2102,7 +2090,7 @@ class ReviewPipeline:
                 extra_validation=lambda candidate, expected=path: _validate_project_file(candidate, expected),
                 candidate_normalizer=normalize_repro_project_file_candidate,
                 request_timeout=request_timeout,
-                client=self.generation_client or self.client,  # stronger coder fixes the science
+                client=self.client,
             )
             content = "\n".join(str(line) for line in parsed["content_lines"])
             target = repro_project_dir / path

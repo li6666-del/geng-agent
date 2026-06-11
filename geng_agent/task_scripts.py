@@ -26,7 +26,7 @@ from .io_runtime import io_slug
 
 
 DEFAULT_SMOKE_TIMEOUT_S = 60
-DEFAULT_FULL_TIMEOUT_S = 600
+DEFAULT_FULL_TIMEOUT_S = 2000
 
 
 def task_module_name(task_id: object, used: set[str] | None = None) -> str:

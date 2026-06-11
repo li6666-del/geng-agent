@@ -8,6 +8,10 @@ and MUST NOT be edited during repair -- it is the deterministic ``p≈1`` layer 
 guarantees the artifact-correctness rules the model used to re-derive (and get
 wrong) on every file.
 
+`BACKEND_RUNTIME_PY` is the same idea for optional compute backends. It owns the
+fragile "is torch importable / is CUDA available" probing so generated code does
+not need forbidden ``importlib`` checks or broad try/except import guards.
+
 The string is authored once, here, and is identical for every paper because it
 only does paper-independent plumbing (seed, write CSV/PNG/summary, scrub
 NaN/Inf/complex/numpy, self-check, honest exit code). It is deliberately written
@@ -246,14 +250,147 @@ src/_io.py 是本地已提供的“受信任运行时”，已经在项目里，
 """
 
 
+BACKEND_RUNTIME_PY = r'''"""Trusted optional compute-backend runtime (injected by geng-agent).
+
+DO NOT EDIT. Generated code may call this helper to decide whether a torch/CUDA
+backend is actually available. Keeping the probe here prevents generated science
+files from using importlib or broad try/except around third-party imports.
+"""
+from __future__ import annotations
+
+_TORCH = None
+_TORCH_PROBED = False
+_TORCH_ERROR = ""
+
+__all__ = ["select_backend", "torch", "torch_available"]
+
+
+def _as_int(value, default=0):
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _load_torch():
+    global _TORCH, _TORCH_PROBED, _TORCH_ERROR
+    if _TORCH_PROBED:
+        return _TORCH
+    _TORCH_PROBED = True
+    try:
+        import torch as torch_module
+    except Exception as exc:  # trusted runtime records the reason instead of hiding it
+        _TORCH = None
+        _TORCH_ERROR = f"{type(exc).__name__}: {exc}"
+    else:
+        _TORCH = torch_module
+        _TORCH_ERROR = ""
+    return _TORCH
+
+
+def torch_available(require_cuda=False):
+    module = _load_torch()
+    if module is None:
+        return False
+    if require_cuda:
+        try:
+            return bool(module.cuda.is_available())
+        except Exception:
+            return False
+    return True
+
+
+def torch():
+    module = _load_torch()
+    if module is None:
+        raise RuntimeError("torch is not importable in this interpreter: " + (_TORCH_ERROR or "unknown error"))
+    return module
+
+
+def select_backend(config=None, work_items=0, heavy=False):
+    cfg = config if isinstance(config, dict) else {}
+    prefer = str(cfg.get("backend") or cfg.get("compute_backend") or "auto").strip().lower()
+    min_cuda_work_items = _as_int(cfg.get("min_cuda_work_items"), 0)
+    work = _as_int(work_items, 0)
+    info = {
+        "backend": "numpy",
+        "requested": prefer,
+        "fallback_reason": "",
+        "torch_available": False,
+        "cuda_available": False,
+    }
+
+    if prefer in {"numpy", "cpu", "numpy_cpu"}:
+        info["fallback_reason"] = "cuda_not_requested"
+        return info
+
+    if prefer not in {"auto", "cuda", "torch_cuda", "torch", "torch_cpu"}:
+        info["fallback_reason"] = "unsupported_backend_request"
+        return info
+
+    module = _load_torch()
+    if module is None:
+        info["fallback_reason"] = "torch_not_importable:" + (_TORCH_ERROR or "unknown")
+        return info
+
+    info["torch_available"] = True
+    try:
+        info["torch_version"] = str(module.__version__)
+    except Exception:
+        pass
+
+    try:
+        cuda_ok = bool(module.cuda.is_available())
+    except Exception as exc:
+        cuda_ok = False
+        info["cuda_probe_error"] = f"{type(exc).__name__}: {exc}"
+    info["cuda_available"] = cuda_ok
+
+    if prefer in {"torch", "torch_cpu"}:
+        info["backend"] = "torch_cpu"
+        return info
+
+    if prefer == "auto" and not heavy and work < min_cuda_work_items:
+        info["fallback_reason"] = "workload_below_cuda_threshold"
+        return info
+
+    if cuda_ok:
+        info["backend"] = "torch_cuda"
+        try:
+            info["cuda_device"] = str(module.cuda.get_device_name(0))
+        except Exception:
+            pass
+        return info
+
+    info["fallback_reason"] = "torch_importable_but_cuda_unavailable"
+    return info
+'''
+
+
+BACKEND_RUNTIME_API_DOC = """\
+src/_backend.py 是本地已提供的“受信任计算后端探测器”，已经在项目里，禁止生成或修改它。
+生成代码不要自己 import importlib，也不要用 broad try/except 包住 `import torch` 来探测 GPU。
+- `from src import _backend`
+- `backend = _backend.select_backend(config, work_items=..., heavy=True)`：返回 `backend/fallback_reason/torch_available/cuda_available/torch_version/cuda_device` 等信息。
+- 当 `backend["backend"] == "torch_cuda"` 或 `"torch_cpu"` 时，可用 `torch = _backend.torch()` 取得 torch 模块并实现批量化计算。
+- 如果调用 `_backend.torch()` 或实际使用 torch 后端，requirements.txt 必须包含 `torch`；若只是 CPU/NumPy fallback，可不写 torch。
+- summary.json 的 metrics 里必须写入这个 backend 字典，不能静默降级后假装用了 GPU。
+"""
+
+
 def inject_io_runtime(project_dir: Path) -> Path:
-    """Write the trusted src/_io.py (and src/__init__.py) into a project, and make
+    """Write the trusted src/_io.py / src/_backend.py (and src/__init__.py) into a project, and make
     sure numpy + matplotlib are declared so its imports pass the consistency gate.
     Idempotent: safe to call on a fresh project or an existing/candidate copy."""
     project_dir = Path(project_dir)
     src_dir = project_dir / "src"
     src_dir.mkdir(parents=True, exist_ok=True)
     (src_dir / "_io.py").write_text(IO_RUNTIME_PY, encoding="utf-8", newline="\n")
+    (src_dir / "_backend.py").write_text(BACKEND_RUNTIME_PY, encoding="utf-8", newline="\n")
     init_path = src_dir / "__init__.py"
     if not init_path.exists():
         init_path.write_text("", encoding="utf-8", newline="\n")

@@ -40,7 +40,7 @@ def main() -> None:
         doc,
         "这里的 harness 可以理解成“把论文复现审查这件事串起来的工作台”。"
         "它不是单个 LLM，也不是单个脚本，而是一套负责调度、校验、运行、返修和出报告的流水线。"
-        "LLM 负责理解论文和生成候选内容，本地代码负责把关和执行，监督层负责观察失败并决定下一步。"
+        "LLM 负责理解论文和生成候选内容，本地代码负责把关、执行、重试、修复和兜底。"
     )
     add_callout(
         doc,
@@ -78,20 +78,20 @@ def main() -> None:
     add_codegen_table(doc)
 
     add_section(doc, "6. 本地执行与失败恢复闭环")
-    add_image(doc, diagrams["recovery"], "图 4  smoke/full 运行、LLM repair、OpenHands 和 fallback")
+    add_image(doc, diagrams["recovery"], "图 4  smoke/full 运行、LLM repair 和 fallback")
     add_para(
         doc,
         "smoke 是小规模试跑，full 是完整 config 运行。现在 smoke 通过不会直接进入最终审查，"
-        "必须继续跑完整 config。若运行失败，先尝试 LLM repair；修不好再交给 OpenHands 候选副本；"
+        "必须继续跑完整 config。若运行失败，先尝试 LLM repair；"
         "仍不可靠时才使用本地确定性模板 fallback。"
     )
 
-    add_section(doc, "7. 监督模式：为什么叫 agent")
-    add_supervise_table(doc)
+    add_section(doc, "7. 自动化闭环：为什么叫 agent")
+    add_agent_loop_table(doc)
     add_para(
         doc,
-        "普通 review 是单向流水线；supervise 是外面套了一层观察者。它不会盲目相信每一步成功，"
-        "而是读取 status、audit、runtime_result、repair_logs 和 risk_report，再决定继续、重试、fallback、修复、暂停或停止。"
+        "当前系统没有单独的监督命令；agent 性主要体现在主流水线内部的闭环。"
+        "它会读取 schema 校验、audit、runtime_result、repair_logs 和 result_review，再决定重试、补抽、修复、兜底或停止。"
     )
 
     add_section(doc, "8. 输出目录怎么读")
@@ -262,11 +262,11 @@ def add_kv_table(doc: Document, rows: list[tuple[str, str]]) -> None:
 
 def add_layer_table(doc: Document) -> None:
     rows = [
-        ("CLI 层", "review / supervise / status", "接收用户命令，决定是否运行、是否监督、输出到哪个 case。"),
+        ("用户入口层", "CLI: review/status/doctor；Web: /api/runs", "接收用户命令或上传 PDF，决定输出到哪个 case。"),
         ("Pipeline 层", "ReviewPipeline", "串起每一阶段：解析、LLM 调用、项目生成、运行、报告。"),
         ("LLM 层", "MiniMax/OpenAI-compatible API", "做论文理解、复现任务、代码生成、结果审查。"),
         ("本地校验层", "schema/security/outputs", "不信任 LLM，负责结构审查、安全扫描、依赖校验、产物校验。"),
-        ("执行与修复层", "runner/LLM repair/OpenHands/fallback", "在隔离思路下运行代码，失败后尝试修复或兜底。"),
+        ("执行与修复层", "runner/LLM repair/fallback", "在隔离思路下运行代码，失败后尝试修复或兜底。"),
         ("报告层", "review/result_review/docx", "把过程证据整理成 Markdown、JSON 和 Word。"),
     ]
     add_matrix_table(doc, ["层", "代表模块", "小白解释"], rows, [1500, 2600, 5260])
@@ -293,16 +293,16 @@ def add_codegen_table(doc: Document) -> None:
     add_matrix_table(doc, ["护栏", "含义"], rows, [2200, 7160])
 
 
-def add_supervise_table(doc: Document) -> None:
+def add_agent_loop_table(doc: Document) -> None:
     rows = [
-        ("continue", "阶段通过，继续下一步。"),
-        ("retry_stage", "当前阶段失败但还可重试。"),
-        ("use_fallback", "LLM 多次失败，改用本地确定性兜底。"),
-        ("repair_code", "运行失败，触发 LLM repair 或 OpenHands 修代码。"),
-        ("ask_human", "安全风险或重试耗尽，需要人工看日志。"),
-        ("stop", "流程完成，或结果审查不能伪造。"),
+        ("JSON 重试", "LLM 输出解析或 schema 校验失败时，带错误信息重新请求。"),
+        ("事实补抽", "图表或 figure claim 覆盖不足时，定向追加 facts gap round。"),
+        ("任务补齐", "可复现实验没有任务覆盖时，定向追加 tasks gap round。"),
+        ("代码修复", "受限运行失败时，触发 LLM repair。"),
+        ("模板兜底", "生成项目无法通过本地校验或运行验收时，写入确定性 fallback。"),
+        ("结果复审", "有真实输出时，把本地 PNG/CSV/论文页交给多模态模型逐实验审查。"),
     ]
-    add_matrix_table(doc, ["监督动作", "什么时候用"], rows, [2200, 7160])
+    add_matrix_table(doc, ["闭环动作", "什么时候用"], rows, [2200, 7160])
 
 
 def add_output_tree(doc: Document) -> None:
@@ -547,12 +547,12 @@ def draw_layers_diagram(path: Path) -> Path:
     d = ImageDraw.Draw(img)
     d.text((60, 35), "分层架构：谁负责什么", fill="#" + DARK, font=font(40, True))
     layers = [
-        ("用户入口层", "CLI: review / supervise / status", "E8EEF5"),
-        ("监督调度层", "Supervisor: observe -> decide -> act -> reflect", "F4F6F9"),
+        ("用户入口层", "CLI: review / status / doctor；Web API", "E8EEF5"),
+        ("配置与客户端层", "GENG_LLM_* / GENG_LLM2_* / GENG_GEN_* / OpenAI-compatible client", "F4F6F9"),
         ("主流水线层", "ReviewPipeline: facts -> tasks -> project -> runtime -> reports", "E8EEF5"),
         ("LLM 能力层", "MiniMax/OpenAI-compatible: 事实、任务、代码、结果审查", "F4F6F9"),
         ("本地护栏层", "Pydantic schema / security scan / requirements / output validation", "E8EEF5"),
-        ("执行修复层", "runner / LLM repair / OpenHands candidate / template fallback", "F4F6F9"),
+        ("执行修复层", "runner / LLM repair / template fallback", "F4F6F9"),
         ("证据报告层", "audit / runtime_result / risk_report / review.docx", "E8EEF5"),
     ]
     y = 120
@@ -592,7 +592,6 @@ def draw_recovery_diagram(path: Path) -> Path:
         ((520, 150, 820, 270), "运行 full config"),
         ((950, 150, 1300, 270), "产物校验\nCSV/PNG/summary"),
         ((520, 410, 820, 530), "LLM repair\n返回修复 manifest"),
-        ((950, 410, 1300, 530), "OpenHands\n候选副本修复"),
         ((520, 670, 820, 790), "template fallback\n本地确定性兜底"),
         ((950, 670, 1300, 790), "risk_report\n记录降级原因"),
     ]
@@ -601,8 +600,7 @@ def draw_recovery_diagram(path: Path) -> Path:
     arrow(d, (390, 210), (520, 210))
     arrow(d, (820, 210), (950, 210))
     arrow(d, (670, 270), (670, 410))
-    arrow(d, (820, 470), (950, 470))
-    arrow(d, (1125, 530), (670, 670))
+    arrow(d, (670, 530), (670, 670))
     arrow(d, (820, 730), (950, 730))
     d.text((105, 315), "失败时进入修复链路；成功时继续下一步", fill="#555555", font=font(24))
     img.save(path)

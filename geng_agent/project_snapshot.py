@@ -1,8 +1,7 @@
 """Whole-project snapshot/restore for reversible repro-project mutations.
 
 Used by the Phase-D science-repair loop: snapshot before a repair round, restore when the
-gate rejects it. (Formerly lived in the code-review module; the review feature was removed
-but these primitives are load-bearing for the repair gate.)
+gate rejects it. These primitives are load-bearing for the repair gate.
 """
 
 from __future__ import annotations

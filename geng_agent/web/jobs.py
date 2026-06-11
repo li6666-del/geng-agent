@@ -146,6 +146,8 @@ def _run_pipeline(record: RunRecord) -> None:
             result_review=True,
             resume=False,
             template_fallback=True,
+            project_backend="codex",
+            codex_agent_rounds=3,
         )
         with _lock:
             record.status = "succeeded"

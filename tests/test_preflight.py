@@ -77,7 +77,7 @@ class CheckEnvironmentTests(unittest.TestCase):
             repro_names,
             {
                 "numpy", "scipy", "matplotlib", "scikit-learn", "reedsolo",
-                "pandas", "sympy", "numba", "scikit-commpy", "galois",
+                "pandas", "sympy", "numba", "torch", "scikit-commpy", "galois",
                 "networkx", "h5py", "tqdm",
             },
         )

@@ -268,43 +268,6 @@ class PerTaskResumeTests(unittest.TestCase):
             self.assertFalse((audit / "resume_invalid_03_generate_repro_project.json").exists())
 
 
-class _GenerationOnlyFake:
-    """A coder client that may ONLY receive per-file code-generation calls. If it ever sees a
-    facts/thesis/plan/review call, routing is wrong and it raises."""
-
-    def __init__(self) -> None:
-        self.targets: list[str] = []
-
-    def complete(self, prompt: str, *, system=None, response_format=None) -> str:
-        if _schema_name(response_format) != "repro_project_file":
-            raise AssertionError(f"generation client wrongly got a {_schema_name(response_format)} call")
-        target = _target_path(prompt)
-        self.targets.append(target)
-        return json.dumps({"path": target, "content_lines": PER_TASK_FILES[target].splitlines()})
-
-
-class GenerationClientRoutingTests(unittest.TestCase):
-    def test_per_file_codegen_routes_to_generation_client_only(self) -> None:
-        with TemporaryDirectory() as temp_dir:
-            temp = Path(temp_dir)
-            paper = temp / "paper.md"
-            paper.write_text("Simulation Results\nAWGN channel, BER vs SNR.", encoding="utf-8")
-
-            main = PerTaskFakeLLM()       # facts/tasks/plan/manifest (multimodal-capable in real life)
-            gen = _GenerationOnlyFake()   # gets ONLY the per-file codegen calls
-            result = ReviewPipeline(client=main, generation_client=gen).run(
-                paper, temp / "case", run_repro=True, run_timeout=60, repair_attempts=0,
-                result_review=False, facts_gap_rounds=0, tasks_gap_rounds=0,
-                per_task_layout=True,
-            )
-            # Every generated file went through the coder, incl. the hard science file + a task.
-            self.assertIn("src/modulation.py", gen.targets)
-            self.assertIn("tasks/reproduce_fig_1.py", gen.targets)
-            # The plan (03a) stayed on the main client -> main never delegated it to the coder
-            # (the coder's guard would have raised). The project still runs.
-            self.assertTrue(result.runtime_passed)
-
-
 class ScienceRepairIntegrationTests(unittest.TestCase):
     def test_science_repair_regenerates_offending_files_and_keeps_a_fix(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -350,8 +313,7 @@ class ScienceRepairIntegrationTests(unittest.TestCase):
                 paper_thesis={"central_claim": "c", "proposed_method": "STAB", "mechanism": "m",
                               "comparisons": [], "headline_shape": "", "caveats": []},
                 runtime_result={"coverage": "1/1"}, result_review_result={"passed": True},
-                science_repair_rounds=1, repair_attempts=0, run_timeout=60, repair_backend="hybrid",
-                openhands_timeout=10, openhands_max_iterations=1, max_attempts=2, project_timeout=60,
+                science_repair_rounds=1, repair_attempts=0, run_timeout=60, max_attempts=2, project_timeout=60,
                 evaluate=fake_evaluate,
             )
 
@@ -425,8 +387,7 @@ class ScienceRepairIntegrationTests(unittest.TestCase):
                     manifest=manifest, facts={}, tasks={}, paper={}, paper_path=paper,
                     paper_context_json="[]", paper_thesis=None,
                     runtime_result={"coverage": "1/1"}, result_review_result={"passed": True},
-                    science_repair_rounds=1, repair_attempts=0, run_timeout=60, repair_backend="hybrid",
-                    openhands_timeout=10, openhands_max_iterations=1, max_attempts=2, project_timeout=60,
+                    science_repair_rounds=1, repair_attempts=0, run_timeout=60, max_attempts=2, project_timeout=60,
                     science_repair_backend="codex", science_repair_timeout=60,
                     evaluate=fake_evaluate,
                 )
@@ -476,8 +437,7 @@ class ScienceRepairIntegrationTests(unittest.TestCase):
                 manifest=manifest, facts={}, tasks={}, paper={}, paper_path=paper,
                 paper_context_json="[]", paper_thesis=None,
                 runtime_result=runtime_in, result_review_result=review_in,
-                science_repair_rounds=1, repair_attempts=0, run_timeout=60, repair_backend="hybrid",
-                openhands_timeout=10, openhands_max_iterations=1, max_attempts=2, project_timeout=60,
+                science_repair_rounds=1, repair_attempts=0, run_timeout=60, max_attempts=2, project_timeout=60,
                 evaluate=fake_evaluate,
             )
             self.assertEqual(called["evaluate"], 0)  # nothing to repair -> no rerun

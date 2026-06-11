@@ -77,8 +77,6 @@ ScientificVerdict = Literal[
     "does_not_support_paper_claim",
     "cannot_assess",
 ]
-SupervisorAction = Literal["continue", "retry_stage", "use_fallback", "repair_code", "ask_human", "stop"]
-SupervisorRiskLevel = Literal["low", "medium", "high"]
 ExperimentIndexStatus = Literal["ready", "ready_with_limitations", "blocked"]
 ReproducibilityVerdict = Literal[
     "fully_reproduced",
@@ -346,17 +344,6 @@ class ResultReviewDocument(StrictModel):
     note: NonEmptyStr
 
 
-class SupervisorDecisionDocument(StrictModel):
-    action: SupervisorAction
-    target_stage: NonEmptyStr
-    reason: NonEmptyStr
-    evidence_paths: list[NonEmptyStr]
-    risk_level: SupervisorRiskLevel
-    confidence: Confidence
-    prompt_adjustment: str | None = None
-    human_question: str | None = None
-
-
 class ReproducibilityVerdictDocument(StrictModel):
     verdict: ReproducibilityVerdict
     confidence: Confidence
@@ -377,7 +364,6 @@ SCHEMA_MODELS: dict[str, type[BaseModel]] = {
     "repair_manifest": RepairManifest,
     "result_review_experiment": ExperimentResultReview,
     "result_review": ResultReviewDocument,
-    "supervisor_decision": SupervisorDecisionDocument,
     "reproducibility_verdict": ReproducibilityVerdictDocument,
 }
 
@@ -393,7 +379,6 @@ SCHEMA_FILENAMES: dict[str, str] = {
     "repair_manifest": "repair_manifest.schema.json",
     "result_review_experiment": "result_review_experiment.schema.json",
     "result_review": "result_review.schema.json",
-    "supervisor_decision": "supervisor_decision.schema.json",
     "reproducibility_verdict": "reproducibility_verdict.schema.json",
 }
 

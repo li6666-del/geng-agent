@@ -19,10 +19,12 @@ ALLOWED_REQUIREMENTS = {
     "pillow",
     # Broadened scientific / communications stack so the generator is not forced into
     # crude simplifications (which drive template fallback). All pure-computation, no
-    # network/system access. Kept in sync with pyproject [repro] and installed locally.
+    # network/system access. Kept in sync with pyproject [repro]; actual local
+    # availability is reported by preflight / dependency policy prompts.
     "pandas",
     "sympy",
     "numba",
+    "torch",
     "scikit-commpy",
     "galois",
     "networkx",
@@ -114,18 +116,30 @@ SECRET_PATTERNS = [
     re.compile(r"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*['\"]?[^'\"\s]+"),
 ]
 
+TRUSTED_RUNTIME_FILES = {
+    "src/_io.py",
+    "src/_backend.py",
+}
+
 
 def build_safe_env() -> dict[str, str]:
     keep = {
         "PATH",
         "SystemRoot",
         "WINDIR",
+        "windir",
         "TEMP",
         "TMP",
         "PYTHONIOENCODING",
         "MPLBACKEND",
     }
-    safe_env = {key: value for key, value in os.environ.items() if key in keep}
+    keep_lower = {key.lower() for key in keep}
+    safe_env = {key: value for key, value in os.environ.items() if key.lower() in keep_lower}
+    windows_root = os.environ.get("SystemRoot") or os.environ.get("WINDIR") or os.environ.get("windir")
+    if windows_root:
+        safe_env.setdefault("SystemRoot", windows_root)
+        safe_env.setdefault("WINDIR", windows_root)
+        safe_env.setdefault("windir", windows_root)
     safe_env["PYTHONIOENCODING"] = "utf-8"
     safe_env["MPLBACKEND"] = "Agg"
     safe_env["MPLCONFIGDIR"] = safe_env.get("TEMP") or safe_env.get("TMP") or "."
@@ -219,6 +233,13 @@ def reconcile_whitelisted_requirements(root: Path) -> list[str]:
                 for name in import_names_for_requirement(package)
             ):
                 to_add.add(package)
+        if (
+            uses_trusted_torch_backend(tree)
+            and "torch" not in declared
+            and "torch" in ALLOWED_REQUIREMENTS
+            and importlib.util.find_spec("torch") is not None
+        ):
+            to_add.add("torch")
 
     if not to_add:
         return []
@@ -286,6 +307,24 @@ def validate_import_requirements(root: Path, declared_packages: set[str]) -> lis
                     }
                 )
 
+        if uses_trusted_torch_backend(tree):
+            if "torch" not in declared_packages:
+                issues.append(
+                    {
+                        "file": rel,
+                        "line": "0",
+                        "message": "trusted torch backend is used but requirements.txt does not declare torch",
+                    }
+                )
+            elif importlib.util.find_spec("torch") is None:
+                issues.append(
+                    {
+                        "file": rel,
+                        "line": "0",
+                        "message": "trusted torch backend is requested but torch is not installed in current environment",
+                    }
+                )
+
         for node in ast.walk(tree):
             if isinstance(node, ast.Try) and catches_broad_exception(node):
                 guarded_imports = []
@@ -329,6 +368,8 @@ def iter_project_python_files(root: Path):
     for py_file in root.rglob("*.py"):
         rel_parts = py_file.relative_to(root).parts
         if "__pycache__" in rel_parts or "repair_logs" in rel_parts or "outputs" in rel_parts:
+            continue
+        if py_file.relative_to(root).as_posix() in TRUSTED_RUNTIME_FILES:
             continue
         yield py_file
 
@@ -377,6 +418,30 @@ def catches_broad_exception(node: ast.Try) -> bool:
             for item in handler.type.elts:
                 if isinstance(item, ast.Name) and item.id in {"Exception", "BaseException"}:
                     return True
+    return False
+
+
+def uses_trusted_torch_backend(tree: ast.AST) -> bool:
+    backend_aliases = {"_backend"}
+    torch_func_aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "src":
+            for alias in node.names:
+                if alias.name == "_backend":
+                    backend_aliases.add(alias.asname or alias.name)
+        elif isinstance(node, ast.ImportFrom) and node.module == "src._backend":
+            for alias in node.names:
+                if alias.name == "torch":
+                    torch_func_aliases.add(alias.asname or alias.name)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _call_name(node.func)
+        if name in torch_func_aliases:
+            return True
+        if any(name == f"{alias}.torch" for alias in backend_aliases):
+            return True
     return False
 
 

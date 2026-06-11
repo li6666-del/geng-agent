@@ -11,6 +11,10 @@ from __future__ import annotations
 from typing import Any, Callable
 
 DOES_NOT_SUPPORT = "does_not_support_paper_claim"
+PARTIALLY_SUPPORTS = "partially_supports_paper_claim"
+CANNOT_ASSESS = "cannot_assess"
+ACTIONABLE_REVIEW_VERDICTS = {PARTIALLY_SUPPORTS, DOES_NOT_SUPPORT, CANNOT_ASSESS}
+ACTIONABLE_DIMENSION_RATINGS = {"weak", "missing", "unknown"}
 
 
 def collect_science_mismatches(result_review_doc: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -41,6 +45,62 @@ def collect_science_mismatches(result_review_doc: dict[str, Any] | None) -> list
             }
         )
     return mismatches
+
+
+def collect_actionable_review_feedback(result_review_doc: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Flatten every non-supporting experiment review into writer feedback.
+
+    The legacy science-repair loop only repairs hard ``does_not_support`` verdicts. The Codex
+    moderator loop has a stricter success gate: every task must reach ``supports_paper_claim``.
+    Therefore ``partially_supports`` and ``cannot_assess`` must also be fed back to the writer.
+    """
+    feedback: list[dict[str, Any]] = []
+    for review in (result_review_doc or {}).get("experiment_reviews", []):
+        if not isinstance(review, dict):
+            continue
+        verdict = str(review.get("scientific_verdict") or "")
+        if verdict not in ACTIONABLE_REVIEW_VERDICTS:
+            continue
+        dims = {
+            str(item.get("dimension")): item
+            for item in review.get("dimension_reviews", [])
+            if isinstance(item, dict)
+        }
+        weak_dimensions: list[dict[str, Any]] = []
+        for item in review.get("dimension_reviews", []):
+            if not isinstance(item, dict):
+                continue
+            rating = str(item.get("rating") or "")
+            if rating not in ACTIONABLE_DIMENSION_RATINGS:
+                continue
+            weak_dimensions.append(
+                {
+                    "dimension": str(item.get("dimension") or ""),
+                    "rating": rating,
+                    "finding": str(item.get("finding") or ""),
+                    "evidence": [str(x) for x in item.get("evidence", [])[:3] if str(x).strip()],
+                }
+            )
+        feedback.append(
+            {
+                "type": "paper_alignment_gap",
+                "task_id": str(review.get("task_id") or ""),
+                "scientific_verdict": verdict,
+                "paper_alignment": str(review.get("paper_alignment") or ""),
+                "paper_result_summary": str(review.get("paper_result_summary") or ""),
+                "local_result_summary": str(review.get("local_result_summary") or ""),
+                "differences": [str(x) for x in review.get("differences", []) if str(x).strip()],
+                "possible_causes": [str(x) for x in review.get("possible_causes", []) if str(x).strip()],
+                "weak_dimension_findings": weak_dimensions,
+                "baseline_finding": str((dims.get("baseline_comparison") or {}).get("finding") or ""),
+                "reproduction_logic_finding": str((dims.get("reproduction_logic") or {}).get("finding") or ""),
+                "metric_axis_scale_finding": str((dims.get("metric_axis_scale") or {}).get("finding") or ""),
+                "statistical_reliability_finding": str(
+                    (dims.get("statistical_reliability") or {}).get("finding") or ""
+                ),
+            }
+        )
+    return feedback
 
 
 def diagnose_csv_symptoms(numeric_columns: dict[str, Any]) -> list[str]:

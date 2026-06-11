@@ -171,7 +171,7 @@ def round3(path: Path) -> Path:
     box(d, (410, 505, 670, 635), "smoke 运行", "先小规模试跑")
     box(d, (800, 505, 1035, 635), "full config", "完整配置运行")
     box(d, (1165, 505, 1435, 635), "outputs", "CSV / PNG / summary")
-    box(d, (615, 690, 895, 810), "失败修复", "LLM repair / OpenHands")
+    box(d, (615, 690, 895, 810), "失败修复", "LLM repair / fallback")
     arrow(d, (285, 280), (410, 280))
     arrow(d, (670, 280), (800, 280))
     arrow(d, (1035, 280), (1165, 280))
@@ -315,7 +315,7 @@ def build_doc() -> Path:
         [
             "LLM 可以自由写代码，但每个文件最多 200 行，并且要通过依赖、import、安全和路径审查。",
             "运行顺序改成先 smoke，再跑 full config；最终产物必须是 CSV、PNG 和 summary JSON。",
-            "失败时进入修复链：LLM repair、OpenHands 候选副本、本地模板 fallback。",
+            "失败时进入修复链：LLM repair、本地模板 fallback。",
         ],
     )
     add_round(

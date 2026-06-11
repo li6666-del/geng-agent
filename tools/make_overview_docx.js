@@ -91,7 +91,7 @@ const doc = new Document({
       new Paragraph({ heading: HeadingLevel.HEADING_1, children: [new TextRun("四、当前进展")] }),
       bullet("第一、二轮都加上了“归一化 / 部分接受 / 截断抢救”，大幅减少“被迫退兜底”的情况。"),
       bullet("第四轮科学完整性闸新增“近常数 / 低方差”判据，堵住“BER≈0.5 随机结果蒙混过关”的盲区。"),
-      bullet("监督层补全：把 LLM 的“提示词调整”真正接入重试（此前是不起作用的死字段）。"),
+      bullet("流水线补强：事实/任务查漏补缺、逐文件生成和运行修复闭环已经接入主流程。"),
       bullet("安全加固：静态扫描新增拦截 eval / exec / __import__ / getattr 等反射式动态执行。"),
       bullet("已用一篇真实通信论文（arXiv:1404.2302）端到端跑通全流程；当生成代码质量不佳时，系统诚实判为 high_reproducibility_risk，而不是谎报成功。"),
       bullet("以上改动均有自动化测试覆盖（当前 129 项测试全部通过）。"),

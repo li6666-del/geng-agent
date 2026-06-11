@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
 import shutil
 import subprocess
@@ -10,15 +11,8 @@ from typing import Any
 
 from .json_utils import parse_json_object, pretty_json
 from .llm import LLMClient
-from .openhands_repair import (
-    OpenHandsInvoker,
-    changed_project_files,
-    copy_candidate_changes,
-    run_openhands_repair_candidate,
-)
 from .outputs import inspect_output_artifacts, validate_repro_project, write_file_manifest, write_json, write_text
 from .prompts import PromptBook
-from .runner_types import RepairBackend, normalize_repair_backend
 from .task_scripts import load_tasks_manifest
 from .schema_models import response_format_for_stage
 from .schemas import format_issues, validate_stage
@@ -32,6 +26,9 @@ from .security import (
 
 
 TRACEBACK_FILE_RE = re.compile(r'File "([^"]+)", line (\d+)')
+MAX_TASK_TIMEOUT_SECONDS = 2000.0
+
+
 def run_repro_with_repair(
     repro_project_dir: Path,
     client: LLMClient,
@@ -39,12 +36,7 @@ def run_repro_with_repair(
     system_message: str,
     max_repair_attempts: int = 2,
     timeout_seconds: float = 120.0,
-    repair_backend: RepairBackend | str = RepairBackend.LLM,
-    openhands_timeout: float = 900.0,
-    openhands_max_iterations: int = 25,
-    openhands_invoker: OpenHandsInvoker | None = None,
 ) -> dict[str, Any]:
-    backend = normalize_repair_backend(repair_backend)
     logs_dir = repro_project_dir / "repair_logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -61,14 +53,13 @@ def run_repro_with_repair(
             prompt_book=prompt_book,
             system_message=system_message,
             max_repair_attempts=max_repair_attempts,
-            backend=backend,
+            timeout_seconds=timeout_seconds,
         )
 
     phases = repro_run_phases(repro_project_dir)
     phase_results: list[dict[str, Any]] = []
     all_attempts: list[dict[str, Any]] = []
     all_repair_failures: list[dict[str, Any]] = []
-    all_openhands_attempts: list[dict[str, Any]] = []
 
     for phase in phases:
         phase_result = run_repro_phase_with_repair(
@@ -79,15 +70,10 @@ def run_repro_with_repair(
             phase=phase,
             max_repair_attempts=max_repair_attempts,
             timeout_seconds=timeout_seconds,
-            backend=backend,
-            openhands_timeout=openhands_timeout,
-            openhands_max_iterations=openhands_max_iterations,
-            openhands_invoker=openhands_invoker,
         )
         phase_results.append(phase_result)
         all_attempts.extend(phase_result["attempts"])
         all_repair_failures.extend(phase_result["repair_failures"])
-        all_openhands_attempts.extend(phase_result["openhands_attempts"])
         if not phase_result["passed"]:
             return {
                 "enabled": True,
@@ -95,12 +81,11 @@ def run_repro_with_repair(
                 "run_profile": phase,
                 "completed_profiles": [item["profile"] for item in phase_results if item["passed"]],
                 "failed_profile": phase,
-                "repair_backend": backend.value,
+                "repair_backend": "llm",
                 "repair_attempts_used": sum(item["repair_attempts_used"] for item in phase_results),
                 "attempts": all_attempts,
                 "phase_results": phase_results,
                 "repair_failures": all_repair_failures,
-                "openhands_attempts": all_openhands_attempts,
                 "artifacts": phase_result.get("artifacts", {}),
                 "logs_dir": str(logs_dir),
                 "security_issues": phase_result.get("security_issues", []),
@@ -113,12 +98,11 @@ def run_repro_with_repair(
         "passed": True,
         "run_profile": final_phase["profile"],
         "completed_profiles": [item["profile"] for item in phase_results],
-        "repair_backend": backend.value,
+        "repair_backend": "llm",
         "repair_attempts_used": sum(item["repair_attempts_used"] for item in phase_results),
         "attempts": all_attempts,
         "phase_results": phase_results,
         "repair_failures": all_repair_failures,
-        "openhands_attempts": all_openhands_attempts,
         "artifacts": final_phase["artifacts"],
         "logs_dir": str(logs_dir),
     }
@@ -139,15 +123,10 @@ def run_repro_phase_with_repair(
     phase: str,
     max_repair_attempts: int,
     timeout_seconds: float,
-    backend: RepairBackend,
-    openhands_timeout: float,
-    openhands_max_iterations: int,
-    openhands_invoker: OpenHandsInvoker | None,
 ) -> dict[str, Any]:
     logs_dir = repro_project_dir / "repair_logs"
     attempts: list[dict[str, Any]] = []
     repair_failures: list[dict[str, Any]] = []
-    openhands_attempts: list[dict[str, Any]] = []
 
     for attempt_index in range(max_repair_attempts + 1):
         run_result = run_repro_once(
@@ -165,11 +144,10 @@ def run_repro_phase_with_repair(
             return {
                 "profile": phase,
                 "passed": True,
-                "repair_backend": backend.value,
+                "repair_backend": "llm",
                 "repair_attempts_used": attempt_index,
                 "attempts": attempts,
                 "repair_failures": repair_failures,
-                "openhands_attempts": openhands_attempts,
                 "artifacts": run_result["artifacts"],
                 "logs_dir": str(logs_dir),
             }
@@ -181,25 +159,6 @@ def run_repro_phase_with_repair(
         code_context = collect_error_code_context(repro_project_dir, combined_log)
         write_text(logs_dir / f"attempt_{attempt_index + 1:02d}_code_context.md", code_context)
         validation = validate_repro_project(repro_project_dir)
-
-        if backend == RepairBackend.OPENHANDS:
-            openhands_result = run_openhands_repair_candidate(
-                repro_project_dir=repro_project_dir,
-                logs_dir=logs_dir,
-                attempt_index=attempt_index + 1,
-                run_result=run_result,
-                code_context=code_context,
-                validation=validation,
-                timeout_seconds=openhands_timeout,
-                max_iterations=openhands_max_iterations,
-                invoke_openhands=openhands_invoker,
-                run_profile=phase,
-            )
-            openhands_attempts.append(openhands_result)
-            if openhands_result["accepted"]:
-                continue
-            repair_failures.append(_openhands_failure(attempt_index + 1, openhands_result))
-            continue
 
         repair_prompt = prompt_book.render(
             "repair_repro_project.md",
@@ -227,24 +186,6 @@ def run_repro_phase_with_repair(
             }
             repair_failures.append(failure)
             write_json(logs_dir / f"{phase}_attempt_{attempt_index + 1:02d}_repair_failure.json", failure)
-            if backend == RepairBackend.HYBRID:
-                openhands_result = run_openhands_repair_candidate(
-                    repro_project_dir=repro_project_dir,
-                    logs_dir=logs_dir,
-                    attempt_index=attempt_index + 1,
-                    run_result=run_result,
-                    code_context=code_context,
-                    validation=validation,
-                    timeout_seconds=openhands_timeout,
-                    max_iterations=openhands_max_iterations,
-                    invoke_openhands=openhands_invoker,
-                    run_profile=phase,
-                )
-                openhands_attempts.append(openhands_result)
-                if openhands_result["accepted"]:
-                    continue
-                repair_failures.append(_openhands_failure(attempt_index + 1, openhands_result))
-                continue
             break
 
         candidate_result = try_repair_candidate(
@@ -260,33 +201,15 @@ def run_repro_phase_with_repair(
             write_file_manifest(repair_manifest, repro_project_dir)
         else:
             repair_failures.append(_llm_candidate_failure(attempt_index + 1, candidate_result))
-            if backend == RepairBackend.HYBRID:
-                openhands_result = run_openhands_repair_candidate(
-                    repro_project_dir=repro_project_dir,
-                    logs_dir=logs_dir,
-                    attempt_index=attempt_index + 1,
-                    run_result=run_result,
-                    code_context=code_context,
-                    validation=validation,
-                    timeout_seconds=openhands_timeout,
-                    max_iterations=openhands_max_iterations,
-                    invoke_openhands=openhands_invoker,
-                    run_profile=phase,
-                )
-                openhands_attempts.append(openhands_result)
-                if openhands_result["accepted"]:
-                    continue
-                repair_failures.append(_openhands_failure(attempt_index + 1, openhands_result))
 
     final_attempt = attempts[-1] if attempts else {}
     return {
         "profile": phase,
         "passed": False,
-        "repair_backend": backend.value,
+        "repair_backend": "llm",
         "repair_attempts_used": max(0, len(attempts) - 1),
         "attempts": attempts,
         "repair_failures": repair_failures,
-        "openhands_attempts": openhands_attempts,
         "artifacts": final_attempt.get("artifacts", {}),
         "logs_dir": str(logs_dir),
         "security_issues": final_attempt.get("security_issues", []),
@@ -298,26 +221,9 @@ def _llm_candidate_failure(attempt_index: int, candidate_result: dict[str, Any])
     return {
         "attempt": attempt_index,
         "stage": "repair_candidate",
-        "backend": RepairBackend.LLM.value,
+        "backend": "llm",
         "message": "candidate repair did not pass guarded execution",
         "candidate_result": candidate_result,
-    }
-
-
-def _openhands_failure(attempt_index: int, openhands_result: dict[str, Any]) -> dict[str, Any]:
-    agent_result = openhands_result.get("agent_result") if isinstance(openhands_result, dict) else None
-    return {
-        "attempt": attempt_index,
-        "stage": "openhands_candidate",
-        "backend": RepairBackend.OPENHANDS.value,
-        "message": "OpenHands candidate did not pass local guarded acceptance",
-        "candidate_dir": openhands_result.get("candidate_dir") if isinstance(openhands_result, dict) else None,
-        "diff_path": openhands_result.get("diff_path") if isinstance(openhands_result, dict) else None,
-        "agent_error": agent_result.get("error") if isinstance(agent_result, dict) else None,
-        "accepted": openhands_result.get("accepted") if isinstance(openhands_result, dict) else False,
-        "run_passed": openhands_result.get("run_result", {}).get("passed") if isinstance(openhands_result, dict) else None,
-        "security_issues": openhands_result.get("run_result", {}).get("security_issues", []) if isinstance(openhands_result, dict) else [],
-        "requirements_issues": openhands_result.get("run_result", {}).get("requirements_issues", []) if isinstance(openhands_result, dict) else [],
     }
 
 
@@ -612,6 +518,55 @@ def ensure_inside(root: Path, target: Path) -> None:
         raise ValueError(f"Refusing to operate outside {root}: {target}")
 
 
+def changed_project_files(original_dir: Path, candidate_dir: Path) -> list[str]:
+    paths = set(_project_text_files(original_dir)) | set(_project_text_files(candidate_dir))
+    changed = []
+    for rel_path in sorted(paths):
+        if _read_text(original_dir / rel_path) != _read_text(candidate_dir / rel_path):
+            changed.append(rel_path)
+    return changed
+
+
+def copy_candidate_changes(original_dir: Path, candidate_dir: Path, rel_paths: list[str]) -> None:
+    for rel_path in rel_paths:
+        source = candidate_dir / rel_path
+        target = original_dir / rel_path
+        if not source.exists() or not source.is_file():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(source.read_text(encoding="utf-8", errors="replace"), encoding="utf-8", newline="\n")
+
+
+def _project_text_files(root: Path) -> list[str]:
+    if not root.exists():
+        return []
+    files = []
+    for path in root.rglob("*"):
+        if not path.is_file() or _skip_path(path, root):
+            continue
+        if path.suffix.lower() in {".py", ".json", ".md", ".txt"} or path.name == "requirements.txt":
+            files.append(path.relative_to(root).as_posix())
+    return files
+
+
+def _skip_path(path: Path, root: Path) -> bool:
+    try:
+        parts = path.relative_to(root).parts
+    except ValueError:
+        parts = path.parts
+    return any(part in {"outputs", "repair_logs", "__pycache__"} for part in parts) or path.suffix.lower() in {
+        ".pyc",
+        ".png",
+        ".csv",
+    }
+
+
+def _read_text(path: Path) -> str | None:
+    if not path.exists() or not path.is_file():
+        return None
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
 def wrap_untrusted(label: str, text: str) -> str:
     return f"BEGIN UNTRUSTED DATA: {label}\n{text}\nEND UNTRUSTED DATA: {label}"
 
@@ -624,7 +579,6 @@ def run_tasks_with_repair(
     prompt_book: Any = None,
     system_message: str = "",
     max_repair_attempts: int = 0,
-    backend: RepairBackend = RepairBackend.LLM,
     timeout_seconds: float = 120.0,
 ) -> dict[str, Any]:
     """Task-aware orchestration: run each task as its OWN subprocess with its OWN timeout, so
@@ -648,7 +602,6 @@ def run_tasks_with_repair(
             prompt_book=prompt_book,
             system_message=system_message,
             max_repair_attempts=max_repair_attempts,
-            backend=backend,
         )
         write_json(logs_dir / f"tasks_{phase}_run.json", redact_data(result))
         phase_results.append(result)
@@ -662,7 +615,7 @@ def run_tasks_with_repair(
         "enabled": True,
         "passed": bool(final["all_passed"]),
         "per_task_orchestration": True,
-        "repair_backend": backend.value,
+        "repair_backend": "llm",
         "run_profile": final["run_profile"],
         "tasks_total": final["tasks_total"],
         "tasks_passed": final["tasks_passed"],
@@ -715,10 +668,13 @@ def run_tasks_once(
         clear_outputs(repro_project_dir)
     started_at = time.time()
     tasks = [task for task in manifest.get("tasks", []) if isinstance(task, dict) and task.get("module")]
-    per_task = [
-        run_task_once(repro_project_dir, task, phase=phase, config_name=config_name, since=started_at)
-        for task in tasks
-    ]
+    per_task = run_tasks_parallel_once(
+        repro_project_dir,
+        tasks,
+        phase=phase,
+        config_name=config_name,
+        since=started_at,
+    )
     passed = sum(1 for item in per_task if item["passed"])
     total = len(per_task)
     return {
@@ -735,6 +691,67 @@ def run_tasks_once(
     }
 
 
+def run_tasks_parallel_once(
+    repro_project_dir: Path,
+    tasks: list[dict[str, Any]],
+    *,
+    phase: str,
+    config_name: str,
+    since: float,
+) -> list[dict[str, Any]]:
+    """Run one manifest batch concurrently while preserving manifest order in results."""
+    if not tasks:
+        return []
+
+    results_by_index: dict[int, dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
+        future_to_index = {
+            executor.submit(
+                run_task_once,
+                repro_project_dir,
+                task,
+                phase=phase,
+                config_name=config_name,
+                since=since,
+            ): index
+            for index, task in enumerate(tasks)
+        }
+        for future in as_completed(future_to_index):
+            index = future_to_index[future]
+            try:
+                results_by_index[index] = future.result()
+            except Exception as exc:
+                task = tasks[index]
+                module = str(task.get("module") or "")
+                output_subdir = str(task.get("output_subdir") or task.get("task_id") or "")
+                results_by_index[index] = {
+                    "task_id": task.get("task_id"),
+                    "module": module,
+                    "output_subdir": output_subdir,
+                    "command": [sys.executable, "-m", f"tasks.{module}", config_name],
+                    "returncode": None,
+                    "timed_out": False,
+                    "timeout_seconds": task_timeout_seconds(task, phase),
+                    "passed": False,
+                    "artifacts": inspect_output_artifacts(repro_project_dir, since=since, subdir=output_subdir),
+                    "stdout": "",
+                    "stderr": f"task runner failed before reporting a result: {type(exc).__name__}: {exc}",
+                }
+    return [results_by_index[index] for index in range(len(tasks))]
+
+
+def task_timeout_seconds(task: dict[str, Any], phase: str) -> float:
+    default_timeout = 60.0 if phase == "smoke" else MAX_TASK_TIMEOUT_SECONDS
+    raw_timeout = task.get(f"timeout_{phase}_s") or default_timeout
+    try:
+        timeout = float(raw_timeout)
+    except (TypeError, ValueError):
+        timeout = default_timeout
+    if timeout <= 0:
+        timeout = default_timeout
+    return min(timeout, MAX_TASK_TIMEOUT_SECONDS)
+
+
 def run_task_once(
     repro_project_dir: Path,
     task: dict[str, Any],
@@ -749,8 +766,7 @@ def run_task_once(
     this task; everything is reported, nothing else is touched."""
     module = str(task.get("module") or "")
     output_subdir = str(task.get("output_subdir") or task.get("task_id") or "")
-    default_timeout = 60.0 if phase == "smoke" else 600.0
-    timeout = float(task.get(f"timeout_{phase}_s") or default_timeout)
+    timeout = task_timeout_seconds(task, phase)
     command = [sys.executable, "-m", f"tasks.{module}", config_name]
     try:
         completed = subprocess.run(
@@ -777,6 +793,7 @@ def run_task_once(
             "command": command,
             "returncode": completed.returncode,
             "timed_out": False,
+            "timeout_seconds": timeout,
             "passed": passed,
             "artifacts": artifacts,
             "stdout": redact_text(completed.stdout)[-4000:],
@@ -790,6 +807,7 @@ def run_task_once(
             "command": command,
             "returncode": None,
             "timed_out": True,
+            "timeout_seconds": timeout,
             "passed": False,
             "artifacts": inspect_output_artifacts(repro_project_dir, since=since, subdir=output_subdir),
             "stdout": "",
@@ -807,10 +825,12 @@ def run_tasks_phase_with_repair(
     prompt_book: Any = None,
     system_message: str = "",
     max_repair_attempts: int = 0,
-    backend: RepairBackend = RepairBackend.LLM,
 ) -> dict[str, Any]:
-    """One profile: gate + clear once, then run each task (with localized repair). Tasks that
-    pass become the regression baseline for any repair that touches a shared src/ file."""
+    """One profile: gate + clear once, then run the initial task batch in parallel.
+
+    Localized repair remains sequential because accepted patches can mutate shared project
+    files; tasks that pass become the regression baseline for repairs touching shared src/.
+    """
     config_name = (
         "config_smoke.json"
         if phase == "smoke" and (repro_project_dir / "config_smoke.json").exists()
@@ -835,26 +855,43 @@ def run_tasks_phase_with_repair(
 
     archive_outputs(repro_project_dir, logs_dir, f"tasks_{phase}")
     tasks = [task for task in manifest.get("tasks", []) if isinstance(task, dict) and task.get("module")]
-    per_task: list[dict[str, Any]] = []
-    passed_tasks: list[dict[str, Any]] = []
-    for task in tasks:
-        result = run_task_with_repair(
-            repro_project_dir,
-            task,
-            phase=phase,
-            config_name=config_name,
-            logs_dir=logs_dir,
-            client=client,
-            prompt_book=prompt_book,
-            system_message=system_message,
-            max_repair_attempts=max_repair_attempts,
-            backend=backend,
-            passed_tasks=passed_tasks,
-        )
-        per_task.append(result)
-        if result["passed"]:
-            passed_tasks.append(task)
-    passed = len(passed_tasks)
+    started_at = time.time()
+    per_task = run_tasks_parallel_once(
+        repro_project_dir,
+        tasks,
+        phase=phase,
+        config_name=config_name,
+        since=started_at,
+    )
+    passed_tasks = [task for task, result in zip(tasks, per_task) if result["passed"]]
+
+    if max_repair_attempts > 0 and client is not None and prompt_book is not None:
+        project_may_have_changed = False
+        repaired_per_task = list(per_task)
+        for index, (task, initial_result) in enumerate(zip(tasks, per_task)):
+            if initial_result["passed"]:
+                continue
+            result = run_task_with_repair(
+                repro_project_dir,
+                task,
+                phase=phase,
+                config_name=config_name,
+                logs_dir=logs_dir,
+                client=client,
+                prompt_book=prompt_book,
+                system_message=system_message,
+                max_repair_attempts=max_repair_attempts,
+                passed_tasks=passed_tasks,
+                initial_result=None if project_may_have_changed else initial_result,
+            )
+            repaired_per_task[index] = result
+            if result["passed"]:
+                passed_tasks.append(task)
+            if any(item.get("accepted") for item in result.get("repair_attempts", [])):
+                project_may_have_changed = True
+        per_task = repaired_per_task
+
+    passed = sum(1 for item in per_task if item["passed"])
     total = len(per_task)
     return {
         "run_profile": phase,
@@ -864,7 +901,7 @@ def run_tasks_phase_with_repair(
         "all_passed": total > 0 and passed == total,
         "coverage": f"{passed}/{total}",
         "per_task": per_task,
-        "artifacts": inspect_output_artifacts(repro_project_dir),
+        "artifacts": inspect_output_artifacts(repro_project_dir, since=started_at),
         "requirements_issues": [],
         "security_issues": [],
     }
@@ -881,8 +918,8 @@ def run_task_with_repair(
     prompt_book: Any = None,
     system_message: str = "",
     max_repair_attempts: int = 0,
-    backend: RepairBackend = RepairBackend.LLM,
     passed_tasks: list[dict[str, Any]] | None = None,
+    initial_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run one task, and on failure repair JUST its script (verified by re-running only this
     task), rejecting any repair that regresses an already-passing task through a shared src/
@@ -891,8 +928,11 @@ def run_task_with_repair(
     repair_attempts: list[dict[str, Any]] = []
     result: dict[str, Any] = {}
     for attempt in range(max_repair_attempts + 1):
-        started = time.time()
-        result = run_task_once(repro_project_dir, task, phase=phase, config_name=config_name, since=started)
+        if attempt == 0 and initial_result is not None:
+            result = dict(initial_result)
+        else:
+            started = time.time()
+            result = run_task_once(repro_project_dir, task, phase=phase, config_name=config_name, since=started)
         if result["passed"] or attempt >= max_repair_attempts or client is None or prompt_book is None:
             break
         combined_log = "\n".join([result.get("stdout", ""), result.get("stderr", "")])

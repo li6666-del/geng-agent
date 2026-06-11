@@ -67,6 +67,21 @@ def inspect_case_status(output_dir: Path) -> dict[str, Any]:
 def inspect_stage(output_dir: Path, name: str, rel_path: str, schema_stage: str | None) -> dict[str, Any]:
     path = output_dir / rel_path
     if not path.exists():
+        if name == "result_review":
+            error_path = output_dir / "result_review_error.json"
+            if error_path.exists():
+                try:
+                    error_data = read_json(error_path)
+                    reason = error_data.get("reason") or error_data.get("error") or "result review failed"
+                except Exception:
+                    reason = "result review failed"
+                return {
+                    "stage": name,
+                    "ok": False,
+                    "path": str(path),
+                    "reason": str(reason),
+                    "error_path": str(error_path),
+                }
         return {"stage": name, "ok": False, "path": str(path), "reason": "missing"}
 
     if name == "paper":
@@ -93,7 +108,23 @@ def inspect_stage(output_dir: Path, name: str, rel_path: str, schema_stage: str 
     if schema_stage:
         try:
             data = read_json(path)
-            issues = validate_stage(schema_stage, data)
+            if name == "result_review":
+                error_path = output_dir / "result_review_error.json"
+                if error_path.exists() and error_path.stat().st_mtime >= path.stat().st_mtime:
+                    try:
+                        error_data = read_json(error_path)
+                        reason = error_data.get("reason") or error_data.get("error") or "result review failed"
+                    except Exception:
+                        reason = "result review failed"
+                    return {
+                        "stage": name,
+                        "ok": False,
+                        "path": str(path),
+                        "reason": str(reason),
+                        "error_path": str(error_path),
+                    }
+            required_files = _required_files_for_stage(name, data)
+            issues = validate_stage(schema_stage, data, required_files=required_files)
             ok = not issues
             return {
                 "stage": name,
@@ -106,6 +137,18 @@ def inspect_stage(output_dir: Path, name: str, rel_path: str, schema_stage: str 
             return {"stage": name, "ok": False, "path": str(path), "reason": f"invalid json: {exc}"}
 
     return {"stage": name, "ok": path.is_file(), "path": str(path), "reason": "present" if path.is_file() else "not a file"}
+
+
+def _required_files_for_stage(name: str, data: dict[str, Any]) -> set[str] | None:
+    if name != "repro_project_manifest":
+        return None
+    meta = data.get("_meta") if isinstance(data, dict) else None
+    if not isinstance(meta, dict) or not meta.get("agentic_project_used"):
+        return None
+    generated = meta.get("generated_paths")
+    if isinstance(generated, list) and all(isinstance(item, str) for item in generated):
+        return set(generated)
+    return None
 
 
 def latest_audit_items(audit_dir: Path, limit: int = 8) -> list[dict[str, Any]]:

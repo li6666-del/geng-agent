@@ -2,6 +2,7 @@ import unittest
 
 from geng_agent.science_repair import (
     build_science_directive,
+    collect_actionable_review_feedback,
     collect_science_mismatches,
     diagnose_csv_symptoms,
     is_improvement,
@@ -40,6 +41,19 @@ class PureHelperTests(unittest.TestCase):
         mismatches = collect_science_mismatches(doc)
         self.assertEqual([m["task_id"] for m in mismatches], ["t1"])
         self.assertEqual(mismatches[0]["baseline_finding"], "曲线相对高低与论文相反")
+
+    def test_actionable_feedback_collects_partial_and_cannot_assess(self) -> None:
+        doc = _doc(
+            "supports_paper_claim",
+            "partially_supports_paper_claim",
+            "does_not_support_paper_claim",
+            "cannot_assess",
+        )
+        feedback = collect_actionable_review_feedback(doc)
+        self.assertEqual([item["task_id"] for item in feedback], ["t1", "t2", "t3"])
+        self.assertEqual([item["type"] for item in feedback], ["paper_alignment_gap"] * 3)
+        self.assertEqual(feedback[0]["scientific_verdict"], "partially_supports_paper_claim")
+        self.assertEqual(feedback[0]["weak_dimension_findings"][0]["dimension"], "baseline_comparison")
 
     def test_directive_carries_diagnosis_and_forbids_number_fudging(self) -> None:
         directive = build_science_directive(collect_science_mismatches(_doc("does_not_support_paper_claim")))

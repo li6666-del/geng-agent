@@ -4,7 +4,6 @@ import json
 import unittest
 
 from geng_agent.outputs import write_file_manifest
-from geng_agent.openhands_repair import normalize_openhands_model
 from geng_agent.prompts import PromptBook
 from geng_agent.runner import choose_repro_command, run_repro_once, run_repro_with_repair
 from geng_agent.security import build_safe_env
@@ -65,29 +64,15 @@ def base_repro_files(run_experiment: str) -> list[tuple[str, str]]:
     ]
 
 
-def write_valid_experiment(path: Path) -> None:
-    path.write_text(
-        "import base64\n"
-        f"PNG_B64 = '{PNG_B64}'\n"
-        "from pathlib import Path\n"
-        "Path('outputs').mkdir(exist_ok=True)\n"
-        "Path('outputs/results.csv').write_text('x,y\\n1,2\\n', encoding='utf-8')\n"
-        "Path('outputs/plot.png').write_bytes(base64.b64decode(PNG_B64))\n"
-        "Path('outputs/summary.json').write_text('{\"task_id\":\"smoke\",\"metrics\":{},\"assumptions\":[]}', encoding='utf-8')\n",
-        encoding="utf-8",
-    )
-
-
 class RunnerTests(unittest.TestCase):
     def test_safe_env_sets_matplotlib_config_dir(self) -> None:
         safe_env = build_safe_env()
 
         self.assertEqual(safe_env["MPLBACKEND"], "Agg")
         self.assertIn("MPLCONFIGDIR", safe_env)
-
-    def test_openhands_model_uses_openai_prefix_for_compatible_base_url(self) -> None:
-        self.assertEqual(normalize_openhands_model("MiniMax-M3", "https://api.minimaxi.com/v1"), "openai/MiniMax-M3")
-        self.assertEqual(normalize_openhands_model("openai/MiniMax-M3", "https://api.minimaxi.com/v1"), "openai/MiniMax-M3")
+        # PyTorch imports asyncio internals on Windows; those need SystemRoot
+        # even though the runner still strips secrets and user configuration.
+        self.assertIn("SystemRoot", safe_env)
 
     def test_choose_repro_command_uses_config_flag_when_supported(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -154,107 +139,27 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(summary["profile"], "full")
             self.assertTrue((root / "repair_logs" / "full_attempt_01_previous_outputs").exists())
 
-    def test_hybrid_uses_openhands_after_llm_repair_failure(self) -> None:
+    def test_repair_manifest_failure_records_failure(self) -> None:
         files = base_repro_files("raise ValueError('boom')\n")
-        calls: list[Path] = []
-
-        def fake_openhands(candidate_dir: Path, prompt: str, config: object) -> dict[str, object]:
-            calls.append(candidate_dir)
-            write_valid_experiment(candidate_dir / "run_experiment.py")
-            (candidate_dir / "src" / "helper.py").write_text("VALUE = 1\n", encoding="utf-8")
-            return {"ok": True, "mode": "fake"}
-
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             write_file_manifest({"files": [{"path": p, "content": c} for p, c in files]}, root)
+            llm = FailingRepairLLM()
 
             result = run_repro_with_repair(
                 repro_project_dir=root,
-                client=FailingRepairLLM(),
+                client=llm,
                 prompt_book=PromptBook(),
                 system_message="system",
                 max_repair_attempts=1,
                 timeout_seconds=10,
-                repair_backend="hybrid",
-                openhands_invoker=fake_openhands,
-            )
-
-            self.assertTrue(result["passed"])
-            self.assertEqual(result["repair_backend"], "hybrid")
-            self.assertEqual(len(calls), 1)
-            self.assertTrue((root / "repair_logs" / "attempt_01_openhands_result.json").exists())
-            self.assertIn("PNG_B64", (root / "run_experiment.py").read_text(encoding="utf-8"))
-            self.assertTrue((root / "src" / "helper.py").exists())
-
-    def test_hybrid_does_not_call_openhands_when_llm_repair_succeeds(self) -> None:
-        def forbidden_openhands(candidate_dir: Path, prompt: str, config: object) -> dict[str, object]:
-            raise AssertionError("OpenHands should not be called")
-
-        with TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            write_file_manifest({"files": [{"path": p, "content": c} for p, c in base_repro_files("raise ValueError('boom')\n")]}, root)
-
-            result = run_repro_with_repair(
-                repro_project_dir=root,
-                client=RepairLLM(),
-                prompt_book=PromptBook(),
-                system_message="system",
-                max_repair_attempts=1,
-                timeout_seconds=10,
-                repair_backend="hybrid",
-                openhands_invoker=forbidden_openhands,
-            )
-
-            self.assertTrue(result["passed"])
-            self.assertEqual(result["openhands_attempts"], [])
-
-    def test_openhands_backend_records_adapter_error_without_crashing(self) -> None:
-        def failing_openhands(candidate_dir: Path, prompt: str, config: object) -> dict[str, object]:
-            raise RuntimeError("OpenHands SDK is not installed")
-
-        with TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            write_file_manifest({"files": [{"path": p, "content": c} for p, c in base_repro_files("raise ValueError('boom')\n")]}, root)
-
-            result = run_repro_with_repair(
-                repro_project_dir=root,
-                client=RepairLLM(),
-                prompt_book=PromptBook(),
-                system_message="system",
-                max_repair_attempts=1,
-                timeout_seconds=10,
-                repair_backend="openhands",
-                openhands_invoker=failing_openhands,
             )
 
             self.assertFalse(result["passed"])
-            self.assertEqual(result["repair_backend"], "openhands")
-            self.assertIn("OpenHands SDK is not installed", result["openhands_attempts"][0]["agent_result"]["error"])
-            self.assertTrue((root / "repair_logs" / "attempt_01_openhands_result.json").exists())
-
-    def test_openhands_candidate_rejected_when_security_scan_fails(self) -> None:
-        def unsafe_openhands(candidate_dir: Path, prompt: str, config: object) -> dict[str, object]:
-            (candidate_dir / "run_experiment.py").write_text("import os\nprint(os.getenv('GENG_LLM_API_KEY'))\n", encoding="utf-8")
-            return {"ok": True, "mode": "fake"}
-
-        with TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            write_file_manifest({"files": [{"path": p, "content": c} for p, c in base_repro_files("raise ValueError('boom')\n")]}, root)
-
-            result = run_repro_with_repair(
-                repro_project_dir=root,
-                client=RepairLLM(),
-                prompt_book=PromptBook(),
-                system_message="system",
-                max_repair_attempts=1,
-                timeout_seconds=10,
-                repair_backend="openhands",
-                openhands_invoker=unsafe_openhands,
-            )
-
-            self.assertFalse(result["passed"])
-            self.assertTrue(result["openhands_attempts"][0]["run_result"]["security_issues"])
-            self.assertNotIn("os.getenv", (root / "run_experiment.py").read_text(encoding="utf-8"))
+            self.assertEqual(result["repair_backend"], "llm")
+            self.assertEqual(llm.calls, 1)
+            self.assertEqual(result["repair_failures"][0]["stage"], "repair_manifest_validation")
+            self.assertTrue((root / "repair_logs" / "smoke_attempt_01_repair_failure.json").exists())
 
     def test_guard_refuses_env_access(self) -> None:
         files = base_repro_files("import os\nprint(os.getenv('GENG_LLM_API_KEY'))\n")

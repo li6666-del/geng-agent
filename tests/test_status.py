@@ -87,6 +87,74 @@ class StatusTests(unittest.TestCase):
             self.assertIn(str(root / "paper.md"), status["suggested_command"])
             self.assertIn("--run-repro", status["suggested_command"])
 
+    def test_status_accepts_agentic_manifest_required_files(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            case = Path(temp_dir) / "case"
+            case.mkdir()
+            files = ["README.md", "requirements.txt", "config.json", "config_smoke.json", "src/channel.py"]
+            write_json(
+                case / "repro_project_manifest.json",
+                {
+                    "files": [{"path": path, "content_lines": ["x"]} for path in files],
+                    "_meta": {"agentic_project_used": True, "generated_paths": files},
+                },
+            )
+
+            stage = next(item for item in inspect_case_status(case)["stages"] if item["stage"] == "repro_project_manifest")
+
+            self.assertTrue(stage["ok"], stage)
+
+    def test_status_prefers_newer_result_review_error_over_stale_json(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            case = Path(temp_dir) / "case"
+            case.mkdir()
+            dims = [
+                "artifact_coverage",
+                "reproduction_logic",
+                "trend_shape",
+                "metric_axis_scale",
+                "baseline_comparison",
+                "statistical_reliability",
+                "conclusion_support",
+            ]
+            write_json(
+                case / "result_review.json",
+                {
+                    "overall_result_credibility": "medium",
+                    "overall_alignment": "partial_match",
+                    "experiment_reviews": [
+                        {
+                            "task_id": "t1",
+                            "local_result_credibility": "medium",
+                            "paper_alignment": "partial_match",
+                            "scientific_verdict": "partially_supports_paper_claim",
+                            "dimension_reviews": [
+                                {"dimension": dim, "rating": "acceptable", "finding": "ok", "evidence": ["e"]}
+                                for dim in dims
+                            ],
+                            "paper_result_summary": "paper",
+                            "local_result_summary": "local",
+                            "differences": [],
+                            "possible_causes": [],
+                            "evidence": ["e"],
+                            "limitations": [],
+                            "confidence": "medium",
+                        }
+                    ],
+                    "cross_experiment_findings": [],
+                    "recommended_human_checks": [],
+                },
+            )
+            write_json(
+                case / "result_review_error.json",
+                {"enabled": True, "passed": False, "reason": "Codex result reviewer failed", "error": "empty JSON"},
+            )
+
+            stage = next(item for item in inspect_case_status(case)["stages"] if item["stage"] == "result_review")
+
+            self.assertFalse(stage["ok"])
+            self.assertIn("Codex result reviewer failed", stage["reason"])
+
 
 if __name__ == "__main__":
     unittest.main()

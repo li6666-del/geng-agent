@@ -124,27 +124,27 @@ class TemplateFallbackRiskTests(unittest.TestCase):
 class UsageRollupTests(unittest.TestCase):
     def test_cumulative_and_by_model_rollup(self) -> None:
         main = _UsageClient("main", [{"model": "main", "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}])
-        reviewer = _UsageClient(
-            "rev",
+        secondary = _UsageClient(
+            "sec",
             [
-                {"model": "rev", "prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
-                {"model": "rev"},  # provider omitted usage -> counts as a call, 0 tokens
+                {"model": "sec", "prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+                {"model": "sec"},  # provider omitted usage -> counts as a call, 0 tokens
             ],
         )
-        pipe = ReviewPipeline(main, generation_client=reviewer)
+        pipe = ReviewPipeline(main, extraction_client_2=secondary)
 
         cum = pipe._cumulative_usage()
         self.assertEqual(cum["llm_calls"], 3)
         self.assertEqual(cum["total_tokens"], 25)
 
         by_model = pipe._usage_by_model()
-        self.assertEqual(by_model["rev"]["llm_calls"], 2)
-        self.assertEqual(by_model["rev"]["total_tokens"], 10)
+        self.assertEqual(by_model["sec"]["llm_calls"], 2)
+        self.assertEqual(by_model["sec"]["total_tokens"], 10)
         self.assertEqual(by_model["main"]["total_tokens"], 15)
 
-    def test_same_client_for_generation_is_not_double_counted(self) -> None:
+    def test_same_client_for_secondary_extraction_is_not_double_counted(self) -> None:
         main = _UsageClient("main", [{"model": "main", "total_tokens": 15}])
-        pipe = ReviewPipeline(main, generation_client=main)
+        pipe = ReviewPipeline(main, extraction_client_2=main)
         self.assertEqual(pipe._cumulative_usage()["llm_calls"], 1)
 
 
