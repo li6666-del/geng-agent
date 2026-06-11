@@ -116,6 +116,7 @@ def _write_mock_writer(temp: Path) -> str:
         textwrap.dedent(
             r'''
             import sys
+            import shutil
             from pathlib import Path
 
             args = sys.argv[1:]
@@ -170,6 +171,10 @@ def _write_mock_writer(temp: Path) -> str:
             (proj / "src" / "_io.py").write_text("SABOTAGED\n", encoding="utf-8")
             (proj / "run_experiment.py").write_text("SABOTAGED\n", encoding="utf-8")
             (proj / "unexpected.py").write_text("print('bad')\n", encoding="utf-8")
+            evidence = proj / "paper_evidence"
+            if evidence.exists():
+                shutil.rmtree(evidence)
+            evidence.write_text("writer tampered evidence\n", encoding="utf-8")
             print("writer done")
             if Path(__file__).with_name("writer_exit_1.flag").exists():
                 raise SystemExit(1)
@@ -353,6 +358,34 @@ class AgenticProjectWorkflowTests(unittest.TestCase):
         self.assertEqual(support_score["scientific_gap_count"], 0)
         self.assertTrue(_is_better_score(support_score, partial_score))
 
+    def test_best_round_score_keeps_runtime_coverage_fallbacks(self) -> None:
+        review_doc = {"experiment_reviews": [_review("supports_paper_claim", "match")]}
+        status = {"enabled": True, "passed": True}
+        writer = {"ok": True}
+        validation = {"required_files_present": True, "python_compiles": True}
+
+        nested_score = _score_candidate(
+            {"passed": True, "full": {"coverage": "4/4"}},
+            review_doc,
+            status,
+            writer,
+            validation,
+            [],
+        )
+        passed_only_score = _score_candidate(
+            {"passed": True},
+            review_doc,
+            status,
+            writer,
+            validation,
+            [],
+        )
+
+        self.assertEqual(nested_score["coverage_passed"], 4)
+        self.assertEqual(nested_score["coverage_total"], 4)
+        self.assertEqual(passed_only_score["coverage_passed"], 1)
+        self.assertEqual(passed_only_score["coverage_total"], 1)
+
     def test_codex_writer_reviewer_loop_restores_trusted_files_and_feeds_back_review(self) -> None:
         with TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
@@ -407,7 +440,18 @@ class AgenticProjectWorkflowTests(unittest.TestCase):
             self.assertIn("def begin", (out / "repro_project" / "src" / "_io.py").read_text(encoding="utf-8"))
             self.assertIn("Auto-generated run-all dispatcher", (out / "repro_project" / "run_experiment.py").read_text(encoding="utf-8"))
             self.assertFalse((out / "repro_project" / "unexpected.py").exists())
+            evidence_index_path = out / "repro_project" / "paper_evidence" / "index.json"
+            self.assertTrue(evidence_index_path.exists())
+            self.assertTrue(evidence_index_path.parent.is_dir())
+            evidence_index = json.loads(evidence_index_path.read_text(encoding="utf-8"))
+            self.assertEqual(evidence_index["kind"], "task_scoped_paper_evidence")
+            self.assertTrue(evidence_index["paper_source"]["copied"])
+            task_evidence_rel = evidence_index["tasks"][0]["task_evidence_json"]
+            self.assertTrue((out / "repro_project" / task_evidence_rel).exists())
             self.assertTrue((out / "result_review.json").exists())
+            round1_brief = (audit / "03c_agentic_project_round_01_writer_brief.md").read_text(encoding="utf-8")
+            self.assertIn("Task-level paper evidence bundle", round1_brief)
+            self.assertIn(task_evidence_rel, round1_brief)
             round2_brief = (audit / "03c_agentic_project_round_02_writer_brief.md").read_text(encoding="utf-8")
             self.assertIn("paper ordering is not matched yet", round2_brief)
             self.assertIn("mock modeling issue", round2_brief)
@@ -534,7 +578,7 @@ class AgenticProjectWorkflowTests(unittest.TestCase):
             max_rounds=3,
         )
 
-        self.assertIn("paper_context_json truncated by geng-agent", brief)
+        self.assertIn("global_paper_context_json truncated by geng-agent", brief)
         self.assertLess(len(brief), 60_000)
 
     def test_full_pipeline_codex_backend_generates_final_reports_with_fake_agents(self) -> None:

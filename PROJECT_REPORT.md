@@ -179,7 +179,6 @@ Web job 实现在 `geng_agent/web/jobs.py`：
 | `runner.py` | 受限运行、smoke/full 两相、LLM 修复调度 |
 | `security.py` | 依赖白名单、危险导入/调用扫描、脱敏 |
 | `result_review.py` | 结果级多模态审查 |
-| `science_repair.py` | 论文思路闭环后的科学返修 |
 | `verdict.py` | 本地复现结论映射 |
 | `risk_report.py` / `review_markdown.py` / `docx_writer.py` | 风险报告和文档输出 |
 | `web/app.py` / `web/jobs.py` / `web/stages.py` | 极简本地 Web API 和进度展示 |

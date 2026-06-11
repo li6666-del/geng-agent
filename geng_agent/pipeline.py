@@ -8,9 +8,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from .agentic_repair import run_agentic_science_repair
-from .project_snapshot import _restore_project, _snapshot_project
-from .science_repair import build_science_directive, diagnose_csv_symptoms, run_science_repair
 from .documents import load_paper
 from .experiment_index import build_local_experiment_index
 from .facts_coverage import (
@@ -32,7 +29,7 @@ from .io_runtime import inject_io_runtime
 from .task_scripts import build_tasks_manifest, write_task_scaffolding
 from .outputs import validate_repro_project, write_file_manifest, write_json, write_text
 from .prompts import PromptBook
-from .result_review import run_result_review, summarize_csv_file
+from .result_review import run_result_review
 from .runner import build_json_retry_prompt, run_repro_with_repair
 from .schema_models import response_format_for_stage
 from .schemas import (
@@ -413,9 +410,6 @@ class ReviewPipeline:
         tasks_gap_rounds: int = 3,
         per_task_layout: bool = False,
         science_loop: bool = False,
-        science_repair_rounds: int = 1,
-        science_repair_backend: str = "llm",
-        science_repair_timeout: float = 1800.0,
         project_backend: str = "llm",
         codex_agent_rounds: int = 3,
         codex_agent_timeout: float | None = None,
@@ -759,46 +753,6 @@ class ReviewPipeline:
                 paper_thesis=paper_thesis,
             )
             _mark("result_review")
-
-        # Phase D of the science loop: if the review judged any experiment
-        # does_not_support_paper_claim, feed that diagnosis back into a bounded, reversible
-        # regeneration of the offending science code, then re-run + re-review. Gated to per-task
-        # layout (needs task isolation to localize the repair) and to a real (non-fallback) run.
-        science_template_fallback = bool(
-            runtime_result.get("template_fallback_used")
-            or (manifest.get("_meta") or {}).get("template_fallback_used")
-        )
-        if (
-            science_loop
-            and project_backend != "codex"
-            and per_task_layout
-            and run_repro
-            and science_repair_rounds > 0
-            and not science_template_fallback
-            and result_review_result.get("passed")
-        ):
-            runtime_result, result_review_result = self._run_science_repair(
-                output_dir=output_dir,
-                audit_dir=audit_dir,
-                repro_project_dir=repro_project_dir,
-                manifest=manifest,
-                facts=facts,
-                tasks=tasks,
-                paper=paper,
-                paper_path=paper_path,
-                paper_context_json=paper_context,
-                paper_thesis=paper_thesis,
-                runtime_result=runtime_result,
-                result_review_result=result_review_result,
-                science_repair_rounds=science_repair_rounds,
-                science_repair_backend=science_repair_backend,
-                science_repair_timeout=science_repair_timeout,
-                repair_attempts=repair_attempts,
-                run_timeout=run_timeout,
-                max_attempts=json_repair_attempts + 1,
-                project_timeout=project_timeout,
-            )
-            _mark("science_repair")
 
         validation = validate_repro_project(repro_project_dir)
         risk_report = build_risk_report(
@@ -1831,276 +1785,6 @@ class ReviewPipeline:
             }
             write_json(output_dir / "result_review_error.json", result)
             return result
-
-    def _run_science_repair(
-        self,
-        *,
-        output_dir: Path,
-        audit_dir: Path,
-        repro_project_dir: Path,
-        manifest: dict[str, Any],
-        facts: dict[str, Any],
-        tasks: dict[str, Any],
-        paper: dict[str, Any],
-        paper_path: Path,
-        paper_context_json: str,
-        paper_thesis: dict[str, Any] | None,
-        runtime_result: dict[str, Any],
-        result_review_result: dict[str, Any],
-        science_repair_rounds: int,
-        repair_attempts: int,
-        run_timeout: float,
-        max_attempts: int,
-        project_timeout: float | None,
-        science_repair_backend: str = "llm",
-        science_repair_timeout: float = 1800.0,
-        evaluate: Callable[[], tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] | None = None,
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Drive the bounded, reversible science-repair loop (geng_agent.science_repair) with
-        real effects: regenerate the offending science files, re-run the per-task suite, and
-        re-review, keeping a round only if mismatch strictly dropped without losing coverage.
-        Returns the possibly-updated (runtime_result, result_review_result); a no-op returns the
-        inputs unchanged. ``evaluate`` is injectable for testing the live regeneration without a
-        real subprocess + multimodal review."""
-        tasks_manifest = (manifest.get("_meta") or {}).get("tasks_manifest")
-        if not isinstance(tasks_manifest, dict) or not tasks_manifest.get("tasks"):
-            return runtime_result, result_review_result  # not per-task -> cannot localize a repair
-        review_json = output_dir / "result_review.json"
-        review_doc = _read_json_file(review_json) if review_json.exists() else {}
-        if not review_doc:
-            return runtime_result, result_review_result
-
-        snapshot_dir = audit_dir / "science_repair_snapshot"
-        saved_dir = audit_dir / "science_repair_saved"
-        runtime_json = output_dir / "runtime_result.json"
-
-        def _copy(src: Path, dst: Path) -> None:
-            if src.exists():
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                dst.write_bytes(src.read_bytes())
-
-        def snapshot() -> None:
-            _snapshot_project(repro_project_dir, snapshot_dir)
-            _copy(runtime_json, saved_dir / "runtime_result.json")
-            _copy(review_json, saved_dir / "result_review.json")
-
-        def restore() -> None:
-            _restore_project(snapshot_dir, repro_project_dir, prune=True)
-            _copy(saved_dir / "runtime_result.json", runtime_json)
-            _copy(saved_dir / "result_review.json", review_json)
-
-        # Backend selection: "llm" = one-shot per-file regeneration (default, unchanged);
-        # "codex" = hand the project to a headless coding agent that can iterate (run a task,
-        # print intermediates, fix, re-run). Either way the gate/evaluate/snapshot/restore
-        # safety properties below are identical — only the regenerate effect differs.
-        agentic_round = {"n": 0}
-
-        def regenerate(mismatches: list[dict[str, Any]]) -> None:
-            if science_repair_backend == "codex":
-                agentic_round["n"] += 1
-                run_agentic_science_repair(
-                    repro_project_dir=repro_project_dir,
-                    mismatches=mismatches,
-                    tasks_manifest=tasks_manifest,
-                    thesis_anchor=_thesis_anchor_text(paper_thesis),
-                    audit_dir=audit_dir,
-                    timeout=science_repair_timeout,
-                    round_no=agentic_round["n"],
-                )
-                return
-            self._regenerate_science_files(
-                mismatches=mismatches,
-                manifest=manifest,
-                repro_project_dir=repro_project_dir,
-                facts=facts,
-                tasks=tasks,
-                paper_context_json=paper_context_json,
-                tasks_manifest=tasks_manifest,
-                paper_thesis=paper_thesis,
-                audit_dir=audit_dir,
-                max_attempts=max_attempts,
-                request_timeout=project_timeout,
-            )
-
-        def real_evaluate() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-            new_runtime = self._load_or_run_repro(
-                output_dir=output_dir,
-                repro_project_dir=repro_project_dir,
-                repair_attempts=repair_attempts,
-                run_timeout=run_timeout,
-                resume=False,
-            )
-            new_review_result = self._run_result_review_if_ready(
-                enabled=True,
-                run_repro=True,
-                runtime_result=new_runtime,
-                template_fallback_used=False,
-                paper_path=paper_path,
-                paper=paper,
-                facts=facts,
-                tasks=tasks,
-                paper_context_json=paper_context_json,
-                repro_project_dir=repro_project_dir,
-                output_dir=output_dir,
-                audit_dir=audit_dir,
-                max_attempts=max_attempts,
-                resume=False,
-                paper_thesis=paper_thesis,
-            )
-            new_doc = (
-                _read_json_file(review_json)
-                if review_json.exists() and new_review_result.get("passed")
-                else {}
-            )
-            return new_runtime, new_review_result, new_doc
-
-        result = run_science_repair(
-            result_review_doc=review_doc,
-            runtime_result=runtime_result,
-            max_rounds=science_repair_rounds,
-            regenerate=regenerate,
-            evaluate=evaluate or real_evaluate,
-            snapshot=snapshot,
-            restore=restore,
-        )
-        write_json(
-            output_dir / "science_repair.json",
-            {key: result[key] for key in ("applied", "kept", "reason", "rounds")},
-        )
-        new_runtime = result.get("runtime_result") or runtime_result
-        new_review = result.get("result_review_result") or result_review_result
-        return new_runtime, new_review
-
-    def _regenerate_science_files(
-        self,
-        *,
-        mismatches: list[dict[str, Any]],
-        manifest: dict[str, Any],
-        repro_project_dir: Path,
-        facts: dict[str, Any],
-        tasks: dict[str, Any],
-        paper_context_json: str,
-        tasks_manifest: dict[str, Any],
-        paper_thesis: dict[str, Any] | None,
-        audit_dir: Path,
-        max_attempts: int,
-        request_timeout: float | None,
-    ) -> list[str]:
-        """Regenerate the science files implicated by the mismatches: the shared src/*.py
-        (the channel/model/metric code, where ordering bugs almost always live) followed by the
-        offending tasks/<module>.py drivers. Each is regenerated with the review's repair brief
-        threaded through review_feedback + the thesis anchor + its current content (minimal-edit,
-        not blind rewrite). src first so task scripts import the corrected symbols."""
-        facts_json = wrap_untrusted("engineering_facts_json", pretty_json(facts))
-        tasks_json = wrap_untrusted("repro_tasks_json", pretty_json(tasks))
-        thesis_anchor = _thesis_anchor_text(paper_thesis)
-        plan_meta = (manifest.get("_meta") or {}).get("project_plan") or {}
-        plan = {
-            "implementation_strategy": plan_meta.get("implementation_strategy") or "per-task reproduction",
-            "assumptions": plan_meta.get("assumptions", []),
-            "files": [],
-        }
-        manifest_tasks = [t for t in tasks_manifest.get("tasks", []) if isinstance(t, dict) and t.get("script")]
-        task_id_by_script = {t["script"]: t["task_id"] for t in manifest_tasks if t.get("task_id")}
-        script_by_task_id = {t["task_id"]: t["script"] for t in manifest_tasks if t.get("task_id")}
-
-        def read_files() -> list[dict[str, Any]]:
-            collected: list[dict[str, Any]] = []
-            for path in sorted((repro_project_dir / "src").glob("*.py")):
-                if path.name == "_io.py":
-                    continue
-                collected.append({"path": f"src/{path.name}", "content_lines": path.read_text(encoding="utf-8").splitlines()})
-            for path in sorted((repro_project_dir / "tasks").glob("*.py")):
-                if path.name == "__init__.py":
-                    continue
-                collected.append({"path": f"tasks/{path.name}", "content_lines": path.read_text(encoding="utf-8").splitlines()})
-            return collected
-
-        src_targets = [
-            f"src/{name}.py"
-            for name in ("channel", "modulation", "metrics", "simulation")
-            if (repro_project_dir / "src" / f"{name}.py").exists()
-        ]
-        task_targets: list[str] = []
-        for mismatch in mismatches:
-            script = script_by_task_id.get(mismatch["task_id"])
-            if script and (repro_project_dir / script).exists() and script not in task_targets:
-                task_targets.append(script)
-
-        # Symptom-driven repair (general, paper-agnostic): read each mismatch task's output CSV
-        # and turn observed numeric pathologies (all-zero, one-curve-zero, constant, anomalous
-        # scale) into concrete "where to look" leads for the rewrite -- not just "ordering wrong".
-        subdir_by_task = {
-            t["task_id"]: (t.get("output_subdir") or t["task_id"]) for t in manifest_tasks if t.get("task_id")
-        }
-        symptoms_by_task: dict[str, list[str]] = {}
-        for mismatch in mismatches:
-            subdir = subdir_by_task.get(mismatch["task_id"], mismatch["task_id"])
-            tips: list[str] = []
-            for csv_path in sorted((repro_project_dir / "outputs" / subdir).glob("*.csv")):
-                try:
-                    tips.extend(diagnose_csv_symptoms(summarize_csv_file(csv_path).get("numeric_columns", {})))
-                except Exception:
-                    continue
-            if tips:
-                symptoms_by_task[mismatch["task_id"]] = tips
-
-        shared_directive = build_science_directive(mismatches, symptoms_by_task)
-        directive_by_script = {
-            script_by_task_id[m["task_id"]]: build_science_directive([m], symptoms_by_task)
-            for m in mismatches
-            if m["task_id"] in script_by_task_id
-        }
-
-        regenerated: list[str] = []
-        for index, path in enumerate(src_targets + task_targets, start=1):
-            files = read_files()
-            others = [item for item in files if item["path"] != path]
-            current = "\n".join(next((item["content_lines"] for item in files if item["path"] == path), []))
-            directive = directive_by_script.get(path, shared_directive)
-            file_prompt = self.prompt_book.render(
-                "generate_repro_project_file.md",
-                target_path=path,
-                project_plan_json=wrap_untrusted("project_plan_json", pretty_json(plan)),
-                generated_files_context_json=wrap_untrusted("generated_files_context_json", _generated_files_context(others)),
-                engineering_facts_json=facts_json,
-                repro_tasks_json=tasks_json,
-                paper_context_json=paper_context_json,
-                review_feedback_json=wrap_untrusted("review_feedback_json", directive),
-            )
-            if path in task_id_by_script:
-                file_prompt += _per_task_file_override(task_id_by_script[path], tasks, _available_src_symbols(others))
-            elif path.startswith("src/") and path.endswith(".py"):
-                file_prompt += _per_task_src_override()
-            if path.endswith(".py") and path != "src/_io.py":
-                file_prompt += thesis_anchor
-            file_prompt += (
-                "\n\n# 【当前文件内容·待修正（UNTRUSTED DATA）】\n"
-                "在下面这版的基础上做**最小必要修改**以修正上述科学问题（不要从零重写、保持对外接口/函数名稳定）：\n"
-                + current
-            )
-            label = f"05_science_repair_{index:02d}_{_manifest_path_slug(path)}"
-            write_text(audit_dir / f"{label}.md", file_prompt)
-            parsed = self._call_validated_json(
-                prompt=file_prompt,
-                stage_label=label,
-                schema_stage="repro_project_file",
-                audit_dir=audit_dir,
-                max_attempts=max_attempts,
-                extra_validation=lambda candidate, expected=path: _validate_project_file(candidate, expected),
-                candidate_normalizer=normalize_repro_project_file_candidate,
-                request_timeout=request_timeout,
-                client=self.client,
-            )
-            content = "\n".join(str(line) for line in parsed["content_lines"])
-            target = repro_project_dir / path
-            target.parent.mkdir(parents=True, exist_ok=True)
-            write_text(target, content if content.endswith("\n") else content + "\n")
-            regenerated.append(path)
-
-        inject_io_runtime(repro_project_dir)
-        write_json(audit_dir / "science_repair_regenerated.json", {"files": regenerated})
-        return regenerated
 
     def _generate_docx_reports(
         self,
