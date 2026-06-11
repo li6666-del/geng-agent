@@ -330,6 +330,40 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual((proj / "run_experiment.py").read_text(encoding="utf-8"), "print('best')\n")
             self.assertEqual((proj / "src" / "metrics.py").read_text(encoding="utf-8"), "X = 1\n")
 
+    def test_restore_with_prune_deletes_files_absent_from_snapshot(self) -> None:
+        from geng_agent.project_snapshot import _restore_project, _snapshot_project
+
+        with TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            proj = base / "proj"
+            (proj / "src").mkdir(parents=True)
+            (proj / "run_experiment.py").write_text("print('best')\n", encoding="utf-8")
+            snap = _snapshot_project(proj, base / "snap")
+
+            # a rejected repair round adds a stray file, then a live output lands
+            (proj / "src" / "stray_helper.py").write_text("BACKDOOR = 1\n", encoding="utf-8")
+            (proj / "outputs").mkdir(exist_ok=True)
+            (proj / "outputs" / "results.csv").write_text("a\n", encoding="utf-8")
+
+            _restore_project(snap, proj, prune=True)
+            self.assertFalse((proj / "src" / "stray_helper.py").exists())  # stray gone -> truly reversible
+            self.assertTrue((proj / "outputs" / "results.csv").exists())   # live outputs/ never pruned
+            self.assertEqual((proj / "run_experiment.py").read_text(encoding="utf-8"), "print('best')\n")
+
+    def test_restore_without_prune_keeps_new_files(self) -> None:
+        # The Codex path relies on the default (prune=False) + its own explicit prune step.
+        from geng_agent.project_snapshot import _restore_project, _snapshot_project
+
+        with TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            proj = base / "proj"
+            proj.mkdir()
+            (proj / "run_experiment.py").write_text("x\n", encoding="utf-8")
+            snap = _snapshot_project(proj, base / "snap")
+            (proj / "extra.py").write_text("y\n", encoding="utf-8")
+            _restore_project(snap, proj)
+            self.assertTrue((proj / "extra.py").exists())
+
     def test_pipeline_creates_review_bundle(self) -> None:
         with TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)

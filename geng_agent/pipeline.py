@@ -1885,7 +1885,7 @@ class ReviewPipeline:
             _copy(review_json, saved_dir / "result_review.json")
 
         def restore() -> None:
-            _restore_project(snapshot_dir, repro_project_dir)
+            _restore_project(snapshot_dir, repro_project_dir, prune=True)
             _copy(saved_dir / "runtime_result.json", runtime_json)
             _copy(saved_dir / "result_review.json", review_json)
 
