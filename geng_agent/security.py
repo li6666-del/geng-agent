@@ -57,6 +57,9 @@ FORBIDDEN_IMPORTS = {
     "webbrowser",
     "ctypes",
     "importlib",
+    "asyncio",   # asyncio.create_subprocess_* spawns processes -> shell bypass
+    "pty",       # pty.spawn() launches an interactive shell
+    "winreg",    # Windows registry write = persistence / RCE pivot
 }
 
 # Dynamic-execution / reflection builtins. Clean numerical reproduction code never
@@ -75,13 +78,48 @@ FORBIDDEN_BUILTINS = {
     "vars",
 }
 
+# Reflection/introspection dunders that defeat the name-based call scan. getattr is a
+# blocked builtin, but `os.__getattribute__("system")` fetches os.system unscathed; the
+# `().__class__.__bases__[0].__subclasses__()` chain reaches arbitrary C-level callables;
+# __globals__/__builtins__ recover eval/exec; __reduce__ is the pickle RCE hook. Clean
+# numerical code never touches these (__class__/__dict__ are deliberately NOT here -- they
+# see legitimate use and blocking __bases__/__subclasses__/__mro__ already breaks the chain).
+FORBIDDEN_DUNDER_ATTRS = {
+    "__getattribute__",
+    "__subclasses__",
+    "__bases__",
+    "__mro__",
+    "__globals__",
+    "__builtins__",
+    "__reduce__",
+    "__reduce_ex__",
+    "__code__",
+}
+
 FORBIDDEN_CALLS = {
     "os.system",
     "os.popen",
+    "os.startfile",
+    # process-launch family: spawn* replaces/forks, exec* replaces the image,
+    # posix_spawn* forks -- all are os.system-equivalent command execution.
     "os.spawnl",
+    "os.spawnle",
     "os.spawnlp",
+    "os.spawnlpe",
     "os.spawnv",
+    "os.spawnve",
     "os.spawnvp",
+    "os.spawnvpe",
+    "os.execl",
+    "os.execle",
+    "os.execlp",
+    "os.execlpe",
+    "os.execv",
+    "os.execve",
+    "os.execvp",
+    "os.execvpe",
+    "os.posix_spawn",
+    "os.posix_spawnp",
     "os.remove",
     "os.unlink",
     "os.rmdir",
@@ -90,6 +128,8 @@ FORBIDDEN_CALLS = {
     "subprocess.run",
     "subprocess.call",
     "subprocess.Popen",
+    "asyncio.create_subprocess_exec",
+    "asyncio.create_subprocess_shell",
     "Path.home",
     "Path.expanduser",
 }
@@ -474,6 +514,8 @@ def static_scan_repro_project(root: Path) -> list[dict[str, str]]:
                 if name in {"open", "Path", "PurePath"}:
                     _check_absolute_path_literal(node, rel, issues)
             elif isinstance(node, ast.Attribute):
+                if node.attr in FORBIDDEN_DUNDER_ATTRS:
+                    issues.append({"file": rel, "line": str(getattr(node, "lineno", 0)), "message": f"forbidden reflection attribute: {node.attr}"})
                 name = _call_name(node)
                 if name in {"os.environ", "os.getenv"}:
                     issues.append({"file": rel, "line": str(getattr(node, "lineno", 0)), "message": f"forbidden environment access: {name}"})

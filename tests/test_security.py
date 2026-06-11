@@ -45,6 +45,41 @@ class StaticScanDynamicBuiltinTests(unittest.TestCase):
         issues = scan_source("import importlib\nimportlib.import_module('socket')\n")
         self.assertIn("forbidden import: importlib", messages(issues))
 
+    def test_flags_getattribute_reflection_bypass(self) -> None:
+        # getattr is blocked, but __getattribute__ fetches os.system just the same.
+        issues = scan_source("import os\nos.__getattribute__('sys' + 'tem')('echo hi')\n")
+        self.assertIn("forbidden reflection attribute: __getattribute__", messages(issues))
+
+    def test_flags_subclasses_escape_chain(self) -> None:
+        issues = scan_source("p = ().__class__.__bases__[0].__subclasses__()\n")
+        flagged = messages(issues)
+        self.assertIn("forbidden reflection attribute: __bases__", flagged)
+        self.assertIn("forbidden reflection attribute: __subclasses__", flagged)
+
+    def test_flags_os_exec_and_startfile_family(self) -> None:
+        for call in ("os.execvp('cmd', ['cmd'])", "os.startfile('calc.exe')", "os.posix_spawn('x', [], {})"):
+            with self.subTest(call=call):
+                issues = scan_source(f"import os\n{call}\n")
+                self.assertTrue(
+                    any(m.startswith("forbidden call: os.") for m in messages(issues)),
+                    msg=f"{call} was not blocked",
+                )
+
+    def test_flags_asyncio_pty_winreg_imports(self) -> None:
+        for module in ("asyncio", "pty", "winreg"):
+            with self.subTest(module=module):
+                issues = scan_source(f"import {module}\n")
+                self.assertIn(f"forbidden import: {module}", messages(issues))
+
+    def test_does_not_flag_benign_dunder_or_class_access(self) -> None:
+        # __class__/__name__/__dict__ see legitimate use and must stay clean.
+        source = (
+            "import numpy as np\n"
+            "arr = np.array([1, 2, 3])\n"
+            "name = arr.__class__.__name__\n"
+        )
+        self.assertEqual(scan_source(source), [])
+
     def test_records_file_and_line(self) -> None:
         issues = scan_source("x = 1\ny = eval('2')\n")
         flagged = [issue for issue in issues if issue["message"] == "forbidden dynamic builtin: eval"]
