@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import shlex
 import shutil
 import subprocess
@@ -47,6 +48,25 @@ ACTIONABLE_REVIEW_VERDICTS = {
     "cannot_assess",
 }
 ACTIONABLE_DIMENSION_RATINGS = {"weak", "missing", "unknown"}
+REVIEW_DIMENSIONS = (
+    "artifact_coverage",
+    "reproduction_logic",
+    "trend_shape",
+    "metric_axis_scale",
+    "baseline_comparison",
+    "statistical_reliability",
+    "conclusion_support",
+)
+REVIEW_CONTROL_START = "<!-- geng-agent-review-summary"
+REVIEW_CONTROL_END = "-->"
+VALID_REVIEW_VERDICTS = {
+    "supports_paper_claim",
+    "partially_supports_paper_claim",
+    "does_not_support_paper_claim",
+    "cannot_assess",
+}
+VALID_REVIEW_ALIGNMENTS = {"match", "partial_match", "mismatch", "inconclusive"}
+VALID_REVIEW_CONFIDENCE = {"high", "medium", "low"}
 
 TRUSTED_PROJECT_FILES = (
     "src/_io.py",
@@ -623,6 +643,7 @@ def _run_codex_result_review(
         raise RuntimeError("Codex result review requires at least one valid PNG image.")
     task_items = [task for task in tasks.get("repro_tasks", []) if isinstance(task, dict)]
     statuses: list[dict[str, Any]] = []
+    experiment_reviews: list[dict[str, Any]] = []
     markdown_sections: list[str] = []
     for index, task in enumerate(task_items, start=1):
         task_id = str(task.get("task_id") or f"task_{index}")
@@ -652,11 +673,16 @@ def _run_codex_result_review(
             image_paths=image_paths,
         )
         try:
-            markdown = _read_last_message_file(status).strip()
+            raw_markdown = _read_last_message_file(status).strip()
+            markdown = strip_review_control_footer(raw_markdown).strip()
             if len(markdown) < 40:
                 raise RuntimeError("Codex reviewer produced an empty or too-short Markdown report")
             section_path = audit_dir / f"{base_stage_label}_review.md"
             write_text(section_path, markdown)
+            review_summary = summarize_markdown_review(task_id=task_id, markdown=raw_markdown)
+            review_summary_path = audit_dir / f"{base_stage_label}_summary.json"
+            write_json(review_summary_path, review_summary)
+            experiment_reviews.append(review_summary)
             markdown_sections.append(
                 _render_task_markdown_section(
                     index=index,
@@ -676,10 +702,18 @@ def _run_codex_result_review(
                     "transport_ok": bool(status.get("ok")),
                     "transport_error": status.get("error"),
                     "markdown_path": str(section_path),
+                    "review_summary_path": str(review_summary_path),
+                    "scientific_verdict": review_summary.get("scientific_verdict"),
+                    "paper_alignment": review_summary.get("paper_alignment"),
+                    "confidence": review_summary.get("confidence"),
                 }
             )
         except Exception as exc:
             error = redact_text(f"{type(exc).__name__}: {exc}")[:500]
+            review_summary = _failed_markdown_review_summary(task_id=task_id, error=error)
+            review_summary_path = audit_dir / f"{base_stage_label}_summary.json"
+            write_json(review_summary_path, review_summary)
+            experiment_reviews.append(review_summary)
             failed_section = (
                 "### Reviewer failed\n\n"
                 "Codex reviewer did not produce a usable Markdown section for this task.\n\n"
@@ -702,6 +736,10 @@ def _run_codex_result_review(
                     "error": error,
                     "images_sent": image_entries,
                     "paper_pages_sent": task_evidence.get("selected_paper_pages", []),
+                    "review_summary_path": str(review_summary_path),
+                    "scientific_verdict": review_summary.get("scientific_verdict"),
+                    "paper_alignment": review_summary.get("paper_alignment"),
+                    "confidence": review_summary.get("confidence"),
                 }
             )
             write_json(audit_dir / f"review_failed_{base_stage_label}.json", {"ok": False, "error": error})
@@ -718,7 +756,7 @@ def _run_codex_result_review(
     review_doc = {
         "_meta": {"markdown_review": True},
         "markdown": markdown_doc,
-        "experiment_reviews": [],
+        "experiment_reviews": experiment_reviews,
     }
     return review_doc, {
         "enabled": True,
@@ -739,6 +777,200 @@ def _render_codex_markdown_result_review(
     task_sections: list[str],
 ) -> str:
     return "\n\n".join(section.strip() for section in task_sections if str(section).strip()).strip() + "\n"
+
+
+def summarize_markdown_review(*, task_id: str, markdown: str) -> dict[str, Any]:
+    """Best-effort machine summary for the human-readable Codex reviewer path.
+
+    The Markdown report remains the source for humans. This summary is deliberately
+    conservative so the moderator does not treat an ambiguous review as full support.
+    """
+    text = str(markdown or "")
+    control = _parse_review_control_footer(text)
+    verdict = str(control.get("scientific_verdict") or _infer_markdown_scientific_verdict(text))
+    alignment = {
+        "supports_paper_claim": "match",
+        "partially_supports_paper_claim": "partial_match",
+        "does_not_support_paper_claim": "mismatch",
+        "cannot_assess": "inconclusive",
+    }[verdict]
+    alignment = str(control.get("paper_alignment") or alignment)
+    confidence = str(control.get("confidence") or _infer_markdown_confidence(text, verdict))
+    differences = _extract_markdown_section_items(text, ("主要差异", "Main differences", "Differences"))
+    possible_causes = _extract_markdown_section_items(text, ("可能原因", "Possible causes", "Likely causes"))
+    limitations = _extract_markdown_section_items(text, ("人工复核建议", "limitations", "Limitations"))
+    conclusion = _first_nonempty_lines(_extract_markdown_section_text(text, ("结论", "Conclusion")), limit=2)
+    return {
+        "task_id": task_id,
+        "local_result_credibility": "medium" if verdict != "cannot_assess" else "unknown",
+        "paper_alignment": alignment,
+        "scientific_verdict": verdict,
+        "dimension_reviews": _summarize_markdown_dimensions(text),
+        "paper_result_summary": "",
+        "local_result_summary": " ".join(conclusion),
+        "differences": differences,
+        "possible_causes": possible_causes,
+        "evidence": ["Codex Markdown reviewer report"],
+        "limitations": limitations,
+        "confidence": confidence,
+        "_meta": {"source": "codex_markdown_summary_v1", "control_footer_used": bool(control)},
+    }
+
+
+def _failed_markdown_review_summary(*, task_id: str, error: str) -> dict[str, Any]:
+    return {
+        "task_id": task_id,
+        "local_result_credibility": "unknown",
+        "paper_alignment": "inconclusive",
+        "scientific_verdict": "cannot_assess",
+        "dimension_reviews": [
+            {
+                "dimension": dimension,
+                "rating": "unknown",
+                "finding": "Codex reviewer failed before producing a usable task review.",
+                "evidence": [error],
+            }
+            for dimension in REVIEW_DIMENSIONS
+        ],
+        "paper_result_summary": "",
+        "local_result_summary": "",
+        "differences": ["Reviewer did not complete this task-level comparison."],
+        "possible_causes": [error] if error else [],
+        "evidence": ["Codex reviewer transport/status failure"],
+        "limitations": ["No task-level scientific verdict was available because reviewer failed."],
+        "confidence": "low",
+        "_meta": {"source": "codex_markdown_summary_v1", "review_failed": True},
+    }
+
+
+def strip_review_control_footer(markdown: str) -> str:
+    body, _control = _split_review_control_footer(markdown)
+    return body
+
+
+def _parse_review_control_footer(markdown: str) -> dict[str, str]:
+    _body, control = _split_review_control_footer(markdown)
+    verdict = control.get("scientific_verdict", "")
+    alignment = control.get("paper_alignment", "")
+    confidence = control.get("confidence", "")
+    parsed: dict[str, str] = {}
+    if verdict in VALID_REVIEW_VERDICTS:
+        parsed["scientific_verdict"] = verdict
+    if alignment in VALID_REVIEW_ALIGNMENTS:
+        parsed["paper_alignment"] = alignment
+    if confidence in VALID_REVIEW_CONFIDENCE:
+        parsed["confidence"] = confidence
+    return parsed
+
+
+def _split_review_control_footer(markdown: str) -> tuple[str, dict[str, str]]:
+    text = str(markdown or "")
+    start = text.rfind(REVIEW_CONTROL_START)
+    if start < 0:
+        return text, {}
+    end = text.find(REVIEW_CONTROL_END, start)
+    if end < 0:
+        return text, {}
+    block = text[start + len(REVIEW_CONTROL_START) : end]
+    body = (text[:start] + text[end + len(REVIEW_CONTROL_END) :]).strip()
+    control: dict[str, str] = {}
+    for raw_line in block.splitlines():
+        if ":" not in raw_line:
+            continue
+        key, value = raw_line.split(":", 1)
+        key = key.strip().lower()
+        value = value.strip().lower().replace("-", "_")
+        if key in {"task_id", "scientific_verdict", "paper_alignment", "confidence"}:
+            control[key] = value
+    return body, control
+
+
+def _infer_markdown_scientific_verdict(markdown: str) -> str:
+    text = _normalize_review_text(markdown)
+    if any(token in text for token in ("cannot_assess", "无法判断", "不能判断", "证据不足", "无法评估")):
+        return "cannot_assess"
+    if any(token in text for token in ("does_not_support_paper_claim", "不支持论文", "不能支持论文", "结论相反", "明显不一致", "contradict")):
+        return "does_not_support_paper_claim"
+    if any(token in text for token in ("partially_supports_paper_claim", "部分支持", "定性复现", "不是精确", "不完全一致", "partial")):
+        return "partially_supports_paper_claim"
+    if any(token in text for token in ("基本支持", "总体支持")) and any(token in text for token in ("但", "不足", "偏高", "偏低", "差异")):
+        return "partially_supports_paper_claim"
+    if any(token in text for token in ("supports_paper_claim", "完全支持", "强复现", "总体支持", "基本支持", "一致")):
+        return "supports_paper_claim"
+    return "cannot_assess"
+
+
+def _infer_markdown_confidence(markdown: str, verdict: str) -> str:
+    text = _normalize_review_text(markdown)
+    if verdict == "cannot_assess":
+        return "low"
+    if any(token in text for token in ("低置信", "证据不足", "样本", "monte carlo 次数只有", "weak")):
+        return "low" if verdict != "supports_paper_claim" else "medium"
+    if any(token in text for token in ("高置信", "strong", "充分")) and verdict == "supports_paper_claim":
+        return "high"
+    return "medium"
+
+
+def _summarize_markdown_dimensions(markdown: str) -> list[dict[str, Any]]:
+    text = _normalize_review_text(markdown)
+    reviews: list[dict[str, Any]] = []
+    for dimension in REVIEW_DIMENSIONS:
+        rating = "unknown"
+        pattern = re.compile(rf"{re.escape(dimension)}[^a-zA-Z0-9_]*(strong|acceptable|weak|missing|unknown|partial|moderate)", re.I)
+        match = pattern.search(markdown)
+        if match:
+            raw = match.group(1).lower()
+            rating = "acceptable" if raw in {"partial", "moderate"} else raw
+        elif dimension in text:
+            rating = "acceptable"
+        reviews.append(
+            {
+                "dimension": dimension,
+                "rating": rating,
+                "finding": "",
+                "evidence": ["Codex Markdown reviewer report"],
+            }
+        )
+    return reviews
+
+
+def _normalize_review_text(markdown: str) -> str:
+    return str(markdown or "").lower().replace("-", "_")
+
+
+def _extract_markdown_section_items(markdown: str, headings: tuple[str, ...]) -> list[str]:
+    section = _extract_markdown_section_text(markdown, headings)
+    if not section:
+        return []
+    items: list[str] = []
+    for raw_line in section.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        line = re.sub(r"^[-*]\s+", "", line)
+        line = re.sub(r"^\d+[.)、]\s*", "", line)
+        line = line.strip()
+        if line:
+            items.append(line)
+    return items[:8]
+
+
+def _extract_markdown_section_text(markdown: str, headings: tuple[str, ...]) -> str:
+    lines = str(markdown or "").splitlines()
+    for index, line in enumerate(lines):
+        heading = line.strip().lstrip("#").strip()
+        if any(heading.lower().startswith(candidate.lower()) for candidate in headings):
+            body: list[str] = []
+            for next_line in lines[index + 1 :]:
+                if next_line.lstrip().startswith("#"):
+                    break
+                body.append(next_line)
+            return "\n".join(body).strip()
+    return ""
+
+
+def _first_nonempty_lines(text: str, *, limit: int) -> list[str]:
+    return [line.strip() for line in str(text or "").splitlines() if line.strip()][:limit]
 
 
 def _render_task_markdown_section(
@@ -831,6 +1063,16 @@ Write concise Chinese findings. Include these Markdown headings:
 - 主要差异
 - 可能原因
 - 人工复核建议
+
+At the very end append this HTML comment control footer. It is for the moderator
+only and will be removed from the human report. Replace each placeholder with
+exactly one allowed value; do not leave pipe-separated alternatives in the footer.
+<!-- geng-agent-review-summary
+task_id: {str(task.get("task_id") or "")}
+scientific_verdict: <supports_paper_claim OR partially_supports_paper_claim OR does_not_support_paper_claim OR cannot_assess>
+paper_alignment: <match OR partial_match OR mismatch OR inconclusive>
+confidence: <high OR medium OR low>
+-->
 
 If the local result contradicts the paper's claimed ordering or trend, explain the
 difference and likely modeling causes clearly. This report is for humans, so be
@@ -1310,8 +1552,6 @@ def _count_review_verdicts(review_doc: dict[str, Any] | None, verdict: str) -> i
 def _is_success(runtime_result: dict[str, Any], review_doc: dict[str, Any] | None) -> bool:
     if runtime_result.get("passed") is not True or not review_doc:
         return False
-    if review_doc.get("_meta", {}).get("markdown_review"):
-        return True
     reviews = [item for item in review_doc.get("experiment_reviews", []) if isinstance(item, dict)]
     return bool(reviews) and all(str(item.get("scientific_verdict")) == "supports_paper_claim" for item in reviews)
 

@@ -9,11 +9,14 @@ from tempfile import TemporaryDirectory
 from geng_agent.agentic_project import (
     _feedback_from_results,
     _is_better_score,
+    _is_success,
     _load_cached_agentic_project,
     _render_task_markdown_section,
     _score_candidate,
     build_writer_brief,
     run_codex_project_workflow,
+    strip_review_control_footer,
+    summarize_markdown_review,
 )
 from geng_agent.pipeline import ReviewPipeline
 from geng_agent.prompts import PromptBook
@@ -234,7 +237,18 @@ def _write_failing_after_first_reviewer(temp: Path) -> str:
             if n > 0:
                 print("reviewer failed on the second task")
                 raise SystemExit(1)
-            markdown = "# Mock review\n\nThe first task has enough detail to be accepted as a Markdown review."
+            markdown = "\n".join([
+                "# Mock review",
+                "",
+                "The first task has enough detail to be accepted as a Markdown review.",
+                "",
+                "<!-- geng-agent-review-summary",
+                "task_id: reproduce_fig_1",
+                "scientific_verdict: supports_paper_claim",
+                "paper_alignment: match",
+                "confidence: high",
+                "-->",
+            ])
             out.write_text(markdown, encoding="utf-8")
             print(markdown)
             '''
@@ -288,6 +302,12 @@ def _write_mock_reviewer(temp: Path) -> str:
                 "请核对 CSV 和 PNG。",
                 "",
             ])
+            markdown += "\n<!-- geng-agent-review-summary\n"
+            markdown += "task_id: reproduce_fig_1\n"
+            markdown += "scientific_verdict: supports_paper_claim\n"
+            markdown += "paper_alignment: match\n"
+            markdown += "confidence: high\n"
+            markdown += "-->\n"
             out.write_text(markdown, encoding="utf-8")
             print(markdown)
             '''
@@ -298,6 +318,74 @@ def _write_mock_reviewer(temp: Path) -> str:
 
 
 class AgenticProjectWorkflowTests(unittest.TestCase):
+    def test_markdown_review_partial_summary_blocks_success_and_feeds_back(self) -> None:
+        markdown = "\n".join(
+            [
+                "## 结论",
+                "本地复现部分支持 Fig. 7 的核心结论。",
+                "整体科学结论更适合写成 partially_supports_paper_claim，不是强复现。",
+                "",
+                "## 主要差异",
+                "1. ZF 排名差异明显。",
+                "",
+                "## 可能原因",
+                "- baseline 用户选择策略不同。",
+            ]
+        )
+        review = summarize_markdown_review(task_id="reproduce_fig_7", markdown=markdown)
+        review_doc = {"_meta": {"markdown_review": True}, "experiment_reviews": [review]}
+
+        self.assertEqual(review["scientific_verdict"], "partially_supports_paper_claim")
+        self.assertEqual(review["paper_alignment"], "partial_match")
+        self.assertFalse(_is_success({"passed": True, "coverage": "1/1"}, review_doc))
+
+        score = _score_candidate(
+            {"passed": True, "coverage": "1/1"},
+            review_doc,
+            {"enabled": True, "passed": True},
+            {"ok": True},
+            {"required_files_present": True, "python_compiles": True},
+            [],
+        )
+        self.assertEqual(score["partial_count"], 1)
+        self.assertEqual(score["scientific_gap_count"], 1)
+
+        feedback = _feedback_from_results(
+            {"passed": True, "coverage": "1/1"},
+            review_doc,
+            {"enabled": True, "passed": True},
+        )
+        self.assertEqual(feedback[0]["task_id"], "reproduce_fig_7")
+        self.assertIn("ZF 排名差异明显", feedback[0]["differences"][0])
+        self.assertIn("baseline 用户选择策略不同", feedback[0]["possible_causes"][0])
+
+    def test_markdown_review_control_footer_overrides_ambiguous_text_and_is_stripped(self) -> None:
+        markdown = "\n".join(
+            [
+                "## Conclusion",
+                "The result is obviously inconsistent in one baseline, but the core claim is partially supported.",
+                "",
+                "<!-- geng-agent-review-summary",
+                "task_id: reproduce_fig_7",
+                "scientific_verdict: partially_supports_paper_claim",
+                "paper_alignment: partial_match",
+                "confidence: medium",
+                "-->",
+            ]
+        )
+        review = summarize_markdown_review(task_id="reproduce_fig_7", markdown=markdown)
+
+        self.assertEqual(review["scientific_verdict"], "partially_supports_paper_claim")
+        self.assertEqual(review["paper_alignment"], "partial_match")
+        self.assertEqual(review["confidence"], "medium")
+        stripped = strip_review_control_footer(markdown)
+        self.assertNotIn("geng-agent-review-summary", stripped)
+        self.assertIn("obviously inconsistent", stripped)
+
+    def test_empty_markdown_review_doc_is_not_success(self) -> None:
+        review_doc = {"_meta": {"markdown_review": True}, "experiment_reviews": []}
+        self.assertFalse(_is_success({"passed": True, "coverage": "1/1"}, review_doc))
+
     def test_partial_review_feedback_is_actionable_for_next_writer_round(self) -> None:
         review_doc = {
             "experiment_reviews": [
@@ -529,6 +617,13 @@ class AgenticProjectWorkflowTests(unittest.TestCase):
             self.assertEqual(result["status"]["best_round"], 1)
             self.assertTrue(result["result_review_result"]["passed"])
             self.assertEqual(result["result_review_result"]["partial_failures"], 1)
+            round1_score = result["status"]["rounds"][0]["score"]
+            self.assertEqual(round1_score["cannot_assess_count"], 1)
+            self.assertGreater(round1_score["scientific_gap_count"], 0)
+            self.assertNotEqual(
+                result["status"].get("stopped_reason"),
+                "runtime passed and every reviewed task supports the paper claim",
+            )
             self.assertTrue((out / "result_review.md").exists())
             self.assertFalse((out / "result_review_error.json").exists())
             review_md = (out / "result_review.md").read_text(encoding="utf-8")
