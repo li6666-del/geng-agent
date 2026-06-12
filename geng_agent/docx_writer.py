@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -19,6 +20,7 @@ SERIF_FONT = "SimSun"
 ACCENT = "1F4E79"
 HEADER_FILL = "E8EEF7"
 LIGHT_FILL = "F6F8FB"
+RESULT_REVIEW_IMAGE_WIDTH_IN = 6.2
 DISCLAIMER = "本报告只表达复现风险、结果差异与人工复核建议，不直接判定论文造假。"
 
 RISK_LABELS = {
@@ -367,19 +369,6 @@ def write_result_review_markdown_docx(
         "由 Codex reviewer 直接生成的人工阅读版结果对比报告",
     )
 
-    status = status or {}
-    _add_heading(document, "报告状态", 1)
-    _add_kv_table(
-        document,
-        [
-            ("是否通过", "是" if status.get("passed") else "否"),
-            ("审查模式", status.get("mode", "未记录")),
-            ("Markdown 报告", status.get("result_review_markdown_path", "未记录")),
-            ("说明", status.get("reason") or status.get("error") or "无"),
-        ],
-    )
-
-    _add_heading(document, "审查正文", 1)
     _add_markdown_body(document, markdown_text)
     _add_disclaimer(document)
     return _save(document, path)
@@ -390,7 +379,10 @@ def _add_markdown_body(document: DocumentObject, markdown_text: str) -> None:
         line = raw_line.strip()
         if not line:
             continue
-        if line.startswith("### "):
+        image_match = re.fullmatch(r"!\[([^\]]*)\]\((.*)\)", line)
+        if image_match:
+            _add_markdown_image(document, image_match.group(1).strip(), image_match.group(2).strip())
+        elif line.startswith("### "):
             _add_heading(document, line[4:].strip(), 3)
         elif line.startswith("## "):
             _add_heading(document, line[3:].strip(), 2)
@@ -402,6 +394,27 @@ def _add_markdown_body(document: DocumentObject, markdown_text: str) -> None:
             continue
         else:
             document.add_paragraph(_safe_text(line))
+
+
+def _add_markdown_image(document: DocumentObject, caption: str, raw_path: str) -> None:
+    image_path = Path(raw_path.strip().strip("<>"))
+    if not image_path.exists():
+        _add_note(document, f"图片缺失：{raw_path}")
+        return
+    try:
+        paragraph = document.add_paragraph()
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = paragraph.add_run()
+        run.add_picture(str(image_path), width=Inches(RESULT_REVIEW_IMAGE_WIDTH_IN))
+        if caption:
+            caption_paragraph = document.add_paragraph()
+            caption_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            caption_run = caption_paragraph.add_run(_safe_text(caption))
+            caption_run.italic = True
+            caption_run.font.color.rgb = RGBColor(95, 95, 95)
+            _set_run_font(caption_run, BODY_FONT, Pt(9))
+    except Exception as exc:
+        _add_note(document, f"图片插入失败：{raw_path}（{type(exc).__name__}: {exc}）")
 
 
 def _setup_document(document: DocumentObject) -> None:

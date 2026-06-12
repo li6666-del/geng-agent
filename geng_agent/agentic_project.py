@@ -627,7 +627,8 @@ def _run_codex_result_review(
     for index, task in enumerate(task_items, start=1):
         task_id = str(task.get("task_id") or f"task_{index}")
         selected = select_images_for_task(task=task, evidence=evidence, images=images, paper=paper, facts=facts)
-        image_paths = _write_review_images(audit_dir, f"{round_label}_{index:02d}_{safe_label(task_id)}", selected)
+        image_entries = _write_review_images(audit_dir, f"{round_label}_{index:02d}_{safe_label(task_id)}", selected)
+        image_paths = [Path(str(entry["path"])) for entry in image_entries if entry.get("path")]
         task_evidence = compact_result_evidence_for_task(evidence=evidence, task=task, selected_images=selected)
         task_context = paper_context_for_task(paper=paper, facts=facts, task=task)
         prompt = build_reviewer_brief(
@@ -656,13 +657,20 @@ def _run_codex_result_review(
                 raise RuntimeError("Codex reviewer produced an empty or too-short Markdown report")
             section_path = audit_dir / f"{base_stage_label}_review.md"
             write_text(section_path, markdown)
-            markdown_sections.append(f"## {index}. {task_id}\n\n{markdown}")
+            markdown_sections.append(
+                _render_task_markdown_section(
+                    index=index,
+                    task_id=task_id,
+                    image_entries=image_entries,
+                    body_markdown=markdown,
+                )
+            )
             statuses.append(
                 {
                     "task_id": task_id,
                     "stage_label": base_stage_label,
                     "attempts": 1,
-                    "images_sent": [{"label": image.label, "mime_type": image.mime_type} for image in selected],
+                    "images_sent": image_entries,
                     "paper_pages_sent": task_evidence.get("selected_paper_pages", []),
                     "backend": "codex",
                     "transport_ok": bool(status.get("ok")),
@@ -673,12 +681,18 @@ def _run_codex_result_review(
         except Exception as exc:
             error = redact_text(f"{type(exc).__name__}: {exc}")[:500]
             failed_section = (
-                f"## {index}. {task_id}\n\n"
                 "### Reviewer failed\n\n"
                 "Codex reviewer did not produce a usable Markdown section for this task.\n\n"
                 f"- Error: {error}\n"
             )
-            markdown_sections.append(failed_section)
+            markdown_sections.append(
+                _render_task_markdown_section(
+                    index=index,
+                    task_id=task_id,
+                    image_entries=image_entries,
+                    body_markdown=failed_section,
+                )
+            )
             statuses.append(
                 {
                     "task_id": task_id,
@@ -686,6 +700,8 @@ def _run_codex_result_review(
                     "review_failed": True,
                     "backend": "codex",
                     "error": error,
+                    "images_sent": image_entries,
+                    "paper_pages_sent": task_evidence.get("selected_paper_pages", []),
                 }
             )
             write_json(audit_dir / f"review_failed_{base_stage_label}.json", {"ok": False, "error": error})
@@ -697,8 +713,6 @@ def _run_codex_result_review(
     result_md_path = output_dir / "result_review.md"
     markdown_doc = _render_codex_markdown_result_review(
         task_sections=markdown_sections,
-        evidence=evidence,
-        statuses=statuses,
     )
     write_text(result_md_path, markdown_doc)
     review_doc = {
@@ -723,39 +737,51 @@ def _run_codex_result_review(
 def _render_codex_markdown_result_review(
     *,
     task_sections: list[str],
-    evidence: dict[str, Any],
-    statuses: list[dict[str, Any]],
 ) -> str:
-    lines = [
-        "# 复现结果二次审查报告",
-        "",
-        "本报告由 Codex reviewer 子智能体直接生成，面向人工阅读；不再要求 reviewer 输出 JSON。",
-        "",
-        "## 输入证据摘要",
-        f"- CSV 摘要文件：{', '.join(str(x) for x in evidence.get('csv_summaries', [])[:5]) or '未记录'}",
-        f"- summary JSON：{', '.join(str(x) for x in evidence.get('summary_jsons', [])[:5]) or '未记录'}",
-        f"- 本地图像数：{len(evidence.get('output_images', []))}",
-        f"- 论文页图数：{len(evidence.get('paper_images', []))}",
-        f"- 选中论文页：{', '.join(str(x) for x in evidence.get('selected_paper_pages', [])) or '未记录'}",
-        "",
-        "## 审查任务状态",
-    ]
-    for status in statuses:
-        lines.append(
-            f"- `{status.get('task_id')}`：{'失败' if status.get('review_failed') else '完成'}；"
-            f"图片 {len(status.get('images_sent', []))} 张；论文页 {status.get('paper_pages_sent', [])}"
-        )
-    lines.extend(["", "## 逐任务审查", ""])
-    lines.extend(task_sections or ["未生成逐任务审查。"])
-    lines.extend(
-        [
-            "",
-            "## 人工复核提醒",
-            "- 本报告是面向人工阅读的结果级审查，不提供机器可判定的 JSON verdict。",
-            "- 请优先核对本地 PNG/CSV 与论文原图的坐标轴、趋势、baseline 排序和统计规模。",
-        ]
-    )
+    return "\n\n".join(section.strip() for section in task_sections if str(section).strip()).strip() + "\n"
+
+
+def _render_task_markdown_section(
+    *,
+    index: int,
+    task_id: str,
+    image_entries: list[dict[str, Any]],
+    body_markdown: str,
+) -> str:
+    lines = [f"## {index}. {task_id}", ""]
+    local_images = _select_task_local_image_entries(task_id, image_entries)
+    paper_images = [entry for entry in image_entries if entry.get("kind") == "paper_page"]
+    lines.extend(_render_markdown_image_group("本地复现图", local_images))
+    lines.extend(_render_markdown_image_group("论文原图页", paper_images))
+    lines.extend(["### 审查正文", "", body_markdown.strip()])
     return "\n".join(lines).strip() + "\n"
+
+
+def _select_task_local_image_entries(task_id: str, image_entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    local_images = [entry for entry in image_entries if entry.get("kind") == "local_output"]
+    task_key = task_id.lower()
+    preferred = [entry for entry in local_images if task_key in str(entry.get("label", "")).lower()]
+    return preferred or local_images
+
+
+def _render_markdown_image_group(title: str, entries: list[dict[str, Any]]) -> list[str]:
+    lines = [f"### {title}", ""]
+    if not entries:
+        lines.extend(["未记录。", ""])
+        return lines
+    for entry in entries:
+        caption = _image_caption(title, str(entry.get("label") or "image"))
+        path = str(entry.get("path") or "")
+        lines.extend([f"![{caption}]({path})", ""])
+    return lines
+
+
+def _image_caption(prefix: str, label: str) -> str:
+    if label.startswith("local_output:"):
+        return f"{prefix}: {label.split(':', 1)[1]}"
+    if label.startswith("paper_page:"):
+        return f"{prefix}: p{label.split(':', 1)[1]}"
+    return f"{prefix}: {label}"
 
 
 def build_reviewer_brief(
@@ -1152,10 +1178,10 @@ def _annotate_writer_post_run_status(
         )
 
 
-def _write_review_images(audit_dir: Path, label: str, images: list[LLMImage]) -> list[Path]:
+def _write_review_images(audit_dir: Path, label: str, images: list[LLMImage]) -> list[dict[str, Any]]:
     image_dir = audit_dir / "03c_reviewer_images" / label
     image_dir.mkdir(parents=True, exist_ok=True)
-    paths: list[Path] = []
+    entries: list[dict[str, Any]] = []
     for index, image in enumerate(images, start=1):
         suffix = ".png" if image.mime_type == "image/png" else ".img"
         path = image_dir / f"{index:02d}_{safe_label(image.label)}{suffix}"
@@ -1163,8 +1189,23 @@ def _write_review_images(audit_dir: Path, label: str, images: list[LLMImage]) ->
             path.write_bytes(base64.b64decode(image.data_b64))
         except Exception:
             continue
-        paths.append(path)
-    return paths
+        entries.append(
+            {
+                "label": image.label,
+                "kind": _review_image_kind(image.label),
+                "mime_type": image.mime_type,
+                "path": str(path.resolve()),
+            }
+        )
+    return entries
+
+
+def _review_image_kind(label: str) -> str:
+    if label.startswith("local_output:"):
+        return "local_output"
+    if label.startswith("paper_page:"):
+        return "paper_page"
+    return "other"
 
 
 def _read_last_message(status: dict[str, Any]) -> str:

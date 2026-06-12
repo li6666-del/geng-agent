@@ -10,6 +10,7 @@ from geng_agent.agentic_project import (
     _feedback_from_results,
     _is_better_score,
     _load_cached_agentic_project,
+    _render_task_markdown_section,
     _score_candidate,
     build_writer_brief,
     run_codex_project_workflow,
@@ -465,7 +466,11 @@ class AgenticProjectWorkflowTests(unittest.TestCase):
             self.assertIn("Task-level paper evidence bundle", round1_brief)
             self.assertIn(task_evidence_rel, round1_brief)
             result_review_md = (out / "result_review.md").read_text(encoding="utf-8")
-            self.assertIn("复现结果二次审查报告", result_review_md)
+            self.assertTrue(result_review_md.startswith("## 1. reproduce_fig_1"))
+            self.assertNotIn("输入证据摘要", result_review_md)
+            self.assertNotIn("审查任务状态", result_review_md)
+            self.assertIn("![本地复现图:", result_review_md)
+            self.assertIn("### 审查正文", result_review_md)
             self.assertIn("本地曲线与论文趋势一致", result_review_md)
 
     def test_failed_reviewer_round_cannot_win_best_round_or_leave_stale_error(self) -> None:
@@ -529,6 +534,32 @@ class AgenticProjectWorkflowTests(unittest.TestCase):
             review_md = (out / "result_review.md").read_text(encoding="utf-8")
             self.assertIn("Mock review", review_md)
             self.assertIn("Reviewer failed", review_md)
+
+    def test_task_markdown_section_embeds_local_and_paper_images(self) -> None:
+        section = _render_task_markdown_section(
+            index=1,
+            task_id="reproduce_fig_1",
+            image_entries=[
+                {
+                    "label": "local_output:reproduce_fig_1/fig1.png",
+                    "kind": "local_output",
+                    "mime_type": "image/png",
+                    "path": "C:/tmp/local_fig1.png",
+                },
+                {
+                    "label": "paper_page:3",
+                    "kind": "paper_page",
+                    "mime_type": "image/png",
+                    "path": "C:/tmp/paper_page_3.png",
+                },
+            ],
+            body_markdown="Reviewer body.",
+        )
+
+        self.assertTrue(section.startswith("## 1. reproduce_fig_1"))
+        self.assertIn("![本地复现图: reproduce_fig_1/fig1.png](C:/tmp/local_fig1.png)", section)
+        self.assertIn("![论文原图页: p3](C:/tmp/paper_page_3.png)", section)
+        self.assertIn("### 审查正文", section)
 
     def test_cached_markdown_review_ignored_when_newer_error_exists(self) -> None:
         with TemporaryDirectory() as temp_dir:
