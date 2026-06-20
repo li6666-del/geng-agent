@@ -195,7 +195,7 @@ paper-vs-output feedback.
 Optional Codex controls:
 
 ```bash
-python -m geng_agent review paper.pdf --out case_001 --run-repro --codex-agent-rounds 3 --codex-agent-timeout 1800
+python -m geng_agent review paper.pdf --out case_001 --run-repro --codex-agent-rounds 8 --codex-agent-stall-rounds 2 --codex-agent-timeout 1800
 set GENG_CODEX_CMD=codex
 set GENG_CODEX_WRITER_CMD=codex
 set GENG_CODEX_REVIEWER_CMD=codex
@@ -204,6 +204,9 @@ set GENG_CODEX_REVIEWER_CMD=codex
 常用参数：
 
 ```text
+--codex-agent-rounds 8       第三轮 Codex writer/reviewer 自适应闭环最大轮数；默认 8，不代表固定跑满
+--codex-agent-stall-rounds 2 连续 2 轮没有刷新最佳评分后停止；设 0 可关闭平台期停止
+--codex-agent-timeout 1800   单个 Codex writer/reviewer 子进程超时；当前没有第三轮总墙钟预算
 --json-repair-attempts 3   每轮 JSON 审查失败后的返修次数
 --run-repro                显式运行生成的复现项目
 --no-result-review         关闭运行成功后的结果级多模态二次审查

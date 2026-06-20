@@ -40,7 +40,7 @@ def _add_common_review_args(parser: argparse.ArgumentParser, *, include_resume: 
     parser.add_argument("--temperature", type=float, default=0.1, help="LLM 采样温度，默认 0.1。")
     parser.add_argument("--timeout", type=float, default=120.0, help="单次 LLM 请求超时时间，单位秒。")
     parser.add_argument("--tasks-timeout", type=float, default=300.0, help="第二轮生成复现任务的单次 LLM 请求超时时间，单位秒。")
-    parser.add_argument("--project-timeout", type=float, default=1200.0, help="第三轮 Codex 项目工作流的超时预算，单位秒。")
+    parser.add_argument("--project-timeout", type=float, default=1200.0, help="第三轮单个生成/审查子进程的默认超时，单位秒；Codex 自适应闭环没有总墙钟预算。")
     parser.add_argument("--thinking", choices=("enabled", "disabled"), default=None, help="DeepSeek V4 Pro thinking 开关。")
     parser.add_argument("--reasoning-effort", choices=("low", "medium", "high"), default=None, help="推理模型 reasoning_effort 参数。")
     run_group = parser.add_mutually_exclusive_group()
@@ -59,8 +59,19 @@ def _add_common_review_args(parser: argparse.ArgumentParser, *, include_resume: 
     parser.add_argument("--facts-gap-rounds", type=int, default=3, help="第一轮事实抽取后的“查漏补缺”追加轮数（确定性覆盖校验图/表锚点 + 定向补抽遗漏事实），循环到一轮无新增为止；默认 3，设 0 关闭。")
     parser.add_argument("--tasks-gap-rounds", type=int, default=3, help="第二轮复现任务设计后的“查漏补缺”追加轮数（确定性校验每个可复现实验是否都有任务 + 为遗漏实验补任务），循环到全覆盖或无新增为止；默认 3，设 0 关闭。")
     parser.add_argument("--science-loop", action="store_true", help="开启论文思路锚点，供第三轮 Codex writer/reviewer 闭环使用。")
-    parser.add_argument("--codex-agent-rounds", type=int, default=3, help="Max Codex writer/reviewer moderator rounds.")
-    parser.add_argument("--codex-agent-timeout", type=float, default=None, help="Timeout in seconds for one Codex writer/reviewer process; defaults to --project-timeout or 1800.")
+    parser.add_argument(
+        "--codex-agent-rounds",
+        type=int,
+        default=8,
+        help="第三轮 Codex writer/reviewer 自适应闭环最大轮数；默认 8，不代表固定跑满。",
+    )
+    parser.add_argument(
+        "--codex-agent-stall-rounds",
+        type=int,
+        default=2,
+        help="第三轮连续多少轮没有刷新最佳评分后停止；默认 2，设 0 关闭平台期停止。",
+    )
+    parser.add_argument("--codex-agent-timeout", type=float, default=None, help="单个 Codex writer/reviewer 子进程超时，单位秒；默认复用 --project-timeout，未设置时 1800。")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -104,6 +115,7 @@ def main(argv: list[str] | None = None) -> int:
             science_loop=args.science_loop,
             project_backend="codex",
             codex_agent_rounds=args.codex_agent_rounds,
+            codex_agent_stall_rounds=args.codex_agent_stall_rounds,
             codex_agent_timeout=args.codex_agent_timeout,
         )
         print(f"审查完成：{result.output_dir}")

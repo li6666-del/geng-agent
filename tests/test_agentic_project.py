@@ -317,6 +317,62 @@ def _write_mock_reviewer(temp: Path) -> str:
     return f'"{sys.executable}" "{script}"'
 
 
+def _write_partial_reviewer(temp: Path) -> str:
+    script = temp / "mock_partial_reviewer.py"
+    script.write_text(
+        textwrap.dedent(
+            r'''
+            import sys
+            from pathlib import Path
+
+            args = sys.argv[1:]
+            out = Path(args[args.index("--output-last-message") + 1])
+            counter = Path(__file__).with_name("partial_review_count.txt")
+            n = int(counter.read_text(encoding="utf-8")) if counter.exists() else 0
+            counter.write_text(str(n + 1), encoding="utf-8")
+            markdown = "\n".join([
+                "# reproduce_fig_1",
+                "",
+                "## 结论",
+                "本地曲线只部分支持论文主张，仍需继续调整模型。",
+                "",
+                "## 原论文结果摘要",
+                "paper says curve should increase",
+                "",
+                "## 本地复现结果摘要",
+                "local curve increases but scale remains weak",
+                "",
+                "## 七维度审查",
+                "- artifact_coverage: mock evidence",
+                "- reproduction_logic: surrogate model remains incomplete",
+                "- trend_shape: qualitative trend only",
+                "- metric_axis_scale: numeric scale differs",
+                "- baseline_comparison: baseline not fully matched",
+                "- statistical_reliability: few samples",
+                "- conclusion_support: partial only",
+                "",
+                "## 主要差异",
+                "- numeric scale still differs from the paper",
+                "",
+                "## 可能原因",
+                "- missing paper parameters",
+                "",
+            ])
+            markdown += "\n<!-- geng-agent-review-summary\n"
+            markdown += "task_id: reproduce_fig_1\n"
+            markdown += "scientific_verdict: partially_supports_paper_claim\n"
+            markdown += "paper_alignment: partial_match\n"
+            markdown += "confidence: high\n"
+            markdown += "-->\n"
+            out.write_text(markdown, encoding="utf-8")
+            print(markdown)
+            '''
+        ),
+        encoding="utf-8",
+    )
+    return f'"{sys.executable}" "{script}"'
+
+
 class AgenticProjectWorkflowTests(unittest.TestCase):
     def test_markdown_review_partial_summary_blocks_success_and_feeds_back(self) -> None:
         markdown = "\n".join(
@@ -480,6 +536,63 @@ class AgenticProjectWorkflowTests(unittest.TestCase):
         self.assertEqual(nested_score["coverage_total"], 4)
         self.assertEqual(passed_only_score["coverage_passed"], 1)
         self.assertEqual(passed_only_score["coverage_total"], 1)
+
+    def test_codex_loop_stops_after_configured_stall_rounds(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            paper = temp / "paper.md"
+            paper.write_text("Figure 1 shows rate increasing with SNR.", encoding="utf-8")
+            out = temp / "case"
+            audit = out / "audit"
+
+            old_writer = os.environ.get("GENG_CODEX_WRITER_CMD")
+            old_reviewer = os.environ.get("GENG_CODEX_REVIEWER_CMD")
+            os.environ["GENG_CODEX_WRITER_CMD"] = _write_mock_writer(temp)
+            os.environ["GENG_CODEX_REVIEWER_CMD"] = _write_partial_reviewer(temp)
+            try:
+                result = run_codex_project_workflow(
+                    facts={"engineering_facts": []},
+                    tasks={"repro_tasks": [{"task_id": "reproduce_fig_1", "expected_artifacts": ["fig1.png"]}]},
+                    experiment_index={"experiments": []},
+                    paper={"format": "markdown", "chunks": []},
+                    paper_path=paper,
+                    paper_context_json="Figure 1 shows rate increasing with SNR.",
+                    paper_thesis=None,
+                    output_dir=out,
+                    audit_dir=audit,
+                    repro_project_dir=out / "repro_project",
+                    client=DummyLLM(),
+                    prompt_book=PromptBook(),
+                    system_message="system",
+                    run_repro=True,
+                    result_review=True,
+                    rounds=5,
+                    stall_rounds=2,
+                    timeout=30,
+                    run_timeout=30,
+                    resume=False,
+                )
+            finally:
+                if old_writer is None:
+                    os.environ.pop("GENG_CODEX_WRITER_CMD", None)
+                else:
+                    os.environ["GENG_CODEX_WRITER_CMD"] = old_writer
+                if old_reviewer is None:
+                    os.environ.pop("GENG_CODEX_REVIEWER_CMD", None)
+                else:
+                    os.environ["GENG_CODEX_REVIEWER_CMD"] = old_reviewer
+
+            status = result["status"]
+            self.assertEqual(status["rounds_requested"], 5)
+            self.assertEqual(status["stall_rounds_requested"], 2)
+            self.assertEqual(status["rounds_run"], 3)
+            self.assertEqual(status["best_round"], 1)
+            self.assertEqual(status["stop_class"], "plateau")
+            self.assertIn("best score did not improve", status["stopped_reason"])
+            self.assertEqual([item["improved_best"] for item in status["rounds"]], [True, False, False])
+            self.assertEqual([item["stall_count"] for item in status["rounds"]], [0, 1, 2])
+            prompts = (temp / "writer_prompts.txt").read_text(encoding="utf-8")
+            self.assertEqual(prompts.count("---PROMPT---"), 3)
 
     def test_codex_writer_reviewer_loop_restores_trusted_files_and_feeds_back_review(self) -> None:
         with TemporaryDirectory() as temp_dir:

@@ -197,7 +197,8 @@ def run_codex_project_workflow(
     system_message: str,
     run_repro: bool,
     result_review: bool,
-    rounds: int = 3,
+    rounds: int = 8,
+    stall_rounds: int = 2,
     timeout: float = 1800.0,
     run_timeout: float = 120.0,
     resume: bool = True,
@@ -212,6 +213,7 @@ def run_codex_project_workflow(
     output_dir.mkdir(parents=True, exist_ok=True)
     audit_dir.mkdir(parents=True, exist_ok=True)
     rounds = max(1, int(rounds or 1))
+    stall_rounds = max(0, int(stall_rounds or 0))
     timeout = float(timeout or 1800.0)
 
     cached = _load_cached_agentic_project(
@@ -232,6 +234,8 @@ def run_codex_project_workflow(
     status: dict[str, Any] = {
         "backend": CODEX_PROJECT_BACKEND,
         "rounds_requested": rounds,
+        "stall_rounds_requested": stall_rounds,
+        "stall_count": 0,
         "rounds": [],
         "expected_paths": sorted(expected_paths),
     }
@@ -240,6 +244,7 @@ def run_codex_project_workflow(
     best: dict[str, Any] | None = None
     best_snapshot = audit_dir / "03c_agentic_project_best_snapshot"
     feedback: list[dict[str, Any]] = []
+    stall_count = 0
 
     for round_no in range(1, rounds + 1):
         round_label = f"03c_agentic_project_round_{round_no:02d}"
@@ -356,6 +361,12 @@ def run_codex_project_workflow(
                 write_json(output_dir / "result_review_error.json", review_status)
 
         score = _score_candidate(runtime_result, review_doc, review_status, writer_status, validation, manifest_issues)
+        improved_best = best is None or _is_better_score(score, best["score"])
+        if improved_best:
+            stall_count = 0
+        else:
+            stall_count += 1
+        status["stall_count"] = stall_count
         round_record = {
             "round": round_no,
             "writer": writer_status,
@@ -364,6 +375,8 @@ def run_codex_project_workflow(
             "runtime": _compact_runtime(runtime_result),
             "result_review": _compact_review_status(review_status),
             "score": score,
+            "improved_best": improved_best,
+            "stall_count": stall_count,
         }
         write_json(audit_dir / f"{round_label}.json", round_record)
         status["rounds"].append(round_record)
@@ -376,20 +389,35 @@ def run_codex_project_workflow(
             "result_review_result": review_status,
             "result_review_doc": review_doc,
         }
-        if best is None or _is_better_score(score, best["score"]):
+        if improved_best:
             best = candidate
             _snapshot_project(repro_project_dir, best_snapshot)
             write_json(audit_dir / "03c_agentic_project_best.json", {"round": round_no, "score": score})
 
         if _is_success(runtime_result, review_doc):
             status["stopped_reason"] = "runtime passed and every reviewed task supports the paper claim"
+            status["stop_class"] = "success"
+            break
+        if stall_rounds > 0 and stall_count >= stall_rounds:
+            status["stopped_reason"] = (
+                f"best score did not improve for {stall_count} consecutive round(s); "
+                "adaptive Codex loop reached a plateau under the current evidence and prompts"
+            )
+            status["stop_class"] = "plateau"
             break
         feedback = _feedback_from_results(runtime_result, review_doc, review_status)
 
     if best is None:
         error = {"enabled": True, "passed": False, "error": "Codex project workflow produced no candidate"}
         write_json(output_dir / "agentic_project_error.json", error)
+        status["rounds_run"] = len(status["rounds"])
+        status["stopped_reason"] = "Codex project workflow produced no candidate"
+        status["stop_class"] = "no_candidate"
+        write_json(audit_dir / "03c_agentic_project_status.json", status)
         raise RuntimeError(error["error"])
+    if "stop_class" not in status:
+        status["stopped_reason"] = "maximum Codex agent rounds exhausted before full paper-claim support"
+        status["stop_class"] = "max_rounds_exhausted"
 
     if best_snapshot.exists():
         _restore_project(best_snapshot, repro_project_dir)

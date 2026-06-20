@@ -351,7 +351,8 @@ class ReviewPipeline:
         facts_gap_rounds: int = 3,
         tasks_gap_rounds: int = 3,
         project_backend: str = "llm",
-        codex_agent_rounds: int = 3,
+        codex_agent_rounds: int = 8,
+        codex_agent_stall_rounds: int = 2,
         codex_agent_timeout: float | None = None,
     ) -> PipelineResult:
         stage_cleanup = {
@@ -389,6 +390,7 @@ class ReviewPipeline:
             tasks_gap_rounds=tasks_gap_rounds,
             project_backend=project_backend,
             codex_agent_rounds=codex_agent_rounds,
+            codex_agent_stall_rounds=codex_agent_stall_rounds,
             codex_agent_timeout=codex_agent_timeout,
         )
 
@@ -411,7 +413,8 @@ class ReviewPipeline:
         per_task_layout: bool = False,
         science_loop: bool = False,
         project_backend: str = "llm",
-        codex_agent_rounds: int = 3,
+        codex_agent_rounds: int = 8,
+        codex_agent_stall_rounds: int = 2,
         codex_agent_timeout: float | None = None,
     ) -> PipelineResult:
         output_dir = output_dir.expanduser().resolve()
@@ -627,6 +630,7 @@ class ReviewPipeline:
                 timeout=codex_agent_timeout or project_timeout or 1800.0,
                 run_timeout=run_timeout,
                 resume=resume,
+                stall_rounds=codex_agent_stall_rounds,
             )
             manifest = agentic_result["manifest"]
             written_files = [Path(path) for path in agentic_result.get("written_files", [])]
