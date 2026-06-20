@@ -373,6 +373,79 @@ def _write_partial_reviewer(temp: Path) -> str:
     return f'"{sys.executable}" "{script}"'
 
 
+def _write_mock_analysis(temp: Path) -> str:
+    script = temp / "mock_analysis.py"
+    script.write_text(
+        textwrap.dedent(
+            r'''
+            import json
+            import sys
+            from pathlib import Path
+
+            args = sys.argv[1:]
+            out = Path(args[args.index("--output-last-message") + 1])
+            prompt = sys.stdin.read() if args and args[-1] == "-" else args[-1]
+            log = Path(__file__).with_name("analysis_prompts.txt")
+            with log.open("a", encoding="utf-8") as handle:
+                handle.write("---PROMPT---\n" + prompt + "\n")
+            if "Schema: engineering_facts" in prompt:
+                doc = {
+                    "paper_domain": "communication",
+                    "paper_repro_type": "signal_chain",
+                    "engineering_facts": [
+                        {
+                            "type": "channel_model",
+                            "name": "AWGN",
+                            "value": {"snr_db": [0, 5]},
+                            "source": {
+                                "source_kind": "text",
+                                "chunk_id": "text_c1",
+                                "page": None,
+                                "section": "Simulation",
+                                "quote": "AWGN",
+                                "figure_ref": "",
+                            },
+                            "confidence": "high",
+                            "used_for_reproduction": True,
+                        }
+                    ],
+                    "missing_information": [],
+                }
+            elif "Schema: repro_tasks" in prompt:
+                doc = {
+                    "repro_tasks": [
+                        {
+                            "task_id": "reproduce_fig_1",
+                            "target": "BER vs SNR",
+                            "metric": "bit_error_rate",
+                            "metric_formula": "bit_error_rate = bit_errors / total_bits",
+                            "figure_or_claim": "Fig. 1",
+                            "expected_artifacts": ["outputs/reproduce_fig_1/results.csv"],
+                            "output_columns": ["snr_db", "bit_error_rate"],
+                            "expected_trend": {
+                                "x_axis": "snr_db",
+                                "y_axis": "bit_error_rate",
+                                "direction": "decreasing",
+                                "reason": "higher SNR lowers BER",
+                            },
+                            "comparison": {"baselines": ["AWGN reference"], "curve_groups": ["sim"], "tolerance": "trend"},
+                            "required_facts": [{"type": "channel_model", "name": "AWGN"}],
+                            "assumptions": [],
+                            "risk_if_unreproducible": "core curve unchecked",
+                        }
+                    ]
+                }
+            else:
+                raise SystemExit("unexpected analysis prompt")
+            out.write_text(json.dumps(doc), encoding="utf-8")
+            print(json.dumps(doc))
+            '''
+        ),
+        encoding="utf-8",
+    )
+    return f'"{sys.executable}" "{script}"'
+
+
 class AgenticProjectWorkflowTests(unittest.TestCase):
     def test_markdown_review_partial_summary_blocks_success_and_feeds_back(self) -> None:
         markdown = "\n".join(
@@ -924,6 +997,7 @@ class AgenticProjectWorkflowTests(unittest.TestCase):
                     resume=False,
                     facts_gap_rounds=0,
                     tasks_gap_rounds=0,
+                    analysis_backend="llm",
                     project_backend="codex",
                     codex_agent_rounds=2,
                     codex_agent_timeout=30,
@@ -945,6 +1019,62 @@ class AgenticProjectWorkflowTests(unittest.TestCase):
             generated = json.loads((result.output_dir / "generated_files.json").read_text(encoding="utf-8"))
             self.assertTrue(generated["result_review"]["passed"])
             self.assertEqual(generated["docx_generation"]["result_review_docx"]["passed"], True)
+
+    def test_full_pipeline_codex_analysis_default_needs_no_llm_client(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            paper = temp / "paper.md"
+            paper.write_text("Simulation Results\nAWGN channel, BER vs SNR. Fig. 1 decreases.", encoding="utf-8")
+            analysis_cmd = _write_mock_analysis(temp)
+            writer_cmd = _write_mock_writer(temp)
+            reviewer_cmd = _write_mock_reviewer(temp)
+
+            old_analysis = os.environ.get("GENG_CODEX_ANALYSIS_CMD")
+            old_writer = os.environ.get("GENG_CODEX_WRITER_CMD")
+            old_reviewer = os.environ.get("GENG_CODEX_REVIEWER_CMD")
+            os.environ["GENG_CODEX_ANALYSIS_CMD"] = analysis_cmd
+            os.environ["GENG_CODEX_WRITER_CMD"] = writer_cmd
+            os.environ["GENG_CODEX_REVIEWER_CMD"] = reviewer_cmd
+            try:
+                result = ReviewPipeline().run(
+                    paper,
+                    temp / "case",
+                    run_repro=True,
+                    run_timeout=30,
+                    repair_attempts=0,
+                    result_review=True,
+                    resume=False,
+                    facts_gap_rounds=0,
+                    tasks_gap_rounds=0,
+                    project_backend="codex",
+                    codex_agent_rounds=1,
+                    codex_agent_timeout=30,
+                    codex_analysis_timeout=30,
+                )
+            finally:
+                if old_analysis is None:
+                    os.environ.pop("GENG_CODEX_ANALYSIS_CMD", None)
+                else:
+                    os.environ["GENG_CODEX_ANALYSIS_CMD"] = old_analysis
+                if old_writer is None:
+                    os.environ.pop("GENG_CODEX_WRITER_CMD", None)
+                else:
+                    os.environ["GENG_CODEX_WRITER_CMD"] = old_writer
+                if old_reviewer is None:
+                    os.environ.pop("GENG_CODEX_REVIEWER_CMD", None)
+                else:
+                    os.environ["GENG_CODEX_REVIEWER_CMD"] = old_reviewer
+
+            self.assertTrue(result.runtime_passed)
+            self.assertTrue(result.result_review_passed)
+            facts = json.loads((result.output_dir / "engineering_facts.json").read_text(encoding="utf-8"))
+            tasks = json.loads((result.output_dir / "repro_tasks.json").read_text(encoding="utf-8"))
+            run_cost = json.loads((result.output_dir / "run_cost.json").read_text(encoding="utf-8"))
+            self.assertEqual(facts["_meta"]["analysis_backend"], "codex")
+            self.assertEqual(tasks["_meta"]["analysis_backend"], "codex")
+            self.assertEqual(run_cost["analysis_backend"], "codex")
+            prompts = (temp / "analysis_prompts.txt").read_text(encoding="utf-8")
+            self.assertEqual(prompts.count("---PROMPT---"), 2)
 
     def test_writer_transport_failure_after_edits_is_explicitly_annotated(self) -> None:
         with TemporaryDirectory() as temp_dir:

@@ -56,9 +56,21 @@ def _add_common_review_args(parser: argparse.ArgumentParser, *, include_resume: 
     parser.add_argument("--no-template-fallback", action="store_true", help="禁用本地确定性兜底；默认启用以提高端到端稳定性。")
     parser.add_argument("--run-timeout", type=float, default=120.0, help="单次复现运行超时时间，单位秒。")
     parser.add_argument("--json-repair-attempts", type=int, default=5, help="每轮 JSON 结构审查失败后的返修次数（默认 5：实跑发现最难的科学文件 src/modulation.py 偶发语法/结构错，3 次重试不够会拖垮整个逐任务项目→兜底；只在失败时才追加重试，文件一次过则无额外开销）。")
-    parser.add_argument("--facts-gap-rounds", type=int, default=3, help="第一轮事实抽取后的“查漏补缺”追加轮数（确定性覆盖校验图/表锚点 + 定向补抽遗漏事实），循环到一轮无新增为止；默认 3，设 0 关闭。")
-    parser.add_argument("--tasks-gap-rounds", type=int, default=3, help="第二轮复现任务设计后的“查漏补缺”追加轮数（确定性校验每个可复现实验是否都有任务 + 为遗漏实验补任务），循环到全覆盖或无新增为止；默认 3，设 0 关闭。")
+    parser.add_argument("--facts-gap-rounds", type=int, default=6, help="第一轮事实抽取后的“查漏补缺”追加轮数（确定性覆盖校验图/表锚点 + 定向补抽遗漏事实），循环到一轮无新增为止；默认最多 6 轮，设 0 关闭。")
+    parser.add_argument("--tasks-gap-rounds", type=int, default=6, help="第二轮复现任务设计后的“查漏补缺”追加轮数（确定性校验每个可复现实验是否都有任务 + 为遗漏实验补任务），循环到全覆盖或无新增为止；默认最多 6 轮，设 0 关闭。")
     parser.add_argument("--science-loop", action="store_true", help="开启论文思路锚点，供第三轮 Codex writer/reviewer 闭环使用。")
+    parser.add_argument(
+        "--analysis-backend",
+        choices=("codex", "llm"),
+        default="codex",
+        help="前两阶段事实抽取/任务拆解 backend；默认 codex，llm 为旧 OpenAI-compatible 兼容路径。",
+    )
+    parser.add_argument(
+        "--codex-analysis-timeout",
+        type=float,
+        default=None,
+        help="前两阶段单个 Codex analysis 子进程超时，单位秒；默认 600。",
+    )
     parser.add_argument(
         "--codex-agent-rounds",
         type=int,
@@ -90,10 +102,14 @@ def main(argv: list[str] | None = None) -> int:
         from .config import build_secondary_extraction_client
         from .pipeline import ReviewPipeline
 
-        client = _build_client_or_error(args, parser)
-        # Optional second multimodal extraction model (GENG_LLM2_*) for the round-1 ensemble;
-        # None when unconfigured -> single-model behavior.
-        extraction_client_2 = build_secondary_extraction_client(temperature=args.temperature, timeout=args.timeout)
+        if args.analysis_backend == "llm":
+            client = _build_client_or_error(args, parser)
+            # Optional second multimodal extraction model (GENG_LLM2_*) for the round-1 ensemble;
+            # None when unconfigured -> single-model behavior.
+            extraction_client_2 = build_secondary_extraction_client(temperature=args.temperature, timeout=args.timeout)
+        else:
+            client = None
+            extraction_client_2 = None
         result = ReviewPipeline(
             client=client,
             extraction_client_2=extraction_client_2,
@@ -113,6 +129,8 @@ def main(argv: list[str] | None = None) -> int:
             facts_gap_rounds=args.facts_gap_rounds,
             tasks_gap_rounds=args.tasks_gap_rounds,
             science_loop=args.science_loop,
+            analysis_backend=args.analysis_backend,
+            codex_analysis_timeout=args.codex_analysis_timeout,
             project_backend="codex",
             codex_agent_rounds=args.codex_agent_rounds,
             codex_agent_stall_rounds=args.codex_agent_stall_rounds,

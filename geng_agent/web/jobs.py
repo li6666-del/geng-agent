@@ -11,7 +11,7 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from geng_agent.config import build_llm_client, get_cases_root
+from geng_agent.config import get_cases_root
 from geng_agent.pipeline import ReviewPipeline
 from geng_agent.status import inspect_case_status
 
@@ -137,8 +137,7 @@ def _run_pipeline(record: RunRecord) -> None:
         record.started_at = _utc_now()
 
     try:
-        client = build_llm_client()
-        pipeline = ReviewPipeline(client=client)
+        pipeline = ReviewPipeline()
         result = pipeline.run(
             paper_path=record.paper_path,
             output_dir=record.case_dir,
@@ -146,6 +145,7 @@ def _run_pipeline(record: RunRecord) -> None:
             result_review=True,
             resume=False,
             template_fallback=True,
+            analysis_backend="codex",
             project_backend="codex",
             codex_agent_rounds=8,
             codex_agent_stall_rounds=2,

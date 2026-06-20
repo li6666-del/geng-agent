@@ -17,11 +17,12 @@ python -m pip install -e ".[repro]"
 # 3. 喂 PDF 前先自检环境，全绿再继续
 python -m geng_agent doctor
 
-# 4. 配自己的 key 和模型（本会话有效；持久化改用 setx）
-$env:GENG_LLM_API_KEY="你的 API Key"
-$env:GENG_LLM_MODEL="gpt-4o"          # 需支持图像，结果级审查才跑得起来
-# 非 OpenAI 才需设 base url，例如 deepseek：
-# $env:GENG_LLM_BASE_URL="https://api.deepseek.com"
+# 4. 确认 Codex CLI 可用（默认全流程使用 Codex 子进程）
+$env:GENG_CODEX_CMD="codex"
+# 可选：为不同阶段指定不同 Codex 命令
+# $env:GENG_CODEX_ANALYSIS_CMD="codex"
+# $env:GENG_CODEX_WRITER_CMD="codex"
+# $env:GENG_CODEX_REVIEWER_CMD="codex"
 
 # 5. 拿仓库自带的示例论文跑一遍“全流程”
 #    = 受限运行复现 + 结果级多模态审查（结果级审查与兜底默认开）
@@ -30,30 +31,29 @@ python -m geng_agent review sample_papers\rayleigh_error_probability_2406.16548.
 
 跑完看 `case_001\` 下的 `review.md`（主报告）、`repro_project\`（生成的复现项目）、`result_review.md`（结果级审查）。
 
-> 要点：① API key 是你自己的、要花钱，本项目不含 key；② 模型需支持多模态，否则结果级审查会写 `result_review_error.json`（其余仍正常），不想跑可加 `--no-result-review`；③ 只想生成、不运行代码就去掉 `--run-repro`；④ 想跑得更稳可加 `--repair-attempts 3 --run-timeout 600` 等调优参数。安装、运行解释器、模型配置的细节见下文各节。
+> 要点：① 默认路径依赖本机 Codex CLI 登录状态，不需要 `GENG_LLM_API_KEY`；② 只想生成、不运行代码就去掉 `--run-repro`；③ 想跑得更稳可调 `--codex-agent-rounds`、`--codex-agent-stall-rounds`、`--run-timeout` 等参数；④ 只有显式使用 `--analysis-backend llm` 的旧路径才需要配置 OpenAI-compatible API。安装、运行解释器、模型配置的细节见下文各节。
 
 ## 工作流
 
 ```text
 论文 PDF/TXT/Markdown
   -> 本地解析成带 chunk_id/page/section 的文本块
-  -> LLM 抽取 engineering_facts.json
+  -> Codex analysis 子智能体抽取 engineering_facts.json
   -> 本地归一化：枚举近义词归位、补默认、修正空字段、剥多余键，改动全部记入 _meta
   -> 本地用 Pydantic schema 审查 JSON 结构和 source.chunk_id 回指
   -> 校验失败时只丢无法修复或无出处的单条事实，保留其余（部分接受）
   -> 输出被截断时从可解析前缀抢救事实数组；仅当零条可用事实才退本地关键词 fallback
-  -> LLM 生成 repro_tasks.json
+  -> Codex analysis 子智能体生成 repro_tasks.json
   -> 本地审查任务引用的 fact、指标公式、输出列、趋势和 baseline
-  -> LLM 生成 repro_project/ 文件 manifest
-  -> 本地审查 manifest、路径、内容字段和必要文件
-  -> 写入 repro_project/ 并做语法检查
-  -> 默认停止，不自动运行 LLM 代码
+  -> Codex writer 子智能体生成/修改 repro_project/
+  -> 本地审查路径、内容、依赖白名单、必要文件和语法
+  -> 默认停止，不自动运行生成代码
   -> 用户显式传 --run-repro 时，进入受限运行器
   -> 运行器做依赖白名单、静态安全扫描（禁网络/子进程导入、禁危险调用、禁 eval/exec/__import__/getattr 等反射类动态执行内置函数）、干净环境变量、outputs 新鲜度和格式校验
-  -> 运行失败时，把脱敏日志和代码片段交给 LLM 修复
+  -> 运行结果和 reviewer 反馈进入 Codex writer/reviewer 自适应闭环
   -> 运行通过后，默认进入结果级多模态二次审查
-  -> 把 CSV/summary、本地 PNG、论文页面 PNG 和论文上下文交给多模态 LLM
-  -> 生成 result_review.json、result_review.md、risk_report.json 和 review.md
+  -> 把 CSV/summary、本地 PNG、论文页面 PNG 和论文上下文交给 Codex reviewer
+  -> 生成 result_review.md、risk_report.json 和 review.md
 ```
 
 ## 安装与部署（输入 PDF 前必看）
@@ -108,9 +108,22 @@ C:\Users\84475\miniconda3\envs\torch\python.exe -m geng_agent review paper.pdf -
 
 > 解释器路径变了，可以设置 `GENG_PYTHON` 临时覆盖，或改 `run.ps1` / `run.cmd` 顶部的默认路径。下文示例里的 `python` 一律指这个解释器（建议用 `.\run.ps1` 代替 `python -m geng_agent`）。
 
-## 配置模型
+## 配置 Codex / 兼容模型
 
-支持 OpenAI 兼容 API：
+### 默认：Codex analysis + writer/reviewer
+
+```powershell
+$env:GENG_CODEX_CMD="codex"              # 默认命令
+$env:GENG_CODEX_ANALYSIS_CMD="codex"     # 可选：单独指定前两阶段分析子智能体
+$env:GENG_CODEX_WRITER_CMD="codex"       # 可选：单独指定写代码子智能体
+$env:GENG_CODEX_REVIEWER_CMD="codex"     # 可选：单独指定结果审查子智能体
+```
+
+前两阶段包括 `engineering_facts.json`、facts gap、可选 `paper_thesis.json`、`repro_tasks.json` 和 tasks gap。Codex 子智能体只负责产出候选 JSON；最终能否进入下一阶段仍由本地 schema、source 校验、coverage gap、任务引用校验和 fallback 策略决定。
+
+### 旧 LLM analysis 兼容路径
+
+需要显式加 `--analysis-backend llm` 才会使用 OpenAI 兼容 API：
 
 ```powershell
 $env:GENG_LLM_API_KEY="你的 API Key"
@@ -118,29 +131,9 @@ $env:GENG_LLM_BASE_URL="https://api.openai.com/v1"
 $env:GENG_LLM_MODEL="你的模型名"
 ```
 
-DeepSeek 示例：
+### 第二事实抽取模型（仅旧 LLM analysis 可选）
 
-```powershell
-$env:GENG_LLM_API_KEY="你的 DeepSeek API Key"
-$env:GENG_LLM_BASE_URL="https://api.deepseek.com"
-$env:GENG_LLM_MODEL="deepseek-v4-flash"
-```
-
-结果级二次审查要求模型/API 支持 OpenAI-compatible 多模态 `image_url` 输入。若不支持，系统不会退回纯文本替代审查，而是写入 `result_review_error.json`。
-
-### Codex writer/reviewer（第三轮默认）
-
-第三轮代码生成、运行反馈修复，以及运行结果与论文结果对比，默认交给 Codex CLI 子进程。主模型仍用于论文事实抽取、任务拆解和可选的论文思路锚点。
-
-```powershell
-$env:GENG_CODEX_CMD="codex"            # 默认命令
-$env:GENG_CODEX_WRITER_CMD="codex"     # 可选：单独指定写代码子智能体
-$env:GENG_CODEX_REVIEWER_CMD="codex"   # 可选：单独指定结果审查子智能体
-```
-
-### 第二事实抽取模型（可选）
-
-第一轮事实抽取支持第二个多模态模型做 ensemble，减少图表和公式漏抽。三项都设置时启用；缺任意一项则保持单模型行为。
+`--analysis-backend llm` 时，第一轮事实抽取支持第二个多模态模型做 ensemble，减少图表和公式漏抽。三项都设置时启用；缺任意一项则保持单模型行为。默认 Codex analysis 路径不会叠加 `GENG_LLM2_*`。
 
 ```powershell
 $env:GENG_LLM2_MODEL="你的第二模型名"
@@ -154,8 +147,7 @@ $env:GENG_LLM2_API_KEY="你的第二模型 API Key"
 
 ```powershell
 pip install -e ".[web]"
-$env:GENG_LLM_API_KEY="你的 API Key"
-$env:GENG_LLM_MODEL="你的模型名"
+$env:GENG_CODEX_CMD="codex"
 # 可选：案例输出目录，默认 %USERPROFILE%\Documents\geng_cases
 # $env:GENG_CASES_ROOT="C:\Users\84475\Documents\耿同学agent"
 
@@ -165,7 +157,7 @@ geng-agent-web
 
 ## 使用
 
-默认只生成审查包和复现项目，不自动运行 LLM 生成的代码：
+默认只生成审查包和复现项目，不自动运行生成代码：
 
 ```bash
 python -m geng_agent review paper.pdf --out case_001
@@ -183,20 +175,20 @@ python -m geng_agent review paper.pdf --out case_001 --run-repro
 python -m geng_agent review paper.pdf --out case_001 --run-repro --no-result-review
 ```
 
-Round-3 project generation now defaults to the Codex CLI moderator workflow:
+默认模式下，前两阶段 analysis 和第三阶段 project generation 都走 Codex CLI 子进程：
 
 ```bash
 python -m geng_agent review paper.pdf --out case_001 --run-repro
 ```
 
-In that default mode, Codex writer/reviewer subprocesses own generated code and
-paper-vs-output feedback.
+Codex analysis 子进程负责事实抽取和任务拆解；Codex writer/reviewer 子进程负责生成代码、运行反馈和论文-结果对比。旧 LLM analysis 只在显式传 `--analysis-backend llm` 时启用。
 
 Optional Codex controls:
 
 ```bash
-python -m geng_agent review paper.pdf --out case_001 --run-repro --codex-agent-rounds 8 --codex-agent-stall-rounds 2 --codex-agent-timeout 1800
+python -m geng_agent review paper.pdf --out case_001 --run-repro --codex-analysis-timeout 600 --codex-agent-rounds 8 --codex-agent-stall-rounds 2 --codex-agent-timeout 1800
 set GENG_CODEX_CMD=codex
+set GENG_CODEX_ANALYSIS_CMD=codex
 set GENG_CODEX_WRITER_CMD=codex
 set GENG_CODEX_REVIEWER_CMD=codex
 ```
@@ -204,6 +196,10 @@ set GENG_CODEX_REVIEWER_CMD=codex
 常用参数：
 
 ```text
+--analysis-backend codex    前两阶段事实抽取/任务拆解 backend；默认 codex，llm 为旧兼容路径
+--codex-analysis-timeout 600 前两阶段单个 Codex analysis 子进程超时
+--facts-gap-rounds 6         第一轮事实查漏补缺最多 6 轮；一轮无新增即停，设 0 关闭
+--tasks-gap-rounds 6         第二轮任务查漏补缺最多 6 轮；全覆盖或一轮无新增即停，设 0 关闭
 --codex-agent-rounds 8       第三轮 Codex writer/reviewer 自适应闭环最大轮数；默认 8，不代表固定跑满
 --codex-agent-stall-rounds 2 连续 2 轮没有刷新最佳评分后停止；设 0 可关闭平台期停止
 --codex-agent-timeout 1800   单个 Codex writer/reviewer 子进程超时；当前没有第三轮总墙钟预算
@@ -225,14 +221,14 @@ case_001/
   risk_report.json
   generated_files.json
   review.md
-  result_review.json
   result_review.md
+  result_review.json          # 旧结构化 result-review 路径可能生成
   result_review_error.json
   audit/
     01_extract_engineering_facts.md
     02_build_repro_tasks.md
-    03_generate_repro_project.md
-    04_review_reproduction_results.md
+    03c_agentic_project_*.json
+    03c_*_brief.md
     raw_*.txt
     validation_*.json
   repro_project/
@@ -250,7 +246,7 @@ case_001/
     outputs/
 ```
 
-`result_review.json/md` 只会在 `--run-repro` 成功并且多模态结果审查通过时生成；失败时生成 `result_review_error.json`。
+默认 Codex 路径下，`result_review.md` 只会在 `--run-repro` 产生可用输出并且 reviewer 完成时生成；失败时生成 `result_review_error.json`。`result_review.json` 主要保留给旧结构化 result-review 路径。
 
 ## Schema 真源
 
@@ -277,13 +273,13 @@ schemas/
 python -m geng_agent.export_schemas --out schemas
 ```
 
-文本阶段会优先把对应 JSON Schema 作为 `response_format` 发给兼容模型；如果服务端不支持严格 `json_schema`，客户端会退回 `json_object`，但本地仍会用 Pydantic 再审查一次。多模态结果审查不会退回纯文本替代。
+默认 Codex analysis 阶段会把 JSON Schema 写入 audit 并在 prompt 中展示，但不把含自由字典字段的 schema 直接传给 Codex CLI 的 `--output-schema`；最终结构、source 回指和业务规则由本地 Pydantic/coverage 校验兜底。旧 `--analysis-backend llm` 路径会把 JSON Schema 作为 `response_format` 发给兼容模型，如果服务端不支持严格 `json_schema`，客户端会退回 `json_object`。无论哪条路径，本地都会用 Pydantic 再审查一次。
 
 ## 核心原则
 
-- LLM 负责抽取事实、设计复现任务、生成代码、修复代码和审查复现结果。
+- 默认由 Codex 子智能体负责抽取事实、设计复现任务、生成代码和审查复现结果；旧 LLM analysis 只在显式选择时启用。
 - 本地程序负责 Pydantic JSON 审查、路径审查、安全扫描、语法检查、运行验证、图像打包和风险汇总。
-- 首轮工程事实先做本地归一化、部分接受和截断抢救，尽量保住 LLM 的真实抽取而不是退回关键词 fallback；所有纠正和被丢弃的事实都记入 `_meta` 并在 `risk_report.json` 标注，绝不凭空编造，无有效 `source.chunk_id` 出处的事实仍会被丢弃。
+- 首轮工程事实先做本地归一化、部分接受和截断抢救，尽量保住模型的真实抽取而不是退回关键词 fallback；所有纠正和被丢弃的事实都记入 `_meta` 并在 `risk_report.json` 标注，绝不凭空编造，无有效 `source.chunk_id` 出处的事实仍会被丢弃。
 - 论文文本、日志、stdout/stderr、代码片段、表格和图像都按 `UNTRUSTED DATA` 处理。
-- `risk_report.json` 和 `result_review.json` 只表达复现风险与差异分析，不直接给出造假结论。
+- `risk_report.json` 和 `result_review.md` 只表达复现风险与差异分析，不直接给出造假结论。
 - smoke 通过只说明“轻量复现项目能跑并生成格式正确的产物”，不代表论文已经完整复现。

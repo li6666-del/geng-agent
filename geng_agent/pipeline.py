@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .documents import load_paper
+from .agentic_analysis import CODEX_ANALYSIS_BACKEND, run_codex_json_stage
 from .experiment_index import build_local_experiment_index
 from .facts_coverage import (
     compute_fact_coverage,
@@ -286,7 +287,7 @@ def _inject_task_scaffolding(manifest: dict[str, Any], repro_project_dir: Path) 
 class ReviewPipeline:
     def __init__(
         self,
-        client: LLMClient,
+        client: LLMClient | None = None,
         prompt_book: PromptBook | None = None,
         extraction_client_2: LLMClient | None = None,
     ) -> None:
@@ -298,7 +299,7 @@ class ReviewPipeline:
 
     def _llm_clients(self) -> list[Any]:
         """The distinct LLM clients whose token usage should roll up into run_cost.json."""
-        clients: list[Any] = [self.client]
+        clients: list[Any] = [self.client] if self.client is not None else []
         for extra in (self.extraction_client_2,):
             if extra is not None and all(extra is not existing for existing in clients):
                 clients.append(extra)
@@ -348,8 +349,10 @@ class ReviewPipeline:
         project_timeout: float = 1200.0,
         result_review: bool = True,
         template_fallback: bool = True,
-        facts_gap_rounds: int = 3,
-        tasks_gap_rounds: int = 3,
+        facts_gap_rounds: int = 6,
+        tasks_gap_rounds: int = 6,
+        analysis_backend: str | None = None,
+        codex_analysis_timeout: float | None = None,
         project_backend: str = "llm",
         codex_agent_rounds: int = 8,
         codex_agent_stall_rounds: int = 2,
@@ -388,6 +391,8 @@ class ReviewPipeline:
             template_fallback=template_fallback,
             facts_gap_rounds=facts_gap_rounds,
             tasks_gap_rounds=tasks_gap_rounds,
+            analysis_backend=analysis_backend,
+            codex_analysis_timeout=codex_analysis_timeout,
             project_backend=project_backend,
             codex_agent_rounds=codex_agent_rounds,
             codex_agent_stall_rounds=codex_agent_stall_rounds,
@@ -408,10 +413,12 @@ class ReviewPipeline:
         result_review: bool = True,
         resume: bool = True,
         template_fallback: bool = True,
-        facts_gap_rounds: int = 3,
-        tasks_gap_rounds: int = 3,
+        facts_gap_rounds: int = 6,
+        tasks_gap_rounds: int = 6,
         per_task_layout: bool = False,
         science_loop: bool = False,
+        analysis_backend: str | None = None,
+        codex_analysis_timeout: float | None = None,
         project_backend: str = "llm",
         codex_agent_rounds: int = 8,
         codex_agent_stall_rounds: int = 2,
@@ -421,6 +428,14 @@ class ReviewPipeline:
         output_dir.mkdir(parents=True, exist_ok=True)
         audit_dir = output_dir / "audit"
         audit_dir.mkdir(parents=True, exist_ok=True)
+        if analysis_backend is None:
+            analysis_backend = CODEX_ANALYSIS_BACKEND if self.client is None or project_backend == "codex" else "llm"
+        if analysis_backend not in {CODEX_ANALYSIS_BACKEND, "llm"}:
+            raise ValueError(f"unknown analysis_backend: {analysis_backend}")
+        if analysis_backend == "llm" and self.client is None:
+            raise ValueError("analysis_backend='llm' requires an LLM client")
+        if project_backend == "llm" and self.client is None:
+            raise ValueError("project_backend='llm' requires an LLM client")
 
         run_start = time.perf_counter()
         cost_marks: list[dict[str, Any]] = []
@@ -467,7 +482,7 @@ class ReviewPipeline:
             "extract_engineering_facts.md",
             paper_chunks_json=paper_context,
         )
-        if self.extraction_client_2 is None:
+        if analysis_backend == CODEX_ANALYSIS_BACKEND or self.extraction_client_2 is None:
             facts = self._load_or_create_stage_json(
                 output_path=output_dir / "engineering_facts.json",
                 output_dir=output_dir,
@@ -485,10 +500,12 @@ class ReviewPipeline:
                 ),
                 candidate_normalizer=lambda parsed: finalize_engineering_facts(parsed, valid_chunk_ids, valid_pages),
                 truncation_recovery=recover_truncated_engineering_facts,
+                backend=analysis_backend,
+                codex_timeout=codex_analysis_timeout,
                 fallback_factory=(
                     (lambda exc: build_fallback_engineering_facts(
                         paper=paper,
-                        reason=f"LLM engineering fact extraction failed after retries: {exc}",
+                        reason=f"{analysis_backend} engineering fact extraction failed after retries: {exc}",
                     ))
                     if template_fallback
                     else None
@@ -525,6 +542,8 @@ class ReviewPipeline:
             resume=resume,
             max_attempts=json_repair_attempts + 1,
             max_rounds=facts_gap_rounds,
+            analysis_backend=analysis_backend,
+            codex_analysis_timeout=codex_analysis_timeout,
         )
 
         _mark("facts")
@@ -545,6 +564,8 @@ class ReviewPipeline:
                 paper_images=paper_images,
                 resume=resume,
                 max_attempts=json_repair_attempts + 1,
+                analysis_backend=analysis_backend,
+                codex_analysis_timeout=codex_analysis_timeout,
             )
             _mark("thesis")
 
@@ -567,11 +588,13 @@ class ReviewPipeline:
             candidate_normalizer=lambda parsed: finalize_repro_tasks(parsed, facts),
             truncation_recovery=recover_truncated_repro_tasks,
             request_timeout=tasks_timeout,
+            backend=analysis_backend,
+            codex_timeout=codex_analysis_timeout,
             fallback_factory=(
                 (lambda exc: build_fallback_repro_tasks(
                     facts=facts,
                     paper=paper,
-                    reason=f"LLM reproduction task generation failed after retries: {exc}",
+                    reason=f"{analysis_backend} reproduction task generation failed after retries: {exc}",
                 ))
                 if template_fallback
                 else None
@@ -590,6 +613,8 @@ class ReviewPipeline:
             max_attempts=json_repair_attempts + 1,
             max_rounds=tasks_gap_rounds,
             tasks_timeout=tasks_timeout,
+            analysis_backend=analysis_backend,
+            codex_analysis_timeout=codex_analysis_timeout,
         )
         _mark("tasks")
         experiment_index = self._load_or_create_experiment_index(
@@ -828,13 +853,18 @@ class ReviewPipeline:
             },
         )
         _mark("reports")
+        run_cost = _build_run_cost(
+            cost_marks,
+            total_wall_s=round(time.perf_counter() - run_start, 3),
+            by_model=self._usage_by_model(),
+        )
+        run_cost["analysis_backend"] = analysis_backend
+        run_cost["project_backend"] = project_backend
+        if analysis_backend == CODEX_ANALYSIS_BACKEND:
+            run_cost["codex_analysis_timeout_s"] = codex_analysis_timeout or 600.0
         write_json(
             output_dir / "run_cost.json",
-            _build_run_cost(
-                cost_marks,
-                total_wall_s=round(time.perf_counter() - run_start, 3),
-                by_model=self._usage_by_model(),
-            ),
+            run_cost,
         )
 
         result_review_json_path = output_dir / "result_review.json"
@@ -898,6 +928,8 @@ class ReviewPipeline:
         truncation_recovery: Callable[[str], dict[str, Any] | None] | None = None,
         images: list | None = None,
         client: Any = None,
+        backend: str = "llm",
+        codex_timeout: float | None = None,
     ) -> dict[str, Any]:
         if resume and output_path.exists():
             cached = _load_valid_stage_cache(
@@ -913,19 +945,36 @@ class ReviewPipeline:
         _clear_stage_outputs(output_dir, cleanup_stage)
         write_text(audit_dir / f"{stage_label}.md", prompt)
         try:
-            parsed = self._call_validated_json(
-                prompt=prompt,
-                stage_label=stage_label,
-                schema_stage=schema_stage,
-                audit_dir=audit_dir,
-                max_attempts=max_attempts,
-                extra_validation=extra_validation,
-                request_timeout=request_timeout,
-                candidate_normalizer=candidate_normalizer,
-                truncation_recovery=truncation_recovery,
-                images=images,
-                client=client,
-            )
+            if backend == CODEX_ANALYSIS_BACKEND:
+                parsed = run_codex_json_stage(
+                    prompt=prompt,
+                    stage_label=stage_label,
+                    schema_stage=schema_stage,
+                    output_dir=output_dir,
+                    audit_dir=audit_dir,
+                    max_attempts=max_attempts,
+                    timeout=codex_timeout,
+                    extra_validation=extra_validation,
+                    candidate_normalizer=candidate_normalizer,
+                    truncation_recovery=truncation_recovery,
+                    images=images,
+                )
+            elif backend == "llm":
+                parsed = self._call_validated_json(
+                    prompt=prompt,
+                    stage_label=stage_label,
+                    schema_stage=schema_stage,
+                    audit_dir=audit_dir,
+                    max_attempts=max_attempts,
+                    extra_validation=extra_validation,
+                    request_timeout=request_timeout,
+                    candidate_normalizer=candidate_normalizer,
+                    truncation_recovery=truncation_recovery,
+                    images=images,
+                    client=client,
+                )
+            else:
+                raise ValueError(f"unknown analysis backend: {backend}")
         except Exception as exc:
             if fallback_factory is None:
                 raise
@@ -958,6 +1007,8 @@ class ReviewPipeline:
         paper_images: list,
         resume: bool,
         max_attempts: int,
+        analysis_backend: str = "llm",
+        codex_analysis_timeout: float | None = None,
     ) -> dict[str, Any] | None:
         """Distill the paper's central thesis: claim + mechanism + the head-to-head method
         orderings it asserts. Multimodal (the main result figure carries the headline shape).
@@ -980,6 +1031,8 @@ class ReviewPipeline:
                 max_attempts=max_attempts,
                 resume=resume,
                 images=paper_images,
+                backend=analysis_backend,
+                codex_timeout=codex_analysis_timeout,
                 fallback_factory=None,
             )
         except Exception as exc:
@@ -1101,6 +1154,8 @@ class ReviewPipeline:
         resume: bool,
         max_attempts: int,
         max_rounds: int,
+        analysis_backend: str = "llm",
+        codex_analysis_timeout: float | None = None,
     ) -> dict[str, Any]:
         """Round-1 recall hardening. After the first extraction, deterministically compute
         which paper figures/tables the facts actually cover, then run a targeted LLM
@@ -1147,6 +1202,8 @@ class ReviewPipeline:
                     ),
                     truncation_recovery=recover_truncated_engineering_facts,
                     images=paper_images,
+                    backend=analysis_backend,
+                    codex_timeout=codex_analysis_timeout,
                     fallback_factory=None,
                 )
             except Exception as exc:
@@ -1161,6 +1218,14 @@ class ReviewPipeline:
             gap_meta = dict(meta.get("gap_finder", {})) if isinstance(meta.get("gap_finder"), dict) else {}
             gap_meta[f"round_{round_no}_added"] = added
             gap_meta["rounds_run"] = round_no
+            gap_meta["max_rounds"] = max_rounds
+            terminal_stop = None
+            if added == 0:
+                terminal_stop = "no_new_facts"
+            elif round_no >= max_rounds:
+                terminal_stop = "max_rounds"
+            if terminal_stop is not None:
+                gap_meta["stop_reason"] = terminal_stop
             meta["gap_finder"] = gap_meta
             facts["_meta"] = meta
             write_json(output_dir / "engineering_facts.json", facts)
@@ -1172,6 +1237,8 @@ class ReviewPipeline:
                     "total_facts": len(facts.get("engineering_facts", [])),
                     "uncovered_figures_before": coverage.get("uncovered_figures"),
                     "uncovered_tables_before": coverage.get("uncovered_tables"),
+                    "max_rounds": max_rounds,
+                    "stop_reason": terminal_stop,
                 },
             )
             if added == 0:
@@ -1190,6 +1257,8 @@ class ReviewPipeline:
         max_attempts: int,
         max_rounds: int,
         tasks_timeout: float,
+        analysis_backend: str = "llm",
+        codex_analysis_timeout: float | None = None,
     ) -> dict[str, Any]:
         """Round-2 recall hardening -- the round-1 idea applied to task building. Deterministically
         check that every reproducible experiment (a figure_claim fact) has a repro task; for any
@@ -1205,6 +1274,26 @@ class ReviewPipeline:
             coverage = compute_task_coverage(facts, tasks)
             write_json(audit_dir / f"tasks_coverage_round_{round_no}.json", coverage)
             if coverage["fully_covered"]:
+                meta = dict(tasks.get("_meta", {})) if isinstance(tasks.get("_meta"), dict) else {}
+                gap_meta = dict(meta.get("gap_finder", {})) if isinstance(meta.get("gap_finder"), dict) else {}
+                gap_meta["rounds_run"] = max(0, round_no - 1)
+                gap_meta["max_rounds"] = max_rounds
+                gap_meta["stop_reason"] = "coverage_complete"
+                meta["gap_finder"] = gap_meta
+                tasks["_meta"] = meta
+                write_json(output_dir / "repro_tasks.json", tasks)
+                write_json(
+                    audit_dir / f"tasks_gap_round_{round_no}_summary.json",
+                    {
+                        "ok": True,
+                        "added_tasks": 0,
+                        "total_tasks": len(tasks.get("repro_tasks", [])),
+                        "uncovered_figures_before": coverage.get("uncovered_figures"),
+                        "uncovered_tables_before": coverage.get("uncovered_tables"),
+                        "max_rounds": max_rounds,
+                        "stop_reason": "coverage_complete",
+                    },
+                )
                 break  # every reproducible experiment already has a task
 
             gap_prompt = self.prompt_book.render(
@@ -1232,6 +1321,8 @@ class ReviewPipeline:
                     candidate_normalizer=lambda parsed: finalize_repro_tasks(parsed, facts),
                     truncation_recovery=recover_truncated_repro_tasks,
                     request_timeout=tasks_timeout,
+                    backend=analysis_backend,
+                    codex_timeout=codex_analysis_timeout,
                     fallback_factory=None,
                 )
             except Exception as exc:
@@ -1259,6 +1350,14 @@ class ReviewPipeline:
             gap_meta = dict(meta.get("gap_finder", {})) if isinstance(meta.get("gap_finder"), dict) else {}
             gap_meta[f"round_{round_no}_added"] = added
             gap_meta["rounds_run"] = round_no
+            gap_meta["max_rounds"] = max_rounds
+            terminal_stop = None
+            if added == 0:
+                terminal_stop = "no_new_tasks"
+            elif round_no >= max_rounds:
+                terminal_stop = "max_rounds"
+            if terminal_stop is not None:
+                gap_meta["stop_reason"] = terminal_stop
             meta["gap_finder"] = gap_meta
             tasks["_meta"] = meta
             write_json(output_dir / "repro_tasks.json", tasks)
@@ -1270,6 +1369,8 @@ class ReviewPipeline:
                     "total_tasks": len(tasks.get("repro_tasks", [])),
                     "uncovered_figures_before": coverage.get("uncovered_figures"),
                     "uncovered_tables_before": coverage.get("uncovered_tables"),
+                    "max_rounds": max_rounds,
+                    "stop_reason": terminal_stop,
                 },
             )
             if added == 0:
@@ -1610,11 +1711,13 @@ class ReviewPipeline:
         """Render every page of a PDF paper to images for multimodal prompting, so the
         figures/diagrams/axis-labels/in-figure values that plain text extraction drops are
         still seen by fact-extraction and code-generation. Returns [] for non-PDF papers,
-        when the main client has no multimodal support, or if rendering is unavailable, so
-        callers transparently fall back to text-only."""
+        when a configured LLM client has no multimodal support, or if rendering is
+        unavailable, so callers transparently fall back to text-only. A missing
+        LLM client still renders pages because the Codex analysis backend can pass
+        images directly to Codex CLI."""
         if paper.get("format") != "pdf":
             return []
-        if not hasattr(self.client, "complete_multimodal"):
+        if self.client is not None and not hasattr(self.client, "complete_multimodal"):
             return []
         try:
             from .result_review import render_pdf_pages_for_llm
@@ -1631,6 +1734,8 @@ class ReviewPipeline:
         breaks the stage. ``client`` defaults to the primary client; the ensemble passes
         the secondary extraction client here."""
         client = client or self.client
+        if client is None:
+            raise RuntimeError("LLM client is required for analysis_backend='llm'")
         response_format = response_format_for_stage(schema_stage)
         if images and hasattr(client, "complete_multimodal"):
             try:

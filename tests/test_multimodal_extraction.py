@@ -62,6 +62,20 @@ class RenderPaperImagesTests(unittest.TestCase):
         pipeline = ReviewPipeline(client=TextOnlyClient())
         self.assertEqual(pipeline._render_paper_images(paper_path=SAMPLE_PDF, paper={"format": "pdf"}), [])
 
+    def test_renders_without_client_for_codex_backend(self) -> None:
+        if not SAMPLE_PDF.exists():
+            self.skipTest("sample PDF not available")
+        try:
+            import fitz  # noqa: F401
+            from PIL import Image  # noqa: F401
+        except ImportError:
+            self.skipTest("pymupdf/Pillow not installed")
+        images = ReviewPipeline(client=None)._render_paper_images(
+            paper_path=SAMPLE_PDF, paper={"format": "pdf"}
+        )
+        self.assertGreaterEqual(len(images), 1)
+        self.assertEqual(images[0].mime_type, "image/png")
+
     def test_real_pdf_renders_images(self) -> None:
         if not SAMPLE_PDF.exists():
             self.skipTest("sample PDF not available")

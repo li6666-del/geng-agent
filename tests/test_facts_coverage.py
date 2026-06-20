@@ -159,6 +159,30 @@ class _GapLLM:
         })
 
 
+class _AlwaysNewGapLLM:
+    """Returns one unique fact every time, so the gap loop can only stop at max_rounds."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def complete(self, prompt: str, *, system=None, response_format=None) -> str:
+        self.calls += 1
+        return json.dumps({
+            "paper_domain": "communication",
+            "paper_repro_type": "other",
+            "engineering_facts": [{
+                "type": "simulation_parameter",
+                "name": f"gap_fact_{self.calls}",
+                "value": {"round": self.calls},
+                "source": {"source_kind": "text", "chunk_id": "c1", "page": 1,
+                           "section": "S", "quote": f"gap fact {self.calls}", "figure_ref": ""},
+                "confidence": "high",
+                "used_for_reproduction": True,
+            }],
+            "missing_information": [],
+        })
+
+
 class GapFinderIntegrationTests(unittest.TestCase):
     def test_gap_finder_adds_missing_fact_merges_and_terminates(self) -> None:
         base = {
@@ -193,6 +217,35 @@ class GapFinderIntegrationTests(unittest.TestCase):
             self.assertEqual(client.calls, 2)
             written = json.loads((out_dir / "engineering_facts.json").read_text(encoding="utf-8"))
             self.assertEqual(written["_meta"]["gap_finder"]["round_1_added"], 1)
+            self.assertEqual(written["_meta"]["gap_finder"]["round_2_added"], 0)
+            self.assertEqual(written["_meta"]["gap_finder"]["stop_reason"], "no_new_facts")
+
+    def test_gap_finder_runs_until_six_round_cap_when_always_adding(self) -> None:
+        base = {
+            "paper_domain": "communication",
+            "paper_repro_type": "other",
+            "engineering_facts": [],
+            "missing_information": [],
+        }
+        paper = {"chunks": [{"chunk_id": "c1", "text": "Fig. 1 reports a curve.", "page": 1, "section": "S"}]}
+
+        with TemporaryDirectory() as d:
+            out_dir = Path(d)
+            (out_dir / "audit").mkdir()
+            client = _AlwaysNewGapLLM()
+            pipe = ReviewPipeline(client=client)
+            result = pipe._augment_facts_with_gap_finder(
+                facts=base, paper=paper, paper_context="ctx", paper_images=[],
+                valid_chunk_ids={"c1"}, valid_pages=set(),
+                output_dir=out_dir, audit_dir=out_dir / "audit",
+                resume=False, max_attempts=1, max_rounds=6,
+            )
+
+            self.assertEqual(client.calls, 6)
+            self.assertEqual(len(result["engineering_facts"]), 6)
+            self.assertEqual(result["_meta"]["gap_finder"]["rounds_run"], 6)
+            self.assertEqual(result["_meta"]["gap_finder"]["max_rounds"], 6)
+            self.assertEqual(result["_meta"]["gap_finder"]["stop_reason"], "max_rounds")
 
     def test_zero_rounds_is_a_noop(self) -> None:
         base = {"paper_domain": "communication", "paper_repro_type": "other",
@@ -326,6 +379,7 @@ class TasksGapFinderIntegrationTests(unittest.TestCase):
             self.assertEqual(figs, {"Fig. 4", "Fig. 7"})   # gap task added
             self.assertEqual(client.calls, 1)              # 1 gap call; then fully covered -> stop
             self.assertEqual(result["_meta"]["gap_finder"]["round_1_added"], 1)
+            self.assertEqual(result["_meta"]["gap_finder"]["stop_reason"], "coverage_complete")
             self.assertTrue((out_dir / "repro_tasks.json").exists())
 
     def test_no_gap_call_when_already_fully_covered(self) -> None:
@@ -393,6 +447,7 @@ class TaskGapMetricGateTests(unittest.TestCase):
             )
             figs = {t["figure_or_claim"] for t in result["repro_tasks"]}
             self.assertEqual(figs, {"Fig. 4"})  # the metric=other Fig.7 task was rejected, not added
+            self.assertEqual(result["_meta"]["gap_finder"]["stop_reason"], "no_new_tasks")
             self.assertTrue((Path(d) / "audit" / "tasks_gap_round_1_rejected.json").exists())
 
 
