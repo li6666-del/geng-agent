@@ -11,7 +11,7 @@ class CliDefaultsTests(unittest.TestCase):
         args = parser.parse_args(["review", "paper.pdf", "--out", "case"])
         self.assertEqual(args.analysis_backend, "codex")
         self.assertIsNone(args.codex_analysis_timeout)
-        self.assertEqual(args.facts_gap_rounds, 6)
+        self.assertEqual(args.facts_gap_rounds, 10)
         self.assertEqual(args.tasks_gap_rounds, 6)
         self.assertEqual(args.codex_agent_rounds, 8)
         self.assertEqual(args.codex_agent_stall_rounds, 2)

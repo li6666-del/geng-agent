@@ -56,7 +56,7 @@ def _add_common_review_args(parser: argparse.ArgumentParser, *, include_resume: 
     parser.add_argument("--no-template-fallback", action="store_true", help="禁用本地确定性兜底；默认启用以提高端到端稳定性。")
     parser.add_argument("--run-timeout", type=float, default=120.0, help="单次复现运行超时时间，单位秒。")
     parser.add_argument("--json-repair-attempts", type=int, default=5, help="每轮 JSON 结构审查失败后的返修次数（默认 5：实跑发现最难的科学文件 src/modulation.py 偶发语法/结构错，3 次重试不够会拖垮整个逐任务项目→兜底；只在失败时才追加重试，文件一次过则无额外开销）。")
-    parser.add_argument("--facts-gap-rounds", type=int, default=6, help="第一轮事实抽取后的“查漏补缺”追加轮数（确定性覆盖校验图/表锚点 + 定向补抽遗漏事实），循环到一轮无新增为止；默认最多 6 轮，设 0 关闭。")
+    parser.add_argument("--facts-gap-rounds", type=int, default=10, help="第一轮事实抽取后的“查漏补缺”追加轮数（确定性覆盖校验图/表锚点 + 定向补抽遗漏事实），循环到一轮无新增为止；默认最多 10 轮，设 0 关闭。")
     parser.add_argument("--tasks-gap-rounds", type=int, default=6, help="第二轮复现任务设计后的“查漏补缺”追加轮数（确定性校验每个可复现实验是否都有任务 + 为遗漏实验补任务），循环到全覆盖或无新增为止；默认最多 6 轮，设 0 关闭。")
     parser.add_argument("--science-loop", action="store_true", help="开启论文思路锚点，供第三轮 Codex writer/reviewer 闭环使用。")
     parser.add_argument(

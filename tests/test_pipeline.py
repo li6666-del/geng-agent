@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -144,6 +145,10 @@ class FakeLLM:
 
 
 class PipelineTests(unittest.TestCase):
+    def test_facts_gap_rounds_default_is_ten(self) -> None:
+        self.assertEqual(inspect.signature(ReviewPipeline.run).parameters["facts_gap_rounds"].default, 10)
+        self.assertEqual(inspect.signature(ReviewPipeline.run_stage).parameters["facts_gap_rounds"].default, 10)
+
     def test_normalizes_manifest_with_extra_descriptive_fields(self) -> None:
         manifest = {
             "schema_version": "not part of schema",

@@ -7,6 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from geng_agent.agentic_project import (
+    _augment_review_display_images,
     _feedback_from_results,
     _is_better_score,
     _is_success,
@@ -841,6 +842,48 @@ class AgenticProjectWorkflowTests(unittest.TestCase):
         self.assertIn("![本地复现图: reproduce_fig_1/fig1.png](C:/tmp/local_fig1.png)", section)
         self.assertIn("![论文原图页: p3](C:/tmp/paper_page_3.png)", section)
         self.assertIn("### 审查正文", section)
+
+    def test_task_markdown_section_prefers_paper_crop_when_available(self) -> None:
+        try:
+            from PIL import Image, ImageDraw
+        except Exception:
+            self.skipTest("Pillow is not available")
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paper_page = root / "paper_page_3.png"
+            image = Image.new("RGB", (800, 1000), "white")
+            draw = ImageDraw.Draw(image)
+            draw.rectangle((120, 220, 680, 560), fill=(220, 220, 220), outline=(0, 0, 0), width=4)
+            for y in range(260, 540, 40):
+                draw.line((150, y, 650, y), fill=(70, 70, 70), width=2)
+            image.save(paper_page)
+
+            display_entries = _augment_review_display_images(
+                task={"task_id": "reproduce_fig_2", "figure_or_claim": "Fig. 2"},
+                image_entries=[
+                    {
+                        "label": "paper_page:3",
+                        "kind": "paper_page",
+                        "mime_type": "image/png",
+                        "path": str(paper_page),
+                    }
+                ],
+            )
+            crop_entries = [entry for entry in display_entries if entry.get("kind") == "paper_crop"]
+            self.assertEqual(len(crop_entries), 1)
+            self.assertTrue(Path(str(crop_entries[0]["path"])).exists())
+
+            section = _render_task_markdown_section(
+                index=1,
+                task_id="reproduce_fig_2",
+                image_entries=display_entries,
+                body_markdown="Reviewer body.",
+            )
+
+            self.assertIn("![论文原图裁剪: Fig. 2, p3](", section)
+            self.assertIn(str(crop_entries[0]["path"]), section)
+            self.assertNotIn(f"]({paper_page})", section)
 
     def test_cached_markdown_review_ignored_when_newer_error_exists(self) -> None:
         with TemporaryDirectory() as temp_dir:

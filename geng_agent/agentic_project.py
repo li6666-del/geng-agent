@@ -582,6 +582,7 @@ def _run_codex_result_review(
         task_id = str(task.get("task_id") or f"task_{index}")
         selected = select_images_for_task(task=task, evidence=evidence, images=images, paper=paper, facts=facts)
         image_entries = _write_review_images(audit_dir, f"{round_label}_{index:02d}_{safe_label(task_id)}", selected)
+        display_image_entries = _augment_review_display_images(task=task, image_entries=image_entries)
         image_paths = [Path(str(entry["path"])) for entry in image_entries if entry.get("path")]
         task_evidence = compact_result_evidence_for_task(evidence=evidence, task=task, selected_images=selected)
         task_context = paper_context_for_task(paper=paper, facts=facts, task=task)
@@ -620,7 +621,7 @@ def _run_codex_result_review(
                 _render_task_markdown_section(
                     index=index,
                     task_id=task_id,
-                    image_entries=image_entries,
+                    image_entries=display_image_entries,
                     body_markdown=markdown,
                 )
             )
@@ -630,6 +631,7 @@ def _run_codex_result_review(
                     "stage_label": base_stage_label,
                     "attempts": 1,
                     "images_sent": image_entries,
+                    "display_images": display_image_entries,
                     "paper_pages_sent": task_evidence.get("selected_paper_pages", []),
                     "backend": "codex",
                     "transport_ok": bool(status.get("ok")),
@@ -656,7 +658,7 @@ def _run_codex_result_review(
                 _render_task_markdown_section(
                     index=index,
                     task_id=task_id,
-                    image_entries=image_entries,
+                    image_entries=display_image_entries,
                     body_markdown=failed_section,
                 )
             )
@@ -668,6 +670,7 @@ def _run_codex_result_review(
                     "backend": "codex",
                     "error": error,
                     "images_sent": image_entries,
+                    "display_images": display_image_entries,
                     "paper_pages_sent": task_evidence.get("selected_paper_pages", []),
                     "review_summary_path": str(review_summary_path),
                     "scientific_verdict": review_summary.get("scientific_verdict"),
@@ -915,9 +918,9 @@ def _render_task_markdown_section(
 ) -> str:
     lines = [f"## {index}. {task_id}", ""]
     local_images = _select_task_local_image_entries(task_id, image_entries)
-    paper_images = [entry for entry in image_entries if entry.get("kind") == "paper_page"]
+    paper_images = _select_task_paper_display_entries(image_entries)
     lines.extend(_render_markdown_image_group("本地复现图", local_images))
-    lines.extend(_render_markdown_image_group("论文原图页", paper_images))
+    lines.extend(_render_markdown_image_group("论文原图", paper_images))
     lines.extend(["### 审查正文", "", body_markdown.strip()])
     return "\n".join(lines).strip() + "\n"
 
@@ -929,13 +932,250 @@ def _select_task_local_image_entries(task_id: str, image_entries: list[dict[str,
     return preferred or local_images
 
 
+def _select_task_paper_display_entries(image_entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    paper_pages = [entry for entry in image_entries if entry.get("kind") == "paper_page"]
+    paper_crops = [entry for entry in image_entries if entry.get("kind") == "paper_crop"]
+    if not paper_crops:
+        return paper_pages
+
+    crops_by_source: dict[str, list[dict[str, Any]]] = {}
+    for crop in paper_crops:
+        source_label = str(crop.get("source_label") or "")
+        if source_label:
+            crops_by_source.setdefault(source_label, []).append(crop)
+
+    selected: list[dict[str, Any]] = []
+    used_crop_ids: set[int] = set()
+    for page in paper_pages:
+        page_crops = crops_by_source.get(str(page.get("label") or ""), [])
+        if page_crops:
+            selected.extend(page_crops)
+            used_crop_ids.update(id(crop) for crop in page_crops)
+        else:
+            selected.append(page)
+    for crop in paper_crops:
+        if id(crop) not in used_crop_ids:
+            selected.append(crop)
+    return selected
+
+
+def _augment_review_display_images(*, task: dict[str, Any], image_entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    display_entries = [dict(entry) for entry in image_entries]
+    crop_entries: list[dict[str, Any]] = []
+    for entry in display_entries:
+        if entry.get("kind") != "paper_page":
+            continue
+        crop_entry = _create_paper_crop_entry(task=task, page_entry=entry)
+        if crop_entry:
+            crop_entries.append(crop_entry)
+    return display_entries + crop_entries
+
+
+def _create_paper_crop_entry(*, task: dict[str, Any], page_entry: dict[str, Any]) -> dict[str, Any] | None:
+    source_path_text = str(page_entry.get("path") or "")
+    if not source_path_text:
+        return None
+    source_path = Path(source_path_text)
+    if not source_path.exists() or not source_path.is_file():
+        return None
+    target_path = source_path.with_name(f"{source_path.stem}_crop.png")
+    crop_info = _write_best_effort_paper_figure_crop(source_path=source_path, target_path=target_path)
+    if not crop_info:
+        return None
+    page_no = _paper_page_number_from_label(str(page_entry.get("label") or ""))
+    figure_label = _task_figure_label(task)
+    caption_bits = [bit for bit in (figure_label, f"p{page_no}" if page_no else "") if bit]
+    caption_suffix = ", ".join(caption_bits)
+    caption = "论文原图裁剪" if not caption_suffix else f"论文原图裁剪: {caption_suffix}"
+    label_bits = ["paper_crop", safe_label(figure_label or "figure")]
+    if page_no:
+        label_bits.append(f"p{page_no}")
+    return {
+        "label": ":".join(label_bits),
+        "kind": "paper_crop",
+        "mime_type": "image/png",
+        "path": str(target_path.resolve()),
+        "caption": caption,
+        "source_label": str(page_entry.get("label") or ""),
+        "source_path": str(source_path.resolve()),
+        "crop_box": crop_info.get("crop_box"),
+        "crop_reason": crop_info.get("crop_reason"),
+    }
+
+
+def _write_best_effort_paper_figure_crop(*, source_path: Path, target_path: Path) -> dict[str, Any] | None:
+    try:
+        from PIL import Image
+    except Exception:
+        return None
+
+    try:
+        with Image.open(source_path) as opened:
+            image = opened.convert("RGB")
+            width, height = image.size
+            if width < 180 or height < 180:
+                return None
+            analysis_width = min(width, 900)
+            analysis_height = max(1, int(height * (analysis_width / width)))
+            gray = image.convert("L").resize((analysis_width, analysis_height))
+            rows = _paper_crop_row_stats(gray)
+            segment = _best_paper_figure_segment(rows=rows, width=analysis_width, height=analysis_height)
+            if not segment:
+                return None
+
+            y0, y1 = segment["start"], segment["end"]
+            margin_x = max(6, int(analysis_width * 0.035))
+            margin_y = max(5, int(analysis_height * 0.018))
+            caption_extra = max(8, int(analysis_height * 0.055))
+            top = max(0, y0 - margin_y)
+            bottom = min(analysis_height - 1, y1 + margin_y + caption_extra)
+            x_bounds = _paper_crop_x_bounds(rows=rows, start=top, end=bottom)
+            if not x_bounds:
+                return None
+            left = max(0, x_bounds[0] - margin_x)
+            right = min(analysis_width - 1, x_bounds[1] + margin_x)
+
+            scale_x = width / analysis_width
+            scale_y = height / analysis_height
+            box = (
+                max(0, int(left * scale_x)),
+                max(0, int(top * scale_y)),
+                min(width, int((right + 1) * scale_x)),
+                min(height, int((bottom + 1) * scale_y)),
+            )
+            if not _is_useful_paper_crop(box=box, page_size=(width, height)):
+                return None
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            image.crop(box).save(target_path, format="PNG")
+            return {"crop_box": list(box), "crop_reason": "largest_dense_page_region"}
+    except Exception:
+        return None
+
+
+def _paper_crop_row_stats(gray_image: Any) -> list[dict[str, int]]:
+    width, height = gray_image.size
+    pixels = gray_image.load()
+    rows: list[dict[str, int]] = []
+    for y in range(height):
+        count = 0
+        left = width
+        right = -1
+        for x in range(width):
+            if pixels[x, y] < 245:
+                count += 1
+                if x < left:
+                    left = x
+                if x > right:
+                    right = x
+        rows.append({"count": count, "left": left if count else -1, "right": right})
+    return rows
+
+
+def _best_paper_figure_segment(*, rows: list[dict[str, int]], width: int, height: int) -> dict[str, Any] | None:
+    row_threshold = max(4, int(width * 0.015))
+    merge_gap = max(4, int(height * 0.012))
+    min_height = max(24, int(height * 0.045))
+    segments: list[tuple[int, int]] = []
+    start: int | None = None
+    last_dense: int | None = None
+    gap = 0
+    for y, row in enumerate(rows):
+        if row["count"] >= row_threshold:
+            if start is None:
+                start = y
+            last_dense = y
+            gap = 0
+        elif start is not None:
+            gap += 1
+            if gap > merge_gap and last_dense is not None:
+                segments.append((start, last_dense))
+                start = None
+                last_dense = None
+                gap = 0
+    if start is not None and last_dense is not None:
+        segments.append((start, last_dense))
+
+    best: dict[str, Any] | None = None
+    best_score = -1.0
+    for start, end in segments:
+        segment_height = end - start + 1
+        if segment_height < min_height:
+            continue
+        x_bounds = _paper_crop_x_bounds(rows=rows, start=start, end=end)
+        if not x_bounds:
+            continue
+        segment_width = x_bounds[1] - x_bounds[0] + 1
+        if segment_width < width * 0.18:
+            continue
+        total_nonwhite = sum(row["count"] for row in rows[start : end + 1])
+        width_ratio = segment_width / max(1, width)
+        density_bonus = total_nonwhite / max(1, segment_height * width)
+        score = segment_height * (0.65 + width_ratio) + density_bonus * height
+        if segment_height > height * 0.72:
+            score *= 0.45
+        if score > best_score:
+            best_score = score
+            best = {"start": start, "end": end, "x_bounds": x_bounds}
+    return best
+
+
+def _paper_crop_x_bounds(*, rows: list[dict[str, int]], start: int, end: int) -> tuple[int, int] | None:
+    lefts = [row["left"] for row in rows[start : end + 1] if row["count"] > 0 and row["left"] >= 0]
+    rights = [row["right"] for row in rows[start : end + 1] if row["count"] > 0 and row["right"] >= 0]
+    if not lefts or not rights:
+        return None
+    return min(lefts), max(rights)
+
+
+def _is_useful_paper_crop(*, box: tuple[int, int, int, int], page_size: tuple[int, int]) -> bool:
+    left, top, right, bottom = box
+    width, height = page_size
+    crop_width = right - left
+    crop_height = bottom - top
+    if crop_width <= 0 or crop_height <= 0:
+        return False
+    if crop_width < width * 0.22 or crop_height < height * 0.08:
+        return False
+    area_ratio = (crop_width * crop_height) / max(1, width * height)
+    if area_ratio < 0.025 or area_ratio > 0.76:
+        return False
+    return True
+
+
+def _paper_page_number_from_label(label: str) -> str:
+    match = re.search(r"paper_page:(\d+)", label)
+    return match.group(1) if match else ""
+
+
+def _task_figure_label(task: dict[str, Any]) -> str:
+    for key in ("figure_or_claim", "figure_or_table", "figure", "target", "description"):
+        label = _extract_figure_label(str(task.get(key) or ""))
+        if label:
+            return label
+    task_text = json.dumps(task, ensure_ascii=False)
+    return _extract_figure_label(task_text)
+
+
+def _extract_figure_label(text: str) -> str:
+    figure_match = re.search(r"\bfig(?:ure)?[._\s:-]*([0-9]+[a-zA-Z]?)", text, re.I)
+    if figure_match:
+        return f"Fig. {figure_match.group(1)}"
+    table_match = re.search(r"\btable[._\s:-]*([0-9]+[a-zA-Z]?)", text, re.I)
+    if table_match:
+        return f"Table {table_match.group(1)}"
+    chinese_match = re.search(r"图\s*([0-9]+[a-zA-Z]?)", text)
+    if chinese_match:
+        return f"图{chinese_match.group(1)}"
+    return ""
+
+
 def _render_markdown_image_group(title: str, entries: list[dict[str, Any]]) -> list[str]:
     lines = [f"### {title}", ""]
     if not entries:
         lines.extend(["未记录。", ""])
         return lines
     for entry in entries:
-        caption = _image_caption(title, str(entry.get("label") or "image"))
+        caption = str(entry.get("caption") or _image_caption(title, str(entry.get("label") or "image")))
         path = str(entry.get("path") or "")
         lines.extend([f"![{caption}]({path})", ""])
     return lines
@@ -945,7 +1185,9 @@ def _image_caption(prefix: str, label: str) -> str:
     if label.startswith("local_output:"):
         return f"{prefix}: {label.split(':', 1)[1]}"
     if label.startswith("paper_page:"):
-        return f"{prefix}: p{label.split(':', 1)[1]}"
+        return f"论文原图页: p{label.split(':', 1)[1]}"
+    if label.startswith("paper_crop:"):
+        return f"论文原图裁剪: {label.split(':', 1)[1]}"
     return f"{prefix}: {label}"
 
 
@@ -1376,6 +1618,8 @@ def _review_image_kind(label: str) -> str:
         return "local_output"
     if label.startswith("paper_page:"):
         return "paper_page"
+    if label.startswith("paper_crop:"):
+        return "paper_crop"
     return "other"
 
 

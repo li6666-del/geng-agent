@@ -198,7 +198,7 @@ set GENG_CODEX_REVIEWER_CMD=codex
 ```text
 --analysis-backend codex    前两阶段事实抽取/任务拆解 backend；默认 codex，llm 为旧兼容路径
 --codex-analysis-timeout 600 前两阶段单个 Codex analysis 子进程超时
---facts-gap-rounds 6         第一轮事实查漏补缺最多 6 轮；一轮无新增即停，设 0 关闭
+--facts-gap-rounds 10        第一轮事实查漏补缺最多 10 轮；一轮无新增即停，设 0 关闭
 --tasks-gap-rounds 6         第二轮任务查漏补缺最多 6 轮；全覆盖或一轮无新增即停，设 0 关闭
 --codex-agent-rounds 8       第三轮 Codex writer/reviewer 自适应闭环最大轮数；默认 8，不代表固定跑满
 --codex-agent-stall-rounds 2 连续 2 轮没有刷新最佳评分后停止；设 0 可关闭平台期停止
