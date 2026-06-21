@@ -89,12 +89,15 @@ import json
 import sys
 from pathlib import Path
 
+from src import _io
+
 '''
 
 _DISPATCHER_MAIN = '''
 
 def main() -> int:
     config_path = sys.argv[1] if len(sys.argv) > 1 else "config_smoke.json"
+    _io.guard_writer_selftest_config_path(config_path)
     results = {}
     all_passed = True
     for task_id, run_task in _TASKS:

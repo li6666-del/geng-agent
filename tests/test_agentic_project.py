@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import sys
 import textwrap
 import unittest
@@ -12,6 +13,7 @@ from geng_agent.agentic_project import (
     _is_better_score,
     _is_success,
     _load_cached_agentic_project,
+    _prepare_writer_selftest_shim,
     _render_task_markdown_section,
     _score_candidate,
     build_writer_brief,
@@ -122,6 +124,8 @@ def _write_mock_writer(temp: Path) -> str:
     script.write_text(
         textwrap.dedent(
             r'''
+            import json
+            import os
             import sys
             import shutil
             from pathlib import Path
@@ -132,6 +136,15 @@ def _write_mock_writer(temp: Path) -> str:
             log = Path(__file__).with_name("writer_prompts.txt")
             with log.open("a", encoding="utf-8") as handle:
                 handle.write("---PROMPT---\n" + prompt + "\n")
+            Path(__file__).with_name("writer_env.txt").write_text(
+                json.dumps({
+                    "mode": os.environ.get("GENG_WRITER_SELFTEST_MODE", ""),
+                    "geng_python": os.environ.get("GENG_PYTHON", ""),
+                    "python": os.environ.get("PYTHON", ""),
+                    "path0": (os.environ.get("PATH") or os.environ.get("Path") or "").split(os.pathsep)[0],
+                }),
+                encoding="utf-8",
+            )
 
             (proj / "src").mkdir(exist_ok=True)
             (proj / "tasks").mkdir(exist_ok=True)
@@ -447,6 +460,56 @@ def _write_mock_analysis(temp: Path) -> str:
     return f'"{sys.executable}" "{script}"'
 
 
+class WriterSelftestShimTests(unittest.TestCase):
+    def test_python_shim_allows_only_smoke_commands(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            project = temp / "project"
+            audit = temp / "audit"
+            project.mkdir()
+            audit.mkdir()
+            (project / "run_experiment.py").write_text("print('smoke ok')\n", encoding="utf-8")
+            shim = _prepare_writer_selftest_shim(audit, "round_01")
+            env = dict(os.environ)
+            env.update(shim["env"])
+            env["PATH"] = str(shim["bin_dir"]) + os.pathsep + env.get("PATH", "")
+            if os.name == "nt":
+                env["Path"] = env["PATH"]
+
+            allowed = subprocess.run(
+                [env["GENG_PYTHON"], "run_experiment.py", "config_smoke.json"],
+                cwd=project,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=env,
+            )
+            self.assertEqual(allowed.returncode, 0, msg=allowed.stderr)
+            self.assertIn("smoke ok", allowed.stdout)
+
+            full = subprocess.run(
+                [env["GENG_PYTHON"], "run_experiment.py", "config.json"],
+                cwd=project,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=env,
+            )
+            self.assertEqual(full.returncode, 97)
+            self.assertIn("only run smoke self-tests", full.stderr)
+
+            arbitrary = subprocess.run(
+                [env["GENG_PYTHON"], "-c", "print('heavy')"],
+                cwd=project,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=env,
+            )
+            self.assertEqual(arbitrary.returncode, 97)
+            self.assertIn("only run smoke self-tests", arbitrary.stderr)
+
+
 class AgenticProjectWorkflowTests(unittest.TestCase):
     def test_markdown_review_partial_summary_blocks_success_and_feeds_back(self) -> None:
         markdown = "\n".join(
@@ -667,6 +730,13 @@ class AgenticProjectWorkflowTests(unittest.TestCase):
             self.assertEqual([item["stall_count"] for item in status["rounds"]], [0, 1, 2])
             prompts = (temp / "writer_prompts.txt").read_text(encoding="utf-8")
             self.assertEqual(prompts.count("---PROMPT---"), 3)
+            self.assertIn("Writer self-tests are smoke-only", prompts)
+            self.assertIn("Forbidden for writer self-checks", prompts)
+            writer_env = json.loads((temp / "writer_env.txt").read_text(encoding="utf-8"))
+            self.assertEqual(writer_env["mode"], "smoke_only")
+            self.assertIn("writer_python_shim", writer_env["geng_python"])
+            self.assertEqual(writer_env["geng_python"], writer_env["python"])
+            self.assertIn("writer_python_shim", writer_env["path0"])
 
     def test_codex_writer_reviewer_loop_restores_trusted_files_and_feeds_back_review(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -740,6 +810,13 @@ class AgenticProjectWorkflowTests(unittest.TestCase):
             round1_brief = (audit / "03c_agentic_project_round_01_writer_brief.md").read_text(encoding="utf-8")
             self.assertIn("Task-level paper evidence bundle", round1_brief)
             self.assertIn(task_evidence_rel, round1_brief)
+            self.assertIn("Writer self-tests are smoke-only", round1_brief)
+            self.assertIn("python run_experiment.py config.json", round1_brief)
+            writer_env = json.loads((temp / "writer_env.txt").read_text(encoding="utf-8"))
+            self.assertEqual(writer_env["mode"], "smoke_only")
+            self.assertIn("writer_python_shim", writer_env["geng_python"])
+            self.assertEqual(writer_env["geng_python"], writer_env["python"])
+            self.assertIn("writer_python_shim", writer_env["path0"])
             result_review_md = (out / "result_review.md").read_text(encoding="utf-8")
             self.assertTrue(result_review_md.startswith("## 1. reproduce_fig_1"))
             self.assertNotIn("输入证据摘要", result_review_md)

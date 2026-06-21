@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shlex
 import shutil
 import subprocess
@@ -27,6 +28,8 @@ def run_codex_subprocess(
     command_override: str | None = None,
     output_schema: Path | None = None,
     image_paths: list[Path] | None = None,
+    extra_env: dict[str, str] | None = None,
+    path_prepend: list[Path | str] | None = None,
 ) -> dict[str, Any]:
     raw_cmd = command_override or get_config_value("GENG_CODEX_CMD") or "codex"
     argv = split_command(raw_cmd)
@@ -71,10 +74,15 @@ def run_codex_subprocess(
 
     started = time.monotonic()
     try:
+        env = codex_safe_env()
+        if extra_env:
+            env.update({str(key): str(value) for key, value in extra_env.items()})
+        if path_prepend:
+            _prepend_path(env, path_prepend)
         completed = subprocess.run(
             command,
             cwd=work_dir,
-            env=codex_safe_env(),
+            env=env,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -105,6 +113,15 @@ def run_codex_subprocess(
     status["transcript"] = str(transcript_path)
     write_json(audit_dir / f"{label}.json", status)
     return status
+
+
+def _prepend_path(env: dict[str, str], entries: list[Path | str]) -> None:
+    existing = env.get("PATH") or env.get("Path") or ""
+    parts = [str(entry) for entry in entries if str(entry)]
+    parts.extend(item for item in existing.split(os.pathsep) if item)
+    env["PATH"] = os.pathsep.join(parts)
+    if os.name == "nt":
+        env["Path"] = env["PATH"]
 
 
 def split_command(raw: str) -> list[str]:

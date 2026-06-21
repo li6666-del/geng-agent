@@ -43,7 +43,9 @@ DO NOT EDIT. Generated task scripts import and call these helpers for every
 artifact they write. They make the artifact-correctness guarantees deterministic
 so generated code cannot get them wrong:
 
-- begin(task_id, config)  -> seeds numpy + random from config["seed"], records the
+- guard_writer_selftest_config_path(config_path) -> rejects writer-side full runs.
+- begin(task_id, config)  -> rejects writer-side non-smoke configs, seeds numpy +
+  random from config["seed"], records the
   seed, creates outputs/<task_id>/, and returns a numpy Generator.
 - write_table(task_id, columns, rows) -> outputs/<task_id>/results.csv with a
   header and >=1 row; every cell coerced to a finite real scalar (complex -> real
@@ -59,7 +61,9 @@ from __future__ import annotations
 import csv
 import json
 import math
+import os
 import random
+import sys
 from pathlib import Path
 
 import matplotlib
@@ -67,7 +71,14 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-__all__ = ["begin", "write_table", "write_figure", "finish", "outputs_dir"]
+__all__ = [
+    "begin",
+    "write_table",
+    "write_figure",
+    "finish",
+    "outputs_dir",
+    "guard_writer_selftest_config_path",
+]
 
 _OUTPUTS = Path("outputs")
 _SEEDS = {}
@@ -96,8 +107,64 @@ def _to_int(value, default):
         return default
 
 
+def _writer_smoke_only_mode():
+    return os.environ.get("GENG_WRITER_SELFTEST_MODE", "").strip().lower() in {"smoke", "smoke_only"}
+
+
+def _canonical_for_guard(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _read_smoke_config_for_guard():
+    path = Path("config_smoke.json")
+    if not path.exists():
+        raise RuntimeError(
+            "Codex writer self-tests are smoke-only, but config_smoke.json is missing. "
+            "Do not run full configs in writer; let the moderator guarded runner execute them."
+        )
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(
+            "Codex writer self-tests are smoke-only, but config_smoke.json could not be read. "
+            "Do not run full configs in writer; let the moderator guarded runner execute them."
+        ) from exc
+
+
+def guard_writer_selftest_config_path(config_path):
+    """Refuse full config execution inside the Codex writer subprocess."""
+    if not _writer_smoke_only_mode():
+        return
+    name = Path(str(config_path or "config_smoke.json")).name.lower()
+    if name != "config_smoke.json":
+        raise RuntimeError(
+            "Codex writer self-tests are smoke-only. Do not run config.json/full sweeps here; "
+            "exit after editing and let the moderator guarded runner execute full config.json."
+        )
+
+
+def _guard_writer_selftest_config(config):
+    if not _writer_smoke_only_mode():
+        return
+    saw_explicit_json_config = False
+    for arg in sys.argv[1:]:
+        if str(arg).lower().endswith(".json"):
+            saw_explicit_json_config = True
+            guard_writer_selftest_config_path(arg)
+    if saw_explicit_json_config:
+        return
+    smoke_config = _read_smoke_config_for_guard()
+    if _canonical_for_guard(config) != _canonical_for_guard(smoke_config):
+        raise RuntimeError(
+            "Codex writer self-tests are smoke-only. The config passed to _io.begin does not "
+            "match config_smoke.json, so this looks like a full/manual run. Let the moderator "
+            "guarded runner execute full config.json."
+        )
+
+
 def begin(task_id, config):
     """Seed RNGs deterministically, create outputs/<task_id>/, return a Generator."""
+    _guard_writer_selftest_config(config)
     seed = 12345
     if isinstance(config, dict):
         seed = _to_int(config.get("seed"), 12345)
@@ -244,6 +311,8 @@ IO_RUNTIME_API_DOC = """\
 src/_io.py 是本地已提供的“受信任运行时”，已经在项目里，禁止生成或修改它，只能 `from src import _io` 调用。
 所有 CSV / PNG / summary.json 必须通过它写出，不要自己写 csv/json/savefig 的序列化或写后自检逻辑：
 - `rng = _io.begin(task_id, config)`：按 config["seed"] 播种 numpy+random、建 outputs/<task_id>/、返回 numpy Generator。
+  在任务 main() 里应尽早调用它；writer 子智能体自测时它会拒绝非 config_smoke.json 的 full/manual 配置。
+- `_io.guard_writer_selftest_config_path(config_path)`：run_experiment.py 已自动调用；生成任务一般不需要手动调用。
 - `_io.write_table(task_id, columns, rows)`：写 outputs/<task_id>/results.csv（带表头、≥1 行；每格自动转有限实数，复数取实部、数组取均值、NaN/Inf 留空）。rows 可为 list[dict] 或 list[list]。
 - `_io.write_figure(task_id, name, fig)`：把非空 matplotlib figure 存成 outputs/<task_id>/<name>.png（空图会报错）。
 - `return _io.finish(task_id, metrics=..., assumptions=...)`：写 outputs/<task_id>/summary.json（自动转 JSON 安全类型、刷 NaN/Inf、写后复读自检）并返回诚实退出码；放在 main() 末尾 `raise SystemExit(_io.finish(...))`。

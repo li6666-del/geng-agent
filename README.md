@@ -45,10 +45,10 @@ python -m geng_agent review sample_papers\rayleigh_error_probability_2406.16548.
   -> 输出被截断时从可解析前缀抢救事实数组；仅当零条可用事实才退本地关键词 fallback
   -> Codex analysis 子智能体生成 repro_tasks.json
   -> 本地审查任务引用的 fact、指标公式、输出列、趋势和 baseline
-  -> Codex writer 子智能体生成/修改 repro_project/
+  -> Codex writer 子智能体生成/修改 repro_project/（只允许可选 smoke 自测，不允许跑 full）
   -> 本地审查路径、内容、依赖白名单、必要文件和语法
   -> 默认停止，不自动运行生成代码
-  -> 用户显式传 --run-repro 时，进入受限运行器
+  -> 用户显式传 --run-repro 时，进入受限运行器；full config.json 只由本地 harness runner 权威运行
   -> 运行器做依赖白名单、静态安全扫描（禁网络/子进程导入、禁危险调用、禁 eval/exec/__import__/getattr 等反射类动态执行内置函数）、干净环境变量、outputs 新鲜度和格式校验
   -> 运行结果和 reviewer 反馈进入 Codex writer/reviewer 自适应闭环
   -> 运行通过后，默认进入结果级多模态二次审查
@@ -279,6 +279,7 @@ python -m geng_agent.export_schemas --out schemas
 
 - 默认由 Codex 子智能体负责抽取事实、设计复现任务、生成代码和审查复现结果；旧 LLM analysis 只在显式选择时启用。
 - 本地程序负责 Pydantic JSON 审查、路径审查、安全扫描、语法检查、运行验证、图像打包和风险汇总。
+- 第三轮 writer 只负责写代码和可选 `config_smoke.json` 自测；`config.json` full 运行永远交给本地 harness runner，避免 writer 自测和权威 runner 重复耗时。
 - 首轮工程事实先做本地归一化、部分接受和截断抢救，尽量保住模型的真实抽取而不是退回关键词 fallback；所有纠正和被丢弃的事实都记入 `_meta` 并在 `risk_report.json` 标注，绝不凭空编造，无有效 `source.chunk_id` 出处的事实仍会被丢弃。
 - 论文文本、日志、stdout/stderr、代码片段、表格和图像都按 `UNTRUSTED DATA` 处理。
 - `risk_report.json` 和 `result_review.md` 只表达复现风险与差异分析，不直接给出造假结论。

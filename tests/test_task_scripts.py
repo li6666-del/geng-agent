@@ -1,5 +1,6 @@
 import ast
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -166,6 +167,151 @@ class EndToEndDispatcherTests(unittest.TestCase):
             aggregate = json.loads((root / "outputs" / "summary.json").read_text(encoding="utf-8"))
             self.assertTrue(aggregate["all_passed"])
             self.assertEqual(aggregate["tasks"]["demo_task"]["status"], "ok")
+
+    def test_writer_selftest_guard_rejects_dispatcher_full_config(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            inject_io_runtime(root)
+            manifest = build_tasks_manifest(_tasks_doc("demo_task"))
+            write_task_scaffolding(root, manifest)
+            (root / "tasks" / "demo_task.py").write_text(TASK_PY, encoding="utf-8")
+            (root / "config_smoke.json").write_text(json.dumps({"seed": 1}), encoding="utf-8")
+            (root / "config.json").write_text(json.dumps({"seed": 2, "samples": 1_000_000}), encoding="utf-8")
+            env = dict(os.environ)
+            env["GENG_WRITER_SELFTEST_MODE"] = "smoke_only"
+
+            completed = subprocess.run(
+                [sys.executable, "run_experiment.py", "config.json"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=env,
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("smoke-only", completed.stderr)
+
+    def test_writer_selftest_guard_rejects_direct_task_full_config(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            inject_io_runtime(root)
+            manifest = build_tasks_manifest(_tasks_doc("demo_task"))
+            write_task_scaffolding(root, manifest)
+            (root / "tasks" / "demo_task.py").write_text(TASK_PY, encoding="utf-8")
+            (root / "config_smoke.json").write_text(json.dumps({"seed": 1}), encoding="utf-8")
+            (root / "config.json").write_text(json.dumps({"seed": 2, "samples": 1_000_000}), encoding="utf-8")
+            env = dict(os.environ)
+            env["GENG_WRITER_SELFTEST_MODE"] = "smoke_only"
+
+            completed = subprocess.run(
+                [sys.executable, "-m", "tasks.demo_task", "config.json"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=env,
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("smoke-only", completed.stderr)
+
+    def test_writer_selftest_guard_rejects_direct_task_config_json_even_if_same_content(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            inject_io_runtime(root)
+            manifest = build_tasks_manifest(_tasks_doc("demo_task"))
+            write_task_scaffolding(root, manifest)
+            (root / "tasks" / "demo_task.py").write_text(TASK_PY, encoding="utf-8")
+            config = json.dumps({"seed": 1})
+            (root / "config_smoke.json").write_text(config, encoding="utf-8")
+            (root / "config.json").write_text(config, encoding="utf-8")
+            env = dict(os.environ)
+            env["GENG_WRITER_SELFTEST_MODE"] = "smoke_only"
+
+            completed = subprocess.run(
+                [sys.executable, "-m", "tasks.demo_task", "config.json"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=env,
+            )
+
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("smoke-only", completed.stderr)
+
+    def test_writer_selftest_guard_allows_direct_task_smoke_config(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            inject_io_runtime(root)
+            manifest = build_tasks_manifest(_tasks_doc("demo_task"))
+            write_task_scaffolding(root, manifest)
+            (root / "tasks" / "demo_task.py").write_text(TASK_PY, encoding="utf-8")
+            (root / "config_smoke.json").write_text(json.dumps({"seed": 1}), encoding="utf-8")
+            env = dict(os.environ)
+            env["GENG_WRITER_SELFTEST_MODE"] = "smoke_only"
+
+            completed = subprocess.run(
+                [sys.executable, "-m", "tasks.demo_task", "config_smoke.json"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=90,
+                env=env,
+            )
+
+            self.assertEqual(completed.returncode, 0, msg=completed.stderr[-2000:])
+
+    def test_writer_selftest_guard_allows_smoke_config_after_task_normalization(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            inject_io_runtime(root)
+            manifest = build_tasks_manifest(_tasks_doc("demo_task"))
+            write_task_scaffolding(root, manifest)
+            task = TASK_PY.replace(
+                "    _io.begin('demo_task', cfg)\n",
+                "    cfg.setdefault('samples', 10)\n"
+                "    _io.begin('demo_task', cfg)\n",
+            )
+            (root / "tasks" / "demo_task.py").write_text(task, encoding="utf-8")
+            (root / "config_smoke.json").write_text(json.dumps({"seed": 1}), encoding="utf-8")
+            env = dict(os.environ)
+            env["GENG_WRITER_SELFTEST_MODE"] = "smoke_only"
+
+            completed = subprocess.run(
+                [sys.executable, "-m", "tasks.demo_task", "config_smoke.json"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=90,
+                env=env,
+            )
+
+            self.assertEqual(completed.returncode, 0, msg=completed.stderr[-2000:])
+
+    def test_writer_selftest_guard_accepts_smoke_config_case_insensitively(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            inject_io_runtime(root)
+            manifest = build_tasks_manifest(_tasks_doc("demo_task"))
+            write_task_scaffolding(root, manifest)
+            (root / "tasks" / "demo_task.py").write_text(TASK_PY, encoding="utf-8")
+            (root / "config_smoke.json").write_text(json.dumps({"seed": 1}), encoding="utf-8")
+            (root / "CONFIG_SMOKE.JSON").write_text(json.dumps({"seed": 1}), encoding="utf-8")
+            env = dict(os.environ)
+            env["GENG_WRITER_SELFTEST_MODE"] = "smoke_only"
+
+            completed = subprocess.run(
+                [sys.executable, "-m", "tasks.demo_task", "CONFIG_SMOKE.JSON"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=90,
+                env=env,
+            )
+
+            self.assertEqual(completed.returncode, 0, msg=completed.stderr[-2000:])
 
 
 class PlanPathContractTests(unittest.TestCase):
