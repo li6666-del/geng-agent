@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
+import re
 import secrets
 import shutil
 from pathlib import Path
@@ -11,6 +12,7 @@ from typing import Any
 from .agentic_project import (
     CODEX_PROJECT_BACKEND,
     PAPER_EVIDENCE_DIR,
+    _augment_review_display_images,
     _clear_result_review_outputs,
     _load_cached_agentic_project,
     _manifest_from_project,
@@ -21,6 +23,7 @@ from .agentic_project import (
     _render_writer_python_sh_wrapper,
     _resolve_writer_real_python,
     _restore_trusted_files,
+    _select_task_paper_display_entries,
     _write_paper_evidence_bundle,
 )
 from .codex_runner import run_codex_subprocess
@@ -45,6 +48,7 @@ from .task_scripts import build_tasks_manifest, write_task_scaffolding
 
 TASK_WRITER_STATUSES = {"matched", "explained_gap", "failed"}
 DEFAULT_TASK_WRITER_AGENT_CONCURRENCY = 4
+MAX_TASK_WRITER_SELF_ITERATIONS = 5
 
 
 def run_codex_task_writer_workflow(
@@ -64,7 +68,7 @@ def run_codex_task_writer_workflow(
     system_message: str,
     run_repro: bool,
     result_review: bool,
-    rounds: int = 8,
+    rounds: int = MAX_TASK_WRITER_SELF_ITERATIONS,
     timeout: float = 1800.0,
     run_timeout: float = 120.0,
     resume: bool = True,
@@ -78,7 +82,7 @@ def run_codex_task_writer_workflow(
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     audit_dir.mkdir(parents=True, exist_ok=True)
-    rounds = max(1, int(rounds or 1))
+    rounds = max(1, min(MAX_TASK_WRITER_SELF_ITERATIONS, int(rounds or MAX_TASK_WRITER_SELF_ITERATIONS)))
     timeout = float(timeout or 1800.0)
 
     cached = _load_cached_agentic_project(
@@ -215,6 +219,8 @@ def run_codex_task_writer_workflow(
                     "task_id": record.get("task_id"),
                     "status": record.get("task_writer_status"),
                     "structural_ok": record.get("structural_ok"),
+                    "writer_error_kind": record.get("writer_error_kind"),
+                    "blocked_reason": record.get("blocked_reason"),
                     "warnings": record.get("warnings", []),
                 }
                 for record in task_records
@@ -252,6 +258,8 @@ def run_codex_task_writer_workflow(
                     "task_id": record.get("task_id"),
                     "status": record.get("task_writer_status"),
                     "structural_ok": record.get("structural_ok"),
+                    "writer_error_kind": record.get("writer_error_kind"),
+                    "blocked_reason": record.get("blocked_reason"),
                     "errors": record.get("errors", []),
                     "warnings": record.get("warnings", []),
                 }
@@ -444,7 +452,26 @@ You own exactly one reproduction task. There is no separate reviewer. You must w
 - {full_instruction}
 - You may run smoke with `python -m tasks.{module} config_smoke.json`.
 - Full runs use the sandbox-local Python guard; do not bypass it.
-- Max internal science iterations: {rounds}. Stop earlier when you reach a stable conclusion.
+- Required internal science iterations: keep iterating until `matched`, up to {rounds} cycles maximum.
+
+## Mandatory self-iteration protocol
+You are not a one-shot report writer. You are the coder, runner, and reviewer for this task. Work in repeated cycles until the result is either matched, explained by a defensible gap, or genuinely failed.
+
+For each cycle:
+1. Implement or revise the task code/config.
+2. Run smoke only as a quick sanity check.
+3. Run full with `python -m tasks.{module} config.json` when `--run-repro` is enabled.
+4. Inspect the local CSV/summary/PNG and compare them with the paper evidence images/text.
+5. If the result does not match the paper claim, first assume your implementation, configuration, proxy model, axis scaling, normalization, baseline, seed, or plotting could be wrong. Form a concrete repair hypothesis, modify code or config, and run full again.
+6. Record each cycle in `task_agent_result.md`: command, return code, changed files, observed mismatch, repair hypothesis, and next decision.
+
+Do not stop after the first imperfect output. A first mismatch should normally trigger at least one code/config repair and rerun. Report `explained_gap` only after you have tried plausible implementation/config/model fixes and can name the remaining gap with evidence. Report `failed` only for a real blocker such as runtime failure, missing essential paper information, timeout, dependency failure, or no valid artifacts. Report `matched` only when local artifacts support the paper trend, scale, ordering, and baseline comparison for this task.
+
+Stopping rule:
+- If a cycle reaches `matched`, stop immediately and write the final files.
+- If a cycle is not `matched`, continue to the next repair/rerun cycle until cycle {rounds}.
+- Do not choose `explained_gap` before the final allowed cycle unless an essential paper detail is provably unavailable and no code/config change could test it.
+- At cycle {rounds}, if the result is still not a complete match, write the strongest honest conclusion: `explained_gap` when artifacts exist and the remaining difference is evidenced; `failed` when the task lacks usable artifacts or is blocked.
 
 ## Required final files
 - `task_agent_result.md`: Chinese, human-readable comparison report.
@@ -725,8 +752,8 @@ def _validate_task_writer_delivery(
     module = str(manifest_entry.get("module") or "")
     output_subdir = str(manifest_entry.get("output_subdir") or task_id)
     errors: list[str] = []
-    result_path = sandbox / "task_agent_result.json"
-    md_path = sandbox / "task_agent_result.md"
+    result_path, result_path_fallback = _task_result_file_path(sandbox, output_subdir, "task_agent_result.json")
+    md_path, md_path_fallback = _task_result_file_path(sandbox, output_subdir, "task_agent_result.md")
     result_doc: dict[str, Any] = {}
     if result_path.exists():
         try:
@@ -741,6 +768,12 @@ def _validate_task_writer_delivery(
         errors.append("missing task_agent_result.json")
     if not md_path.exists() or len(md_path.read_text(encoding="utf-8", errors="replace").strip()) < 40:
         errors.append("missing or too-short task_agent_result.md")
+
+    warnings: list[str] = []
+    if result_path_fallback:
+        warnings.append("task_agent_result.json found under outputs/<task>; accepted as fallback")
+    if md_path_fallback:
+        warnings.append("task_agent_result.md found under outputs/<task>; accepted as fallback")
 
     status = str(result_doc.get("status") or "failed")
     if status not in TASK_WRITER_STATUSES:
@@ -760,7 +793,6 @@ def _validate_task_writer_delivery(
     if not script_path.exists() or not script_path.is_file():
         errors.append(f"missing assigned task script: tasks/{module}.py")
 
-    warnings: list[str] = []
     run_records = _read_jsonl(trusted_run_log_path)
     trusted_records = [item for item in run_records if _is_trusted_guard_record(item, guard_token, module, output_subdir)]
     full_runs = [item for item in trusted_records if item.get("profile") == "full"]
@@ -781,7 +813,7 @@ def _validate_task_writer_delivery(
         for invalid in artifacts.get("invalid_files", []):
             errors.append(f"invalid artifact: {invalid}")
 
-    paper_images = _task_paper_image_paths(sandbox)
+    paper_images = _task_paper_image_paths(sandbox, task)
     local_images = _task_local_image_paths(sandbox, output_subdir)
     if not paper_images:
         errors.append("missing rendered paper page evidence image")
@@ -809,7 +841,19 @@ def _validate_task_writer_delivery(
         "structural_ok": structural_ok,
         "errors": errors,
         "warnings": warnings,
+        "writer_error_kind": writer_status.get("error_kind") if isinstance(writer_status, dict) else None,
+        "blocked_reason": writer_status.get("blocked_reason") if isinstance(writer_status, dict) else None,
     }
+
+
+def _task_result_file_path(sandbox: Path, output_subdir: str, filename: str) -> tuple[Path, bool]:
+    root_path = sandbox / filename
+    if root_path.exists():
+        return root_path, False
+    output_path = sandbox / "outputs" / output_subdir / filename
+    if output_path.exists():
+        return output_path, True
+    return root_path, False
 
 
 def _non_empty_list(value: Any) -> bool:
@@ -849,11 +893,109 @@ def _run_record_has_required_artifacts(record: dict[str, Any]) -> bool:
     return bool(csv_files and png_files and summary_files)
 
 
-def _task_paper_image_paths(sandbox: Path) -> list[str]:
+def _task_paper_image_paths(sandbox: Path, task: dict[str, Any]) -> list[str]:
     evidence_root = sandbox / PAPER_EVIDENCE_DIR
     if not evidence_root.exists():
         return []
-    return [str(path.resolve()) for path in sorted(evidence_root.rglob("paper_page_*.png")) if path.is_file()]
+    page_paths = [
+        path
+        for path in sorted(evidence_root.rglob("paper_page_*.png"))
+        if path.is_file() and re.fullmatch(r"paper_page_\d+\.png", path.name)
+    ]
+    if not page_paths:
+        return []
+
+    target_pages = _task_target_paper_pages(evidence_root=evidence_root, task=task, available_pages=page_paths)
+    selected_paths = [path for path in page_paths if _paper_page_number_from_path(path) in target_pages]
+    if not selected_paths:
+        selected_paths = page_paths[:1]
+
+    image_entries = [
+        {
+            "label": f"paper_page:{_paper_page_number_from_path(path)}",
+            "kind": "paper_page",
+            "mime_type": "image/png",
+            "path": str(path.resolve()),
+        }
+        for path in selected_paths
+    ]
+    display_entries = _augment_review_display_images(task=task, image_entries=image_entries)
+    paper_entries = _select_task_paper_display_entries(display_entries)
+    preferred = [entry for entry in paper_entries if entry.get("kind") == "paper_crop"] or paper_entries
+    return [str(entry.get("path")) for entry in preferred if str(entry.get("path") or "").strip()]
+
+
+def _task_target_paper_pages(*, evidence_root: Path, task: dict[str, Any], available_pages: list[Path]) -> set[str]:
+    available = {_paper_page_number_from_path(path) for path in available_pages}
+    available.discard("")
+    figure_numbers = _task_figure_numbers(task)
+    if not figure_numbers:
+        return set()
+
+    figure_source_pages: set[str] = set()
+    text_source_pages: set[str] = set()
+    for evidence_path in sorted(evidence_root.rglob("evidence.json")):
+        try:
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        facts = evidence.get("facts", {}).get("engineering_facts", [])
+        if not isinstance(facts, list):
+            continue
+        for fact in facts:
+            if not isinstance(fact, dict) or not _fact_mentions_any_figure(fact, figure_numbers):
+                continue
+            source = fact.get("source") if isinstance(fact.get("source"), dict) else {}
+            page = str(source.get("page") or "")
+            if not page or page not in available:
+                continue
+            if source.get("source_kind") == "figure":
+                figure_source_pages.add(page)
+            else:
+                text_source_pages.add(page)
+
+    if figure_source_pages:
+        return figure_source_pages
+
+    expanded = set(text_source_pages)
+    for page in list(text_source_pages):
+        try:
+            next_page = str(int(page) + 1)
+        except ValueError:
+            continue
+        if next_page in available:
+            expanded.add(next_page)
+    return expanded & available
+
+
+def _task_figure_numbers(task: dict[str, Any]) -> set[str]:
+    text = " ".join(str(task.get(key) or "") for key in ("task_id", "target", "figure_or_claim", "description"))
+    numbers = set(re.findall(r"\bfig(?:ure)?[._\s:-]*([0-9]+)", text.lower()))
+    numbers.update(re.findall(r"图\s*([0-9]+)", text))
+    return numbers
+
+
+def _fact_mentions_any_figure(fact: dict[str, Any], figure_numbers: set[str]) -> bool:
+    source = fact.get("source") if isinstance(fact.get("source"), dict) else {}
+    haystack = " ".join(
+        [
+            str(fact.get("name") or ""),
+            str(source.get("figure_ref") or ""),
+            str(source.get("quote") or ""),
+            json.dumps(fact.get("value", {}), ensure_ascii=False) if isinstance(fact.get("value"), (dict, list)) else str(fact.get("value") or ""),
+        ]
+    ).lower()
+    for number in figure_numbers:
+        if re.search(rf"\bfig(?:\.|ure)?[._\s:-]*{re.escape(number)}\b", haystack):
+            return True
+        if re.search(rf"图\s*{re.escape(number)}\b", haystack):
+            return True
+    return False
+
+
+def _paper_page_number_from_path(path: Path) -> str:
+    match = re.search(r"paper_page_(\d+)", path.name)
+    return match.group(1) if match else ""
 
 
 def _task_local_image_paths(sandbox: Path, output_subdir: str) -> list[str]:
@@ -907,7 +1049,7 @@ def _merge_task_writer_deliveries(
         result_dir = repro_project_dir / "outputs" / output_subdir
         result_dir.mkdir(parents=True, exist_ok=True)
         for name in ("task_agent_result.json", "task_agent_result.md"):
-            source = sandbox / name
+            source, _ = _task_result_file_path(sandbox, output_subdir, name)
             if source.exists():
                 shutil.copy2(source, result_dir / name)
         req_path = sandbox / "requirements.txt"
@@ -1038,6 +1180,8 @@ def _task_writer_runtime_result(
                 "passed": _task_writer_runtime_task_passed(record),
                 "delivery_ok": bool(record.get("structural_ok")),
                 "task_writer_status": record.get("task_writer_status"),
+                "writer_error_kind": record.get("writer_error_kind"),
+                "blocked_reason": record.get("blocked_reason"),
                 "full_run": record.get("full_run"),
                 "artifacts": record.get("artifacts"),
                 "errors": record.get("errors", []),
@@ -1065,6 +1209,12 @@ def _task_writer_alignment_summary(task_records: list[dict[str, Any]]) -> dict[s
             "overall_alignment": "inconclusive",
             "overall_result_credibility": "low",
             "overall_summary": "没有可审查的复现任务。",
+        }
+    if any(_task_writer_blocked_by_codex(record) for record in task_records):
+        return {
+            "overall_alignment": "inconclusive",
+            "overall_result_credibility": "low",
+            "overall_summary": "至少一个 Codex task writer 因额度或限流被阻塞，不能把缺失任务视为科学复现失败。",
         }
     if any(not record.get("structural_ok") for record in task_records):
         return {
@@ -1097,7 +1247,6 @@ def _render_task_writer_result_review(task_records: list[dict[str, Any]]) -> str
     for index, record in enumerate(task_records, start=1):
         task_id = str(record.get("task_id") or f"task_{index}")
         result = record.get("result_json") if isinstance(record.get("result_json"), dict) else {}
-        md = _read_optional_text(record.get("result_markdown_path"))
         lines = [f"## {index}. {task_id}", ""]
         lines.extend(
             [
@@ -1107,10 +1256,13 @@ def _render_task_writer_result_review(task_records: list[dict[str, Any]]) -> str
         )
         if record.get("errors"):
             lines.append("- 结构问题：" + "；".join(str(item) for item in record.get("errors", [])))
+        if record.get("blocked_reason"):
+            lines.append(f"- 执行阻塞：{record.get('blocked_reason')}")
         lines.append("")
         lines.extend(_image_markdown_group("本地复现图", record.get("local_images", [])))
         lines.extend(_image_markdown_group("论文原图", record.get("paper_images", [])))
         lines.extend(["### Writer 自审正文", ""])
+        md = _read_optional_text(record.get("result_markdown_path"))
         if md:
             lines.append(md.strip())
         else:
@@ -1172,6 +1324,8 @@ def _compact_task_writer_review(record: dict[str, Any]) -> dict[str, Any]:
         "evidence_files": result.get("evidence_files", []),
         "errors": record.get("errors", []),
         "warnings": record.get("warnings", []),
+        "writer_error_kind": record.get("writer_error_kind"),
+        "blocked_reason": record.get("blocked_reason"),
     }
 
 
@@ -1210,6 +1364,8 @@ def _task_writer_full_slot_cap() -> int:
 def _task_writer_stop_class(task_records: list[dict[str, Any]]) -> str:
     if not task_records:
         return "no_tasks"
+    if any(_task_writer_blocked_by_codex(record) for record in task_records):
+        return "blocked_by_codex"
     if any(not record.get("structural_ok") for record in task_records):
         return "structural_failures"
     if any(record.get("task_writer_status") == "failed" for record in task_records):
@@ -1223,6 +1379,7 @@ def _task_writer_stopped_reason(task_records: list[dict[str, Any]]) -> str:
     stop_class = _task_writer_stop_class(task_records)
     return {
         "no_tasks": "no reproduction tasks were available",
+        "blocked_by_codex": "one or more Codex task writers were blocked by usage limits or rate limits",
         "structural_failures": "one or more task writers did not satisfy the delivery contract",
         "task_failures_reported": "one or more task writers reported failed",
         "explained_gaps": "all structurally valid task writers either matched or explained remaining gaps",
@@ -1245,3 +1402,8 @@ def _failed_task_record(*, index: int, task_id: str, module: str, error: str) ->
         "local_images": [],
         "paper_images": [],
     }
+
+
+def _task_writer_blocked_by_codex(record: dict[str, Any]) -> bool:
+    kind = str(record.get("writer_error_kind") or "")
+    return kind in {"codex_usage_limit", "codex_rate_limit"}

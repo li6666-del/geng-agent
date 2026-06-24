@@ -74,8 +74,8 @@ def _add_common_review_args(parser: argparse.ArgumentParser, *, include_resume: 
     parser.add_argument(
         "--codex-agent-rounds",
         type=int,
-        default=8,
-        help="第三轮每个自治 task writer 的最大内部科学迭代轮数；默认 8，不代表固定跑满。",
+        default=5,
+        help="第三轮每个自治 task writer 的最大内部科学迭代轮数；默认 5，未完全匹配前要求持续迭代。",
     )
     parser.add_argument("--codex-agent-timeout", type=float, default=None, help="单个自治 task writer 子进程超时，单位秒；默认复用 --project-timeout，未设置时 1800。")
 

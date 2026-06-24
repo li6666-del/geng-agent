@@ -354,7 +354,7 @@ class ReviewPipeline:
         analysis_backend: str | None = None,
         codex_analysis_timeout: float | None = None,
         project_backend: str = "llm",
-        codex_agent_rounds: int = 8,
+        codex_agent_rounds: int = 5,
         codex_agent_timeout: float | None = None,
     ) -> PipelineResult:
         stage_cleanup = {
@@ -418,7 +418,7 @@ class ReviewPipeline:
         analysis_backend: str | None = None,
         codex_analysis_timeout: float | None = None,
         project_backend: str = "llm",
-        codex_agent_rounds: int = 8,
+        codex_agent_rounds: int = 5,
         codex_agent_timeout: float | None = None,
     ) -> PipelineResult:
         output_dir = output_dir.expanduser().resolve()

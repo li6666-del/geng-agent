@@ -16,6 +16,7 @@ from geng_agent.agentic_project import (
     _prepare_writer_selftest_shim,
     _render_task_markdown_section,
     _score_candidate,
+    _task_figure_label,
     build_writer_brief,
     run_codex_project_workflow,
     strip_review_control_footer,
@@ -23,6 +24,7 @@ from geng_agent.agentic_project import (
 )
 from geng_agent.agentic_task_writers import (
     _prepare_task_writer_python_guard,
+    _task_paper_image_paths,
     _task_writer_concurrency,
     run_codex_task_writer_workflow,
 )
@@ -242,7 +244,7 @@ def _write_mock_writer(temp: Path) -> str:
     return f'"{sys.executable}" "{script}"'
 
 
-def _write_mock_task_writer(temp: Path) -> str:
+def _write_mock_task_writer(temp: Path, *, result_location: str = "root") -> str:
     script = temp / "mock_task_writer.py"
     script_source = r'''
             import base64
@@ -266,6 +268,7 @@ def _write_mock_task_writer(temp: Path) -> str:
             task_id = task["task_id"]
             module = task["module"]
             output_subdir = task["output_subdir"]
+            result_location = "__RESULT_LOCATION__"
 
             task_source = f"""
 from __future__ import annotations
@@ -313,8 +316,10 @@ if __name__ == '__main__':
                 "local_image_paths": [f"outputs/{output_subdir}/curve.png"],
                 "paper_image_paths": ["paper_evidence/01_" + task_id + "/paper_page_1.png"],
             }
-            (proj / "task_agent_result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-            (proj / "task_agent_result.md").write_text(
+            result_dir = (proj / "outputs" / output_subdir) if result_location == "output" else proj
+            result_dir.mkdir(parents=True, exist_ok=True)
+            (result_dir / "task_agent_result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+            (result_dir / "task_agent_result.md").write_text(
                 f"# {task_id}\n\nWriter conclusion: {status}\n\nEvidence: outputs/{output_subdir}/curve.png\n",
                 encoding="utf-8",
             )
@@ -325,7 +330,35 @@ if __name__ == '__main__':
         line[12:] if line.startswith("            ") else line
         for line in script_source.splitlines()
     ).lstrip()
-    script.write_text(script_text.replace("__PNG_B64__", PNG_B64), encoding="utf-8")
+    script.write_text(
+        script_text.replace("__PNG_B64__", PNG_B64).replace("__RESULT_LOCATION__", result_location),
+        encoding="utf-8",
+    )
+    return f'"{sys.executable}" "{script}"'
+
+
+def _write_usage_limited_task_writer(temp: Path) -> str:
+    script = temp / "usage_limited_task_writer.py"
+    script.write_text(
+        textwrap.dedent(
+            r'''
+            import sys
+            from pathlib import Path
+
+            args = sys.argv[1:]
+            if "--output-last-message" in args:
+                last = Path(args[args.index("--output-last-message") + 1])
+                last.write_text("Codex usage limit reached", encoding="utf-8")
+            print(
+                "ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage "
+                "to purchase more credits or try again at 9:13 PM.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+            '''
+        ),
+        encoding="utf-8",
+    )
     return f'"{sys.executable}" "{script}"'
 
 
@@ -929,6 +962,150 @@ class TaskWriterWorkflowTests(unittest.TestCase):
             self.assertEqual(prompts.count("---PROMPT---"), 2)
             self.assertIn("Assigned task_id: `match_task`", prompts)
             self.assertIn("Do not run `python run_experiment.py config.json`", prompts)
+            self.assertIn("Mandatory self-iteration protocol", prompts)
+            self.assertIn("Do not stop after the first imperfect output", prompts)
+            self.assertIn("continue to the next repair/rerun cycle until cycle 3", prompts)
+
+    def test_task_writer_paper_images_use_target_figure_crop(self) -> None:
+        try:
+            from PIL import Image, ImageDraw
+        except Exception:
+            self.skipTest("Pillow is not available")
+
+        with TemporaryDirectory() as temp_dir:
+            sandbox = Path(temp_dir)
+            evidence_dir = sandbox / "paper_evidence" / "01_crop_task"
+            evidence_dir.mkdir(parents=True)
+            for page_number in (1, 2):
+                page = evidence_dir / f"paper_page_{page_number}.png"
+                image = Image.new("RGB", (800, 1000), "white")
+                draw = ImageDraw.Draw(image)
+                if page_number == 2:
+                    draw.rectangle((130, 240, 680, 580), fill=(225, 225, 225), outline=(0, 0, 0), width=4)
+                    for y in range(280, 540, 36):
+                        draw.line((160, y, 650, y), fill=(60, 60, 60), width=2)
+                else:
+                    draw.text((80, 120), "unrelated text page", fill=(0, 0, 0))
+                image.save(page)
+            (evidence_dir / "evidence.json").write_text(
+                json.dumps(
+                    {
+                        "facts": {
+                            "engineering_facts": [
+                                {
+                                    "type": "figure_claim",
+                                    "name": "Fig2_rate_curve",
+                                    "source": {"source_kind": "figure", "page": 2, "figure_ref": "Fig.2"},
+                                }
+                            ]
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            images = _task_paper_image_paths(
+                sandbox,
+                {"task_id": "reproduce_fig_2", "figure_or_claim": "Fig. 2 achievable rate"},
+            )
+
+            self.assertEqual(len(images), 1)
+            self.assertIn("paper_page_2_crop.png", images[0])
+            self.assertTrue(Path(images[0]).exists())
+            self.assertNotIn("paper_page_1", images[0])
+
+    def test_task_writer_workflow_accepts_result_files_in_output_subdir(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            paper = temp / "paper.md"
+            paper.write_text("Figure 1 shows a mock curve.", encoding="utf-8")
+            out = temp / "case"
+            audit = out / "audit"
+
+            old_task_writer = os.environ.get("GENG_CODEX_TASK_WRITER_CMD")
+            os.environ["GENG_CODEX_TASK_WRITER_CMD"] = _write_mock_task_writer(temp, result_location="output")
+            try:
+                result = run_codex_task_writer_workflow(
+                    facts={"engineering_facts": []},
+                    tasks={"repro_tasks": [{"task_id": "output_result_task", "figure_or_claim": "Fig. 1"}]},
+                    experiment_index={"experiments": []},
+                    paper={"format": "markdown", "chunks": []},
+                    paper_path=paper,
+                    paper_context_json="Figure 1 shows a mock curve.",
+                    paper_thesis=None,
+                    output_dir=out,
+                    audit_dir=audit,
+                    repro_project_dir=out / "repro_project",
+                    client=DummyLLM(),
+                    prompt_book=PromptBook(),
+                    system_message="system",
+                    run_repro=True,
+                    result_review=True,
+                    rounds=1,
+                    timeout=30,
+                    run_timeout=30,
+                    resume=False,
+                    agent_concurrency=1,
+                )
+            finally:
+                if old_task_writer is None:
+                    os.environ.pop("GENG_CODEX_TASK_WRITER_CMD", None)
+                else:
+                    os.environ["GENG_CODEX_TASK_WRITER_CMD"] = old_task_writer
+
+            self.assertTrue(result["runtime_result"]["passed"], msg=json.dumps(result["runtime_result"], ensure_ascii=False))
+            task_result = result["runtime_result"]["per_task"][0]
+            self.assertEqual(task_result["errors"], [])
+            self.assertIn("accepted as fallback", " ".join(task_result["warnings"]))
+            self.assertTrue((out / "repro_project" / "outputs" / "output_result_task" / "task_agent_result.json").exists())
+
+    def test_task_writer_workflow_marks_codex_usage_limit_as_blocked(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            paper = temp / "paper.md"
+            paper.write_text("Figure 1 shows a mock curve.", encoding="utf-8")
+            out = temp / "case"
+            audit = out / "audit"
+
+            old_task_writer = os.environ.get("GENG_CODEX_TASK_WRITER_CMD")
+            os.environ["GENG_CODEX_TASK_WRITER_CMD"] = _write_usage_limited_task_writer(temp)
+            try:
+                result = run_codex_task_writer_workflow(
+                    facts={"engineering_facts": []},
+                    tasks={"repro_tasks": [{"task_id": "limited_task", "figure_or_claim": "Fig. 1"}]},
+                    experiment_index={"experiments": []},
+                    paper={"format": "markdown", "chunks": []},
+                    paper_path=paper,
+                    paper_context_json="Figure 1 shows a mock curve.",
+                    paper_thesis=None,
+                    output_dir=out,
+                    audit_dir=audit,
+                    repro_project_dir=out / "repro_project",
+                    client=DummyLLM(),
+                    prompt_book=PromptBook(),
+                    system_message="system",
+                    run_repro=True,
+                    result_review=True,
+                    rounds=1,
+                    timeout=30,
+                    run_timeout=30,
+                    resume=False,
+                    agent_concurrency=1,
+                )
+            finally:
+                if old_task_writer is None:
+                    os.environ.pop("GENG_CODEX_TASK_WRITER_CMD", None)
+                else:
+                    os.environ["GENG_CODEX_TASK_WRITER_CMD"] = old_task_writer
+
+            runtime = result["runtime_result"]
+            self.assertFalse(runtime["passed"])
+            task_result = runtime["per_task"][0]
+            self.assertEqual(task_result["writer_error_kind"], "codex_usage_limit")
+            self.assertEqual(task_result["blocked_reason"], "Codex CLI usage limit exhausted")
+            self.assertEqual(result["status"]["stop_class"], "blocked_by_codex")
+            self.assertIn("额度", result["result_review_result"]["overall_summary"])
 
     def test_task_writer_workflow_accepts_delivery_without_trusted_full_log(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -1477,6 +1654,71 @@ class AgenticProjectWorkflowTests(unittest.TestCase):
             self.assertIn("![论文原图裁剪: Fig. 2, p3](", section)
             self.assertIn(str(crop_entries[0]["path"]), section)
             self.assertNotIn(f"]({paper_page})", section)
+
+    def test_paper_crop_targets_requested_subfigure_panel(self) -> None:
+        try:
+            import fitz
+            from PIL import Image
+        except Exception:
+            self.skipTest("PyMuPDF and Pillow are required")
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source"
+            source.mkdir()
+            pdf_path = source / "paper.pdf"
+            document = fitz.open()
+            page = document.new_page(width=612, height=792)
+            for left, top, right, bottom in (
+                (52, 66, 220, 212),
+                (230, 66, 390, 212),
+                (402, 66, 562, 212),
+                (52, 244, 220, 390),
+                (230, 244, 390, 390),
+                (402, 244, 562, 390),
+            ):
+                page.draw_rect(fitz.Rect(left, top, right, bottom), color=(0, 0, 0), width=0.5)
+            page.insert_text((61, 225), "(a) Different modulations: OTFS/AFDM/OFDM.", fontsize=8)
+            page.insert_text((238, 225), "(b) Antenna correlation.", fontsize=8)
+            page.insert_text((400, 225), "(c) Different block length.", fontsize=8)
+            page.insert_text((71, 403), "(d) Different T.", fontsize=8)
+            page.insert_text((238, 403), "(e) Different rho.", fontsize=8)
+            page.insert_text((411, 403), "(f) Different mobility.", fontsize=8)
+            page.insert_textbox(
+                fitz.Rect(49, 417, 563, 456),
+                "Fig. 9: BER performance comparison for multiple communication-system settings.",
+                fontsize=8,
+            )
+            document.save(str(pdf_path))
+            document.close()
+
+            paper_page = root / "paper_page_1.png"
+            Image.new("RGB", (918, 1188), "white").save(paper_page)
+
+            task = {"task_id": "reproduce_fig_9a", "figure_or_claim": "Fig. 9(a) BER curve"}
+            self.assertEqual(_task_figure_label(task), "Fig. 9a")
+            display_entries = _augment_review_display_images(
+                task=task,
+                image_entries=[
+                    {
+                        "label": "paper_page:1",
+                        "kind": "paper_page",
+                        "mime_type": "image/png",
+                        "path": str(paper_page),
+                    }
+                ],
+            )
+
+            crop_entries = [entry for entry in display_entries if entry.get("kind") == "paper_crop"]
+            self.assertEqual(len(crop_entries), 1)
+            crop = crop_entries[0]
+            self.assertEqual(crop.get("crop_reason"), "pdf_subfigure_region")
+            crop_box = crop.get("crop_box")
+            self.assertIsInstance(crop_box, list)
+            self.assertLess(crop_box[0], 80)
+            self.assertLess(crop_box[2], 250)
+            self.assertLess(crop_box[3], 260)
+            self.assertTrue(Path(str(crop["path"])).exists())
 
     def test_cached_markdown_review_ignored_when_newer_error_exists(self) -> None:
         with TemporaryDirectory() as temp_dir:

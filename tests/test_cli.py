@@ -13,7 +13,7 @@ class CliDefaultsTests(unittest.TestCase):
         self.assertIsNone(args.codex_analysis_timeout)
         self.assertEqual(args.facts_gap_rounds, 10)
         self.assertEqual(args.tasks_gap_rounds, 6)
-        self.assertEqual(args.codex_agent_rounds, 8)
+        self.assertEqual(args.codex_agent_rounds, 5)
         self.assertIsNone(args.codex_agent_timeout)
 
     def test_review_help_no_longer_exposes_legacy_third_round_switches(self) -> None:

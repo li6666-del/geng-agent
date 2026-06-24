@@ -41,12 +41,15 @@ def run_codex_subprocess(
         "command": None,
         "returncode": None,
         "timed_out": False,
+        "error_kind": None,
+        "blocked_reason": None,
         "error": None,
         "last_message_path": None,
         "transcript": None,
         "duration_s": None,
     }
     if not argv or resolved is None:
+        status["error_kind"] = "missing_cli"
         status["error"] = f"codex CLI not found: {raw_cmd!r} (install it or set GENG_CODEX_CMD)"
         write_json(audit_dir / f"{label}.json", status)
         return status
@@ -95,9 +98,12 @@ def run_codex_subprocess(
         status["ok"] = completed.returncode == 0
         transcript = (completed.stdout or "") + ("\n--- stderr ---\n" + completed.stderr if completed.stderr else "")
         if completed.returncode != 0:
+            _annotate_codex_failure(status, transcript)
             status["error"] = f"codex exited with status {completed.returncode}"
     except subprocess.TimeoutExpired as exc:
         status["timed_out"] = True
+        status["error_kind"] = "timeout"
+        status["blocked_reason"] = f"agent session timed out after {timeout:.0f}s"
         status["error"] = f"agent session timed out after {timeout:.0f}s"
         out = exc.stdout or b""
         err = exc.stderr or b""
@@ -105,6 +111,7 @@ def run_codex_subprocess(
             "\n--- stderr ---\n" + (err.decode("utf-8", "replace") if isinstance(err, bytes) else str(err))
         )
     except Exception as exc:
+        status["error_kind"] = "subprocess_error"
         status["error"] = f"{type(exc).__name__}: {exc}"
         transcript = ""
     status["duration_s"] = round(time.monotonic() - started, 1)
@@ -113,6 +120,21 @@ def run_codex_subprocess(
     status["transcript"] = str(transcript_path)
     write_json(audit_dir / f"{label}.json", status)
     return status
+
+
+def _annotate_codex_failure(status: dict[str, Any], transcript: str) -> None:
+    lowered = transcript.lower()
+    if "usage limit" in lowered and (
+        "hit your usage limit" in lowered or "purchase more credits" in lowered or "try again" in lowered
+    ):
+        status["error_kind"] = "codex_usage_limit"
+        status["blocked_reason"] = "Codex CLI usage limit exhausted"
+        return
+    if "rate limit" in lowered or "too many requests" in lowered:
+        status["error_kind"] = "codex_rate_limit"
+        status["blocked_reason"] = "Codex CLI rate limit"
+        return
+    status["error_kind"] = "codex_nonzero_exit"
 
 
 def _prepend_path(env: dict[str, str], entries: list[Path | str]) -> None:
