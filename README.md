@@ -21,8 +21,7 @@ python -m geng_agent doctor
 $env:GENG_CODEX_CMD="codex"
 # 可选：为不同阶段指定不同 Codex 命令
 # $env:GENG_CODEX_ANALYSIS_CMD="codex"
-# $env:GENG_CODEX_WRITER_CMD="codex"
-# $env:GENG_CODEX_REVIEWER_CMD="codex"
+# $env:GENG_CODEX_TASK_WRITER_CMD="codex"
 
 # 5. 拿仓库自带的示例论文跑一遍“全流程”
 #    = 受限运行复现 + 结果级多模态审查（结果级审查与兜底默认开）
@@ -31,7 +30,7 @@ python -m geng_agent review sample_papers\rayleigh_error_probability_2406.16548.
 
 跑完看 `case_001\` 下的 `review.md`（主报告）、`repro_project\`（生成的复现项目）、`result_review.md`（结果级审查）。
 
-> 要点：① 默认路径依赖本机 Codex CLI 登录状态，不需要 `GENG_LLM_API_KEY`；② 只想生成、不运行代码就去掉 `--run-repro`；③ 想跑得更稳可调 `--codex-agent-rounds`、`--codex-agent-stall-rounds`、`--run-timeout` 等参数；④ 只有显式使用 `--analysis-backend llm` 的旧路径才需要配置 OpenAI-compatible API。安装、运行解释器、模型配置的细节见下文各节。
+> 要点：① 默认路径依赖本机 Codex CLI 登录状态，不需要 `GENG_LLM_API_KEY`；② 只想生成、不运行代码就去掉 `--run-repro`；③ 想跑得更稳可调 `--codex-agent-rounds`、`--codex-agent-timeout`、`--run-timeout` 等参数；④ 只有显式使用 `--analysis-backend llm` 的旧路径才需要配置 OpenAI-compatible API。安装、运行解释器、模型配置的细节见下文各节。
 
 ## 工作流
 
@@ -45,14 +44,12 @@ python -m geng_agent review sample_papers\rayleigh_error_probability_2406.16548.
   -> 输出被截断时从可解析前缀抢救事实数组；仅当零条可用事实才退本地关键词 fallback
   -> Codex analysis 子智能体生成 repro_tasks.json
   -> 本地审查任务引用的 fact、指标公式、输出列、趋势和 baseline
-  -> Codex writer 子智能体生成/修改 repro_project/（只允许可选 smoke 自测，不允许跑 full）
-  -> 本地审查路径、内容、依赖白名单、必要文件和语法
-  -> 默认停止，不自动运行生成代码
-  -> 用户显式传 --run-repro 时，进入受限运行器；full config.json 只由本地 harness runner 权威运行
-  -> 运行器做依赖白名单、静态安全扫描（禁网络/子进程导入、禁危险调用、禁 eval/exec/__import__/getattr 等反射类动态执行内置函数）、干净环境变量、outputs 新鲜度和格式校验
-  -> 运行结果和 reviewer 反馈进入 Codex writer/reviewer 自适应闭环
-  -> 运行通过后，默认进入结果级多模态二次审查
-  -> 把 CSV/summary、本地 PNG、论文页面 PNG 和论文上下文交给 Codex reviewer
+  -> 第三轮为每个复现任务启动一个自治 Codex task writer
+  -> 每个 task writer 只写自己的 tasks/<task>.py / 私有 config / README / requirements
+  -> 用户显式传 --run-repro 时，每个 task writer 只允许通过 Python guard 跑自己的 full
+  -> guard 做 full 并发限流、超时、可信运行日志；主持人只验收结构、依赖白名单、静态安全扫描和产物
+  -> 不再启动独立 reviewer；task writer 自己对照论文证据给出 matched / explained_gap / failed
+  -> 主持人合并各任务代码、运行证据、图片证据和自审正文
   -> 生成 result_review.md、risk_report.json 和 review.md
 ```
 
@@ -110,13 +107,13 @@ C:\Users\84475\miniconda3\envs\torch\python.exe -m geng_agent review paper.pdf -
 
 ## 配置 Codex / 兼容模型
 
-### 默认：Codex analysis + writer/reviewer
+### 默认：Codex analysis + 自治 task writers
 
 ```powershell
 $env:GENG_CODEX_CMD="codex"              # 默认命令
 $env:GENG_CODEX_ANALYSIS_CMD="codex"     # 可选：单独指定前两阶段分析子智能体
-$env:GENG_CODEX_WRITER_CMD="codex"       # 可选：单独指定写代码子智能体
-$env:GENG_CODEX_REVIEWER_CMD="codex"     # 可选：单独指定结果审查子智能体
+$env:GENG_CODEX_TASK_WRITER_CMD="codex"  # 可选：单独指定第三轮任务级 writer
+$env:GENG_CODEX_WRITER_CMD="codex"       # 兼容旧环境变量；未设置 TASK_WRITER 时作为 fallback
 ```
 
 前两阶段包括 `engineering_facts.json`、facts gap、可选 `paper_thesis.json`、`repro_tasks.json` 和 tasks gap。Codex 子智能体只负责产出候选 JSON；最终能否进入下一阶段仍由本地 schema、source 校验、coverage gap、任务引用校验和 fallback 策略决定。
@@ -181,16 +178,15 @@ python -m geng_agent review paper.pdf --out case_001 --run-repro --no-result-rev
 python -m geng_agent review paper.pdf --out case_001 --run-repro
 ```
 
-Codex analysis 子进程负责事实抽取和任务拆解；Codex writer/reviewer 子进程负责生成代码、运行反馈和论文-结果对比。旧 LLM analysis 只在显式传 `--analysis-backend llm` 时启用。
+Codex analysis 子进程负责事实抽取和任务拆解；第三轮由任务级 Codex writer 并行负责本任务代码、full 运行和论文-结果对比。旧 LLM analysis 只在显式传 `--analysis-backend llm` 时启用。
 
 Optional Codex controls:
 
 ```bash
-python -m geng_agent review paper.pdf --out case_001 --run-repro --codex-analysis-timeout 600 --codex-agent-rounds 8 --codex-agent-stall-rounds 2 --codex-agent-timeout 1800
+python -m geng_agent review paper.pdf --out case_001 --run-repro --codex-analysis-timeout 600 --codex-agent-rounds 8 --codex-agent-timeout 1800
 set GENG_CODEX_CMD=codex
 set GENG_CODEX_ANALYSIS_CMD=codex
-set GENG_CODEX_WRITER_CMD=codex
-set GENG_CODEX_REVIEWER_CMD=codex
+set GENG_CODEX_TASK_WRITER_CMD=codex
 ```
 
 常用参数：
@@ -200,9 +196,8 @@ set GENG_CODEX_REVIEWER_CMD=codex
 --codex-analysis-timeout 600 前两阶段单个 Codex analysis 子进程超时
 --facts-gap-rounds 10        第一轮事实查漏补缺最多 10 轮；一轮无新增即停，设 0 关闭
 --tasks-gap-rounds 6         第二轮任务查漏补缺最多 6 轮；全覆盖或一轮无新增即停，设 0 关闭
---codex-agent-rounds 8       第三轮 Codex writer/reviewer 自适应闭环最大轮数；默认 8，不代表固定跑满
---codex-agent-stall-rounds 2 连续 2 轮没有刷新最佳评分后停止；设 0 可关闭平台期停止
---codex-agent-timeout 1800   单个 Codex writer/reviewer 子进程超时；当前没有第三轮总墙钟预算
+--codex-agent-rounds 8       第三轮每个自治 task writer 的最大内部科学迭代轮数；默认 8，不代表固定跑满
+--codex-agent-timeout 1800   单个自治 task writer 子进程超时；当前没有第三轮总墙钟预算
 --json-repair-attempts 3   每轮 JSON 审查失败后的返修次数
 --run-repro                显式运行生成的复现项目
 --no-result-review         关闭运行成功后的结果级多模态二次审查

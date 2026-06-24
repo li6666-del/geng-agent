@@ -366,7 +366,7 @@ def write_result_review_markdown_docx(
     _add_title(
         document,
         "复现结果二次审查报告",
-        "由 Codex reviewer 直接生成的人工阅读版结果对比报告",
+        "由自治 task writer 汇总生成的人工阅读版结果对比报告",
     )
 
     _add_markdown_body(document, markdown_text)

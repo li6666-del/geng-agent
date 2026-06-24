@@ -21,8 +21,12 @@ from geng_agent.agentic_project import (
     strip_review_control_footer,
     summarize_markdown_review,
 )
+from geng_agent.agentic_task_writers import _prepare_task_writer_python_guard, run_codex_task_writer_workflow
 from geng_agent.pipeline import ReviewPipeline
 from geng_agent.prompts import PromptBook
+
+
+PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
 
 
 class DummyLLM:
@@ -227,6 +231,149 @@ def _write_mock_writer(temp: Path) -> str:
             print("writer done")
             if Path(__file__).with_name("writer_exit_1.flag").exists():
                 raise SystemExit(1)
+            '''
+        ),
+        encoding="utf-8",
+    )
+    return f'"{sys.executable}" "{script}"'
+
+
+def _write_mock_task_writer(temp: Path) -> str:
+    script = temp / "mock_task_writer.py"
+    script_source = r'''
+            import base64
+            import json
+            import os
+            import subprocess
+            import sys
+            from pathlib import Path
+
+            PNG_BYTES = base64.b64decode("__PNG_B64__")
+
+            args = sys.argv[1:]
+            proj = Path(args[args.index("--cd") + 1])
+            last = Path(args[args.index("--output-last-message") + 1])
+            prompt = sys.stdin.read() if args and args[-1] == "-" else ""
+            with Path(__file__).with_name("task_writer_prompts.txt").open("a", encoding="utf-8") as handle:
+                handle.write("---PROMPT---\n" + prompt + "\n")
+
+            manifest = json.loads((proj / "tasks_manifest.json").read_text(encoding="utf-8"))
+            task = manifest["tasks"][0]
+            task_id = task["task_id"]
+            module = task["module"]
+            output_subdir = task["output_subdir"]
+
+            task_source = f"""
+from __future__ import annotations
+import json
+import matplotlib.pyplot as plt
+from pathlib import Path
+from src import _io
+
+def main(config_path=None) -> int:
+    cfg_path = config_path or 'config_smoke.json'
+    cfg = json.loads(Path(cfg_path).read_text(encoding='utf-8'))
+    task_id = {task_id!r}
+    _io.begin(task_id, cfg)
+    rows = [{{'x': 0, 'y': 0.1}}, {{'x': 1, 'y': 0.2}}, {{'x': 2, 'y': 0.3}}]
+    _io.write_table(task_id, ['x', 'y'], rows)
+    fig, ax = plt.subplots()
+    ax.plot([row['x'] for row in rows], [row['y'] for row in rows])
+    ax.set_xlabel('x')
+    ax.set_ylabel('y')
+    _io.write_figure(task_id, 'curve', fig)
+    return _io.finish(task_id, metrics={{'points': len(rows)}}, assumptions=['mock'])
+
+if __name__ == '__main__':
+    raise SystemExit(main())
+"""
+            (proj / "tasks" / f"{module}.py").write_text(task_source, encoding="utf-8")
+            (proj / "tasks" / f"{module}_lib.py").write_text("HELPER = True\n", encoding="utf-8")
+            for context in (proj / "paper_evidence").rglob("context.md"):
+                (context.parent / "paper_page_1.png").write_bytes(PNG_BYTES)
+
+            py = os.environ["PYTHON"]
+            completed = subprocess.run([py, "-m", f"tasks.{module}", "config.json"], cwd=proj, check=False)
+            if completed.returncode != 0:
+                raise SystemExit(completed.returncode)
+
+            status = "explained_gap" if "gap" in task_id else "matched"
+            result = {
+                "task_id": task_id,
+                "status": status,
+                "summary": "mock writer completed the assigned full run",
+                "differences": ["scale differs"] if status == "explained_gap" else [],
+                "possible_causes": ["missing paper parameter"] if status == "explained_gap" else [],
+                "remaining_uncertainties": ["exact seed"] if status == "explained_gap" else [],
+                "evidence_files": [f"outputs/{output_subdir}/results.csv", f"outputs/{output_subdir}/curve.png"],
+                "local_image_paths": [f"outputs/{output_subdir}/curve.png"],
+                "paper_image_paths": ["paper_evidence/01_" + task_id + "/paper_page_1.png"],
+            }
+            (proj / "task_agent_result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+            (proj / "task_agent_result.md").write_text(
+                f"# {task_id}\n\nWriter conclusion: {status}\n\nEvidence: outputs/{output_subdir}/curve.png\n",
+                encoding="utf-8",
+            )
+            last.write_text("task writer finished", encoding="utf-8")
+            print("task writer finished")
+            '''
+    script_text = "\n".join(
+        line[12:] if line.startswith("            ") else line
+        for line in script_source.splitlines()
+    ).lstrip()
+    script.write_text(script_text.replace("__PNG_B64__", PNG_B64), encoding="utf-8")
+    return f'"{sys.executable}" "{script}"'
+
+
+def _write_spoofing_task_writer(temp: Path) -> str:
+    script = temp / "spoofing_task_writer.py"
+    script.write_text(
+        textwrap.dedent(
+            f'''
+            import base64
+            import json
+            import sys
+            from pathlib import Path
+
+            PNG_BYTES = base64.b64decode({PNG_B64!r})
+
+            args = sys.argv[1:]
+            proj = Path(args[args.index("--cd") + 1])
+            last = Path(args[args.index("--output-last-message") + 1])
+            manifest = json.loads((proj / "tasks_manifest.json").read_text(encoding="utf-8"))
+            task = manifest["tasks"][0]
+            task_id = task["task_id"]
+            output_subdir = task["output_subdir"]
+
+            for context in (proj / "paper_evidence").rglob("context.md"):
+                (context.parent / "paper_page_1.png").write_bytes(PNG_BYTES)
+
+            out = proj / "outputs" / output_subdir
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "results.csv").write_text("x,y\\n0,0.1\\n", encoding="utf-8")
+            (out / "curve.png").write_bytes(PNG_BYTES)
+            (out / "summary.json").write_text(
+                json.dumps({{"task_id": task_id, "metrics": {{"points": 1}}, "assumptions": []}}),
+                encoding="utf-8",
+            )
+            (proj / "task_agent_runs.jsonl").write_text(
+                json.dumps({{"profile": "full", "returncode": 0, "guard_token": "fake"}}) + "\\n",
+                encoding="utf-8",
+            )
+            result = {{
+                "task_id": task_id,
+                "status": "matched",
+                "summary": "spoofed result without running guard",
+                "differences": [],
+                "possible_causes": [],
+                "remaining_uncertainties": [],
+                "evidence_files": [f"outputs/{{output_subdir}}/results.csv"],
+                "local_image_paths": [f"outputs/{{output_subdir}}/curve.png"],
+                "paper_image_paths": ["paper_evidence/01_" + task_id + "/paper_page_1.png"],
+            }}
+            (proj / "task_agent_result.json").write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+            (proj / "task_agent_result.md").write_text("# spoof\\n\\nThis writer did not execute the guard full run.\\n", encoding="utf-8")
+            last.write_text("spoofed", encoding="utf-8")
             '''
         ),
         encoding="utf-8",
@@ -508,6 +655,255 @@ class WriterSelftestShimTests(unittest.TestCase):
             )
             self.assertEqual(arbitrary.returncode, 97)
             self.assertIn("only run smoke self-tests", arbitrary.stderr)
+
+
+class TaskWriterGuardTests(unittest.TestCase):
+    def test_task_writer_guard_allows_assigned_full_and_rejects_dispatcher_full(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            project = temp / "project"
+            audit = temp / "audit"
+            project.mkdir()
+            audit.mkdir()
+            (project / "tasks").mkdir()
+            (project / "outputs" / "demo_task").mkdir(parents=True)
+            (project / "run_experiment.py").write_text("print('dispatcher')\n", encoding="utf-8")
+            (project / "tasks" / "__init__.py").write_text("", encoding="utf-8")
+            (project / "tasks" / "demo_task.py").write_text(
+                "from pathlib import Path\n"
+                "def main():\n"
+                "    out=Path('outputs/demo_task'); out.mkdir(parents=True, exist_ok=True)\n"
+                "    (out/'results.csv').write_text('x\\n1\\n', encoding='utf-8')\n"
+                f"    (out/'plot.png').write_bytes(__import__('base64').b64decode({PNG_B64!r}))\n"
+                "    (out/'summary.json').write_text('{\"task_id\":\"demo_task\",\"metrics\":{\"x\":1},\"assumptions\":[]}', encoding='utf-8')\n"
+                "    return 0\n"
+                "if __name__ == '__main__': raise SystemExit(main())\n",
+                encoding="utf-8",
+            )
+            shim = _prepare_task_writer_python_guard(
+                audit_dir=audit,
+                label="task_01",
+                module="demo_task",
+                output_subdir="demo_task",
+                run_log=audit / "trusted_task_agent_runs.jsonl",
+                lock_dir=audit / "locks",
+                allow_full=True,
+                run_timeout=30,
+            )
+            env = dict(os.environ)
+            env.update(shim["env"])
+            env["PATH"] = str(shim["bin_dir"]) + os.pathsep + env.get("PATH", "")
+            if os.name == "nt":
+                env["Path"] = env["PATH"]
+
+            full = subprocess.run(
+                [env["GENG_PYTHON"], "-m", "tasks.demo_task", "config.json"],
+                cwd=project,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=env,
+            )
+            self.assertEqual(full.returncode, 0, msg=full.stderr)
+            records = [
+                json.loads(line)
+                for line in (audit / "trusted_task_agent_runs.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(records[-1]["profile"], "full")
+            self.assertEqual(records[-1]["returncode"], 0)
+            self.assertEqual(records[-1]["guard_token"], shim["guard_token"])
+            self.assertFalse((project / "task_agent_runs.jsonl").exists())
+
+            dispatcher = subprocess.run(
+                [env["GENG_PYTHON"], "run_experiment.py", "config.json"],
+                cwd=project,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=env,
+            )
+            self.assertEqual(dispatcher.returncode, 97)
+            self.assertIn("only the assigned task module", dispatcher.stderr)
+
+    def test_task_writer_guard_records_timeout_for_assigned_full(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            project = temp / "project"
+            audit = temp / "audit"
+            project.mkdir()
+            audit.mkdir()
+            (project / "tasks").mkdir()
+            (project / "tasks" / "__init__.py").write_text("", encoding="utf-8")
+            (project / "tasks" / "slow_task.py").write_text(
+                "import time\n"
+                "def main(config_path=None):\n"
+                "    time.sleep(5)\n"
+                "    return 0\n"
+                "if __name__ == '__main__': raise SystemExit(main())\n",
+                encoding="utf-8",
+            )
+            shim = _prepare_task_writer_python_guard(
+                audit_dir=audit,
+                label="slow_task",
+                module="slow_task",
+                output_subdir="slow_task",
+                run_log=audit / "slow_runs.jsonl",
+                lock_dir=audit / "locks",
+                allow_full=True,
+                run_timeout=0.2,
+            )
+            env = dict(os.environ)
+            env.update(shim["env"])
+            env["PATH"] = str(shim["bin_dir"]) + os.pathsep + env.get("PATH", "")
+            if os.name == "nt":
+                env["Path"] = env["PATH"]
+
+            completed = subprocess.run(
+                [env["GENG_PYTHON"], "-m", "tasks.slow_task", "config.json"],
+                cwd=project,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=env,
+            )
+
+            self.assertEqual(completed.returncode, 124)
+            records = [json.loads(line) for line in (audit / "slow_runs.jsonl").read_text(encoding="utf-8").splitlines()]
+            self.assertTrue(records[-1]["timed_out"])
+            self.assertEqual(records[-1]["returncode"], 124)
+
+
+class TaskWriterWorkflowTests(unittest.TestCase):
+    def test_task_writer_workflow_merges_parallel_self_reviewed_tasks_without_reviewer_or_final_full(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            paper = temp / "paper.md"
+            paper.write_text("Figure 1 and Figure 2 show increasing mock curves.", encoding="utf-8")
+            out = temp / "case"
+            audit = out / "audit"
+
+            old_task_writer = os.environ.get("GENG_CODEX_TASK_WRITER_CMD")
+            os.environ["GENG_CODEX_TASK_WRITER_CMD"] = _write_mock_task_writer(temp)
+            try:
+                result = run_codex_task_writer_workflow(
+                    facts={"engineering_facts": []},
+                    tasks={
+                        "repro_tasks": [
+                            {"task_id": "match_task", "figure_or_claim": "Fig. 1", "expected_artifacts": ["curve.png"]},
+                            {"task_id": "gap_task", "figure_or_claim": "Fig. 2", "expected_artifacts": ["curve.png"]},
+                        ]
+                    },
+                    experiment_index={"experiments": []},
+                    paper={"format": "markdown", "chunks": []},
+                    paper_path=paper,
+                    paper_context_json="Figure 1 and Figure 2 show increasing mock curves.",
+                    paper_thesis={"central_claim": "mock curves increase", "mechanism": "mock", "comparisons": []},
+                    output_dir=out,
+                    audit_dir=audit,
+                    repro_project_dir=out / "repro_project",
+                    client=DummyLLM(),
+                    prompt_book=PromptBook(),
+                    system_message="system",
+                    run_repro=True,
+                    result_review=True,
+                    rounds=3,
+                    timeout=30,
+                    run_timeout=30,
+                    resume=False,
+                    agent_concurrency=2,
+                )
+            finally:
+                if old_task_writer is None:
+                    os.environ.pop("GENG_CODEX_TASK_WRITER_CMD", None)
+                else:
+                    os.environ["GENG_CODEX_TASK_WRITER_CMD"] = old_task_writer
+
+            self.assertTrue(result["runtime_result"]["passed"], msg=json.dumps(result["runtime_result"], ensure_ascii=False))
+            self.assertFalse(result["runtime_result"]["host_repeated_full"])
+            self.assertEqual(result["result_review_result"]["mode"], "codex_task_writer_self_review")
+            self.assertFalse((out / "result_review.json").exists())
+            self.assertFalse(list(audit.glob("*reviewer*")))
+
+            statuses = {
+                item["task_id"]: item["task_writer_status"]
+                for item in result["runtime_result"]["per_task"]
+            }
+            self.assertEqual(statuses["match_task"], "matched")
+            self.assertEqual(statuses["gap_task"], "explained_gap")
+
+            manifest = json.loads((out / "repro_project" / "tasks_manifest.json").read_text(encoding="utf-8"))
+            manifest_by_task = {item["task_id"]: item for item in manifest["tasks"]}
+            self.assertEqual(manifest_by_task["match_task"]["config_full"], "configs/match_task_config.json")
+            self.assertEqual(manifest_by_task["gap_task"]["config_smoke"], "configs/gap_task_config_smoke.json")
+
+            for task_id in ("match_task", "gap_task"):
+                task_dir = out / "repro_project" / "outputs" / task_id
+                self.assertTrue((task_dir / "results.csv").exists())
+                self.assertTrue((task_dir / "curve.png").exists())
+                self.assertTrue((task_dir / "summary.json").exists())
+                self.assertTrue((task_dir / "task_agent_result.json").exists())
+                records = [
+                    json.loads(line)
+                    for line in (task_dir / "task_agent_runs.jsonl").read_text(encoding="utf-8").splitlines()
+                ]
+                self.assertTrue(any(record.get("profile") == "full" and record.get("returncode") == 0 for record in records))
+
+            review_md = (out / "result_review.md").read_text(encoding="utf-8")
+            self.assertTrue(review_md.startswith("## 1. match_task"))
+            self.assertIn("Writer 结论：`matched`", review_md)
+            self.assertIn("Writer 结论：`explained_gap`", review_md)
+            self.assertIn("![本地复现图:", review_md)
+            self.assertIn("![论文原图:", review_md)
+            self.assertIn("### Writer 自审正文", review_md)
+
+            prompts = (temp / "task_writer_prompts.txt").read_text(encoding="utf-8")
+            self.assertEqual(prompts.count("---PROMPT---"), 2)
+            self.assertIn("Assigned task_id: `match_task`", prompts)
+            self.assertIn("Do not run `python run_experiment.py config.json`", prompts)
+
+    def test_task_writer_workflow_rejects_writer_spoofed_full_log(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            paper = temp / "paper.md"
+            paper.write_text("Figure 1 shows a mock curve.", encoding="utf-8")
+            out = temp / "case"
+            audit = out / "audit"
+
+            old_task_writer = os.environ.get("GENG_CODEX_TASK_WRITER_CMD")
+            os.environ["GENG_CODEX_TASK_WRITER_CMD"] = _write_spoofing_task_writer(temp)
+            try:
+                result = run_codex_task_writer_workflow(
+                    facts={"engineering_facts": []},
+                    tasks={"repro_tasks": [{"task_id": "spoof_task", "figure_or_claim": "Fig. 1"}]},
+                    experiment_index={"experiments": []},
+                    paper={"format": "markdown", "chunks": []},
+                    paper_path=paper,
+                    paper_context_json="Figure 1 shows a mock curve.",
+                    paper_thesis=None,
+                    output_dir=out,
+                    audit_dir=audit,
+                    repro_project_dir=out / "repro_project",
+                    client=DummyLLM(),
+                    prompt_book=PromptBook(),
+                    system_message="system",
+                    run_repro=True,
+                    result_review=True,
+                    rounds=1,
+                    timeout=30,
+                    run_timeout=30,
+                    resume=False,
+                    agent_concurrency=1,
+                )
+            finally:
+                if old_task_writer is None:
+                    os.environ.pop("GENG_CODEX_TASK_WRITER_CMD", None)
+                else:
+                    os.environ["GENG_CODEX_TASK_WRITER_CMD"] = old_task_writer
+
+            self.assertFalse(result["runtime_result"]["passed"])
+            errors = result["runtime_result"]["per_task"][0]["errors"]
+            self.assertIn("missing successful assigned-task full run in task_agent_runs.jsonl", errors)
+            self.assertFalse((out / "repro_project" / "outputs" / "spoof_task" / "task_agent_runs.jsonl").exists())
 
 
 class AgenticProjectWorkflowTests(unittest.TestCase):
@@ -1097,15 +1493,12 @@ class AgenticProjectWorkflowTests(unittest.TestCase):
             temp = Path(temp_dir)
             paper = temp / "paper.md"
             paper.write_text("Simulation Results\nAWGN channel, BER vs SNR. Fig. 1 decreases.", encoding="utf-8")
-            writer_cmd = _write_mock_writer(temp)
-            reviewer_cmd = _write_mock_reviewer(temp)
+            task_writer_cmd = _write_mock_task_writer(temp)
 
             import os
 
-            old_writer = os.environ.get("GENG_CODEX_WRITER_CMD")
-            old_reviewer = os.environ.get("GENG_CODEX_REVIEWER_CMD")
-            os.environ["GENG_CODEX_WRITER_CMD"] = writer_cmd
-            os.environ["GENG_CODEX_REVIEWER_CMD"] = reviewer_cmd
+            old_task_writer = os.environ.get("GENG_CODEX_TASK_WRITER_CMD")
+            os.environ["GENG_CODEX_TASK_WRITER_CMD"] = task_writer_cmd
             try:
                 result = ReviewPipeline(client=MinimalPipelineLLM()).run(
                     paper,
@@ -1123,14 +1516,10 @@ class AgenticProjectWorkflowTests(unittest.TestCase):
                     codex_agent_timeout=30,
                 )
             finally:
-                if old_writer is None:
-                    os.environ.pop("GENG_CODEX_WRITER_CMD", None)
+                if old_task_writer is None:
+                    os.environ.pop("GENG_CODEX_TASK_WRITER_CMD", None)
                 else:
-                    os.environ["GENG_CODEX_WRITER_CMD"] = old_writer
-                if old_reviewer is None:
-                    os.environ.pop("GENG_CODEX_REVIEWER_CMD", None)
-                else:
-                    os.environ["GENG_CODEX_REVIEWER_CMD"] = old_reviewer
+                    os.environ["GENG_CODEX_TASK_WRITER_CMD"] = old_task_writer
 
             self.assertTrue(result.runtime_passed)
             self.assertTrue(result.result_review_passed)
@@ -1138,7 +1527,12 @@ class AgenticProjectWorkflowTests(unittest.TestCase):
             self.assertIsNotNone(result.result_review_docx_path)
             generated = json.loads((result.output_dir / "generated_files.json").read_text(encoding="utf-8"))
             self.assertTrue(generated["result_review"]["passed"])
+            self.assertEqual(generated["result_review"]["overall_alignment"], "match")
+            self.assertEqual(generated["result_review"]["overall_result_credibility"], "medium")
             self.assertEqual(generated["docx_generation"]["result_review_docx"]["passed"], True)
+            self.assertNotEqual(result.reproducibility_verdict["verdict"], "inconclusive")
+            run_cost = json.loads((result.output_dir / "run_cost.json").read_text(encoding="utf-8"))
+            self.assertEqual(run_cost["codex_agent_mode"], "task-writers")
 
     def test_full_pipeline_codex_analysis_default_needs_no_llm_client(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -1146,15 +1540,12 @@ class AgenticProjectWorkflowTests(unittest.TestCase):
             paper = temp / "paper.md"
             paper.write_text("Simulation Results\nAWGN channel, BER vs SNR. Fig. 1 decreases.", encoding="utf-8")
             analysis_cmd = _write_mock_analysis(temp)
-            writer_cmd = _write_mock_writer(temp)
-            reviewer_cmd = _write_mock_reviewer(temp)
+            task_writer_cmd = _write_mock_task_writer(temp)
 
             old_analysis = os.environ.get("GENG_CODEX_ANALYSIS_CMD")
-            old_writer = os.environ.get("GENG_CODEX_WRITER_CMD")
-            old_reviewer = os.environ.get("GENG_CODEX_REVIEWER_CMD")
+            old_task_writer = os.environ.get("GENG_CODEX_TASK_WRITER_CMD")
             os.environ["GENG_CODEX_ANALYSIS_CMD"] = analysis_cmd
-            os.environ["GENG_CODEX_WRITER_CMD"] = writer_cmd
-            os.environ["GENG_CODEX_REVIEWER_CMD"] = reviewer_cmd
+            os.environ["GENG_CODEX_TASK_WRITER_CMD"] = task_writer_cmd
             try:
                 result = ReviewPipeline().run(
                     paper,
@@ -1176,14 +1567,10 @@ class AgenticProjectWorkflowTests(unittest.TestCase):
                     os.environ.pop("GENG_CODEX_ANALYSIS_CMD", None)
                 else:
                     os.environ["GENG_CODEX_ANALYSIS_CMD"] = old_analysis
-                if old_writer is None:
-                    os.environ.pop("GENG_CODEX_WRITER_CMD", None)
+                if old_task_writer is None:
+                    os.environ.pop("GENG_CODEX_TASK_WRITER_CMD", None)
                 else:
-                    os.environ["GENG_CODEX_WRITER_CMD"] = old_writer
-                if old_reviewer is None:
-                    os.environ.pop("GENG_CODEX_REVIEWER_CMD", None)
-                else:
-                    os.environ["GENG_CODEX_REVIEWER_CMD"] = old_reviewer
+                    os.environ["GENG_CODEX_TASK_WRITER_CMD"] = old_task_writer
 
             self.assertTrue(result.runtime_passed)
             self.assertTrue(result.result_review_passed)

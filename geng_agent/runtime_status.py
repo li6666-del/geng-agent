@@ -19,7 +19,10 @@ def _load_result_review_document(output_dir: Path, result_review_result: dict[st
     if not path.exists():
         md_path = output_dir / "result_review.md"
         if md_path.exists():
-            return {"_meta": {"markdown_review": True}, "markdown_path": str(md_path)}
+            status = dict(result_review_result)
+            status["_meta"] = {"markdown_review": True}
+            status["markdown_path"] = str(md_path)
+            return status
         return {}
     try:
         return _read_json_file(path)

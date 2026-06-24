@@ -355,7 +355,6 @@ class ReviewPipeline:
         codex_analysis_timeout: float | None = None,
         project_backend: str = "llm",
         codex_agent_rounds: int = 8,
-        codex_agent_stall_rounds: int = 2,
         codex_agent_timeout: float | None = None,
     ) -> PipelineResult:
         stage_cleanup = {
@@ -395,7 +394,6 @@ class ReviewPipeline:
             codex_analysis_timeout=codex_analysis_timeout,
             project_backend=project_backend,
             codex_agent_rounds=codex_agent_rounds,
-            codex_agent_stall_rounds=codex_agent_stall_rounds,
             codex_agent_timeout=codex_agent_timeout,
         )
 
@@ -421,7 +419,6 @@ class ReviewPipeline:
         codex_analysis_timeout: float | None = None,
         project_backend: str = "llm",
         codex_agent_rounds: int = 8,
-        codex_agent_stall_rounds: int = 2,
         codex_agent_timeout: float | None = None,
     ) -> PipelineResult:
         output_dir = output_dir.expanduser().resolve()
@@ -632,10 +629,10 @@ class ReviewPipeline:
             raise ValueError(f"unknown project_backend: {project_backend}")
 
         if project_backend == "codex":
-            from .agentic_project import run_codex_project_workflow
+            from .agentic_task_writers import run_codex_task_writer_workflow
 
             per_task_layout = True
-            agentic_result = run_codex_project_workflow(
+            agentic_result = run_codex_task_writer_workflow(
                 facts=facts,
                 tasks=tasks,
                 experiment_index=experiment_index,
@@ -655,7 +652,6 @@ class ReviewPipeline:
                 timeout=codex_agent_timeout or project_timeout or 1800.0,
                 run_timeout=run_timeout,
                 resume=resume,
-                stall_rounds=codex_agent_stall_rounds,
             )
             manifest = agentic_result["manifest"]
             written_files = [Path(path) for path in agentic_result.get("written_files", [])]
@@ -860,6 +856,8 @@ class ReviewPipeline:
         )
         run_cost["analysis_backend"] = analysis_backend
         run_cost["project_backend"] = project_backend
+        if project_backend == "codex":
+            run_cost["codex_agent_mode"] = "task-writers"
         if analysis_backend == CODEX_ANALYSIS_BACKEND:
             run_cost["codex_analysis_timeout_s"] = codex_analysis_timeout or 600.0
         write_json(

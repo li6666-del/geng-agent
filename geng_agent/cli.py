@@ -58,7 +58,7 @@ def _add_common_review_args(parser: argparse.ArgumentParser, *, include_resume: 
     parser.add_argument("--json-repair-attempts", type=int, default=5, help="每轮 JSON 结构审查失败后的返修次数（默认 5：实跑发现最难的科学文件 src/modulation.py 偶发语法/结构错，3 次重试不够会拖垮整个逐任务项目→兜底；只在失败时才追加重试，文件一次过则无额外开销）。")
     parser.add_argument("--facts-gap-rounds", type=int, default=10, help="第一轮事实抽取后的“查漏补缺”追加轮数（确定性覆盖校验图/表锚点 + 定向补抽遗漏事实），循环到一轮无新增为止；默认最多 10 轮，设 0 关闭。")
     parser.add_argument("--tasks-gap-rounds", type=int, default=6, help="第二轮复现任务设计后的“查漏补缺”追加轮数（确定性校验每个可复现实验是否都有任务 + 为遗漏实验补任务），循环到全覆盖或无新增为止；默认最多 6 轮，设 0 关闭。")
-    parser.add_argument("--science-loop", action="store_true", help="开启论文思路锚点，供第三轮 Codex writer/reviewer 闭环使用。")
+    parser.add_argument("--science-loop", action="store_true", help="开启论文思路锚点，供第三轮自治 task writer 使用。")
     parser.add_argument(
         "--analysis-backend",
         choices=("codex", "llm"),
@@ -75,15 +75,9 @@ def _add_common_review_args(parser: argparse.ArgumentParser, *, include_resume: 
         "--codex-agent-rounds",
         type=int,
         default=8,
-        help="第三轮 Codex writer/reviewer 自适应闭环最大轮数；默认 8，不代表固定跑满。",
+        help="第三轮每个自治 task writer 的最大内部科学迭代轮数；默认 8，不代表固定跑满。",
     )
-    parser.add_argument(
-        "--codex-agent-stall-rounds",
-        type=int,
-        default=2,
-        help="第三轮连续多少轮没有刷新最佳评分后停止；默认 2，设 0 关闭平台期停止。",
-    )
-    parser.add_argument("--codex-agent-timeout", type=float, default=None, help="单个 Codex writer/reviewer 子进程超时，单位秒；默认复用 --project-timeout，未设置时 1800。")
+    parser.add_argument("--codex-agent-timeout", type=float, default=None, help="单个自治 task writer 子进程超时，单位秒；默认复用 --project-timeout，未设置时 1800。")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -133,7 +127,6 @@ def main(argv: list[str] | None = None) -> int:
             codex_analysis_timeout=args.codex_analysis_timeout,
             project_backend="codex",
             codex_agent_rounds=args.codex_agent_rounds,
-            codex_agent_stall_rounds=args.codex_agent_stall_rounds,
             codex_agent_timeout=args.codex_agent_timeout,
         )
         print(f"审查完成：{result.output_dir}")

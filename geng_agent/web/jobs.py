@@ -148,7 +148,6 @@ def _run_pipeline(record: RunRecord) -> None:
             analysis_backend="codex",
             project_backend="codex",
             codex_agent_rounds=8,
-            codex_agent_stall_rounds=2,
         )
         with _lock:
             record.status = "succeeded"
