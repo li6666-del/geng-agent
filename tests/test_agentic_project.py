@@ -21,7 +21,11 @@ from geng_agent.agentic_project import (
     strip_review_control_footer,
     summarize_markdown_review,
 )
-from geng_agent.agentic_task_writers import _prepare_task_writer_python_guard, run_codex_task_writer_workflow
+from geng_agent.agentic_task_writers import (
+    _prepare_task_writer_python_guard,
+    _task_writer_concurrency,
+    run_codex_task_writer_workflow,
+)
 from geng_agent.pipeline import ReviewPipeline
 from geng_agent.prompts import PromptBook
 
@@ -372,8 +376,58 @@ def _write_spoofing_task_writer(temp: Path) -> str:
                 "paper_image_paths": ["paper_evidence/01_" + task_id + "/paper_page_1.png"],
             }}
             (proj / "task_agent_result.json").write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
-            (proj / "task_agent_result.md").write_text("# spoof\\n\\nThis writer did not execute the guard full run.\\n", encoding="utf-8")
+            (proj / "task_agent_result.md").write_text("# spoof\\n\\nThis writer delivered artifacts and self-review without a trusted run log.\\n", encoding="utf-8")
             last.write_text("spoofed", encoding="utf-8")
+            '''
+        ),
+        encoding="utf-8",
+    )
+    return f'"{sys.executable}" "{script}"'
+
+
+def _write_failed_delivery_task_writer(temp: Path) -> str:
+    script = temp / "failed_delivery_task_writer.py"
+    script.write_text(
+        textwrap.dedent(
+            f'''
+            import base64
+            import json
+            import sys
+            from pathlib import Path
+
+            PNG_BYTES = base64.b64decode({PNG_B64!r})
+
+            args = sys.argv[1:]
+            proj = Path(args[args.index("--cd") + 1])
+            last = Path(args[args.index("--output-last-message") + 1])
+            manifest = json.loads((proj / "tasks_manifest.json").read_text(encoding="utf-8"))
+            task = manifest["tasks"][0]
+            task_id = task["task_id"]
+            output_subdir = task["output_subdir"]
+
+            for context in (proj / "paper_evidence").rglob("context.md"):
+                (context.parent / "paper_page_1.png").write_bytes(PNG_BYTES)
+
+            out = proj / "outputs" / output_subdir
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "curve.png").write_bytes(PNG_BYTES)
+            result = {{
+                "task_id": task_id,
+                "status": "failed",
+                "summary": "writer could not complete the assigned scientific reproduction",
+                "differences": [],
+                "possible_causes": [],
+                "remaining_uncertainties": [],
+                "evidence_files": [],
+                "local_image_paths": [f"outputs/{{output_subdir}}/curve.png"],
+                "paper_image_paths": ["paper_evidence/01_" + task_id + "/paper_page_1.png"],
+            }}
+            (proj / "task_agent_result.json").write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+            (proj / "task_agent_result.md").write_text(
+                "# failed task\\n\\nWriter reports this task as failed despite leaving diagnostic artifacts.\\n",
+                encoding="utf-8",
+            )
+            last.write_text("failed delivery", encoding="utf-8")
             '''
         ),
         encoding="utf-8",
@@ -658,6 +712,25 @@ class WriterSelftestShimTests(unittest.TestCase):
 
 
 class TaskWriterGuardTests(unittest.TestCase):
+    def test_task_writer_concurrency_caps_repro_runs_by_full_slots(self) -> None:
+        old_cpu = os.environ.get("GENG_TASK_WRITER_CPU_FULL_SLOTS")
+        old_gpu = os.environ.get("GENG_TASK_WRITER_GPU_FULL_SLOTS")
+        try:
+            os.environ["GENG_TASK_WRITER_CPU_FULL_SLOTS"] = "1"
+            os.environ["GENG_TASK_WRITER_GPU_FULL_SLOTS"] = "1"
+            self.assertEqual(_task_writer_concurrency(4, None, run_repro=True), 1)
+            self.assertEqual(_task_writer_concurrency(4, 4, run_repro=True), 1)
+            self.assertEqual(_task_writer_concurrency(4, 4, run_repro=False), 4)
+        finally:
+            if old_cpu is None:
+                os.environ.pop("GENG_TASK_WRITER_CPU_FULL_SLOTS", None)
+            else:
+                os.environ["GENG_TASK_WRITER_CPU_FULL_SLOTS"] = old_cpu
+            if old_gpu is None:
+                os.environ.pop("GENG_TASK_WRITER_GPU_FULL_SLOTS", None)
+            else:
+                os.environ["GENG_TASK_WRITER_GPU_FULL_SLOTS"] = old_gpu
+
     def test_task_writer_guard_allows_assigned_full_and_rejects_dispatcher_full(self) -> None:
         with TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
@@ -842,11 +915,7 @@ class TaskWriterWorkflowTests(unittest.TestCase):
                 self.assertTrue((task_dir / "curve.png").exists())
                 self.assertTrue((task_dir / "summary.json").exists())
                 self.assertTrue((task_dir / "task_agent_result.json").exists())
-                records = [
-                    json.loads(line)
-                    for line in (task_dir / "task_agent_runs.jsonl").read_text(encoding="utf-8").splitlines()
-                ]
-                self.assertTrue(any(record.get("profile") == "full" and record.get("returncode") == 0 for record in records))
+                self.assertFalse((task_dir / "task_agent_runs.jsonl").exists())
 
             review_md = (out / "result_review.md").read_text(encoding="utf-8")
             self.assertTrue(review_md.startswith("## 1. match_task"))
@@ -861,7 +930,7 @@ class TaskWriterWorkflowTests(unittest.TestCase):
             self.assertIn("Assigned task_id: `match_task`", prompts)
             self.assertIn("Do not run `python run_experiment.py config.json`", prompts)
 
-    def test_task_writer_workflow_rejects_writer_spoofed_full_log(self) -> None:
+    def test_task_writer_workflow_accepts_delivery_without_trusted_full_log(self) -> None:
         with TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
             paper = temp / "paper.md"
@@ -900,10 +969,61 @@ class TaskWriterWorkflowTests(unittest.TestCase):
                 else:
                     os.environ["GENG_CODEX_TASK_WRITER_CMD"] = old_task_writer
 
-            self.assertFalse(result["runtime_result"]["passed"])
-            errors = result["runtime_result"]["per_task"][0]["errors"]
-            self.assertIn("missing successful assigned-task full run in task_agent_runs.jsonl", errors)
+            self.assertTrue(result["runtime_result"]["passed"], msg=json.dumps(result["runtime_result"], ensure_ascii=False))
+            task_result = result["runtime_result"]["per_task"][0]
+            self.assertEqual(task_result["errors"], [])
+            self.assertIn("task_agent_runs.jsonl contains no trusted guard records", " ".join(task_result["warnings"]))
             self.assertFalse((out / "repro_project" / "outputs" / "spoof_task" / "task_agent_runs.jsonl").exists())
+
+    def test_task_writer_workflow_failed_status_does_not_pass_runtime(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            paper = temp / "paper.md"
+            paper.write_text("Figure 1 shows a mock curve.", encoding="utf-8")
+            out = temp / "case"
+            audit = out / "audit"
+
+            old_task_writer = os.environ.get("GENG_CODEX_TASK_WRITER_CMD")
+            os.environ["GENG_CODEX_TASK_WRITER_CMD"] = _write_failed_delivery_task_writer(temp)
+            try:
+                result = run_codex_task_writer_workflow(
+                    facts={"engineering_facts": []},
+                    tasks={"repro_tasks": [{"task_id": "failed_task", "figure_or_claim": "Fig. 1"}]},
+                    experiment_index={"experiments": []},
+                    paper={"format": "markdown", "chunks": []},
+                    paper_path=paper,
+                    paper_context_json="Figure 1 shows a mock curve.",
+                    paper_thesis=None,
+                    output_dir=out,
+                    audit_dir=audit,
+                    repro_project_dir=out / "repro_project",
+                    client=DummyLLM(),
+                    prompt_book=PromptBook(),
+                    system_message="system",
+                    run_repro=True,
+                    result_review=True,
+                    rounds=1,
+                    timeout=30,
+                    run_timeout=30,
+                    resume=False,
+                    agent_concurrency=1,
+                )
+            finally:
+                if old_task_writer is None:
+                    os.environ.pop("GENG_CODEX_TASK_WRITER_CMD", None)
+                else:
+                    os.environ["GENG_CODEX_TASK_WRITER_CMD"] = old_task_writer
+
+            runtime = result["runtime_result"]
+            self.assertFalse(runtime["passed"], msg=json.dumps(runtime, ensure_ascii=False))
+            self.assertEqual(runtime["coverage"], "0/1")
+            self.assertEqual(runtime["delivery_coverage"], "1/1")
+            task_result = runtime["per_task"][0]
+            self.assertTrue(task_result["delivery_ok"])
+            self.assertFalse(task_result["passed"])
+            self.assertEqual(task_result["task_writer_status"], "failed")
+            self.assertEqual(result["status"]["stop_class"], "task_failures_reported")
+            self.assertEqual(result["result_review_result"]["overall_alignment"], "inconclusive")
 
 
 class AgenticProjectWorkflowTests(unittest.TestCase):

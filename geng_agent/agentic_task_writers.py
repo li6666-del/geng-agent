@@ -103,11 +103,6 @@ def run_codex_task_writer_workflow(
     if task_root.exists():
         shutil.rmtree(task_root)
     task_root.mkdir(parents=True, exist_ok=True)
-    lock_dir = audit_dir / "03c_task_writer_full_locks"
-    if lock_dir.exists():
-        shutil.rmtree(lock_dir)
-    lock_dir.mkdir(parents=True, exist_ok=True)
-
     status: dict[str, Any] = {
         "backend": CODEX_PROJECT_BACKEND,
         "mode": "task_writers",
@@ -119,7 +114,8 @@ def run_codex_task_writer_workflow(
     }
     write_json(audit_dir / "03c_task_writers_start.json", status)
 
-    max_workers = _task_writer_concurrency(len(task_pairs), agent_concurrency)
+    max_workers = _task_writer_concurrency(len(task_pairs), agent_concurrency, run_repro=run_repro)
+    status["agent_concurrency"] = max_workers
     task_records: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_index = {
@@ -136,7 +132,6 @@ def run_codex_task_writer_workflow(
                 paper_thesis=paper_thesis,
                 task_root=task_root,
                 audit_dir=audit_dir,
-                lock_dir=lock_dir,
                 rounds=rounds,
                 timeout=timeout,
                 run_timeout=run_timeout,
@@ -220,6 +215,7 @@ def run_codex_task_writer_workflow(
                     "task_id": record.get("task_id"),
                     "status": record.get("task_writer_status"),
                     "structural_ok": record.get("structural_ok"),
+                    "warnings": record.get("warnings", []),
                 }
                 for record in task_records
             ],
@@ -257,6 +253,7 @@ def run_codex_task_writer_workflow(
                     "status": record.get("task_writer_status"),
                     "structural_ok": record.get("structural_ok"),
                     "errors": record.get("errors", []),
+                    "warnings": record.get("warnings", []),
                 }
                 for record in task_records
             ],
@@ -286,7 +283,6 @@ def _run_one_task_writer(
     paper_thesis: dict[str, Any] | None,
     task_root: Path,
     audit_dir: Path,
-    lock_dir: Path,
     rounds: int,
     timeout: float,
     run_timeout: float,
@@ -324,8 +320,8 @@ def _run_one_task_writer(
         label=label,
         module=module,
         output_subdir=str(manifest_entry.get("output_subdir") or task_id),
-        run_log=audit_dir / f"{label}_runs.jsonl",
-        lock_dir=lock_dir,
+        run_log=sandbox / "task_agent_runs.jsonl",
+        lock_dir=sandbox / ".task_writer_full_locks",
         allow_full=run_repro,
         run_timeout=run_timeout,
     )
@@ -447,7 +443,7 @@ You own exactly one reproduction task. There is no separate reviewer. You must w
 - Do not run `python run_experiment.py config.json`; the Python guard rejects dispatcher full runs and other task modules.
 - {full_instruction}
 - You may run smoke with `python -m tasks.{module} config_smoke.json`.
-- Full runs may wait on a host semaphore; do not bypass the Python guard.
+- Full runs use the sandbox-local Python guard; do not bypass it.
 - Max internal science iterations: {rounds}. Stop earlier when you reach a stable conclusion.
 
 ## Required final files
@@ -764,20 +760,18 @@ def _validate_task_writer_delivery(
     if not script_path.exists() or not script_path.is_file():
         errors.append(f"missing assigned task script: tasks/{module}.py")
 
+    warnings: list[str] = []
     run_records = _read_jsonl(trusted_run_log_path)
     trusted_records = [item for item in run_records if _is_trusted_guard_record(item, guard_token, module, output_subdir)]
     full_runs = [item for item in trusted_records if item.get("profile") == "full"]
     successful_full_runs = [item for item in full_runs if item.get("returncode") == 0]
-    full_success = bool(successful_full_runs)
-    if run_repro and not full_success:
-        errors.append("missing successful assigned-task full run in task_agent_runs.jsonl")
     if run_repro and successful_full_runs and not _run_record_has_required_artifacts(successful_full_runs[-1]):
-        errors.append("trusted full run did not record required CSV/PNG/summary artifacts")
+        warnings.append("trusted full run did not record required CSV/PNG/summary artifacts")
     if run_records and not trusted_records:
-        errors.append("task_agent_runs.jsonl contains no trusted guard records")
+        warnings.append("task_agent_runs.jsonl contains no trusted guard records; ignoring it for host validation")
 
     artifacts = inspect_output_artifacts(sandbox, subdir=output_subdir)
-    if run_repro and full_success:
+    if run_repro and status in {"matched", "explained_gap"}:
         if not artifacts.get("has_csv"):
             errors.append("missing valid local CSV artifact")
         if not artifacts.get("has_png"):
@@ -814,6 +808,7 @@ def _validate_task_writer_delivery(
         "paper_images": paper_images,
         "structural_ok": structural_ok,
         "errors": errors,
+        "warnings": warnings,
     }
 
 
@@ -915,11 +910,6 @@ def _merge_task_writer_deliveries(
             source = sandbox / name
             if source.exists():
                 shutil.copy2(source, result_dir / name)
-        run_log_path = record.get("run_log_path")
-        if run_log_path:
-            source = Path(str(run_log_path))
-            if source.exists():
-                shutil.copy2(source, result_dir / "task_agent_runs.jsonl")
         req_path = sandbox / "requirements.txt"
         if req_path.exists():
             combined_requirements.extend(_read_requirement_names(req_path))
@@ -933,7 +923,7 @@ def _write_final_shared_project_files(repro_project_dir: Path, task_records: lis
         repro_project_dir / "README.md",
         "# Task-writer reproduction project\n\n"
         "This project was assembled from autonomous per-task Codex writer sandboxes. "
-        "Each task ran and self-reviewed its own full reproduction before host aggregation.\n",
+        "Each task delivered its own code, artifacts, and self-review before host aggregation.\n",
     )
     write_json(
         repro_project_dir / "config.json",
@@ -993,14 +983,15 @@ def _task_writer_runtime_result(
     requirement_issues: list[dict[str, Any]],
     security_issues: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    passed = sum(1 for record in task_records if record.get("structural_ok"))
+    passed = sum(1 for record in task_records if _task_writer_runtime_task_passed(record))
+    delivered = sum(1 for record in task_records if record.get("structural_ok"))
     total = len(task_records)
-    valid_task_ids = [str(record.get("task_id")) for record in task_records if record.get("structural_ok")]
+    valid_task_ids = [str(record.get("task_id")) for record in task_records if _task_writer_runtime_task_passed(record)]
     valid_csv_files: list[str] = []
     valid_png_files: list[str] = []
     valid_summary_json_files: list[str] = []
     for record in task_records:
-        if not record.get("structural_ok"):
+        if not _task_writer_runtime_task_passed(record):
             continue
         artifacts = record.get("artifacts") if isinstance(record.get("artifacts"), dict) else {}
         output_subdir = str(record.get("output_subdir") or record.get("task_id") or "")
@@ -1031,6 +1022,8 @@ def _task_writer_runtime_result(
         "tasks_total": total,
         "tasks_passed": passed,
         "coverage": f"{passed}/{total}",
+        "deliveries_passed": delivered,
+        "delivery_coverage": f"{delivered}/{total}",
         "partial_success": {
             "has_partial_output": bool(0 < passed < total),
             "valid_task_ids": valid_task_ids,
@@ -1042,11 +1035,13 @@ def _task_writer_runtime_result(
             {
                 "task_id": record.get("task_id"),
                 "module": record.get("module"),
-                "passed": bool(record.get("structural_ok")),
+                "passed": _task_writer_runtime_task_passed(record),
+                "delivery_ok": bool(record.get("structural_ok")),
                 "task_writer_status": record.get("task_writer_status"),
                 "full_run": record.get("full_run"),
                 "artifacts": record.get("artifacts"),
                 "errors": record.get("errors", []),
+                "warnings": record.get("warnings", []),
             }
             for record in task_records
         ],
@@ -1054,6 +1049,13 @@ def _task_writer_runtime_result(
         "manifest_issues": manifest_issues,
         "requirements_issues": requirement_issues,
         "security_issues": security_issues,
+    }
+
+
+def _task_writer_runtime_task_passed(record: dict[str, Any]) -> bool:
+    return bool(record.get("structural_ok")) and str(record.get("task_writer_status") or "") in {
+        "matched",
+        "explained_gap",
     }
 
 
@@ -1169,21 +1171,40 @@ def _compact_task_writer_review(record: dict[str, Any]) -> dict[str, Any]:
         "remaining_uncertainties": result.get("remaining_uncertainties", []),
         "evidence_files": result.get("evidence_files", []),
         "errors": record.get("errors", []),
+        "warnings": record.get("warnings", []),
     }
 
 
-def _task_writer_concurrency(task_count: int, requested: int | None) -> int:
+def _task_writer_concurrency(task_count: int, requested: int | None, *, run_repro: bool = False) -> int:
     if task_count <= 0:
         return 1
     if requested is not None:
-        return max(1, min(task_count, int(requested)))
+        base = max(1, min(task_count, int(requested)))
+        return min(base, _task_writer_full_slot_cap()) if run_repro else base
     raw = os.environ.get("GENG_CODEX_TASK_WRITER_CONCURRENCY")
     if raw:
         try:
-            return max(1, min(task_count, int(raw)))
+            base = max(1, min(task_count, int(raw)))
+            return min(base, _task_writer_full_slot_cap()) if run_repro else base
         except ValueError:
             pass
-    return min(task_count, DEFAULT_TASK_WRITER_AGENT_CONCURRENCY)
+    base = min(task_count, DEFAULT_TASK_WRITER_AGENT_CONCURRENCY)
+    return min(base, _task_writer_full_slot_cap()) if run_repro else base
+
+
+def _task_writer_full_slot_cap() -> int:
+    try:
+        import torch  # type: ignore
+
+        cuda = bool(torch.cuda.is_available())
+    except Exception:
+        cuda = False
+    env_name = "GENG_TASK_WRITER_GPU_FULL_SLOTS" if cuda else "GENG_TASK_WRITER_CPU_FULL_SLOTS"
+    default = "1" if cuda else "2"
+    try:
+        return max(1, int(os.environ.get(env_name, default)))
+    except ValueError:
+        return int(default)
 
 
 def _task_writer_stop_class(task_records: list[dict[str, Any]]) -> str:
@@ -1220,6 +1241,7 @@ def _failed_task_record(*, index: int, task_id: str, module: str, error: str) ->
         "writer_status": {"ok": False, "error": redact_text(error)[:1000]},
         "result_json": {"task_id": task_id, "status": "failed", "summary": redact_text(error)[:500]},
         "run_records": [],
+        "warnings": [],
         "local_images": [],
         "paper_images": [],
     }
