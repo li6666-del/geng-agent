@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import subprocess
@@ -15,8 +16,8 @@ from geng_agent.agentic_project import (
     _load_cached_agentic_project,
     _prepare_writer_selftest_shim,
     _render_task_markdown_section,
+    _review_image_kind,
     _score_candidate,
-    _task_figure_label,
     build_writer_brief,
     run_codex_project_workflow,
     strip_review_control_footer,
@@ -27,6 +28,7 @@ from geng_agent.agentic_task_writers import (
     _task_paper_image_paths,
     _task_writer_runtime_result,
     _task_writer_concurrency,
+    _validate_paper_locator_doc,
     run_codex_task_writer_workflow,
 )
 from geng_agent.pipeline import ReviewPipeline
@@ -256,6 +258,7 @@ def _write_mock_task_writer(temp: Path, *, result_location: str = "root") -> str
             from pathlib import Path
 
             PNG_BYTES = base64.b64decode("__PNG_B64__")
+            PAPER_BYTES = PNG_BYTES + b"writer-paper-target"
 
             args = sys.argv[1:]
             proj = Path(args[args.index("--cd") + 1])
@@ -305,6 +308,21 @@ if __name__ == '__main__':
             if completed.returncode != 0:
                 raise SystemExit(completed.returncode)
 
+            paper_image_rel = f"outputs/{output_subdir}/paper_target_locator.png"
+            paper_image_path = proj / paper_image_rel
+            paper_image_path.parent.mkdir(parents=True, exist_ok=True)
+            paper_image_path.write_bytes(PAPER_BYTES)
+            paper_locator = {
+                "target_figure": task.get("figure_or_claim", task_id),
+                "source_page": 1,
+                "bbox_norm": [0.1, 0.1, 0.9, 0.9],
+                "confidence": "low",
+                "contains_only_target": False,
+                "fallback_used": True,
+                "reason": "mock writer locator",
+                "paper_image_paths": [paper_image_rel],
+            }
+
             status = "explained_gap" if "gap" in task_id else "matched"
             result = {
                 "task_id": task_id,
@@ -313,12 +331,16 @@ if __name__ == '__main__':
                 "differences": ["scale differs"] if status == "explained_gap" else [],
                 "possible_causes": ["missing paper parameter"] if status == "explained_gap" else [],
                 "remaining_uncertainties": ["exact seed"] if status == "explained_gap" else [],
-                "evidence_files": [f"outputs/{output_subdir}/results.csv", f"outputs/{output_subdir}/curve.png"],
+                "evidence_files": [f"outputs/{output_subdir}/results.csv", f"outputs/{output_subdir}/curve.png", paper_image_rel],
                 "local_image_paths": [f"outputs/{output_subdir}/curve.png"],
-                "paper_image_paths": ["paper_evidence/01_" + task_id + "/paper_page_1.png"],
+                "paper_image_paths": [paper_image_rel],
             }
             result_dir = (proj / "outputs" / output_subdir) if result_location == "output" else proj
             result_dir.mkdir(parents=True, exist_ok=True)
+            (result_dir / "paper_target_figure.json").write_text(
+                json.dumps(paper_locator, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
             (result_dir / "task_agent_result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
             (result_dir / "task_agent_result.md").write_text(
                 f"# {task_id}\n\nWriter conclusion: {status}\n\nEvidence: outputs/{output_subdir}/curve.png\n",
@@ -374,6 +396,7 @@ def _write_spoofing_task_writer(temp: Path) -> str:
             from pathlib import Path
 
             PNG_BYTES = base64.b64decode({PNG_B64!r})
+            PAPER_BYTES = PNG_BYTES + b"writer-paper-target"
 
             args = sys.argv[1:]
             proj = Path(args[args.index("--cd") + 1])
@@ -390,6 +413,7 @@ def _write_spoofing_task_writer(temp: Path) -> str:
             out.mkdir(parents=True, exist_ok=True)
             (out / "results.csv").write_text("x,y\\n0,0.1\\n", encoding="utf-8")
             (out / "curve.png").write_bytes(PNG_BYTES)
+            (out / "paper_target_locator.png").write_bytes(PAPER_BYTES)
             (out / "summary.json").write_text(
                 json.dumps({{"task_id": task_id, "metrics": {{"points": 1}}, "assumptions": []}}),
                 encoding="utf-8",
@@ -405,10 +429,21 @@ def _write_spoofing_task_writer(temp: Path) -> str:
                 "differences": [],
                 "possible_causes": [],
                 "remaining_uncertainties": [],
-                "evidence_files": [f"outputs/{{output_subdir}}/results.csv"],
+                "evidence_files": [f"outputs/{{output_subdir}}/results.csv", f"outputs/{{output_subdir}}/paper_target_locator.png"],
                 "local_image_paths": [f"outputs/{{output_subdir}}/curve.png"],
-                "paper_image_paths": ["paper_evidence/01_" + task_id + "/paper_page_1.png"],
+                "paper_image_paths": [f"outputs/{{output_subdir}}/paper_target_locator.png"],
             }}
+            locator = {{
+                "target_figure": task.get("figure_or_claim", task_id),
+                "source_page": 1,
+                "bbox_norm": [0.1, 0.1, 0.9, 0.9],
+                "confidence": "low",
+                "contains_only_target": False,
+                "fallback_used": True,
+                "reason": "mock locator",
+                "paper_image_paths": [f"outputs/{{output_subdir}}/paper_target_locator.png"],
+            }}
+            (proj / "paper_target_figure.json").write_text(json.dumps(locator, ensure_ascii=False), encoding="utf-8")
             (proj / "task_agent_result.json").write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
             (proj / "task_agent_result.md").write_text("# spoof\\n\\nThis writer delivered artifacts and self-review without a trusted run log.\\n", encoding="utf-8")
             last.write_text("spoofed", encoding="utf-8")
@@ -430,6 +465,7 @@ def _write_failed_delivery_task_writer(temp: Path) -> str:
             from pathlib import Path
 
             PNG_BYTES = base64.b64decode({PNG_B64!r})
+            PAPER_BYTES = PNG_BYTES + b"writer-paper-target"
 
             args = sys.argv[1:]
             proj = Path(args[args.index("--cd") + 1])
@@ -445,6 +481,7 @@ def _write_failed_delivery_task_writer(temp: Path) -> str:
             out = proj / "outputs" / output_subdir
             out.mkdir(parents=True, exist_ok=True)
             (out / "curve.png").write_bytes(PNG_BYTES)
+            (out / "paper_target_locator.png").write_bytes(PAPER_BYTES)
             result = {{
                 "task_id": task_id,
                 "status": "failed",
@@ -454,8 +491,19 @@ def _write_failed_delivery_task_writer(temp: Path) -> str:
                 "remaining_uncertainties": [],
                 "evidence_files": [],
                 "local_image_paths": [f"outputs/{{output_subdir}}/curve.png"],
-                "paper_image_paths": ["paper_evidence/01_" + task_id + "/paper_page_1.png"],
+                "paper_image_paths": [f"outputs/{{output_subdir}}/paper_target_locator.png"],
             }}
+            locator = {{
+                "target_figure": task.get("figure_or_claim", task_id),
+                "source_page": 1,
+                "bbox_norm": [0.1, 0.1, 0.9, 0.9],
+                "confidence": "low",
+                "contains_only_target": False,
+                "fallback_used": True,
+                "reason": "mock failed locator",
+                "paper_image_paths": [f"outputs/{{output_subdir}}/paper_target_locator.png"],
+            }}
+            (proj / "paper_target_figure.json").write_text(json.dumps(locator, ensure_ascii=False), encoding="utf-8")
             (proj / "task_agent_result.json").write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
             (proj / "task_agent_result.md").write_text(
                 "# failed task\\n\\nWriter reports this task as failed despite leaving diagnostic artifacts.\\n",
@@ -1005,129 +1053,109 @@ class TaskWriterWorkflowTests(unittest.TestCase):
             self.assertIn("Do not stop after the first imperfect output", prompts)
             self.assertIn("continue to the next repair/rerun cycle until cycle 3", prompts)
 
-    def test_task_writer_paper_images_use_target_figure_crop(self) -> None:
-        try:
-            from PIL import Image, ImageDraw
-        except Exception:
-            self.skipTest("Pillow is not available")
+    def test_task_writer_paper_images_use_writer_declared_target_image(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            sandbox = Path(temp_dir)
+            output_dir = sandbox / "outputs" / "crop_task"
+            output_dir.mkdir(parents=True)
+            target = output_dir / "paper_target_crop.png"
+            target.write_bytes(base64.b64decode(PNG_B64))
 
+            images, warnings, errors = _task_paper_image_paths(
+                sandbox=sandbox,
+                output_subdir="crop_task",
+                result_doc={"paper_image_paths": ["outputs/crop_task/paper_target_crop.png"]},
+                locator_doc={},
+            )
+
+            self.assertEqual(errors, [])
+            self.assertEqual(warnings, [])
+            self.assertEqual(images, [str(target.resolve())])
+
+    def test_task_writer_paper_images_reject_raw_rendered_page(self) -> None:
         with TemporaryDirectory() as temp_dir:
             sandbox = Path(temp_dir)
             evidence_dir = sandbox / "paper_evidence" / "01_crop_task"
             evidence_dir.mkdir(parents=True)
-            for page_number in (1, 2):
-                page = evidence_dir / f"paper_page_{page_number}.png"
-                image = Image.new("RGB", (800, 1000), "white")
-                draw = ImageDraw.Draw(image)
-                if page_number == 2:
-                    draw.rectangle((130, 240, 680, 580), fill=(225, 225, 225), outline=(0, 0, 0), width=4)
-                    for y in range(280, 540, 36):
-                        draw.line((160, y, 650, y), fill=(60, 60, 60), width=2)
-                else:
-                    draw.text((80, 120), "unrelated text page", fill=(0, 0, 0))
-                image.save(page)
-            pdffigures_dir = sandbox / "paper_evidence" / "pdffigures2"
-            pdffigures_dir.mkdir(parents=True)
-            figure_crop = pdffigures_dir / "fig2.png"
-            Image.new("RGB", (500, 320), (225, 225, 225)).save(figure_crop)
-            (pdffigures_dir / "paper_figures.json").write_text(
-                json.dumps(
-                    {
-                        "enabled": True,
-                        "ok": True,
-                        "figures": [
-                            {
-                                "type": "Figure",
-                                "figure_number": "2",
-                                "page": 2,
-                                "page_index": 1,
-                                "image_path": str(figure_crop),
-                                "figure_box": [130, 240, 680, 580],
-                            }
-                        ],
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
-            (evidence_dir / "evidence.json").write_text(
-                json.dumps(
-                    {
-                        "facts": {
-                            "engineering_facts": [
-                                {
-                                    "type": "figure_claim",
-                                    "name": "Fig2_rate_curve",
-                                    "source": {"source_kind": "figure", "page": 2, "figure_ref": "Fig.2"},
-                                }
-                            ]
-                        }
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
+            raw_page = evidence_dir / "paper_page_1.png"
+            raw_page.write_bytes(base64.b64decode(PNG_B64))
+
+            images, warnings, errors = _task_paper_image_paths(
+                sandbox=sandbox,
+                output_subdir="crop_task",
+                result_doc={"paper_image_paths": ["paper_evidence/01_crop_task/paper_page_1.png"]},
+                locator_doc={},
             )
 
-            images = _task_paper_image_paths(
-                sandbox,
-                {"task_id": "reproduce_fig_2", "figure_or_claim": "Fig. 2 achievable rate"},
-            )
+            self.assertEqual(images, [])
+            self.assertIn("writer declared paper_image_paths but none were usable", warnings)
+            self.assertTrue(any("not raw page" in error for error in errors))
 
-            self.assertEqual(len(images), 1)
-            self.assertIn("paper_page_2_crop.png", images[0])
-            self.assertTrue(Path(images[0]).exists())
-            self.assertNotIn("paper_page_1", images[0])
-
-    def test_task_writer_paper_images_fallback_to_selected_page_order(self) -> None:
-        try:
-            from PIL import Image, ImageDraw
-        except Exception:
-            self.skipTest("Pillow is not available")
-
+    def test_task_writer_paper_images_reject_renamed_raw_rendered_page(self) -> None:
         with TemporaryDirectory() as temp_dir:
             sandbox = Path(temp_dir)
             evidence_dir = sandbox / "paper_evidence" / "01_crop_task"
             evidence_dir.mkdir(parents=True)
-            for page_number in (3, 9, 10):
-                page = evidence_dir / f"paper_page_{page_number}.png"
-                image = Image.new("RGB", (800, 1000), "white")
-                draw = ImageDraw.Draw(image)
-                if page_number == 9:
-                    draw.rectangle((420, 120, 740, 360), fill=(215, 215, 215), outline=(0, 0, 0), width=4)
-                    for x in range(440, 720, 28):
-                        shade = 70 + (x - 440) // 4
-                        draw.rectangle((x, 140, x + 22, 335), fill=(shade, shade, shade))
-                    draw.text((430, 380), "Fig. 4. Empirical CDF", fill=(0, 0, 0))
-                else:
-                    draw.text((80, 120), f"text-heavy page {page_number}", fill=(0, 0, 0))
-                image.save(page)
-            (evidence_dir / "evidence.json").write_text(
-                json.dumps(
-                    {
-                        "selected_paper_pages": [9, 3, 10],
-                        "facts": {
-                            "engineering_facts": [
-                                {
-                                    "type": "metric",
-                                    "name": "spatial ZF metric",
-                                    "source": {"source_kind": "text", "page": 3, "quote": "ZF equation"},
-                                }
-                            ]
-                        },
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
+            raw_bytes = base64.b64decode(PNG_B64)
+            (evidence_dir / "paper_page_1.png").write_bytes(raw_bytes)
+            output_dir = sandbox / "outputs" / "crop_task"
+            output_dir.mkdir(parents=True)
+            renamed = output_dir / "paper_target_crop.png"
+            renamed.write_bytes(raw_bytes)
+
+            images, warnings, errors = _task_paper_image_paths(
+                sandbox=sandbox,
+                output_subdir="crop_task",
+                result_doc={"paper_image_paths": ["outputs/crop_task/paper_target_crop.png"]},
+                locator_doc={},
             )
 
-            images = _task_paper_image_paths(
-                sandbox,
-                {"task_id": "reproduce_fig_4", "figure_or_claim": "Fig. 4 empirical CDF"},
+            self.assertEqual(images, [])
+            self.assertIn("writer declared paper_image_paths but none were usable", warnings)
+            self.assertTrue(any("unmodified rendered paper page" in error for error in errors))
+
+    def test_task_writer_paper_image_root_path_is_copied_into_task_output(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            sandbox = Path(temp_dir)
+            source = sandbox / "paper_target_locator.png"
+            source.write_bytes(base64.b64decode(PNG_B64) + b"target")
+
+            images, warnings, errors = _task_paper_image_paths(
+                sandbox=sandbox,
+                output_subdir="crop_task",
+                result_doc={"paper_image_paths": ["paper_target_locator.png"]},
+                locator_doc={},
             )
 
-            self.assertEqual(len(images), 1)
-            self.assertIn("paper_page_9.png", images[0])
-            self.assertNotIn("paper_page_10", images[0])
+            expected = sandbox / "outputs" / "crop_task" / "paper_target_locator.png"
+            self.assertEqual(errors, [])
+            self.assertTrue(any("copied into outputs/crop_task" in warning for warning in warnings))
+            self.assertEqual(images, [str(expected.resolve())])
+            self.assertTrue(expected.exists())
+
+    def test_task_writer_paper_image_path_does_not_basename_fallback_nested_paths(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            sandbox = Path(temp_dir)
+            output_dir = sandbox / "outputs" / "crop_task"
+            output_dir.mkdir(parents=True)
+            (output_dir / "paper_target_crop.png").write_bytes(base64.b64decode(PNG_B64) + b"target")
+
+            images, _warnings, errors = _task_paper_image_paths(
+                sandbox=sandbox,
+                output_subdir="crop_task",
+                result_doc={"paper_image_paths": ["nested/paper_target_crop.png"]},
+                locator_doc={},
+            )
+
+            self.assertEqual(images, [])
+            self.assertTrue(any("does not exist" in error for error in errors))
+
+    def test_paper_locator_doc_requires_minimum_fields(self) -> None:
+        errors = _validate_paper_locator_doc({})
+
+        self.assertTrue(any("target_figure" in error for error in errors))
+        self.assertTrue(any("source_page" in error for error in errors))
+        self.assertTrue(any("fallback_used" in error for error in errors))
 
     def test_task_writer_workflow_accepts_result_files_in_output_subdir(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -1701,7 +1729,7 @@ class AgenticProjectWorkflowTests(unittest.TestCase):
             self.assertIn("Mock review", review_md)
             self.assertIn("Reviewer failed", review_md)
 
-    def test_task_markdown_section_embeds_local_and_paper_images(self) -> None:
+    def test_task_markdown_section_does_not_embed_raw_paper_page_as_final_original(self) -> None:
         section = _render_task_markdown_section(
             index=1,
             task_id="reproduce_fig_1",
@@ -1724,162 +1752,53 @@ class AgenticProjectWorkflowTests(unittest.TestCase):
 
         self.assertTrue(section.startswith("## 1. reproduce_fig_1"))
         self.assertIn("![本地复现图: reproduce_fig_1/fig1.png](C:/tmp/local_fig1.png)", section)
-        self.assertIn("![论文原图页: p3](C:/tmp/paper_page_3.png)", section)
+        self.assertNotIn("![论文原图页: p3](C:/tmp/paper_page_3.png)", section)
+        self.assertIn("未记录。", section)
         self.assertIn("### 审查正文", section)
 
-    def test_task_markdown_section_prefers_paper_crop_when_available(self) -> None:
-        try:
-            from PIL import Image, ImageDraw
-        except Exception:
-            self.skipTest("Pillow is not available")
+    def test_task_markdown_section_prefers_writer_paper_target_when_available(self) -> None:
+        section = _render_task_markdown_section(
+            index=1,
+            task_id="reproduce_fig_2",
+            image_entries=[
+                {
+                    "label": "paper_page:3",
+                    "kind": "paper_page",
+                    "mime_type": "image/png",
+                    "path": "C:/tmp/paper_page_3.png",
+                },
+                {
+                    "label": "paper_target:Fig. 2",
+                    "kind": "paper_target",
+                    "mime_type": "image/png",
+                    "path": "C:/tmp/paper_target_crop.png",
+                },
+            ],
+            body_markdown="Reviewer body.",
+        )
 
-        with TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            paper_page = root / "paper_page_3.png"
-            image = Image.new("RGB", (800, 1000), "white")
-            draw = ImageDraw.Draw(image)
-            draw.rectangle((120, 220, 680, 560), fill=(220, 220, 220), outline=(0, 0, 0), width=4)
-            for y in range(260, 540, 40):
-                draw.line((150, y, 650, y), fill=(70, 70, 70), width=2)
-            image.save(paper_page)
-            pdffigures_dir = root / "pdffigures2"
-            pdffigures_dir.mkdir()
-            figure_crop = pdffigures_dir / "fig2.png"
-            image.crop((120, 220, 680, 560)).save(figure_crop)
-            (pdffigures_dir / "paper_figures.json").write_text(
-                json.dumps(
-                    {
-                        "enabled": True,
-                        "ok": True,
-                        "figures": [
-                            {
-                                "type": "Figure",
-                                "figure_number": "2",
-                                "page": 3,
-                                "page_index": 2,
-                                "image_path": str(figure_crop),
-                                "figure_box": [120, 220, 680, 560],
-                            }
-                        ],
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
+        self.assertIn("![论文目标图: Fig. 2](C:/tmp/paper_target_crop.png)", section)
+        self.assertNotIn("![论文原图页: p3](C:/tmp/paper_page_3.png)", section)
 
-            display_entries = _augment_review_display_images(
-                task={"task_id": "reproduce_fig_2", "figure_or_claim": "Fig. 2"},
-                image_entries=[
-                    {
-                        "label": "paper_page:3",
-                        "kind": "paper_page",
-                        "mime_type": "image/png",
-                        "path": str(paper_page),
-                    }
-                ],
-            )
-            crop_entries = [entry for entry in display_entries if entry.get("kind") == "paper_crop"]
-            self.assertEqual(len(crop_entries), 1)
-            self.assertTrue(Path(str(crop_entries[0]["path"])).exists())
+    def test_review_image_kind_classifies_writer_paper_images(self) -> None:
+        self.assertEqual(_review_image_kind("paper_target:Fig. 2"), "paper_target")
+        self.assertEqual(_review_image_kind("paper_locator:Fig. 2"), "paper_locator")
 
-            section = _render_task_markdown_section(
-                index=1,
-                task_id="reproduce_fig_2",
-                image_entries=display_entries,
-                body_markdown="Reviewer body.",
-            )
+    def test_augment_review_display_images_no_longer_auto_crops_paper_pages(self) -> None:
+        entries = _augment_review_display_images(
+            task={"task_id": "reproduce_fig_9a", "figure_or_claim": "Fig. 9(a) BER curve"},
+            image_entries=[
+                {
+                    "label": "paper_page:1",
+                    "kind": "paper_page",
+                    "mime_type": "image/png",
+                    "path": "C:/tmp/paper_page_1.png",
+                }
+            ],
+        )
 
-            self.assertIn("![论文原图裁剪: Fig. 2, p3](", section)
-            self.assertIn(str(crop_entries[0]["path"]), section)
-            self.assertNotIn(f"]({paper_page})", section)
-
-    def test_paper_crop_targets_requested_subfigure_panel(self) -> None:
-        try:
-            import fitz
-            from PIL import Image
-        except Exception:
-            self.skipTest("PyMuPDF and Pillow are required")
-
-        with TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            source = root / "source"
-            source.mkdir()
-            pdf_path = source / "paper.pdf"
-            document = fitz.open()
-            page = document.new_page(width=612, height=792)
-            for left, top, right, bottom in (
-                (52, 66, 220, 212),
-                (230, 66, 390, 212),
-                (402, 66, 562, 212),
-                (52, 244, 220, 390),
-                (230, 244, 390, 390),
-                (402, 244, 562, 390),
-            ):
-                page.draw_rect(fitz.Rect(left, top, right, bottom), color=(0, 0, 0), width=0.5)
-            page.insert_text((61, 225), "(a) Different modulations: OTFS/AFDM/OFDM.", fontsize=8)
-            page.insert_text((238, 225), "(b) Antenna correlation.", fontsize=8)
-            page.insert_text((400, 225), "(c) Different block length.", fontsize=8)
-            page.insert_text((71, 403), "(d) Different T.", fontsize=8)
-            page.insert_text((238, 403), "(e) Different rho.", fontsize=8)
-            page.insert_text((411, 403), "(f) Different mobility.", fontsize=8)
-            page.insert_textbox(
-                fitz.Rect(49, 417, 563, 456),
-                "Fig. 9: BER performance comparison for multiple communication-system settings.",
-                fontsize=8,
-            )
-            document.save(str(pdf_path))
-            document.close()
-
-            paper_page = root / "paper_page_1.png"
-            Image.new("RGB", (918, 1188), "white").save(paper_page)
-            pdffigures_dir = root / "pdffigures2"
-            pdffigures_dir.mkdir()
-            (pdffigures_dir / "paper_figures.json").write_text(
-                json.dumps(
-                    {
-                        "enabled": True,
-                        "ok": True,
-                        "figures": [
-                            {
-                                "type": "Figure",
-                                "figure_number": "9",
-                                "page": 1,
-                                "page_index": 0,
-                                "source_pdf": str(pdf_path),
-                                "figure_box": [49, 60, 563, 417],
-                                "caption": "Fig. 9: BER performance comparison for multiple communication-system settings.",
-                            }
-                        ],
-                    },
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
-
-            task = {"task_id": "reproduce_fig_9a", "figure_or_claim": "Fig. 9(a) BER curve"}
-            self.assertEqual(_task_figure_label(task), "Fig. 9a")
-            display_entries = _augment_review_display_images(
-                task=task,
-                image_entries=[
-                    {
-                        "label": "paper_page:1",
-                        "kind": "paper_page",
-                        "mime_type": "image/png",
-                        "path": str(paper_page),
-                    }
-                ],
-            )
-
-            crop_entries = [entry for entry in display_entries if entry.get("kind") == "paper_crop"]
-            self.assertEqual(len(crop_entries), 1)
-            crop = crop_entries[0]
-            self.assertEqual(crop.get("crop_reason"), "pdffigures2_subfigure")
-            crop_box = crop.get("crop_box")
-            self.assertIsInstance(crop_box, list)
-            self.assertLess(crop_box[0], 80)
-            self.assertLess(crop_box[2], 260)
-            self.assertLess(crop_box[3], 260)
-            self.assertTrue(Path(str(crop["path"])).exists())
+        self.assertEqual(entries[0]["kind"], "paper_page")
+        self.assertFalse(any(entry.get("kind") != "paper_page" for entry in entries))
 
     def test_cached_markdown_review_ignored_when_newer_error_exists(self) -> None:
         with TemporaryDirectory() as temp_dir:

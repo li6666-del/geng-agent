@@ -5,7 +5,6 @@ import sys
 import tomllib
 import unittest
 from pathlib import Path
-from tempfile import TemporaryDirectory
 
 from geng_agent.preflight import (
     CRITICAL_REPRO_PACKAGES,
@@ -16,7 +15,6 @@ from geng_agent.preflight import (
     environment_warning,
     format_report,
     remedy_command,
-    _pdffigures2_command_available,
 )
 from geng_agent.security import ALLOWED_REQUIREMENTS
 
@@ -94,32 +92,6 @@ class CheckEnvironmentTests(unittest.TestCase):
         for item in report.repro:
             self.assertEqual(item.critical, item.package in CRITICAL_REPRO_PACKAGES)
         self.assertEqual(CRITICAL_REPRO_PACKAGES, {"numpy", "scipy", "matplotlib"})
-
-    def test_pdffigures2_command_check_requires_java_entry_and_jar(self) -> None:
-        with TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            java = root / "java.exe"
-            jar = root / "pdffigures2.jar"
-            java.write_text("", encoding="utf-8")
-            jar.write_text("", encoding="utf-8")
-
-            available, note = _pdffigures2_command_available(f'"{java}" -jar "{jar}" "{{input_dir}}"')
-
-            self.assertTrue(available)
-            self.assertIsNone(note)
-
-    def test_pdffigures2_command_check_rejects_missing_jar(self) -> None:
-        with TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            java = root / "java.exe"
-            missing_jar = root / "missing.jar"
-            java.write_text("", encoding="utf-8")
-
-            available, note = _pdffigures2_command_available(f'"{java}" -jar "{missing_jar}" "{{input_dir}}"')
-
-            self.assertFalse(available)
-            self.assertIn("jar", str(note))
-
 
 class ReportFormattingTests(unittest.TestCase):
     def test_ready_report_is_ok_and_silent(self) -> None:

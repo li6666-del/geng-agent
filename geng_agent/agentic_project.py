@@ -16,7 +16,6 @@ from .json_utils import pretty_json
 from .llm import LLMClient, LLMImage
 from .manifest_utils import expected_generated_paths
 from .outputs import resolve_inside, validate_repro_project, write_json, write_text
-from .pdffigures2 import build_pdffigures2_evidence, select_pdffigures2_crop_for_task
 from .project_snapshot import _restore_project, _snapshot_project
 from .result_review import (
     collect_result_review_inputs,
@@ -1046,146 +1045,14 @@ def _select_task_local_image_entries(task_id: str, image_entries: list[dict[str,
 
 
 def _select_task_paper_display_entries(image_entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    paper_pages = [entry for entry in image_entries if entry.get("kind") == "paper_page"]
-    paper_crops = [entry for entry in image_entries if entry.get("kind") == "paper_crop"]
-    if not paper_crops:
-        return paper_pages
-
-    crops_by_source: dict[str, list[dict[str, Any]]] = {}
-    for crop in paper_crops:
-        source_label = str(crop.get("source_label") or "")
-        if source_label:
-            crops_by_source.setdefault(source_label, []).append(crop)
-
-    selected: list[dict[str, Any]] = []
-    used_crop_ids: set[int] = set()
-    for page in paper_pages:
-        page_crops = crops_by_source.get(str(page.get("label") or ""), [])
-        if page_crops:
-            selected.extend(page_crops)
-            used_crop_ids.update(id(crop) for crop in page_crops)
-        else:
-            selected.append(page)
-    for crop in paper_crops:
-        if id(crop) not in used_crop_ids:
-            selected.append(crop)
-    return selected
+    writer_targets = [entry for entry in image_entries if entry.get("kind") in {"paper_target", "paper_locator"}]
+    if writer_targets:
+        return writer_targets
+    return []
 
 
 def _augment_review_display_images(*, task: dict[str, Any], image_entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    display_entries = [dict(entry) for entry in image_entries]
-    crop_entries: list[dict[str, Any]] = []
-    for entry in display_entries:
-        if entry.get("kind") != "paper_page":
-            continue
-        crop_entry = _create_paper_crop_entry(task=task, page_entry=entry)
-        if crop_entry:
-            crop_entries.append(crop_entry)
-    return display_entries + crop_entries
-
-
-def _create_paper_crop_entry(*, task: dict[str, Any], page_entry: dict[str, Any]) -> dict[str, Any] | None:
-    source_path_text = str(page_entry.get("path") or "")
-    if not source_path_text:
-        return None
-    source_path = Path(source_path_text)
-    if not source_path.exists() or not source_path.is_file():
-        return None
-    target_path = source_path.with_name(f"{source_path.stem}_crop.png")
-    page_no = _paper_page_number_from_label(str(page_entry.get("label") or ""))
-    figure_label = _task_figure_label(task)
-    caption_bits = [bit for bit in (figure_label, f"p{page_no}" if page_no else "") if bit]
-    caption_suffix = ", ".join(caption_bits)
-    caption = "论文原图裁剪" if not caption_suffix else f"论文原图裁剪: {caption_suffix}"
-    label_bits = ["paper_crop", safe_label(figure_label or "figure")]
-    if page_no:
-        label_bits.append(f"p{page_no}")
-    crop_info = select_pdffigures2_crop_for_task(
-        source_page_image=source_path,
-        figure_ref=_task_figure_reference(task),
-        target_path=target_path,
-    )
-    if not crop_info:
-        return None
-    return {
-        "label": ":".join(label_bits),
-        "kind": "paper_crop",
-        "mime_type": "image/png",
-        "path": str(target_path.resolve()),
-        "caption": caption,
-        "source_label": str(page_entry.get("label") or ""),
-        "source_path": str(source_path.resolve()),
-        "crop_box": crop_info.get("crop_box"),
-        "crop_reason": crop_info.get("crop_reason"),
-        "confidence": crop_info.get("confidence"),
-        "warning": crop_info.get("warning"),
-    }
-
-
-def _paper_page_number_from_label(label: str) -> str:
-    match = re.search(r"paper_page:(\d+)", label)
-    return match.group(1) if match else ""
-
-
-def _task_figure_label(task: dict[str, Any]) -> str:
-    figure_ref = _task_figure_reference(task)
-    if figure_ref.get("number"):
-        return f"Fig. {figure_ref['number']}{figure_ref.get('subfigure', '')}"
-    for key in ("figure_or_claim", "figure_or_table", "figure", "target", "description"):
-        label = _extract_figure_label(str(task.get(key) or ""))
-        if label:
-            return label
-    task_text = json.dumps(task, ensure_ascii=False)
-    return _extract_figure_label(task_text)
-
-
-def _task_figure_reference(task: dict[str, Any]) -> dict[str, str]:
-    for key in ("figure_or_claim", "figure_or_table", "figure", "target", "task_id", "description"):
-        reference = _extract_figure_reference(str(task.get(key) or ""))
-        if reference.get("number"):
-            return reference
-    task_text = json.dumps(task, ensure_ascii=False)
-    return _extract_figure_reference(task_text)
-
-
-def _extract_figure_label(text: str) -> str:
-    reference = _extract_figure_reference(text)
-    if reference.get("number"):
-        return f"Fig. {reference['number']}{reference.get('subfigure', '')}"
-    figure_match = re.search(r"\bfig(?:ure)?[._\s:-]*([0-9]+[a-zA-Z]?)", text, re.I)
-    if figure_match:
-        return f"Fig. {figure_match.group(1)}"
-    table_match = re.search(r"\btable[._\s:-]*([0-9]+[a-zA-Z]?)", text, re.I)
-    if table_match:
-        return f"Table {table_match.group(1)}"
-    chinese_match = re.search(r"图\s*([0-9]+[a-zA-Z]?)", text)
-    if chinese_match:
-        return f"图{chinese_match.group(1)}"
-    return ""
-
-
-def _extract_figure_reference(text: str) -> dict[str, str]:
-    normalized = str(text or "")
-    patterns = [
-        re.compile(r"\bfig(?:ure)?[._\s:-]*([0-9]+)\s*[\(\[]\s*([a-z])\s*[\)\]]", re.I),
-        re.compile(r"\bfig(?:ure)?[._\s:-]*([0-9]+)([a-z])\b", re.I),
-        re.compile(r"\bfig(?:ure)?[._\s-]+([0-9]+)[._-]+([a-z])\b", re.I),
-        re.compile(r"图\s*([0-9]+)\s*[\(\[]\s*([a-z])\s*[\)\]]", re.I),
-        re.compile(r"图\s*([0-9]+)([a-z])\b", re.I),
-    ]
-    for pattern in patterns:
-        match = pattern.search(normalized)
-        if match:
-            return {"number": match.group(1), "subfigure": match.group(2).lower()}
-    number_patterns = [
-        re.compile(r"\bfig(?:ure)?[._\s:-]*([0-9]+)\b", re.I),
-        re.compile(r"图\s*([0-9]+)\b", re.I),
-    ]
-    for pattern in number_patterns:
-        match = pattern.search(normalized)
-        if match:
-            return {"number": match.group(1), "subfigure": ""}
-    return {"number": "", "subfigure": ""}
+    return [dict(entry) for entry in image_entries]
 
 
 def _render_markdown_image_group(title: str, entries: list[dict[str, Any]]) -> list[str]:
@@ -1205,8 +1072,10 @@ def _image_caption(prefix: str, label: str) -> str:
         return f"{prefix}: {label.split(':', 1)[1]}"
     if label.startswith("paper_page:"):
         return f"论文原图页: p{label.split(':', 1)[1]}"
-    if label.startswith("paper_crop:"):
-        return f"论文原图裁剪: {label.split(':', 1)[1]}"
+    if label.startswith("paper_target:"):
+        return f"论文目标图: {label.split(':', 1)[1]}"
+    if label.startswith("paper_locator:"):
+        return f"论文定位图: {label.split(':', 1)[1]}"
     return f"{prefix}: {label}"
 
 
@@ -1316,7 +1185,6 @@ def _write_paper_evidence_bundle(
     evidence_root.mkdir(parents=True, exist_ok=True)
 
     source_record = _copy_paper_source(evidence_root, paper_path)
-    pdffigures2_record = build_pdffigures2_evidence(paper_path=paper_path, evidence_root=evidence_root)
     task_entries: list[dict[str, Any]] = []
     task_items = [task for task in tasks.get("repro_tasks", []) if isinstance(task, dict)]
     for index, task in enumerate(task_items, start=1):
@@ -1347,12 +1215,12 @@ def _write_paper_evidence_bundle(
             "selected_paper_pages": selected_pages,
             "rendered_page_pngs": page_files,
             "render_error": render_error,
-            "pdffigures2": _task_pdffigures2_evidence(pdffigures2_record, task),
             "paper_context": context,
             "paper_source": source_record,
             "use_policy": [
                 "Use this task evidence as the primary implementation reference.",
                 "If a needed parameter is missing, record an explicit assumption in code output summaries.",
+                "The task writer must create its own target paper figure crop or locator image for the final comparison report.",
                 "Do not hard-code curves to match these pages; implement the scientific model that should produce them.",
             ],
         }
@@ -1374,7 +1242,6 @@ def _write_paper_evidence_bundle(
         "version": 1,
         "kind": "task_scoped_paper_evidence",
         "paper_source": source_record,
-        "pdffigures2": pdffigures2_record,
         "policy": [
             "Primary input for Codex writer is the per-task evidence bundle, not a pasted full paper.",
             "The copied paper source is available for on-demand lookup when the bundle is insufficient.",
@@ -1385,22 +1252,6 @@ def _write_paper_evidence_bundle(
     }
     write_json(evidence_root / "index.json", index_doc)
     return index_doc
-
-
-def _task_pdffigures2_evidence(pdffigures2_record: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
-    figure_ref = _task_figure_reference(task)
-    number = str(figure_ref.get("number") or "")
-    figures = pdffigures2_record.get("figures") if isinstance(pdffigures2_record, dict) else []
-    matches = []
-    if isinstance(figures, list) and number:
-        matches = [item for item in figures if str(item.get("figure_number") or "").lower() == number.lower()]
-    return {
-        "enabled": bool(pdffigures2_record.get("enabled")) if isinstance(pdffigures2_record, dict) else False,
-        "ok": bool(pdffigures2_record.get("ok")) if isinstance(pdffigures2_record, dict) else False,
-        "target_figure": figure_ref,
-        "matched_figures": matches[:3],
-        "reason": pdffigures2_record.get("reason") if isinstance(pdffigures2_record, dict) else "missing pdffigures2 record",
-    }
 
 
 def _remove_paper_evidence_root(evidence_root: Path) -> None:
@@ -1486,15 +1337,6 @@ def _render_task_evidence_markdown(task_evidence: dict[str, Any]) -> str:
         lines.append("None")
     if task_evidence.get("render_error"):
         lines.extend(["", "## Render Error", str(task_evidence.get("render_error"))])
-    lines.extend(
-        [
-            "",
-            "## PDFFigures2 Figure Evidence",
-            "```json",
-            pretty_json(task_evidence.get("pdffigures2", {})),
-            "```",
-        ]
-    )
     lines.extend(
         [
             "",
@@ -1665,8 +1507,10 @@ def _review_image_kind(label: str) -> str:
         return "local_output"
     if label.startswith("paper_page:"):
         return "paper_page"
-    if label.startswith("paper_crop:"):
-        return "paper_crop"
+    if label.startswith("paper_target:"):
+        return "paper_target"
+    if label.startswith("paper_locator:"):
+        return "paper_locator"
     return "other"
 
 

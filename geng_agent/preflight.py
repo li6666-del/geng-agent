@@ -23,14 +23,9 @@ from __future__ import annotations
 
 import importlib.metadata as importlib_metadata
 import importlib.util
-import os
-import shlex
-import shutil
 import sys
 from dataclasses import dataclass
-from pathlib import Path
 
-from .config import get_config_value
 from .security import ALLOWED_REQUIREMENTS, import_names_for_requirement
 
 # Minimum interpreter. Keep in sync with pyproject `requires-python`.
@@ -64,16 +59,6 @@ class PackageStatus:
 
 
 @dataclass(frozen=True)
-class ExternalToolStatus:
-    name: str
-    configured: bool
-    available: bool
-    command: str | None
-    purpose: str
-    note: str | None = None
-
-
-@dataclass(frozen=True)
 class EnvironmentReport:
     interpreter: str
     python_version: str
@@ -81,7 +66,6 @@ class EnvironmentReport:
     python_ok: bool
     orchestrator: list[PackageStatus]
     repro: list[PackageStatus]
-    pdffigures2: ExternalToolStatus | None = None
 
     @property
     def missing_orchestrator(self) -> list[PackageStatus]:
@@ -167,85 +151,7 @@ def check_environment() -> EnvironmentReport:
         python_ok=sys.version_info[:2] >= REQUIRED_PYTHON,
         orchestrator=orchestrator,
         repro=repro,
-        pdffigures2=_check_pdffigures2(),
     )
-
-
-def _check_pdffigures2() -> ExternalToolStatus:
-    command = get_config_value("GENG_PDFFIGURES2_CMD")
-    purpose = "抽取论文 Figure/Table 边界，用于 result_review 原论文图裁剪"
-    if not command:
-        return ExternalToolStatus(
-            name="PDFFigures2",
-            configured=False,
-            available=False,
-            command=None,
-            purpose=purpose,
-            note="未设置 GENG_PDFFIGURES2_CMD；报告会回退到整页论文图。",
-        )
-    available, note = _pdffigures2_command_available(command)
-    return ExternalToolStatus(
-        name="PDFFigures2",
-        configured=True,
-        available=bool(available),
-        command=command,
-        purpose=purpose,
-        note=note,
-    )
-
-
-def _pdffigures2_command_available(command: str) -> tuple[bool, str | None]:
-    parts = _split_command_tokens(command)
-    if not parts:
-        return False, "命令为空；可设置为 jar 路径或包含 {pdf}/{json_dir} 等占位符的启动命令。"
-    if len(parts) == 1 and parts[0].lower().endswith(".jar"):
-        jar_ok = Path(parts[0]).exists()
-        java_cmd = get_config_value("GENG_PDFFIGURES2_JAVA_CMD") or "java"
-        java_parts = _split_command_tokens(java_cmd)
-        java_ok = bool(java_parts and _command_entry_exists(java_parts[0]))
-        if jar_ok and java_ok:
-            return True, None
-        missing = []
-        if not jar_ok:
-            missing.append("jar 文件不存在")
-        if not java_ok:
-            missing.append("java 入口未找到")
-        return False, "；".join(missing)
-
-    entry_ok = _command_entry_exists(parts[0])
-    jar_ok = True
-    if len(parts) >= 3 and parts[1].lower() == "-jar":
-        jar_ok = Path(parts[2]).exists()
-    if entry_ok and jar_ok:
-        return True, None
-    missing = []
-    if not entry_ok:
-        missing.append("命令入口未找到")
-    if not jar_ok:
-        missing.append("jar 文件不存在")
-    return False, f"{'；'.join(missing)}；可设置为 jar 路径或完整启动命令模板。"
-
-
-def _command_entry_exists(entry: str) -> bool:
-    return bool(shutil.which(entry) or Path(entry).exists())
-
-
-def _split_command_tokens(command: str) -> list[str]:
-    try:
-        parts = shlex.split(command, posix=os.name != "nt")
-    except ValueError:
-        parts = []
-    if not parts:
-        raw = command.strip().strip('"')
-        return [raw] if raw else []
-    return [_strip_outer_quotes(part) for part in parts if _strip_outer_quotes(part)]
-
-
-def _strip_outer_quotes(value: str) -> str:
-    text = str(value).strip()
-    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
-        return text[1:-1]
-    return text
 
 
 def remedy_command(report: EnvironmentReport) -> str | None:
@@ -278,16 +184,6 @@ def format_report(report: EnvironmentReport) -> str:
         tag = "关键" if item.critical else "可选"
         lines.append(f"  [{_mark(item.installed)}] {item.package}{version}  ({tag})")
     lines.append("")
-    if report.pdffigures2 is not None:
-        tool = report.pdffigures2
-        state = "ok " if tool.available else "MISS"
-        command = f"  命令: {tool.command}" if tool.command else "  命令: 未配置"
-        lines.append("三、可选论文原图抽取工具:")
-        lines.append(f"  [{state}] {tool.name}  - {tool.purpose}")
-        lines.append(command)
-        if tool.note:
-            lines.append(f"  说明: {tool.note}")
-        lines.append("")
     if report.ok:
         lines.append("结论: 环境就绪，可以输入 PDF 开始审查。")
         return "\n".join(lines)

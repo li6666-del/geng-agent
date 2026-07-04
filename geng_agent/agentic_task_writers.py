@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
 import json
 import os
 import re
@@ -11,8 +12,6 @@ from typing import Any
 
 from .agentic_project import (
     CODEX_PROJECT_BACKEND,
-    PAPER_EVIDENCE_DIR,
-    _augment_review_display_images,
     _clear_result_review_outputs,
     _load_cached_agentic_project,
     _manifest_from_project,
@@ -23,7 +22,6 @@ from .agentic_project import (
     _render_writer_python_sh_wrapper,
     _resolve_writer_real_python,
     _restore_trusted_files,
-    _select_task_paper_display_entries,
     _write_paper_evidence_bundle,
 )
 from .codex_runner import run_codex_subprocess
@@ -466,7 +464,11 @@ For each cycle:
 3. Run full with `python -m tasks.{module} config.json` when `--run-repro` is enabled.
 4. Inspect the local CSV/summary/PNG and compare them with the paper evidence images/text.
 5. If the result does not match the paper claim, first assume your implementation, configuration, proxy model, axis scaling, normalization, baseline, seed, or plotting could be wrong. Form a concrete repair hypothesis, modify code or config, and run full again.
-6. Record each cycle in `task_agent_result.md`: command, return code, changed files, observed mismatch, repair hypothesis, and next decision.
+6. Create or refresh the paper-side comparison image for this task:
+   - Prefer a tight crop of the exact target figure/subfigure from the rendered `paper_page_*.png` evidence.
+   - If the exact crop is uncertain, create a small locator image that shows the relevant page/region with a visible red rectangle around the believed target.
+   - Do not use an unannotated full `paper_page_*.png` as the final paper comparison image.
+7. Record each cycle in `task_agent_result.md`: command, return code, changed files, observed mismatch, repair hypothesis, target-paper-figure crop/locator status, and next decision.
 
 Do not stop after the first imperfect output. A first mismatch should normally trigger at least one code/config repair and rerun. Report `explained_gap` only after you have tried plausible implementation/config/model fixes and can name the remaining gap with evidence. Report `failed` only for a real blocker such as runtime failure, missing essential paper information, timeout, dependency failure, or no valid artifacts. Report `matched` only when local artifacts support the paper trend, scale, ordering, and baseline comparison for this task.
 
@@ -478,6 +480,7 @@ Stopping rule:
 
 ## Required final files
 - `task_agent_result.md`: Chinese, human-readable comparison report.
+- `paper_target_figure.json`: JSON object describing how you located the paper-side figure, with fields such as `target_figure`, `source_page`, `bbox_norm`, `confidence`, `contains_only_target`, `fallback_used`, `reason`, and `paper_image_paths`.
 - `task_agent_result.json`: strict JSON object with:
 ```json
 {{
@@ -492,9 +495,17 @@ Stopping rule:
   "paper_image_paths": []
 }}
 ```
+- `paper_image_paths` must list your task-specific paper comparison image(s), preferably under `outputs/{output_subdir}/` and relative to the sandbox root. Use the tight crop when confident; otherwise use the red-box locator image. Do not list raw `paper_page_1.png` / `paper_page_2.png` style full-page files, and do not simply rename a full paper page as a crop.
 - If `status == "explained_gap"`, `differences`, `possible_causes`, `remaining_uncertainties`, and `evidence_files` must all be non-empty.
 - If `status == "matched"`, cite the local CSV/PNG/summary and paper evidence that support the match.
 - If `status == "failed"`, explain whether the blocker is runtime, missing paper details, timeout, dependency, or modeling uncertainty.
+
+## Paper target figure image guidance
+- You may use Python with Pillow/PyMuPDF/OpenCV-like array logic if available, but keep dependencies within the allowed whitelist.
+- Recommended output names: `outputs/{output_subdir}/paper_target_crop.png` for a confident crop, or `outputs/{output_subdir}/paper_target_locator.png` for a red-box fallback.
+- The final report is assembled from `outputs/{output_subdir}/`; put the paper-side PNG there so it remains self-contained after host aggregation.
+- The paper-side image is for human comparison in the final Word report. Favor readability over showing an entire page.
+- Keep original rendered paper pages untouched under `paper_evidence/`; write your derived crop/locator under `outputs/{output_subdir}/`.
 
 ## Trusted runtime APIs
 {IO_RUNTIME_API_DOC}
@@ -816,10 +827,37 @@ def _validate_task_writer_delivery(
         for invalid in artifacts.get("invalid_files", []):
             errors.append(f"invalid artifact: {invalid}")
 
-    paper_images = _task_paper_image_paths(sandbox, task)
+    paper_locator_path, paper_locator_fallback = _task_result_file_path(sandbox, output_subdir, "paper_target_figure.json")
+    paper_locator_doc: dict[str, Any] = {}
+    if paper_locator_path.exists():
+        try:
+            parsed_locator = json.loads(paper_locator_path.read_text(encoding="utf-8"))
+            if isinstance(parsed_locator, dict):
+                paper_locator_doc = parsed_locator
+            else:
+                errors.append("paper_target_figure.json must contain an object")
+        except Exception as exc:
+            errors.append(f"paper_target_figure.json is invalid JSON: {type(exc).__name__}: {exc}")
+    elif status in {"matched", "explained_gap"}:
+        errors.append("missing paper_target_figure.json")
+    if paper_locator_fallback:
+        warnings.append("paper_target_figure.json found under outputs/<task>; accepted as fallback")
+    if status in {"matched", "explained_gap"} and paper_locator_doc:
+        errors.extend(_validate_paper_locator_doc(paper_locator_doc))
+
+    paper_images, paper_image_warnings, paper_image_errors = _task_paper_image_paths(
+        sandbox=sandbox,
+        output_subdir=output_subdir,
+        result_doc=result_doc,
+        locator_doc=paper_locator_doc,
+    )
+    warnings.extend(paper_image_warnings)
+    if status in {"matched", "explained_gap"}:
+        errors.extend(paper_image_errors)
     local_images = _task_local_image_paths(sandbox, output_subdir)
     if not paper_images:
-        errors.append("missing rendered paper page evidence image")
+        if status in {"matched", "explained_gap"}:
+            errors.append("missing writer-provided paper target image")
     if run_repro and not local_images:
         errors.append("missing local output image")
 
@@ -835,6 +873,8 @@ def _validate_task_writer_delivery(
         "result_json": result_doc,
         "result_json_path": str(result_path) if result_path.exists() else None,
         "result_markdown_path": str(md_path) if md_path.exists() else None,
+        "paper_locator_path": str(paper_locator_path) if paper_locator_path.exists() else None,
+        "paper_locator": paper_locator_doc,
         "run_log_path": str(trusted_run_log_path) if trusted_run_log_path.exists() else None,
         "run_records": trusted_records,
         "full_run": full_runs[-1] if full_runs else None,
@@ -861,6 +901,35 @@ def _task_result_file_path(sandbox: Path, output_subdir: str, filename: str) -> 
 
 def _non_empty_list(value: Any) -> bool:
     return isinstance(value, list) and any(str(item).strip() for item in value)
+
+
+def _validate_paper_locator_doc(locator_doc: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    for key in ("target_figure", "confidence", "reason"):
+        if not isinstance(locator_doc.get(key), str) or not str(locator_doc.get(key)).strip():
+            errors.append(f"paper_target_figure.json requires non-empty {key}")
+    source_page = locator_doc.get("source_page")
+    if isinstance(source_page, bool) or not isinstance(source_page, (int, str)) or not str(source_page).strip():
+        errors.append("paper_target_figure.json requires source_page")
+    if not isinstance(locator_doc.get("fallback_used"), bool):
+        errors.append("paper_target_figure.json requires boolean fallback_used")
+    if not isinstance(locator_doc.get("contains_only_target"), bool):
+        errors.append("paper_target_figure.json requires boolean contains_only_target")
+    if not _non_empty_list(locator_doc.get("paper_image_paths")) and not any(
+        isinstance(locator_doc.get(key), str) and str(locator_doc.get(key)).strip()
+        for key in ("crop_path", "locator_path", "image_path")
+    ):
+        errors.append("paper_target_figure.json requires paper_image_paths or a crop/locator/image path")
+    bbox = locator_doc.get("bbox_norm")
+    if bbox is not None:
+        if not isinstance(bbox, list) or len(bbox) != 4:
+            errors.append("paper_target_figure.json bbox_norm must be a list of four numbers")
+        else:
+            for value in bbox:
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0 or value > 1:
+                    errors.append("paper_target_figure.json bbox_norm values must be numbers in [0, 1]")
+                    break
+    return errors
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -896,153 +965,148 @@ def _run_record_has_required_artifacts(record: dict[str, Any]) -> bool:
     return bool(csv_files and png_files and summary_files)
 
 
-def _task_paper_image_paths(sandbox: Path, task: dict[str, Any]) -> list[str]:
-    evidence_root = sandbox / PAPER_EVIDENCE_DIR
-    if not evidence_root.exists():
-        return []
-    page_paths = [
-        path
-        for path in sorted(evidence_root.rglob("paper_page_*.png"))
-        if path.is_file() and re.fullmatch(r"paper_page_\d+\.png", path.name)
-    ]
-    if not page_paths:
-        return []
+def _task_paper_image_paths(
+    *,
+    sandbox: Path,
+    output_subdir: str,
+    result_doc: dict[str, Any],
+    locator_doc: dict[str, Any],
+) -> tuple[list[str], list[str], list[str]]:
+    warnings: list[str] = []
+    errors: list[str] = []
+    raw_paths: list[str] = []
 
-    target_pages = _task_target_paper_pages(evidence_root=evidence_root, task=task, available_pages=page_paths)
-    selected_order = _task_selected_paper_page_order(evidence_root=evidence_root, available_pages=page_paths)
-    selected_paths = _ordered_paper_page_paths(page_paths=page_paths, page_numbers=target_pages, preferred_order=selected_order)
-    if not selected_paths:
-        selected_paths = _ordered_paper_page_paths(
-            page_paths=page_paths,
-            page_numbers=set(selected_order[:1]),
-            preferred_order=selected_order,
-        )
-    if not selected_paths:
-        selected_paths = page_paths[:1]
+    raw_paths.extend(_string_list(result_doc.get("paper_image_paths")))
+    if not raw_paths:
+        raw_paths.extend(_string_list(locator_doc.get("paper_image_paths")))
+    for key in ("crop_path", "locator_path", "image_path"):
+        value = locator_doc.get(key)
+        if isinstance(value, str) and value.strip():
+            raw_paths.append(value)
 
-    image_entries = [
-        {
-            "label": f"paper_page:{_paper_page_number_from_path(path)}",
-            "kind": "paper_page",
-            "mime_type": "image/png",
-            "path": str(path.resolve()),
-        }
-        for path in selected_paths
-    ]
-    display_entries = _augment_review_display_images(task=task, image_entries=image_entries)
-    paper_entries = _select_task_paper_display_entries(display_entries)
-    preferred = [entry for entry in paper_entries if entry.get("kind") == "paper_crop"] or paper_entries
-    return [str(entry.get("path")) for entry in preferred if str(entry.get("path") or "").strip()]
+    if not raw_paths:
+        return [], warnings, ["task_agent_result.json paper_image_paths is empty"]
 
-
-def _ordered_paper_page_paths(*, page_paths: list[Path], page_numbers: set[str], preferred_order: list[str]) -> list[Path]:
-    if not page_numbers:
-        return []
-    by_number = {_paper_page_number_from_path(path): path for path in page_paths}
-    ordered: list[Path] = []
+    resolved_paths: list[str] = []
     seen: set[str] = set()
-    for page_number in preferred_order:
-        if page_number in page_numbers and page_number in by_number and page_number not in seen:
-            ordered.append(by_number[page_number])
-            seen.add(page_number)
-    for path in page_paths:
-        page_number = _paper_page_number_from_path(path)
-        if page_number in page_numbers and page_number not in seen:
-            ordered.append(path)
-            seen.add(page_number)
-    return ordered
-
-
-def _task_selected_paper_page_order(*, evidence_root: Path, available_pages: list[Path]) -> list[str]:
-    available = {_paper_page_number_from_path(path) for path in available_pages}
-    available.discard("")
-    ordered: list[str] = []
-    for evidence_path in sorted(evidence_root.rglob("evidence.json")):
-        try:
-            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
-        except Exception:
+    raw_page_hashes = _raw_rendered_paper_page_hashes(sandbox)
+    for raw in raw_paths:
+        path = _resolve_writer_declared_path(sandbox=sandbox, output_subdir=output_subdir, raw_path=raw)
+        if path is None:
+            errors.append(f"paper image path does not exist: {raw}")
             continue
-        pages = evidence.get("selected_paper_pages")
-        if not isinstance(pages, list):
+        if not _path_is_inside(path, sandbox):
+            errors.append(f"paper image path must stay inside task sandbox: {raw}")
             continue
-        for raw_page in pages:
-            page = str(raw_page)
-            if page in available and page not in ordered:
-                ordered.append(page)
-    return ordered
-
-
-def _task_target_paper_pages(*, evidence_root: Path, task: dict[str, Any], available_pages: list[Path]) -> set[str]:
-    available = {_paper_page_number_from_path(path) for path in available_pages}
-    available.discard("")
-    figure_numbers = _task_figure_numbers(task)
-    if not figure_numbers:
-        return set()
-
-    figure_source_pages: set[str] = set()
-    text_source_pages: set[str] = set()
-    for evidence_path in sorted(evidence_root.rglob("evidence.json")):
-        try:
-            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
-        except Exception:
+        if _is_raw_rendered_paper_page(path):
+            errors.append(f"paper image path must be a writer-created crop or locator, not raw page: {raw}")
             continue
-        facts = evidence.get("facts", {}).get("engineering_facts", [])
-        if not isinstance(facts, list):
+        if not _looks_like_png(path):
+            errors.append(f"paper image path is not a valid PNG: {raw}")
             continue
-        for fact in facts:
-            if not isinstance(fact, dict) or not _fact_mentions_any_figure(fact, figure_numbers):
-                continue
-            source = fact.get("source") if isinstance(fact.get("source"), dict) else {}
-            page = str(source.get("page") or "")
-            if not page or page not in available:
-                continue
-            if source.get("source_kind") == "figure":
-                figure_source_pages.add(page)
-            else:
-                text_source_pages.add(page)
-
-    if figure_source_pages:
-        return figure_source_pages
-
-    expanded = set(text_source_pages)
-    for page in list(text_source_pages):
-        try:
-            next_page = str(int(page) + 1)
-        except ValueError:
+        digest = _file_sha256(path)
+        if digest and digest in raw_page_hashes:
+            errors.append(f"paper image path appears to be an unmodified rendered paper page: {raw}")
             continue
-        if next_page in available:
-            expanded.add(next_page)
-    return expanded & available
+        normalized = _copy_paper_image_to_output_dir(sandbox=sandbox, output_subdir=output_subdir, path=path)
+        if normalized != path:
+            warnings.append(f"paper image copied into outputs/{output_subdir}: {path.name}")
+            path = normalized
+        key = str(path.resolve()).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        resolved_paths.append(str(path.resolve()))
+
+    if not resolved_paths and raw_paths:
+        warnings.append("writer declared paper_image_paths but none were usable")
+    return resolved_paths, warnings, errors
 
 
-def _task_figure_numbers(task: dict[str, Any]) -> set[str]:
-    text = " ".join(str(task.get(key) or "") for key in ("task_id", "target", "figure_or_claim", "description"))
-    numbers = set(re.findall(r"\bfig(?:ure)?[._\s:-]*([0-9]+)", text.lower()))
-    numbers.update(re.findall(r"图\s*([0-9]+)", text))
-    return numbers
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
 
 
-def _fact_mentions_any_figure(fact: dict[str, Any], figure_numbers: set[str]) -> bool:
-    source = fact.get("source") if isinstance(fact.get("source"), dict) else {}
-    haystack = " ".join(
-        [
-            str(fact.get("name") or ""),
-            str(source.get("figure_ref") or ""),
-            str(source.get("quote") or ""),
-            json.dumps(fact.get("value", {}), ensure_ascii=False) if isinstance(fact.get("value"), (dict, list)) else str(fact.get("value") or ""),
-        ]
-    ).lower()
-    for number in figure_numbers:
-        if re.search(rf"\bfig(?:\.|ure)?[._\s:-]*{re.escape(number)}\b", haystack):
-            return True
-        if re.search(rf"图\s*{re.escape(number)}\b", haystack):
-            return True
-    return False
+def _resolve_writer_declared_path(*, sandbox: Path, output_subdir: str, raw_path: str) -> Path | None:
+    raw = str(raw_path).strip().strip('"')
+    if not raw:
+        return None
+    candidate = Path(raw)
+    candidates: list[Path] = []
+    if candidate.is_absolute():
+        candidates.append(candidate)
+    else:
+        candidates.extend([sandbox / candidate, sandbox / "outputs" / output_subdir / candidate])
+        if candidate.parent == Path("."):
+            candidates.append(sandbox / "outputs" / output_subdir / candidate.name)
+    for path in candidates:
+        if path.exists() and path.is_file():
+            return path
+    return None
 
 
-def _paper_page_number_from_path(path: Path) -> str:
-    match = re.search(r"paper_page_(\d+)", path.name)
-    return match.group(1) if match else ""
+def _path_is_inside(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _is_raw_rendered_paper_page(path: Path) -> bool:
+    return bool(re.fullmatch(r"paper_page_\d+\.png", path.name))
+
+
+def _raw_rendered_paper_page_hashes(sandbox: Path) -> set[str]:
+    hashes: set[str] = set()
+    evidence_root = sandbox / "paper_evidence"
+    if not evidence_root.exists():
+        return hashes
+    for path in evidence_root.rglob("paper_page_*.png"):
+        if path.is_file() and _is_raw_rendered_paper_page(path):
+            digest = _file_sha256(path)
+            if digest:
+                hashes.add(digest)
+    return hashes
+
+
+def _file_sha256(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def _looks_like_png(path: Path) -> bool:
+    try:
+        return path.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+    except OSError:
+        return False
+
+
+def _copy_paper_image_to_output_dir(*, sandbox: Path, output_subdir: str, path: Path) -> Path:
+    output_dir = sandbox / "outputs" / output_subdir
+    try:
+        path.resolve().relative_to(output_dir.resolve())
+        return path
+    except ValueError:
+        pass
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = safe_label(path.stem) or "paper_target_image"
+    target = output_dir / f"{stem}{path.suffix or '.png'}"
+    if target.exists() and target.resolve() != path.resolve():
+        for index in range(2, 1000):
+            candidate = output_dir / f"{stem}_{index}{path.suffix or '.png'}"
+            if not candidate.exists():
+                target = candidate
+                break
+    if target.resolve() != path.resolve():
+        shutil.copy2(path, target)
+    return target
 
 
 def _task_local_image_paths(sandbox: Path, output_subdir: str) -> list[str]:
@@ -1095,7 +1159,7 @@ def _merge_task_writer_deliveries(
             shutil.copytree(source_output, target_output)
         result_dir = repro_project_dir / "outputs" / output_subdir
         result_dir.mkdir(parents=True, exist_ok=True)
-        for name in ("task_agent_result.json", "task_agent_result.md"):
+        for name in ("task_agent_result.json", "task_agent_result.md", "paper_target_figure.json"):
             source, _ = _task_result_file_path(sandbox, output_subdir, name)
             if source.exists():
                 shutil.copy2(source, result_dir / name)

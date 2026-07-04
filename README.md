@@ -53,23 +53,13 @@ python -m pip install -e ".[repro,web]"
 python -m geng_agent doctor
 ```
 
-`doctor` 会检查 Python 版本、运行本体依赖、复现白名单库，以及可选的论文图表抽取工具。缺关键库时请先修复，再喂论文。
+`doctor` 会检查 Python 版本、运行本体依赖和复现白名单库。缺关键库时请先修复，再喂论文。
 
-## 论文原图抽取
+## 论文目标图定位
 
-`result_review.md/docx` 的论文原图优先使用 PDFFigures2 抽取出的 Figure/Table 边界。配置方式：
+系统会为每个复现任务准备论文文本、相关页截图和事实证据；第三阶段的 task writer 负责从这些证据中定位目标图或子图，并交付面向报告的论文侧图片。
 
-```bash
-set GENG_PDFFIGURES2_CMD=C:\tools\pdffigures2.jar
-```
-
-如果默认 `java` 不是可用的 JDK，也可以额外设置：
-
-```bash
-set GENG_PDFFIGURES2_JAVA_CMD=C:\tools\jdk17\bin\java.exe
-```
-
-也可以设置为完整命令模板，例如包含 `{pdf}`、`{json_dir}`、`{image_prefix}`、`{stats}` 的启动命令。模板会以参数列表执行，不经过 shell。没有配置或运行失败时，流程不会中断，但结果报告会回退到整页论文截图并标注低置信度。
+writer 必须生成 `paper_target_figure.json`，至少记录 `target_figure`、`source_page`、`confidence`、`contains_only_target`、`fallback_used`、`reason` 和 `paper_image_paths`，并在 `task_agent_result.json.paper_image_paths` 中列出自己创建的 `outputs/<task>/paper_target_crop.png` 或带红框的 `outputs/<task>/paper_target_locator.png`。主持人只做结构验收和报告合并，不再依赖外部图表抽取工具，也不会把裸 `paper_page_*.png` 整页截图当作最终论文原图。
 
 ## Codex 配置
 
@@ -200,7 +190,8 @@ case_001/
 2. 在 `--run-repro` 开启时，通过 guard 运行自己的 full。
 3. 对照论文证据自审结果。
 4. 不匹配时继续修改、重跑和再审查，最多 5 轮。
-5. 输出 `task_agent_result.json` 和 `task_agent_result.md`。
+5. 为目标论文图/子图生成 crop 或红框 locator，并记录到 `paper_target_figure.json`。
+6. 输出 `task_agent_result.json` 和 `task_agent_result.md`。
 
 主持人不会重复跑全项目 full，也不会另起独立 reviewer；主持人只验收结构、合并产物、生成报告。
 
