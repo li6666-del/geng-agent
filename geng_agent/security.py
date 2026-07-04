@@ -43,7 +43,14 @@ IMPORT_REQUIREMENT_NAMES = {
     "sklearn": "scikit-learn",
     "PIL": "pillow",
     "commpy": "scikit-commpy",
+    # Matplotlib exposes several namespace packages that are imported directly
+    # by normal plotting code but are not installable PyPI distributions.
+    "mpl_toolkits": "matplotlib",
 }
+
+_UNDECLARED_IMPORT_RE = re.compile(
+    r"third-party import is not declared in requirements\.txt: .+ \(expected package ([^)]+)\)"
+)
 
 FORBIDDEN_IMPORTS = {
     "socket",
@@ -310,6 +317,43 @@ def validate_requirements(root: Path) -> list[dict[str, str]]:
                 )
     issues.extend(validate_import_requirements(root, declared_packages))
     return issues
+
+
+def split_requirement_issues(issues: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split dependency findings into runner-blocking issues and softer warnings.
+
+    In the task-writer workflow, a writer may already have produced trusted full-run
+    artifacts. A missing declaration for a whitelisted package that is installed in the
+    active environment is reproducibility metadata debt, not evidence that the run failed.
+    Unknown packages, missing installations, unsafe requirement syntax, and broad import
+    fallbacks remain blocking.
+    """
+    blocking: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    for issue in issues:
+        target = warnings if is_nonblocking_requirement_issue(issue) else blocking
+        item = dict(issue)
+        item.setdefault("severity", "warning" if target is warnings else "error")
+        target.append(item)
+    return blocking, warnings
+
+
+def is_nonblocking_requirement_issue(issue: dict[str, Any]) -> bool:
+    message = str(issue.get("message") or "")
+    match = _UNDECLARED_IMPORT_RE.fullmatch(message)
+    if match:
+        package = match.group(1).strip().lower().replace("_", "-")
+        return package in ALLOWED_REQUIREMENTS and _requirement_imports_available(package)
+    if message == "trusted torch backend is used but requirements.txt does not declare torch":
+        return "torch" in ALLOWED_REQUIREMENTS and importlib.util.find_spec("torch") is not None
+    return False
+
+
+def _requirement_imports_available(package: str) -> bool:
+    try:
+        return all(importlib.util.find_spec(name) is not None for name in import_names_for_requirement(package))
+    except (ImportError, ValueError):
+        return False
 
 
 def reconcile_whitelisted_requirements(root: Path) -> list[str]:

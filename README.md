@@ -53,7 +53,23 @@ python -m pip install -e ".[repro,web]"
 python -m geng_agent doctor
 ```
 
-`doctor` 会检查 Python 版本、运行本体依赖和复现白名单库。缺关键库时请先修复，再喂论文。
+`doctor` 会检查 Python 版本、运行本体依赖、复现白名单库，以及可选的论文图表抽取工具。缺关键库时请先修复，再喂论文。
+
+## 论文原图抽取
+
+`result_review.md/docx` 的论文原图优先使用 PDFFigures2 抽取出的 Figure/Table 边界。配置方式：
+
+```bash
+set GENG_PDFFIGURES2_CMD=C:\tools\pdffigures2.jar
+```
+
+如果默认 `java` 不是可用的 JDK，也可以额外设置：
+
+```bash
+set GENG_PDFFIGURES2_JAVA_CMD=C:\tools\jdk17\bin\java.exe
+```
+
+也可以设置为完整命令模板，例如包含 `{pdf}`、`{json_dir}`、`{image_prefix}`、`{stats}` 的启动命令。模板会以参数列表执行，不经过 shell。没有配置或运行失败时，流程不会中断，但结果报告会回退到整页论文截图并标注低置信度。
 
 ## Codex 配置
 

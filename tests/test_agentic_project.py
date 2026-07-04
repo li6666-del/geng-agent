@@ -25,6 +25,7 @@ from geng_agent.agentic_project import (
 from geng_agent.agentic_task_writers import (
     _prepare_task_writer_python_guard,
     _task_paper_image_paths,
+    _task_writer_runtime_result,
     _task_writer_concurrency,
     run_codex_task_writer_workflow,
 )
@@ -880,6 +881,42 @@ class TaskWriterGuardTests(unittest.TestCase):
 
 
 class TaskWriterWorkflowTests(unittest.TestCase):
+    def test_task_writer_runtime_treats_requirement_warnings_as_nonblocking(self) -> None:
+        runtime = _task_writer_runtime_result(
+            task_records=[
+                {
+                    "task_id": "demo_task",
+                    "module": "demo_task",
+                    "structural_ok": True,
+                    "task_writer_status": "matched",
+                    "artifacts": {
+                        "csv_files": ["results.csv"],
+                        "png_files": ["curve.png"],
+                        "summary_json_files": ["summary.json"],
+                    },
+                    "output_subdir": "demo_task",
+                    "errors": [],
+                    "warnings": [],
+                }
+            ],
+            validation={"required_files_present": True, "python_compiles": True},
+            manifest_issues=[],
+            requirement_issues=[],
+            requirement_warnings=[
+                {
+                    "file": "tasks/demo_task.py",
+                    "line": "1",
+                    "message": "third-party import is not declared in requirements.txt: scipy.linalg (expected package scipy)",
+                    "severity": "warning",
+                }
+            ],
+            security_issues=[],
+        )
+
+        self.assertTrue(runtime["passed"], msg=json.dumps(runtime, ensure_ascii=False))
+        self.assertEqual(runtime["requirements_issues"], [])
+        self.assertEqual(len(runtime["requirements_warnings"]), 1)
+
     def test_task_writer_workflow_merges_parallel_self_reviewed_tasks_without_reviewer_or_final_full(self) -> None:
         with TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
@@ -952,11 +989,13 @@ class TaskWriterWorkflowTests(unittest.TestCase):
 
             review_md = (out / "result_review.md").read_text(encoding="utf-8")
             self.assertTrue(review_md.startswith("## 1. match_task"))
-            self.assertIn("Writer 结论：`matched`", review_md)
-            self.assertIn("Writer 结论：`explained_gap`", review_md)
-            self.assertIn("![本地复现图:", review_md)
-            self.assertIn("![论文原图:", review_md)
-            self.assertIn("### Writer 自审正文", review_md)
+            self.assertIn("**Writer 结论：** `matched`", review_md)
+            self.assertIn("**Writer 结论：** `explained_gap`", review_md)
+            self.assertIn("| 本地复现图 | 论文原图 |", review_md)
+            self.assertIn("### 简短审查结论", review_md)
+            self.assertIn("## 附录：Writer 自审原文", review_md)
+            self.assertIn("### A1. match_task", review_md)
+            self.assertNotIn("### Writer 自审正文", review_md)
 
             prompts = (temp / "task_writer_prompts.txt").read_text(encoding="utf-8")
             self.assertEqual(prompts.count("---PROMPT---"), 2)
@@ -987,6 +1026,30 @@ class TaskWriterWorkflowTests(unittest.TestCase):
                 else:
                     draw.text((80, 120), "unrelated text page", fill=(0, 0, 0))
                 image.save(page)
+            pdffigures_dir = sandbox / "paper_evidence" / "pdffigures2"
+            pdffigures_dir.mkdir(parents=True)
+            figure_crop = pdffigures_dir / "fig2.png"
+            Image.new("RGB", (500, 320), (225, 225, 225)).save(figure_crop)
+            (pdffigures_dir / "paper_figures.json").write_text(
+                json.dumps(
+                    {
+                        "enabled": True,
+                        "ok": True,
+                        "figures": [
+                            {
+                                "type": "Figure",
+                                "figure_number": "2",
+                                "page": 2,
+                                "page_index": 1,
+                                "image_path": str(figure_crop),
+                                "figure_box": [130, 240, 680, 580],
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
             (evidence_dir / "evidence.json").write_text(
                 json.dumps(
                     {
@@ -1014,6 +1077,57 @@ class TaskWriterWorkflowTests(unittest.TestCase):
             self.assertIn("paper_page_2_crop.png", images[0])
             self.assertTrue(Path(images[0]).exists())
             self.assertNotIn("paper_page_1", images[0])
+
+    def test_task_writer_paper_images_fallback_to_selected_page_order(self) -> None:
+        try:
+            from PIL import Image, ImageDraw
+        except Exception:
+            self.skipTest("Pillow is not available")
+
+        with TemporaryDirectory() as temp_dir:
+            sandbox = Path(temp_dir)
+            evidence_dir = sandbox / "paper_evidence" / "01_crop_task"
+            evidence_dir.mkdir(parents=True)
+            for page_number in (3, 9, 10):
+                page = evidence_dir / f"paper_page_{page_number}.png"
+                image = Image.new("RGB", (800, 1000), "white")
+                draw = ImageDraw.Draw(image)
+                if page_number == 9:
+                    draw.rectangle((420, 120, 740, 360), fill=(215, 215, 215), outline=(0, 0, 0), width=4)
+                    for x in range(440, 720, 28):
+                        shade = 70 + (x - 440) // 4
+                        draw.rectangle((x, 140, x + 22, 335), fill=(shade, shade, shade))
+                    draw.text((430, 380), "Fig. 4. Empirical CDF", fill=(0, 0, 0))
+                else:
+                    draw.text((80, 120), f"text-heavy page {page_number}", fill=(0, 0, 0))
+                image.save(page)
+            (evidence_dir / "evidence.json").write_text(
+                json.dumps(
+                    {
+                        "selected_paper_pages": [9, 3, 10],
+                        "facts": {
+                            "engineering_facts": [
+                                {
+                                    "type": "metric",
+                                    "name": "spatial ZF metric",
+                                    "source": {"source_kind": "text", "page": 3, "quote": "ZF equation"},
+                                }
+                            ]
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            images = _task_paper_image_paths(
+                sandbox,
+                {"task_id": "reproduce_fig_4", "figure_or_claim": "Fig. 4 empirical CDF"},
+            )
+
+            self.assertEqual(len(images), 1)
+            self.assertIn("paper_page_9.png", images[0])
+            self.assertNotIn("paper_page_10", images[0])
 
     def test_task_writer_workflow_accepts_result_files_in_output_subdir(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -1628,6 +1742,30 @@ class AgenticProjectWorkflowTests(unittest.TestCase):
             for y in range(260, 540, 40):
                 draw.line((150, y, 650, y), fill=(70, 70, 70), width=2)
             image.save(paper_page)
+            pdffigures_dir = root / "pdffigures2"
+            pdffigures_dir.mkdir()
+            figure_crop = pdffigures_dir / "fig2.png"
+            image.crop((120, 220, 680, 560)).save(figure_crop)
+            (pdffigures_dir / "paper_figures.json").write_text(
+                json.dumps(
+                    {
+                        "enabled": True,
+                        "ok": True,
+                        "figures": [
+                            {
+                                "type": "Figure",
+                                "figure_number": "2",
+                                "page": 3,
+                                "page_index": 2,
+                                "image_path": str(figure_crop),
+                                "figure_box": [120, 220, 680, 560],
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
 
             display_entries = _augment_review_display_images(
                 task={"task_id": "reproduce_fig_2", "figure_or_claim": "Fig. 2"},
@@ -1694,6 +1832,29 @@ class AgenticProjectWorkflowTests(unittest.TestCase):
 
             paper_page = root / "paper_page_1.png"
             Image.new("RGB", (918, 1188), "white").save(paper_page)
+            pdffigures_dir = root / "pdffigures2"
+            pdffigures_dir.mkdir()
+            (pdffigures_dir / "paper_figures.json").write_text(
+                json.dumps(
+                    {
+                        "enabled": True,
+                        "ok": True,
+                        "figures": [
+                            {
+                                "type": "Figure",
+                                "figure_number": "9",
+                                "page": 1,
+                                "page_index": 0,
+                                "source_pdf": str(pdf_path),
+                                "figure_box": [49, 60, 563, 417],
+                                "caption": "Fig. 9: BER performance comparison for multiple communication-system settings.",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
 
             task = {"task_id": "reproduce_fig_9a", "figure_or_claim": "Fig. 9(a) BER curve"}
             self.assertEqual(_task_figure_label(task), "Fig. 9a")
@@ -1712,11 +1873,11 @@ class AgenticProjectWorkflowTests(unittest.TestCase):
             crop_entries = [entry for entry in display_entries if entry.get("kind") == "paper_crop"]
             self.assertEqual(len(crop_entries), 1)
             crop = crop_entries[0]
-            self.assertEqual(crop.get("crop_reason"), "pdf_subfigure_region")
+            self.assertEqual(crop.get("crop_reason"), "pdffigures2_subfigure")
             crop_box = crop.get("crop_box")
             self.assertIsInstance(crop_box, list)
             self.assertLess(crop_box[0], 80)
-            self.assertLess(crop_box[2], 250)
+            self.assertLess(crop_box[2], 260)
             self.assertLess(crop_box[3], 260)
             self.assertTrue(Path(str(crop["path"])).exists())
 

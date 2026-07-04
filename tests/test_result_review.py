@@ -132,6 +132,60 @@ class ResultReviewUnitTests(unittest.TestCase):
         self.assertEqual(pages[0], 3)
         self.assertIn(3, pages)
 
+    def test_select_paper_pages_for_task_prefers_target_figure_image_source(self) -> None:
+        paper = {
+            "chunks": [
+                {"chunk_id": "p9_c1", "page": 9, "section": "Results", "text": "\nFig. 6. Heat map over p and q."},
+                {"chunk_id": "p10_c1", "page": 10, "section": "Results", "text": "Fig. 6 illustrates the operating regime in text."},
+            ]
+        }
+        facts = {
+            "engineering_facts": [
+                {
+                    "type": "simulation_parameter",
+                    "name": "asymptotic scaling assumptions",
+                    "source": {"source_kind": "text", "page": 5, "quote": "K=M^p"},
+                },
+                {
+                    "type": "metric",
+                    "name": "Theorem 1 ULA spatial ZF scaling law",
+                    "source": {"source_kind": "text", "page": 6, "quote": "ZF threshold"},
+                },
+                {
+                    "type": "metric",
+                    "name": "Theorem 2 ULA STAB scaling law",
+                    "source": {"source_kind": "text", "page": 7, "quote": "STAB threshold"},
+                },
+                {
+                    "type": "figure_claim",
+                    "name": "Fig. 6 heat map setup",
+                    "source": {"source_kind": "text", "page": 10, "quote": "Fig. 6 illustrates a heat map"},
+                },
+                {
+                    "type": "figure_claim",
+                    "name": "Fig. 6 visual heatmap structure",
+                    "source": {"source_kind": "figure", "page": 9, "figure_ref": "Fig.6 STAB gain heat map"},
+                },
+            ]
+        }
+        task = {
+            "task_id": "reproduce_fig_6_pq_stab_gain_heatmap",
+            "figure_or_claim": "Fig. 6 heat map: STAB gain over the (p,q)-plane",
+            "required_facts": [
+                {"type": "simulation_parameter", "name": "asymptotic scaling assumptions"},
+                {"type": "metric", "name": "Theorem 1 ULA spatial ZF scaling law"},
+                {"type": "metric", "name": "Theorem 2 ULA STAB scaling law"},
+                {"type": "figure_claim", "name": "Fig. 6 heat map setup"},
+                {"type": "figure_claim", "name": "Fig. 6 visual heatmap structure"},
+            ],
+        }
+
+        pages = select_paper_pages_for_task(paper=paper, facts=facts, task=task, max_pages=4)
+
+        self.assertEqual(pages[0], 9)
+        self.assertIn(9, pages)
+        self.assertNotEqual(pages[0], 10)
+
     def test_result_review_schema_rejects_empty_experiment_reviews(self) -> None:
         issues = validate_stage(
             "result_review",

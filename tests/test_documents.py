@@ -7,6 +7,7 @@ from unittest.mock import patch
 from geng_agent.documents import load_paper, split_text
 from geng_agent.facts_normalize import finalize_engineering_facts, select_valid_engineering_facts
 from geng_agent.pipeline import build_risk_report
+from geng_agent.review_markdown import render_review_markdown
 
 
 class DocumentTests(unittest.TestCase):
@@ -198,6 +199,39 @@ class DocumentTests(unittest.TestCase):
         # non-pdf should not inject it
         risk_md = build_risk_report(facts, tasks, validation, paper_format="md")
         self.assertFalse(any(f.get("type") == "pdf_images_lost" for f in risk_md.get("findings", [])))
+
+    def test_dependency_warnings_are_reported_without_failing_runtime(self) -> None:
+        facts = {"engineering_facts": [], "missing_information": []}
+        tasks = {"repro_tasks": []}
+        validation = {"required_files_present": True, "python_compiles": True}
+        runtime_result = {
+            "enabled": True,
+            "passed": True,
+            "requirements_warnings": [
+                {
+                    "file": "tasks/demo.py",
+                    "line": "1",
+                    "message": "third-party import is not declared in requirements.txt: scipy.linalg (expected package scipy)",
+                }
+            ],
+        }
+
+        risk = build_risk_report(facts, tasks, validation, runtime_result=runtime_result)
+
+        self.assertTrue(any(item["type"] == "dependency_warnings" for item in risk["findings"]))
+        self.assertIn("requirements_warnings=1", risk["risk_dimensions"]["security_isolation"]["evidence"])
+
+        markdown = render_review_markdown(
+            paper={"source_path": "paper.md"},
+            facts=facts,
+            tasks=tasks,
+            risk_report=risk,
+            validation=validation,
+            runtime_result=runtime_result,
+            result_review_result={"enabled": False, "passed": None, "reason": "not run"},
+            repro_project_dir=Path("repro_project"),
+        )
+        self.assertIn("通过，有 1 条依赖告警", markdown)
 
 if __name__ == "__main__":
     unittest.main()

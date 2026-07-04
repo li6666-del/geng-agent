@@ -59,15 +59,35 @@ class DocxWriterTests(unittest.TestCase):
                     "findings": [],
                 },
                 validation={"required_files_present": True, "python_compiles": True},
-                runtime_result={"enabled": False, "passed": None, "attempts": []},
+                runtime_result={
+                    "enabled": True,
+                    "passed": True,
+                    "attempts": [],
+                    "requirements_warnings": [
+                        {
+                            "file": "tasks/demo.py",
+                            "line": "1",
+                            "message": "third-party import is not declared in requirements.txt: scipy.linalg (expected package scipy)",
+                        }
+                    ],
+                },
                 result_review_result={"enabled": False, "passed": None, "reason": "not run"},
                 repro_project_dir=root / "repro_project",
             )
 
             document = Document(path)
             text = "\n".join(paragraph.text for paragraph in document.paragraphs)
+            table_text = "\n".join(
+                paragraph.text
+                for table in document.tables
+                for row in table.rows
+                for cell in row.cells
+                for paragraph in cell.paragraphs
+            )
             self.assertIn("耿同学agent 论文工程复现审查报告", text)
             self.assertIn("人工复核建议", text)
+            self.assertIn("依赖告警", text)
+            self.assertIn("scipy.linalg", table_text)
             self.assertGreaterEqual(len(document.tables), 5)
 
     def test_write_result_review_docx_creates_experiment_sections(self) -> None:
@@ -135,15 +155,24 @@ class DocxWriterTests(unittest.TestCase):
             root = Path(temp_dir)
             path = root / "result_review.docx"
             image_path = root / "local.png"
+            paper_image_path = root / "paper.png"
             image_path.write_bytes(TINY_PNG)
+            paper_image_path.write_bytes(TINY_PNG)
 
             write_result_review_markdown_docx(
                 path,
                 markdown_text=(
                     "## 1. reproduce_fig_1\n\n"
-                    f"![local figure]({image_path})\n\n"
-                    "### 审查正文\n\n"
+                    "### 图像对比\n\n"
+                    "| 本地复现图 | 论文原图 |\n"
+                    "|---|---|\n"
+                    f"| ![本地复现图]({image_path}) | ![论文原图：Fig. 1]({paper_image_path}) |\n\n"
+                    "### 简短审查结论\n\n"
                     "- 本地曲线趋势一致。\n"
+                    "\n## 附录：Writer 自审原文\n\n"
+                    "### A1. reproduce_fig_1\n\n"
+                    "# raw writer title\n\n"
+                    "cycle details\n"
                 ),
                 status={
                     "passed": True,
@@ -154,11 +183,20 @@ class DocxWriterTests(unittest.TestCase):
 
             document = Document(path)
             text = "\n".join(paragraph.text for paragraph in document.paragraphs)
+            table_text = "\n".join(
+                paragraph.text
+                for table in document.tables
+                for row in table.rows
+                for cell in row.cells
+                for paragraph in cell.paragraphs
+            )
             self.assertIn("复现结果二次审查报告", text)
             self.assertIn("本地曲线趋势一致", text)
-            self.assertIn("local figure", text)
-            self.assertEqual(len(document.tables), 0)
-            self.assertEqual(len(document.inline_shapes), 1)
+            self.assertIn("本地复现图", table_text)
+            self.assertIn("论文原图：Fig. 1", table_text)
+            self.assertIn("raw writer title", text)
+            self.assertEqual(len(document.tables), 1)
+            self.assertEqual(len(document.inline_shapes), 2)
 
     def test_write_result_review_markdown_docx_records_missing_images(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -177,6 +215,38 @@ class DocxWriterTests(unittest.TestCase):
             self.assertIn("图片缺失", text)
             self.assertIn(str(missing), text)
             self.assertEqual(len(document.inline_shapes), 0)
+
+    def test_write_result_review_markdown_docx_records_missing_image_in_comparison_table(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            path = root / "result_review.docx"
+            local_image = root / "local.png"
+            missing = root / "missing.png"
+            local_image.write_bytes(TINY_PNG)
+
+            write_result_review_markdown_docx(
+                path,
+                markdown_text=(
+                    "## 1. reproduce_fig_1\n\n"
+                    "| 本地复现图 | 论文原图 |\n"
+                    "|---|---|\n"
+                    f"| ![本地复现图]({local_image}) | ![论文原图]({missing}) |\n"
+                ),
+                status={"passed": True},
+            )
+
+            document = Document(path)
+            text = "\n".join(
+                paragraph.text
+                for table in document.tables
+                for row in table.rows
+                for cell in row.cells
+                for paragraph in cell.paragraphs
+            )
+            self.assertIn("图片缺失", text)
+            self.assertIn(str(missing), text)
+            self.assertEqual(len(document.tables), 1)
+            self.assertEqual(len(document.inline_shapes), 1)
 
 
 if __name__ == "__main__":

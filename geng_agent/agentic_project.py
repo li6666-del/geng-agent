@@ -16,6 +16,7 @@ from .json_utils import pretty_json
 from .llm import LLMClient, LLMImage
 from .manifest_utils import expected_generated_paths
 from .outputs import resolve_inside, validate_repro_project, write_json, write_text
+from .pdffigures2 import build_pdffigures2_evidence, select_pdffigures2_crop_for_task
 from .project_snapshot import _restore_project, _snapshot_project
 from .result_review import (
     collect_result_review_inputs,
@@ -1099,14 +1100,11 @@ def _create_paper_crop_entry(*, task: dict[str, Any], page_entry: dict[str, Any]
     label_bits = ["paper_crop", safe_label(figure_label or "figure")]
     if page_no:
         label_bits.append(f"p{page_no}")
-    crop_info = _write_pdf_caption_paper_figure_crop(
-        task=task,
+    crop_info = select_pdffigures2_crop_for_task(
         source_page_image=source_path,
-        page_number=page_no,
+        figure_ref=_task_figure_reference(task),
         target_path=target_path,
     )
-    if not crop_info:
-        crop_info = _write_best_effort_paper_figure_crop(source_path=source_path, target_path=target_path)
     if not crop_info:
         return None
     return {
@@ -1119,593 +1117,9 @@ def _create_paper_crop_entry(*, task: dict[str, Any], page_entry: dict[str, Any]
         "source_path": str(source_path.resolve()),
         "crop_box": crop_info.get("crop_box"),
         "crop_reason": crop_info.get("crop_reason"),
+        "confidence": crop_info.get("confidence"),
+        "warning": crop_info.get("warning"),
     }
-
-
-def _write_pdf_caption_paper_figure_crop(
-    *,
-    task: dict[str, Any],
-    source_page_image: Path,
-    page_number: str,
-    target_path: Path,
-) -> dict[str, Any] | None:
-    if not page_number.isdigit():
-        return None
-    figure_label = _task_figure_label(task)
-    if not figure_label:
-        return None
-    pdf_path = _find_paper_source_pdf(source_page_image)
-    if not pdf_path:
-        return None
-    try:
-        import fitz
-    except Exception:
-        return None
-    try:
-        document = fitz.open(str(pdf_path))
-        try:
-            page_index = int(page_number) - 1
-            if page_index < 0 or page_index >= document.page_count:
-                return None
-            page = document.load_page(page_index)
-            caption_block = _find_pdf_figure_caption_block(page, figure_label)
-            if caption_block is None:
-                return None
-            figure_ref = _task_figure_reference(task)
-            subfigure = str(figure_ref.get("subfigure") or "")
-            crop_reason = "pdf_caption_region"
-            clip = None
-            if subfigure:
-                clip = _pdf_subfigure_crop_rect(page, caption_block, subfigure)
-                if clip is not None:
-                    crop_reason = "pdf_subfigure_region"
-            if clip is None:
-                clip = _pdf_caption_crop_rect(page.rect, caption_block)
-            if clip is None:
-                return None
-            pixmap = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), clip=clip, alpha=False)
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            pixmap.save(str(target_path))
-            return {
-                "crop_box": [round(float(clip.x0), 2), round(float(clip.y0), 2), round(float(clip.x1), 2), round(float(clip.y1), 2)],
-                "crop_reason": crop_reason,
-            }
-        finally:
-            document.close()
-    except Exception:
-        return None
-
-
-def _find_paper_source_pdf(source_page_image: Path) -> Path | None:
-    for parent in [source_page_image.parent, *source_page_image.parents]:
-        source_dir = parent / "source"
-        if source_dir.exists():
-            pdfs = sorted(source_dir.glob("*.pdf"))
-            if pdfs:
-                return pdfs[0]
-    return None
-
-
-def _find_pdf_figure_caption_block(page: Any, figure_label: str) -> Any | None:
-    match = re.search(r"fig\.\s*([0-9]+)", figure_label, re.I)
-    if not match:
-        return None
-    number = match.group(1)
-    patterns = [
-        re.compile(rf"\bfig\.\s*{re.escape(number)}\b", re.I),
-        re.compile(rf"\bfigure\s*{re.escape(number)}\b", re.I),
-    ]
-    try:
-        blocks = page.get_text("blocks")
-    except Exception:
-        return None
-    candidates = []
-    for block in blocks:
-        if len(block) < 5:
-            continue
-        text = str(block[4] or "")
-        if any(pattern.search(text) for pattern in patterns):
-            rect = page.rect.__class__(block[:4])
-            starts_like_caption = bool(re.search(rf"^\s*fig\.\s*{re.escape(number)}\b", text, re.I))
-            candidates.append((0 if starts_like_caption else 1, rect.y0, rect))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda item: (item[0], item[1]))
-    return candidates[0][2]
-
-
-def _pdf_subfigure_crop_rect(page: Any, figure_caption_rect: Any, subfigure_letter: str) -> Any | None:
-    target_letter = subfigure_letter.strip().lower()
-    if not re.fullmatch(r"[a-z]", target_letter):
-        return None
-    labels = _find_pdf_subfigure_label_blocks(page, figure_caption_rect)
-    if not labels:
-        return None
-    page_rect = page.rect
-    page_width = float(page_rect.width)
-    page_height = float(page_rect.height)
-    rows = _group_subfigure_labels_by_row(labels, page_height=page_height)
-    target_row_index = -1
-    target_col_index = -1
-    for row_index, row in enumerate(rows):
-        for col_index, label in enumerate(row):
-            if label["letter"] == target_letter:
-                target_row_index = row_index
-                target_col_index = col_index
-                break
-        if target_row_index >= 0:
-            break
-    if target_row_index < 0 or target_col_index < 0:
-        return None
-
-    row = rows[target_row_index]
-    target = row[target_col_index]
-    target_start_x = float(target["rect"].x0)
-    row_top = min(float(label["rect"].y0) for label in row)
-    row_bottom = max(float(label["rect"].y1) for label in row)
-    row_center_y = sum(_rect_center_y(label["rect"]) for label in row) / len(row)
-
-    if len(row) == 1:
-        left = float(target["rect"].x0) - page_width * 0.13
-        right = float(target["rect"].x1) + page_width * 0.10
-        if figure_caption_rect.width <= page_width * 0.55:
-            same_left_column = _rect_center_x(target["rect"]) <= page_rect.x0 + page_width / 2 and _rect_center_x(figure_caption_rect) <= page_rect.x0 + page_width / 2
-            same_right_column = _rect_center_x(target["rect"]) > page_rect.x0 + page_width / 2 and _rect_center_x(figure_caption_rect) > page_rect.x0 + page_width / 2
-            if same_left_column or same_right_column:
-                right = min(right, float(figure_caption_rect.x1) + page_width * 0.01)
-    else:
-        margin_x = page_width * 0.02
-        left = target_start_x - margin_x
-
-    if len(row) == 1:
-        pass
-    elif target_col_index < len(row) - 1:
-        next_start_x = float(row[target_col_index + 1]["rect"].x0)
-        right = next_start_x - page_width * 0.012
-    elif target_col_index > 0:
-        previous_start_x = float(row[target_col_index - 1]["rect"].x0)
-        right = target_start_x + (target_start_x - previous_start_x) - page_width * 0.012
-    else:
-        right = float(target["rect"].x1) + page_width * 0.18
-
-    left = max(page_rect.x0 + page_width * 0.035, left)
-    right = min(page_rect.x1 - page_width * 0.035, right)
-
-    margin_y = page_height * 0.01
-    if target_row_index > 0:
-        previous_row_bottom = max(float(label["rect"].y1) for label in rows[target_row_index - 1])
-        top = previous_row_bottom + margin_y
-    elif len(rows) > 1:
-        next_row_center_y = sum(_rect_center_y(label["rect"]) for label in rows[target_row_index + 1]) / len(rows[target_row_index + 1])
-        top = row_top - (next_row_center_y - row_center_y) * 0.95
-    else:
-        top = row_top - page_height * 0.28
-
-    if target_row_index < len(rows) - 1:
-        bottom = row_bottom + margin_y
-    else:
-        bottom = min(float(figure_caption_rect.y0) - margin_y, row_bottom + page_height * 0.025)
-
-    top = max(page_rect.y0 + page_height * 0.025, top)
-    bottom = min(page_rect.y1 - page_height * 0.025, bottom)
-    if right <= left or bottom <= top:
-        return None
-    rect = page_rect.__class__(left, top, right, bottom)
-    area_ratio = (rect.width * rect.height) / max(1.0, page_width * page_height)
-    if area_ratio < 0.012 or area_ratio > 0.38:
-        return None
-    if rect.width < page_width * 0.12 or rect.height < page_height * 0.10:
-        return None
-    return rect
-
-
-def _find_pdf_subfigure_label_blocks(page: Any, figure_caption_rect: Any) -> list[dict[str, Any]]:
-    try:
-        blocks = page.get_text("blocks")
-    except Exception:
-        return []
-    page_rect = page.rect
-    page_width = float(page_rect.width)
-    page_height = float(page_rect.height)
-    previous_caption_bottom = float(page_rect.y0)
-    label_pattern = re.compile(r"^\s*\(([a-z])\)(?:\s|$|[:.])", re.I)
-    figure_caption_pattern = re.compile(r"^\s*(?:fig\.|figure)\s*[0-9]+(?:\b|[:.])", re.I)
-    for block in blocks:
-        if len(block) < 5:
-            continue
-        text = str(block[4] or "").strip()
-        rect = page.rect.__class__(block[:4])
-        if rect.y1 >= figure_caption_rect.y0:
-            continue
-        if figure_caption_pattern.search(text):
-            previous_caption_bottom = max(previous_caption_bottom, float(rect.y1))
-
-    labels: list[dict[str, Any]] = []
-    for block in blocks:
-        if len(block) < 5:
-            continue
-        text = str(block[4] or "").strip()
-        if len(label_pattern.findall(text)) > 1:
-            continue
-        match = label_pattern.search(text)
-        if not match:
-            continue
-        rect = page.rect.__class__(block[:4])
-        if not _is_candidate_subfigure_label_rect(
-            rect=rect,
-            page_rect=page_rect,
-            figure_caption_rect=figure_caption_rect,
-            previous_caption_bottom=previous_caption_bottom,
-        ):
-            continue
-        if rect.width > page_width * 0.55:
-            continue
-        _append_unique_subfigure_label(labels, {"letter": match.group(1).lower(), "rect": rect, "text": text})
-    try:
-        words = page.get_text("words")
-    except Exception:
-        words = []
-    for word in words:
-        if len(word) < 5:
-            continue
-        text = str(word[4] or "").strip()
-        match = re.fullmatch(r"\(([a-z])\)", text, re.I)
-        if not match:
-            continue
-        rect = page.rect.__class__(word[:4])
-        if not _is_candidate_subfigure_label_rect(
-            rect=rect,
-            page_rect=page_rect,
-            figure_caption_rect=figure_caption_rect,
-            previous_caption_bottom=previous_caption_bottom,
-        ):
-            continue
-        _append_unique_subfigure_label(labels, {"letter": match.group(1).lower(), "rect": rect, "text": text})
-    labels.sort(key=lambda item: (_rect_center_y(item["rect"]), _rect_center_x(item["rect"])))
-    return labels
-
-
-def _is_candidate_subfigure_label_rect(
-    *,
-    rect: Any,
-    page_rect: Any,
-    figure_caption_rect: Any,
-    previous_caption_bottom: float,
-) -> bool:
-    page_width = float(page_rect.width)
-    page_height = float(page_rect.height)
-    if rect.y0 <= previous_caption_bottom or rect.y0 >= figure_caption_rect.y0:
-        return False
-    if rect.y0 < figure_caption_rect.y0 - page_height * 0.64:
-        return False
-    if rect.height > page_height * 0.075:
-        return False
-    if rect.x0 < page_rect.x0 or rect.x1 > page_rect.x1:
-        return False
-    if rect.width <= 0 or rect.width > page_width * 0.75:
-        return False
-    return True
-
-
-def _append_unique_subfigure_label(labels: list[dict[str, Any]], candidate: dict[str, Any]) -> None:
-    candidate_rect = candidate["rect"]
-    for existing in labels:
-        rect = existing["rect"]
-        if (
-            existing["letter"] == candidate["letter"]
-            and abs(float(rect.x0) - float(candidate_rect.x0)) < 8
-            and abs(_rect_center_y(rect) - _rect_center_y(candidate_rect)) < 8
-        ):
-            if candidate_rect.width > rect.width:
-                existing.update(candidate)
-            return
-    labels.append(candidate)
-
-
-def _group_subfigure_labels_by_row(labels: list[dict[str, Any]], *, page_height: float) -> list[list[dict[str, Any]]]:
-    row_threshold = max(10.0, page_height * 0.035)
-    rows: list[list[dict[str, Any]]] = []
-    row_centers: list[float] = []
-    for label in labels:
-        center_y = _rect_center_y(label["rect"])
-        if rows and abs(center_y - row_centers[-1]) <= row_threshold:
-            rows[-1].append(label)
-            row_centers[-1] = sum(_rect_center_y(item["rect"]) for item in rows[-1]) / len(rows[-1])
-        else:
-            rows.append([label])
-            row_centers.append(center_y)
-    for row in rows:
-        row.sort(key=lambda item: _rect_center_x(item["rect"]))
-    return rows
-
-
-def _rect_center_x(rect: Any) -> float:
-    return (float(rect.x0) + float(rect.x1)) / 2
-
-
-def _rect_center_y(rect: Any) -> float:
-    return (float(rect.y0) + float(rect.y1)) / 2
-
-
-def _pdf_caption_crop_rect(page_rect: Any, caption_rect: Any) -> Any | None:
-    page_width = float(page_rect.width)
-    page_height = float(page_rect.height)
-    if page_width <= 0 or page_height <= 0:
-        return None
-    spans_most_width = caption_rect.width >= page_width * 0.52
-    if spans_most_width:
-        left = page_rect.x0 + page_width * 0.055
-        right = page_rect.x1 - page_width * 0.055
-    else:
-        mid = page_rect.x0 + page_width / 2
-        if caption_rect.x0 + caption_rect.width / 2 >= mid:
-            left = max(mid - page_width * 0.006, caption_rect.x0 - page_width * 0.01)
-            right = page_rect.x1 - page_width * 0.055
-        else:
-            left = page_rect.x0 + page_width * 0.055
-            right = min(mid + page_width * 0.006, caption_rect.x1 + page_width * 0.01)
-    top = max(page_rect.y0 + page_height * 0.035, caption_rect.y0 - page_height * 0.29)
-    bottom = min(page_rect.y1 - page_height * 0.035, caption_rect.y1 + page_height * 0.025)
-    if right <= left or bottom <= top:
-        return None
-    rect = page_rect.__class__(left, top, right, bottom)
-    area_ratio = (rect.width * rect.height) / max(1.0, page_width * page_height)
-    if area_ratio < 0.025 or area_ratio > 0.55:
-        return None
-    return rect
-
-
-def _write_best_effort_paper_figure_crop(*, source_path: Path, target_path: Path) -> dict[str, Any] | None:
-    try:
-        from PIL import Image
-    except Exception:
-        return None
-
-    try:
-        with Image.open(source_path) as opened:
-            image = opened.convert("RGB")
-            width, height = image.size
-            if width < 180 or height < 180:
-                return None
-            analysis_width = min(width, 900)
-            analysis_height = max(1, int(height * (analysis_width / width)))
-            gray = image.convert("L").resize((analysis_width, analysis_height))
-
-            component = _best_paper_figure_component(gray)
-            if component:
-                box = _scale_paper_crop_box(
-                    component["box"],
-                    source_size=(analysis_width, analysis_height),
-                    target_size=(width, height),
-                )
-                if _is_useful_paper_crop(box=box, page_size=(width, height)):
-                    target_path.parent.mkdir(parents=True, exist_ok=True)
-                    image.crop(box).save(target_path, format="PNG")
-                    return {"crop_box": list(box), "crop_reason": "dense_figure_component"}
-
-            rows = _paper_crop_row_stats(gray)
-            segment = _best_paper_figure_segment(rows=rows, width=analysis_width, height=analysis_height)
-            if not segment:
-                return None
-
-            y0, y1 = segment["start"], segment["end"]
-            margin_x = max(6, int(analysis_width * 0.035))
-            margin_y = max(5, int(analysis_height * 0.018))
-            caption_extra = max(8, int(analysis_height * 0.055))
-            top = max(0, y0 - margin_y)
-            bottom = min(analysis_height - 1, y1 + margin_y + caption_extra)
-            x_bounds = _paper_crop_x_bounds(rows=rows, start=top, end=bottom)
-            if not x_bounds:
-                return None
-            left = max(0, x_bounds[0] - margin_x)
-            right = min(analysis_width - 1, x_bounds[1] + margin_x)
-
-            box = _scale_paper_crop_box(
-                (left, top, right + 1, bottom + 1),
-                source_size=(analysis_width, analysis_height),
-                target_size=(width, height),
-            )
-            if not _is_useful_paper_crop(box=box, page_size=(width, height)):
-                return None
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            image.crop(box).save(target_path, format="PNG")
-            return {"crop_box": list(box), "crop_reason": "largest_dense_page_region"}
-    except Exception:
-        return None
-
-
-def _best_paper_figure_component(gray_image: Any) -> dict[str, Any] | None:
-    width, height = gray_image.size
-    pixels = gray_image.load()
-    cell = max(6, min(14, width // 80))
-    cols = (width + cell - 1) // cell
-    rows = (height + cell - 1) // cell
-    occupied: set[tuple[int, int]] = set()
-    threshold = max(3, int(cell * cell * 0.03))
-    for row in range(rows):
-        y0 = row * cell
-        y1 = min(height, y0 + cell)
-        for col in range(cols):
-            x0 = col * cell
-            x1 = min(width, x0 + cell)
-            count = 0
-            for y in range(y0, y1):
-                for x in range(x0, x1):
-                    if pixels[x, y] < 235:
-                        count += 1
-            if count >= threshold:
-                occupied.add((col, row))
-
-    seen: set[tuple[int, int]] = set()
-    best: dict[str, Any] | None = None
-    best_score = -1.0
-    for origin in sorted(occupied):
-        if origin in seen:
-            continue
-        stack = [origin]
-        seen.add(origin)
-        component: list[tuple[int, int]] = []
-        while stack:
-            col, row = stack.pop()
-            component.append((col, row))
-            for dc in (-1, 0, 1):
-                for dr in (-1, 0, 1):
-                    if dc == 0 and dr == 0:
-                        continue
-                    nxt = (col + dc, row + dr)
-                    if nxt in occupied and nxt not in seen:
-                        seen.add(nxt)
-                        stack.append(nxt)
-        min_col = min(col for col, _ in component)
-        max_col = max(col for col, _ in component)
-        min_row = min(row for _, row in component)
-        max_row = max(row for _, row in component)
-        left = max(0, min_col * cell)
-        top = max(0, min_row * cell)
-        right = min(width, (max_col + 1) * cell)
-        bottom = min(height, (max_row + 1) * cell)
-        box_width = right - left
-        box_height = bottom - top
-        if box_width < width * 0.14 or box_height < height * 0.08:
-            continue
-        area_ratio = (box_width * box_height) / max(1, width * height)
-        if area_ratio < 0.018 or area_ratio > 0.40:
-            continue
-        aspect = box_width / max(1, box_height)
-        if aspect < 0.35 or aspect > 4.5:
-            continue
-        occupancy_ratio = len(component) / max(1, (max_col - min_col + 1) * (max_row - min_row + 1))
-        if occupancy_ratio < 0.08:
-            continue
-        score = (box_width * box_height) * (0.75 + occupancy_ratio)
-        # Prefer figure-like blocks in the upper/middle page over long text columns.
-        if box_height > height * 0.45:
-            score *= 0.55
-        if top < height * 0.68:
-            score *= 1.15
-        if score > best_score:
-            margin_x = max(cell, int(width * 0.025))
-            margin_y = max(cell, int(height * 0.018))
-            caption_extra = max(cell, int(height * 0.055))
-            best_score = score
-            best = {
-                "box": (
-                    max(0, left - margin_x),
-                    max(0, top - margin_y),
-                    min(width, right + margin_x),
-                    min(height, bottom + margin_y + caption_extra),
-                )
-            }
-    return best
-
-
-def _scale_paper_crop_box(
-    box: tuple[int, int, int, int],
-    *,
-    source_size: tuple[int, int],
-    target_size: tuple[int, int],
-) -> tuple[int, int, int, int]:
-    source_width, source_height = source_size
-    target_width, target_height = target_size
-    scale_x = target_width / max(1, source_width)
-    scale_y = target_height / max(1, source_height)
-    left, top, right, bottom = box
-    return (
-        max(0, int(left * scale_x)),
-        max(0, int(top * scale_y)),
-        min(target_width, int(right * scale_x)),
-        min(target_height, int(bottom * scale_y)),
-    )
-
-
-def _paper_crop_row_stats(gray_image: Any) -> list[dict[str, int]]:
-    width, height = gray_image.size
-    pixels = gray_image.load()
-    rows: list[dict[str, int]] = []
-    for y in range(height):
-        count = 0
-        left = width
-        right = -1
-        for x in range(width):
-            if pixels[x, y] < 245:
-                count += 1
-                if x < left:
-                    left = x
-                if x > right:
-                    right = x
-        rows.append({"count": count, "left": left if count else -1, "right": right})
-    return rows
-
-
-def _best_paper_figure_segment(*, rows: list[dict[str, int]], width: int, height: int) -> dict[str, Any] | None:
-    row_threshold = max(4, int(width * 0.015))
-    merge_gap = max(4, int(height * 0.012))
-    min_height = max(24, int(height * 0.045))
-    segments: list[tuple[int, int]] = []
-    start: int | None = None
-    last_dense: int | None = None
-    gap = 0
-    for y, row in enumerate(rows):
-        if row["count"] >= row_threshold:
-            if start is None:
-                start = y
-            last_dense = y
-            gap = 0
-        elif start is not None:
-            gap += 1
-            if gap > merge_gap and last_dense is not None:
-                segments.append((start, last_dense))
-                start = None
-                last_dense = None
-                gap = 0
-    if start is not None and last_dense is not None:
-        segments.append((start, last_dense))
-
-    best: dict[str, Any] | None = None
-    best_score = -1.0
-    for start, end in segments:
-        segment_height = end - start + 1
-        if segment_height < min_height:
-            continue
-        x_bounds = _paper_crop_x_bounds(rows=rows, start=start, end=end)
-        if not x_bounds:
-            continue
-        segment_width = x_bounds[1] - x_bounds[0] + 1
-        if segment_width < width * 0.18:
-            continue
-        total_nonwhite = sum(row["count"] for row in rows[start : end + 1])
-        width_ratio = segment_width / max(1, width)
-        density_bonus = total_nonwhite / max(1, segment_height * width)
-        score = segment_height * (0.65 + width_ratio) + density_bonus * height
-        if segment_height > height * 0.72:
-            score *= 0.45
-        if score > best_score:
-            best_score = score
-            best = {"start": start, "end": end, "x_bounds": x_bounds}
-    return best
-
-
-def _paper_crop_x_bounds(*, rows: list[dict[str, int]], start: int, end: int) -> tuple[int, int] | None:
-    lefts = [row["left"] for row in rows[start : end + 1] if row["count"] > 0 and row["left"] >= 0]
-    rights = [row["right"] for row in rows[start : end + 1] if row["count"] > 0 and row["right"] >= 0]
-    if not lefts or not rights:
-        return None
-    return min(lefts), max(rights)
-
-
-def _is_useful_paper_crop(*, box: tuple[int, int, int, int], page_size: tuple[int, int]) -> bool:
-    left, top, right, bottom = box
-    width, height = page_size
-    crop_width = right - left
-    crop_height = bottom - top
-    if crop_width <= 0 or crop_height <= 0:
-        return False
-    if crop_width < width * 0.22 or crop_height < height * 0.08:
-        return False
-    area_ratio = (crop_width * crop_height) / max(1, width * height)
-    if area_ratio < 0.025 or area_ratio > 0.76:
-        return False
-    return True
 
 
 def _paper_page_number_from_label(label: str) -> str:
@@ -1902,6 +1316,7 @@ def _write_paper_evidence_bundle(
     evidence_root.mkdir(parents=True, exist_ok=True)
 
     source_record = _copy_paper_source(evidence_root, paper_path)
+    pdffigures2_record = build_pdffigures2_evidence(paper_path=paper_path, evidence_root=evidence_root)
     task_entries: list[dict[str, Any]] = []
     task_items = [task for task in tasks.get("repro_tasks", []) if isinstance(task, dict)]
     for index, task in enumerate(task_items, start=1):
@@ -1932,6 +1347,7 @@ def _write_paper_evidence_bundle(
             "selected_paper_pages": selected_pages,
             "rendered_page_pngs": page_files,
             "render_error": render_error,
+            "pdffigures2": _task_pdffigures2_evidence(pdffigures2_record, task),
             "paper_context": context,
             "paper_source": source_record,
             "use_policy": [
@@ -1958,6 +1374,7 @@ def _write_paper_evidence_bundle(
         "version": 1,
         "kind": "task_scoped_paper_evidence",
         "paper_source": source_record,
+        "pdffigures2": pdffigures2_record,
         "policy": [
             "Primary input for Codex writer is the per-task evidence bundle, not a pasted full paper.",
             "The copied paper source is available for on-demand lookup when the bundle is insufficient.",
@@ -1968,6 +1385,22 @@ def _write_paper_evidence_bundle(
     }
     write_json(evidence_root / "index.json", index_doc)
     return index_doc
+
+
+def _task_pdffigures2_evidence(pdffigures2_record: dict[str, Any], task: dict[str, Any]) -> dict[str, Any]:
+    figure_ref = _task_figure_reference(task)
+    number = str(figure_ref.get("number") or "")
+    figures = pdffigures2_record.get("figures") if isinstance(pdffigures2_record, dict) else []
+    matches = []
+    if isinstance(figures, list) and number:
+        matches = [item for item in figures if str(item.get("figure_number") or "").lower() == number.lower()]
+    return {
+        "enabled": bool(pdffigures2_record.get("enabled")) if isinstance(pdffigures2_record, dict) else False,
+        "ok": bool(pdffigures2_record.get("ok")) if isinstance(pdffigures2_record, dict) else False,
+        "target_figure": figure_ref,
+        "matched_figures": matches[:3],
+        "reason": pdffigures2_record.get("reason") if isinstance(pdffigures2_record, dict) else "missing pdffigures2 record",
+    }
 
 
 def _remove_paper_evidence_root(evidence_root: Path) -> None:
@@ -2053,6 +1486,15 @@ def _render_task_evidence_markdown(task_evidence: dict[str, Any]) -> str:
         lines.append("None")
     if task_evidence.get("render_error"):
         lines.extend(["", "## Render Error", str(task_evidence.get("render_error"))])
+    lines.extend(
+        [
+            "",
+            "## PDFFigures2 Figure Evidence",
+            "```json",
+            pretty_json(task_evidence.get("pdffigures2", {})),
+            "```",
+        ]
+    )
     lines.extend(
         [
             "",

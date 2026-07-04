@@ -8,6 +8,8 @@ from geng_agent.security import (
     FORBIDDEN_BUILTINS,
     codex_safe_env,
     reconcile_whitelisted_requirements,
+    requirement_name_for_import,
+    split_requirement_issues,
     static_scan_repro_project,
     validate_requirements,
 )
@@ -122,6 +124,55 @@ class ReconcileRequirementsTests(unittest.TestCase):
             text = (root / "requirements.txt").read_text(encoding="utf-8")
             self.assertIn("scipy", text)
             self.assertIn("numpy", text)
+
+    def test_matplotlib_namespace_import_maps_to_matplotlib_requirement(self) -> None:
+        self.assertEqual(requirement_name_for_import("mpl_toolkits"), "matplotlib")
+        with TemporaryDirectory() as tmp:
+            root = self._project(
+                tmp,
+                requirements="matplotlib\n",
+                sim_source="from mpl_toolkits.axes_grid1.inset_locator import inset_axes\n",
+            )
+
+            def fake_find_spec(name: str):
+                return object() if name in {"matplotlib", "mpl_toolkits"} else None
+
+            with patch("geng_agent.security.importlib.util.find_spec", side_effect=fake_find_spec):
+                self.assertEqual(validate_requirements(root), [])
+
+    def test_reconcile_adds_matplotlib_for_mpl_toolkits_namespace_import(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = self._project(
+                tmp,
+                requirements="",
+                sim_source="from mpl_toolkits.axes_grid1.inset_locator import inset_axes\n",
+            )
+            with patch("geng_agent.security.importlib.util.find_spec", return_value=object()):
+                self.assertEqual(reconcile_whitelisted_requirements(root), ["matplotlib"])
+            self.assertIn("matplotlib", (root / "requirements.txt").read_text(encoding="utf-8"))
+
+    def test_split_requirement_issues_downgrades_installed_whitelisted_missing_declaration(self) -> None:
+        issue = {
+            "file": "tasks/demo.py",
+            "line": "1",
+            "message": "third-party import is not declared in requirements.txt: scipy.linalg (expected package scipy)",
+        }
+        with patch("geng_agent.security.importlib.util.find_spec", return_value=object()):
+            blocking, warnings = split_requirement_issues([issue])
+        self.assertEqual(blocking, [])
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual(warnings[0]["severity"], "warning")
+
+    def test_split_requirement_issues_keeps_unknown_package_blocking(self) -> None:
+        issue = {
+            "file": "tasks/demo.py",
+            "line": "1",
+            "message": "third-party import is not declared in requirements.txt: yaml (expected package yaml)",
+        }
+        blocking, warnings = split_requirement_issues([issue])
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(blocking), 1)
+        self.assertEqual(blocking[0]["severity"], "error")
 
     def test_does_not_add_non_whitelisted_import(self) -> None:
         with TemporaryDirectory() as tmp:

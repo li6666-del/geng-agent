@@ -120,6 +120,26 @@ class TemplateFallbackRiskTests(unittest.TestCase):
         self.assertEqual(dims["implementation_fidelity"]["level"], "low")
         self.assertEqual(dims["result_alignment"]["level"], "low")
 
+    def test_dependency_warnings_are_visible_but_not_high_risk(self) -> None:
+        dims = build_risk_dimensions(
+            missing=[],
+            assumptions=[],
+            validation={"required_files_present": True, "python_compiles": True},
+            runtime_result={
+                "enabled": True,
+                "passed": True,
+                "requirements_warnings": [{"message": "missing declaration"}],
+            },
+            scientific_check={},
+            tasks={},
+            result_review_result={"enabled": True, "passed": True},
+            manifest_meta={},
+        )
+
+        self.assertEqual(dims["runtime_reliability"]["level"], "low")
+        self.assertEqual(dims["security_isolation"]["level"], "medium")
+        self.assertIn("requirements_warnings=1", dims["security_isolation"]["evidence"])
+
 
 class UsageRollupTests(unittest.TestCase):
     def test_cumulative_and_by_model_rollup(self) -> None:

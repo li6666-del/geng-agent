@@ -182,9 +182,16 @@ def render_review_markdown(
 def _format_runtime_status(runtime_result: dict[str, Any]) -> str:
     if not runtime_result.get("enabled"):
         return "未运行（默认关闭；需要显式传 --run-repro 才会启动受限运行器）"
+    warning_count = _runtime_requirement_warning_count(runtime_result)
     if runtime_result.get("passed"):
-        return f"通过，自动修复次数 {runtime_result.get('repair_attempts_used', 0)}"
+        warning_note = f"，有 {warning_count} 条依赖告警" if warning_count else ""
+        return f"通过{warning_note}，自动修复次数 {runtime_result.get('repair_attempts_used', 0)}"
     return f"失败，日志目录 `{runtime_result.get('logs_dir', 'unknown')}`"
+
+
+def _runtime_requirement_warning_count(runtime_result: dict[str, Any]) -> int:
+    warnings = runtime_result.get("requirements_warnings")
+    return len(warnings) if isinstance(warnings, list) else 0
 
 
 def _format_result_review_status(result_review_result: dict[str, Any]) -> str:

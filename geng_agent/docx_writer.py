@@ -21,6 +21,7 @@ ACCENT = "1F4E79"
 HEADER_FILL = "E8EEF7"
 LIGHT_FILL = "F6F8FB"
 RESULT_REVIEW_IMAGE_WIDTH_IN = 6.2
+RESULT_REVIEW_COMPARISON_IMAGE_WIDTH_IN = 3.0
 DISCLAIMER = "本报告只表达复现风险、结果差异与人工复核建议，不直接判定论文造假。"
 
 RISK_LABELS = {
@@ -223,9 +224,22 @@ def write_review_docx(
             ("自动运行已启用", runtime_result.get("enabled")),
             ("自动运行是否通过", runtime_result.get("passed")),
             ("自动修复次数", runtime_result.get("repair_attempts_used", 0)),
+            ("依赖告警数", _runtime_requirement_warning_count(runtime_result)),
             ("运行日志目录", runtime_result.get("logs_dir", "未生成")),
         ],
     )
+    requirement_warnings = _runtime_requirement_warnings(runtime_result)
+    if requirement_warnings:
+        _add_heading(document, "依赖告警", 2)
+        rows = [
+            [
+                warning.get("file", "unknown") if isinstance(warning, dict) else "unknown",
+                warning.get("line", "") if isinstance(warning, dict) else "",
+                warning.get("message", warning) if isinstance(warning, dict) else warning,
+            ]
+            for warning in requirement_warnings[:5]
+        ]
+        _add_table(document, ["文件", "行", "说明"], rows)
     artifacts = runtime_result.get("artifacts")
     if isinstance(artifacts, dict) and artifacts:
         rows = [[key, _safe_text(value)] for key, value in artifacts.items()]
@@ -375,25 +389,151 @@ def write_result_review_markdown_docx(
 
 
 def _add_markdown_body(document: DocumentObject, markdown_text: str) -> None:
-    for raw_line in markdown_text.splitlines():
+    lines = markdown_text.splitlines()
+    index = 0
+    in_appendix = False
+    while index < len(lines):
+        raw_line = lines[index]
         line = raw_line.strip()
         if not line:
+            index += 1
+            continue
+        table = _parse_markdown_image_table(lines, index)
+        if table:
+            _add_image_comparison_table(document, table["headers"], table["rows"])
+            index += table["consumed"]
             continue
         image_match = re.fullmatch(r"!\[([^\]]*)\]\((.*)\)", line)
         if image_match:
             _add_markdown_image(document, image_match.group(1).strip(), image_match.group(2).strip())
         elif line.startswith("### "):
-            _add_heading(document, line[4:].strip(), 3)
+            _add_heading(document, line[4:].strip(), 3 if not in_appendix else 3)
         elif line.startswith("## "):
-            _add_heading(document, line[3:].strip(), 2)
+            heading = line[3:].strip()
+            if heading.startswith("附录"):
+                document.add_page_break()
+                in_appendix = True
+                _add_heading(document, heading, 1)
+            else:
+                _add_heading(document, heading, 2 if not in_appendix else 3)
         elif line.startswith("# "):
-            _add_heading(document, line[2:].strip(), 1)
+            if in_appendix:
+                _add_appendix_note(document, line[2:].strip(), bold=True)
+            else:
+                _add_heading(document, line[2:].strip(), 1)
         elif line.startswith(("- ", "* ")):
             _add_bullets(document, [line[2:].strip()])
         elif line.startswith("```"):
-            continue
+            pass
         else:
-            document.add_paragraph(_safe_text(line))
+            if in_appendix:
+                _add_appendix_note(document, _clean_markdown_inline(line))
+            else:
+                document.add_paragraph(_clean_markdown_inline(line))
+        index += 1
+
+
+def _parse_markdown_image_table(lines: list[str], start: int) -> dict[str, Any] | None:
+    if start + 2 >= len(lines):
+        return None
+    header = lines[start].strip()
+    separator = lines[start + 1].strip()
+    if not (header.startswith("|") and header.endswith("|") and separator.startswith("|") and separator.endswith("|")):
+        return None
+    headers = _split_markdown_table_row(header)
+    separators = _split_markdown_table_row(separator)
+    if len(headers) != 2 or len(separators) != 2:
+        return None
+    if not all(re.fullmatch(r":?-{3,}:?", item.strip()) for item in separators):
+        return None
+    if not any("复现图" in item or "论文原图" in item for item in headers):
+        return None
+    rows: list[list[str]] = []
+    index = start + 2
+    while index < len(lines):
+        row = lines[index].strip()
+        if not (row.startswith("|") and row.endswith("|")):
+            break
+        cells = _split_markdown_table_row(row)
+        if len(cells) != len(headers):
+            break
+        rows.append(cells)
+        index += 1
+    if not rows:
+        return None
+    return {"headers": headers, "rows": rows, "consumed": index - start}
+
+
+def _split_markdown_table_row(row: str) -> list[str]:
+    return [cell.strip() for cell in row.strip().strip("|").split("|")]
+
+
+def _add_image_comparison_table(document: DocumentObject, headers: list[str], rows: list[list[str]]) -> None:
+    table = document.add_table(rows=1, cols=2)
+    table.style = "Table Grid"
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    table.autofit = False
+    _set_table_width(table, 9360)
+    _set_table_column_widths(table, [4680, 4680])
+
+    for cell, header in zip(table.rows[0].cells, headers):
+        _set_cell_text(cell, _safe_text(header), bold=True)
+        _shade_cell(cell, HEADER_FILL)
+
+    for row in rows:
+        cells = table.add_row().cells
+        for cell, value in zip(cells, row):
+            _clear_cell(cell)
+            _set_cell_margins(cell, top=120, start=120, bottom=120, end=120)
+            cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+            _add_markdown_image_to_cell(cell, value)
+    document.add_paragraph()
+
+
+def _add_markdown_image_to_cell(cell: _Cell, value: str) -> None:
+    image_match = re.fullmatch(r"!\[([^\]]*)\]\((.*)\)", value.strip())
+    if not image_match:
+        _add_cell_paragraph(cell, _clean_markdown_inline(value) or "无可用图片", align=WD_ALIGN_PARAGRAPH.CENTER)
+        return
+    caption = image_match.group(1).strip()
+    raw_path = image_match.group(2).strip()
+    image_path = Path(raw_path.strip().strip("<>"))
+    if not image_path.exists():
+        _add_cell_paragraph(cell, f"图片缺失：{raw_path}", align=WD_ALIGN_PARAGRAPH.CENTER, italic=True)
+        return
+    try:
+        paragraph = cell.paragraphs[0]
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        paragraph.paragraph_format.space_after = Pt(4)
+        run = paragraph.add_run()
+        run.add_picture(str(image_path), width=Inches(RESULT_REVIEW_COMPARISON_IMAGE_WIDTH_IN))
+        if caption:
+            _add_cell_paragraph(cell, _safe_text(caption), align=WD_ALIGN_PARAGRAPH.CENTER, italic=True, muted=True)
+    except Exception as exc:
+        _add_cell_paragraph(cell, f"图片插入失败：{raw_path}（{type(exc).__name__}: {exc}）", align=WD_ALIGN_PARAGRAPH.CENTER, italic=True)
+
+
+def _add_cell_paragraph(
+    cell: _Cell,
+    text: str,
+    *,
+    align: int | None = None,
+    italic: bool = False,
+    muted: bool = False,
+) -> None:
+    paragraph = cell.add_paragraph() if cell.paragraphs and cell.paragraphs[0].text else cell.paragraphs[0]
+    paragraph.paragraph_format.space_after = Pt(2)
+    if align is not None:
+        paragraph.alignment = align
+    run = paragraph.add_run(_safe_text(text))
+    run.italic = italic
+    if muted:
+        run.font.color.rgb = RGBColor(95, 95, 95)
+    _set_run_font(run, BODY_FONT, Pt(9))
+
+
+def _clear_cell(cell: _Cell) -> None:
+    cell.text = ""
 
 
 def _add_markdown_image(document: DocumentObject, caption: str, raw_path: str) -> None:
@@ -491,6 +631,25 @@ def _add_note(document: DocumentObject, text: str) -> None:
     _set_run_font(run, BODY_FONT, Pt(10.5))
 
 
+def _add_appendix_note(document: DocumentObject, text: str, *, bold: bool = False) -> None:
+    paragraph = document.add_paragraph()
+    paragraph.paragraph_format.space_after = Pt(3)
+    paragraph.paragraph_format.line_spacing = 1.05
+    run = paragraph.add_run(_safe_text(text))
+    run.bold = bold
+    run.font.color.rgb = RGBColor(70, 70, 70)
+    _set_run_font(run, BODY_FONT, Pt(9.2))
+
+
+def _runtime_requirement_warnings(runtime_result: dict[str, Any]) -> list[Any]:
+    warnings = runtime_result.get("requirements_warnings")
+    return warnings if isinstance(warnings, list) else []
+
+
+def _runtime_requirement_warning_count(runtime_result: dict[str, Any]) -> int:
+    return len(_runtime_requirement_warnings(runtime_result))
+
+
 def _add_disclaimer(document: DocumentObject) -> None:
     _add_heading(document, "声明", 1)
     paragraph = document.add_paragraph()
@@ -537,6 +696,32 @@ def _set_table_width(table: Any, width_dxa: int) -> None:
         tbl_pr.insert(0, tbl_w)
     tbl_w.set(qn("w:w"), str(width_dxa))
     tbl_w.set(qn("w:type"), "dxa")
+
+
+def _set_table_column_widths(table: Any, widths_dxa: list[int]) -> None:
+    tbl_grid = table._tbl.tblGrid
+    if tbl_grid is None:
+        tbl_grid = OxmlElement("w:tblGrid")
+        table._tbl.insert(0, tbl_grid)
+    for child in list(tbl_grid):
+        tbl_grid.remove(child)
+    for width in widths_dxa:
+        grid_col = OxmlElement("w:gridCol")
+        grid_col.set(qn("w:w"), str(width))
+        tbl_grid.append(grid_col)
+    for row in table.rows:
+        for cell, width in zip(row.cells, widths_dxa):
+            _set_cell_width(cell, width)
+
+
+def _set_cell_width(cell: _Cell, width_dxa: int) -> None:
+    tc_pr = cell._tc.get_or_add_tcPr()
+    tc_w = tc_pr.find(qn("w:tcW"))
+    if tc_w is None:
+        tc_w = OxmlElement("w:tcW")
+        tc_pr.append(tc_w)
+    tc_w.set(qn("w:w"), str(width_dxa))
+    tc_w.set(qn("w:type"), "dxa")
 
 
 def _set_cell_text(cell: _Cell, text: Any, *, bold: bool = False) -> None:
@@ -642,6 +827,15 @@ def _safe_text(value: Any, limit: int = 1200) -> str:
     if len(text) > limit:
         return text[: limit - 20] + "...[已截断]"
     return text
+
+
+def _clean_markdown_inline(text: str) -> str:
+    cleaned = _safe_text(text)
+    cleaned = re.sub(r"`([^`]+)`", r"\1", cleaned)
+    cleaned = re.sub(r"\*\*([^*]+)\*\*", r"\1", cleaned)
+    cleaned = re.sub(r"__([^_]+)__", r"\1", cleaned)
+    cleaned = re.sub(r"\*([^*]+)\*", r"\1", cleaned)
+    return cleaned
 
 
 def _save(document: DocumentObject, path: Path) -> Path:

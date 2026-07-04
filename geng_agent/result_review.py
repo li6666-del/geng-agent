@@ -514,6 +514,7 @@ def select_paper_pages_for_task(
 ) -> list[int]:
     priority_candidates: list[tuple[int, int]] = []
     candidates: list[int] = []
+    figure_numbers = _task_figure_numbers(task)
     required = {
         (str(ref.get("type")), str(ref.get("name")).lower())
         for ref in task.get("required_facts", [])
@@ -533,14 +534,20 @@ def select_paper_pages_for_task(
             fact_type = str(fact.get("type"))
             fact_name = str(fact.get("name", "")).lower()
             quote = str(source.get("quote", "")).lower()
-            if key in required and fact_type in {"figure_claim", "metric", "simulation_parameter"}:
+            mentions_target_figure = _fact_mentions_any_target_figure(fact, figure_numbers)
+            if mentions_target_figure and source.get("source_kind") == "figure":
                 priority_candidates.append((0, source["page"]))
-            elif key in required and (fact_name in task_text or any(token and token in quote for token in task_match_tokens(task))):
+            elif mentions_target_figure and fact_type == "figure_claim":
                 priority_candidates.append((1, source["page"]))
+            elif key in required and fact_type == "figure_claim" and source.get("source_kind") == "figure":
+                priority_candidates.append((2, source["page"]))
+            elif key in required and fact_type in {"figure_claim", "metric", "simulation_parameter"}:
+                priority_candidates.append((3, source["page"]))
+            elif key in required and (fact_name in task_text or any(token and token in quote for token in task_match_tokens(task))):
+                priority_candidates.append((4, source["page"]))
             else:
                 candidates.append(source["page"])
 
-    figure_numbers = _extract_figure_numbers(str(task.get("figure_or_claim", "")))
     tokens = task_match_tokens(task)
     for chunk in paper.get("chunks", []):
         if not isinstance(chunk, dict):
@@ -549,7 +556,9 @@ def select_paper_pages_for_task(
         if not isinstance(page, int):
             continue
         text = " ".join(str(chunk.get(key, "")) for key in ("section", "text")).lower()
-        if any(f"fig. {number}" in text or f"figure {number}" in text for number in figure_numbers):
+        if any(_text_has_figure_caption(text, number) for number in figure_numbers):
+            priority_candidates.append((5, page))
+        elif any(_text_mentions_figure_number(text, number) for number in figure_numbers):
             candidates.insert(0, page)
         elif any(keyword in text for keyword in RESULT_KEYWORDS) and any(token and token in text for token in tokens):
             candidates.append(page)
@@ -576,6 +585,47 @@ def task_match_tokens(task: dict[str, Any]) -> set[str]:
     tokens = set(re.findall(r"[a-z0-9_]+", " ".join(text_parts).lower()))
     tokens.update(_extract_figure_numbers(str(task.get("figure_or_claim", ""))))
     return {token for token in tokens if len(token) >= 2}
+
+
+def _task_figure_numbers(task: dict[str, Any]) -> set[str]:
+    parts = [
+        str(task.get("task_id", "")),
+        str(task.get("target", "")),
+        str(task.get("figure_or_claim", "")),
+        str(task.get("figure_or_table", "")),
+        str(task.get("description", "")),
+    ]
+    return _extract_figure_numbers(" ".join(parts))
+
+
+def _fact_mentions_any_target_figure(fact: dict[str, Any], figure_numbers: set[str]) -> bool:
+    if not figure_numbers:
+        return False
+    source = fact.get("source") if isinstance(fact.get("source"), dict) else {}
+    haystack = " ".join(
+        [
+            str(fact.get("name") or ""),
+            json.dumps(fact.get("value", {}), ensure_ascii=False) if isinstance(fact.get("value"), (dict, list)) else str(fact.get("value") or ""),
+            str(source.get("figure_ref") or ""),
+            str(source.get("quote") or ""),
+        ]
+    )
+    mentioned = _extract_figure_numbers(haystack)
+    return bool(mentioned & figure_numbers)
+
+
+def _text_mentions_figure_number(text: str, number: str) -> bool:
+    return bool(
+        re.search(rf"\bfig(?:\.|ure)?[._\s:-]*{re.escape(number)}\b", text, re.I)
+        or re.search(rf"图\s*{re.escape(number)}\b", text)
+    )
+
+
+def _text_has_figure_caption(text: str, number: str) -> bool:
+    return bool(
+        re.search(rf"(?:^|\n)\s*(?:fig\.|figure)\s*{re.escape(number)}\b\s*[:.]", text, re.I)
+        or re.search(rf"(?:^|\n)\s*图\s*{re.escape(number)}\b\s*[:：.]", text)
+    )
 
 
 def thesis_comparisons_for_task(paper_thesis: dict[str, Any] | None, task: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1088,4 +1138,6 @@ def wrap_untrusted(label: str, text: str) -> str:
 
 
 def _extract_figure_numbers(text: str) -> set[str]:
-    return set(re.findall(r"(?:fig\.?|figure)\s*([0-9]+)", text.lower()))
+    numbers = set(re.findall(r"\bfig(?:\.|ure)?[._\s:-]*([0-9]+)", text.lower()))
+    numbers.update(re.findall(r"图\s*([0-9]+)", text))
+    return numbers

@@ -39,6 +39,7 @@ from .security import (
     dependency_policy_prompt_text,
     reconcile_whitelisted_requirements,
     redact_text,
+    split_requirement_issues,
     static_scan_repro_project,
     validate_requirements,
 )
@@ -172,6 +173,7 @@ def run_codex_task_writer_workflow(
     reconcile_whitelisted_requirements(repro_project_dir)
     validation = validate_repro_project(repro_project_dir)
     requirement_issues = validate_requirements(repro_project_dir)
+    blocking_requirement_issues, requirement_warnings = split_requirement_issues(requirement_issues)
     security_issues = static_scan_repro_project(repro_project_dir)
     manifest = _manifest_from_project(
         repro_project_dir=repro_project_dir,
@@ -191,7 +193,8 @@ def run_codex_task_writer_workflow(
         task_records=task_records,
         validation=validation,
         manifest_issues=[issue.as_dict() for issue in manifest_issues],
-        requirement_issues=requirement_issues,
+        requirement_issues=blocking_requirement_issues,
+        requirement_warnings=requirement_warnings,
         security_issues=security_issues,
     )
     write_json(output_dir / "runtime_result.json", runtime_result)
@@ -906,7 +909,14 @@ def _task_paper_image_paths(sandbox: Path, task: dict[str, Any]) -> list[str]:
         return []
 
     target_pages = _task_target_paper_pages(evidence_root=evidence_root, task=task, available_pages=page_paths)
-    selected_paths = [path for path in page_paths if _paper_page_number_from_path(path) in target_pages]
+    selected_order = _task_selected_paper_page_order(evidence_root=evidence_root, available_pages=page_paths)
+    selected_paths = _ordered_paper_page_paths(page_paths=page_paths, page_numbers=target_pages, preferred_order=selected_order)
+    if not selected_paths:
+        selected_paths = _ordered_paper_page_paths(
+            page_paths=page_paths,
+            page_numbers=set(selected_order[:1]),
+            preferred_order=selected_order,
+        )
     if not selected_paths:
         selected_paths = page_paths[:1]
 
@@ -923,6 +933,43 @@ def _task_paper_image_paths(sandbox: Path, task: dict[str, Any]) -> list[str]:
     paper_entries = _select_task_paper_display_entries(display_entries)
     preferred = [entry for entry in paper_entries if entry.get("kind") == "paper_crop"] or paper_entries
     return [str(entry.get("path")) for entry in preferred if str(entry.get("path") or "").strip()]
+
+
+def _ordered_paper_page_paths(*, page_paths: list[Path], page_numbers: set[str], preferred_order: list[str]) -> list[Path]:
+    if not page_numbers:
+        return []
+    by_number = {_paper_page_number_from_path(path): path for path in page_paths}
+    ordered: list[Path] = []
+    seen: set[str] = set()
+    for page_number in preferred_order:
+        if page_number in page_numbers and page_number in by_number and page_number not in seen:
+            ordered.append(by_number[page_number])
+            seen.add(page_number)
+    for path in page_paths:
+        page_number = _paper_page_number_from_path(path)
+        if page_number in page_numbers and page_number not in seen:
+            ordered.append(path)
+            seen.add(page_number)
+    return ordered
+
+
+def _task_selected_paper_page_order(*, evidence_root: Path, available_pages: list[Path]) -> list[str]:
+    available = {_paper_page_number_from_path(path) for path in available_pages}
+    available.discard("")
+    ordered: list[str] = []
+    for evidence_path in sorted(evidence_root.rglob("evidence.json")):
+        try:
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        pages = evidence.get("selected_paper_pages")
+        if not isinstance(pages, list):
+            continue
+        for raw_page in pages:
+            page = str(raw_page)
+            if page in available and page not in ordered:
+                ordered.append(page)
+    return ordered
 
 
 def _task_target_paper_pages(*, evidence_root: Path, task: dict[str, Any], available_pages: list[Path]) -> set[str]:
@@ -1123,6 +1170,7 @@ def _task_writer_runtime_result(
     validation: dict[str, Any],
     manifest_issues: list[dict[str, Any]],
     requirement_issues: list[dict[str, Any]],
+    requirement_warnings: list[dict[str, Any]],
     security_issues: list[dict[str, Any]],
 ) -> dict[str, Any]:
     passed = sum(1 for record in task_records if _task_writer_runtime_task_passed(record))
@@ -1192,6 +1240,7 @@ def _task_writer_runtime_result(
         "validation": validation,
         "manifest_issues": manifest_issues,
         "requirements_issues": requirement_issues,
+        "requirements_warnings": requirement_warnings,
         "security_issues": security_issues,
     }
 
@@ -1244,44 +1293,121 @@ def _task_writer_alignment_summary(task_records: list[dict[str, Any]]) -> dict[s
 
 def _render_task_writer_result_review(task_records: list[dict[str, Any]]) -> str:
     sections: list[str] = []
+    appendix_sections: list[str] = []
     for index, record in enumerate(task_records, start=1):
         task_id = str(record.get("task_id") or f"task_{index}")
         result = record.get("result_json") if isinstance(record.get("result_json"), dict) else {}
         lines = [f"## {index}. {task_id}", ""]
         lines.extend(
             [
-                f"- Writer 结论：`{record.get('task_writer_status', 'failed')}`",
-                f"- 主持人结构验收：{'通过' if record.get('structural_ok') else '失败'}",
+                f"**Writer 结论：** `{record.get('task_writer_status', 'failed')}`",
+                f"**主持人结构验收：** {'通过' if record.get('structural_ok') else '失败'}",
             ]
         )
         if record.get("errors"):
-            lines.append("- 结构问题：" + "；".join(str(item) for item in record.get("errors", [])))
+            lines.append("**结构问题：** " + "；".join(str(item) for item in record.get("errors", [])))
         if record.get("blocked_reason"):
-            lines.append(f"- 执行阻塞：{record.get('blocked_reason')}")
+            lines.append(f"**执行阻塞：** {record.get('blocked_reason')}")
         lines.append("")
-        lines.extend(_image_markdown_group("本地复现图", record.get("local_images", [])))
-        lines.extend(_image_markdown_group("论文原图", record.get("paper_images", [])))
-        lines.extend(["### Writer 自审正文", ""])
+
+        lines.extend(_image_comparison_markdown(record=record, result=result))
+        lines.extend(["### 简短审查结论", ""])
+        lines.append(str(result.get("summary") or "Writer 未提供简短结论。"))
+        lines.append("")
+        lines.extend(_result_list_section("关键差异", result.get("differences"), default="未报告明显差异。"))
+        lines.extend(_result_list_section("可能原因", result.get("possible_causes"), default="未报告可能原因。"))
+        lines.extend(_result_list_section("剩余不确定性", result.get("remaining_uncertainties"), default="未报告剩余不确定性。"))
+        lines.extend(_result_list_section("证据文件", result.get("evidence_files"), default="未列出证据文件。"))
+        lines.extend(["", f"完整 writer 自审原文见附录 A{index}。"])
+
         md = _read_optional_text(record.get("result_markdown_path"))
+        appendix_lines = [f"### A{index}. {task_id}", ""]
         if md:
-            lines.append(md.strip())
+            appendix_lines.append(md.strip())
         else:
-            lines.extend(_fallback_writer_review_lines(result))
+            appendix_lines.extend(_fallback_writer_review_lines(result))
+        appendix_sections.append("\n".join(appendix_lines).strip() + "\n")
         sections.append("\n".join(lines).strip() + "\n")
+
+    if appendix_sections:
+        sections.append("## 附录：Writer 自审原文\n")
+        sections.extend(appendix_sections)
     return "\n".join(sections).strip() + "\n"
 
 
-def _image_markdown_group(title: str, paths: Any) -> list[str]:
-    lines = [f"### {title}", ""]
-    items = [str(path) for path in paths or [] if str(path).strip()]
-    if not items:
+def _image_comparison_markdown(*, record: dict[str, Any], result: dict[str, Any]) -> list[str]:
+    local_images = [str(path) for path in record.get("local_images", []) or [] if str(path).strip()]
+    paper_images = [str(path) for path in record.get("paper_images", []) or [] if str(path).strip()]
+    figure_label = _human_figure_label_from_record(record, result)
+    paper_caption = "论文原图" if not figure_label else f"论文原图：{figure_label}"
+    lines = ["### 图像对比", ""]
+    if local_images and paper_images:
+        lines.extend(["| 本地复现图 | 论文原图 |", "|---|---|"])
+        row_count = max(len(local_images), len(paper_images))
+        for row_index in range(row_count):
+            local_cell = _markdown_image_cell(
+                local_images[row_index] if row_index < len(local_images) else "",
+                "本地复现图" if row_count == 1 else f"本地复现图 {row_index + 1}",
+            )
+            paper_cell = _markdown_image_cell(
+                paper_images[row_index] if row_index < len(paper_images) else "",
+                paper_caption if row_count == 1 else f"{paper_caption} {row_index + 1}",
+            )
+            lines.append(f"| {local_cell} | {paper_cell} |")
+        lines.append("")
+        return lines
+
+    single_images = [("本地复现图", path) for path in local_images] or [(paper_caption, path) for path in paper_images]
+    if not single_images:
         lines.extend(["无可用图片。", ""])
         return lines
-    for path in items:
-        caption = f"{title}: {Path(path).name}"
-        lines.append(f"![{caption}]({path})")
+    for caption, path in single_images:
+        lines.append(_markdown_image_cell(path, caption))
         lines.append("")
     return lines
+
+
+def _markdown_image_cell(path: str, caption: str) -> str:
+    if not path:
+        return "无可用图片"
+    return f"![{caption}]({path})"
+
+
+def _result_list_section(title: str, values: Any, *, default: str) -> list[str]:
+    lines = [f"### {title}", ""]
+    if isinstance(values, list):
+        items = [str(item) for item in values if str(item).strip()]
+    elif values:
+        items = [str(values)]
+    else:
+        items = []
+    if not items:
+        items = [default]
+    lines.extend(f"- {item}" for item in items)
+    lines.append("")
+    return lines
+
+
+def _human_figure_label(task_id: str) -> str:
+    match = re.search(r"fig(?:ure)?[._\s:-]*([0-9]+)[._\s:-]*\(?([a-z])?\)?\b", task_id, re.I)
+    if not match:
+        return ""
+    number = match.group(1)
+    letter = match.group(2)
+    return f"Fig. {number}({letter.lower()})" if letter else f"Fig. {number}"
+
+
+def _human_figure_label_from_record(record: dict[str, Any], result: dict[str, Any]) -> str:
+    candidates = [
+        str(record.get("task_id") or ""),
+        str(result.get("task_id") or ""),
+        str(result.get("summary") or ""),
+    ]
+    for candidate in candidates:
+        label = _human_figure_label(candidate)
+        if label:
+            return label
+    return ""
 
 
 def _fallback_writer_review_lines(result: dict[str, Any]) -> list[str]:

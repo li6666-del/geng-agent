@@ -161,6 +161,16 @@ def build_risk_report(
                 "pipeline_error": runtime_result.get("pipeline_error"),
             }
         )
+    requirement_warnings = runtime_result.get("requirements_warnings") if isinstance(runtime_result, dict) else None
+    if isinstance(requirement_warnings, list) and requirement_warnings:
+        findings.append(
+            {
+                "type": "dependency_warnings",
+                "message": "复现项目存在非阻断依赖告警；本次不影响自动运行通过，但建议整理 requirements.txt 以提升可移植性。",
+                "count": len(requirement_warnings),
+                "examples": requirement_warnings[:3],
+            }
+        )
     partial_success = runtime_result.get("partial_success") if isinstance(runtime_result, dict) else None
     if isinstance(partial_success, dict) and partial_success.get("has_partial_output"):
         findings.append(
@@ -261,6 +271,7 @@ def build_risk_dimensions(
     scientific_issues = scientific_check.get("issues", []) if isinstance(scientific_check, dict) else []
     security_issues = runtime_result.get("security_issues", []) if isinstance(runtime_result, dict) else []
     requirement_issues = runtime_result.get("requirements_issues", []) if isinstance(runtime_result, dict) else []
+    requirement_warnings = runtime_result.get("requirements_warnings", []) if isinstance(runtime_result, dict) else []
     result_review_enabled = bool(result_review_result.get("enabled"))
     result_review_passed = result_review_result.get("passed")
     template_fallback_used = bool(manifest_meta.get("template_fallback_used"))
@@ -309,10 +320,11 @@ def build_risk_dimensions(
         ),
         "baseline_fairness": _dimension("high" if _count_missing_baselines(tasks) else "low", [f"tasks_without_baseline={_count_missing_baselines(tasks)}"]),
         "security_isolation": _dimension(
-            "high" if security_issues or requirement_issues else "medium" if runtime_enabled else "low",
+            "high" if security_issues or requirement_issues else "medium" if runtime_enabled or requirement_warnings else "low",
             [
                 f"security_issues={len(security_issues)}",
                 f"requirements_issues={len(requirement_issues)}",
+                f"requirements_warnings={len(requirement_warnings)}",
                 f"host_execution_requested={runtime_enabled}",
             ],
         ),
