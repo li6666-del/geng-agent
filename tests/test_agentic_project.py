@@ -25,6 +25,7 @@ from geng_agent.agentic_project import (
 )
 from geng_agent.agentic_task_writers import (
     _prepare_task_writer_python_guard,
+    _task_local_image_paths,
     _task_paper_image_paths,
     _task_writer_runtime_result,
     _task_writer_concurrency,
@@ -1156,6 +1157,49 @@ class TaskWriterWorkflowTests(unittest.TestCase):
         self.assertTrue(any("target_figure" in error for error in errors))
         self.assertTrue(any("source_page" in error for error in errors))
         self.assertTrue(any("fallback_used" in error for error in errors))
+
+    def test_paper_locator_doc_accepts_multi_page_claim_evidence(self) -> None:
+        errors = _validate_paper_locator_doc(
+            {
+                "target_figure": "Theorem and formula evidence across pages",
+                "source_page": [6, 7],
+                "bbox_norm": {
+                    "page_6": [0.1, 0.2, 0.8, 0.9],
+                    "page_7": [0.2, 0.1, 0.7, 0.4],
+                },
+                "confidence": "high",
+                "contains_only_target": True,
+                "fallback_used": False,
+                "reason": "The evidence spans a theorem statement and its following formula.",
+                "paper_image_paths": ["outputs/claim_task/paper_target_crop.png"],
+            }
+        )
+
+        self.assertEqual(errors, [])
+
+    def test_task_writer_local_images_exclude_paper_target_outputs(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            sandbox = Path(temp_dir)
+            output_dir = sandbox / "outputs" / "crop_task"
+            output_dir.mkdir(parents=True)
+            local = output_dir / "curve.png"
+            paper = output_dir / "paper_target_crop.png"
+            local.write_bytes(base64.b64decode(PNG_B64))
+            paper.write_bytes(base64.b64decode(PNG_B64) + b"paper")
+
+            images = _task_local_image_paths(
+                sandbox,
+                "crop_task",
+                result_doc={
+                    "local_image_paths": [
+                        "outputs/crop_task/curve.png",
+                        "outputs/crop_task/paper_target_crop.png",
+                    ]
+                },
+                paper_images=[str(paper.resolve())],
+            )
+
+            self.assertEqual(images, [str(local.resolve())])
 
     def test_task_writer_workflow_accepts_result_files_in_output_subdir(self) -> None:
         with TemporaryDirectory() as temp_dir:

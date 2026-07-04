@@ -480,7 +480,7 @@ Stopping rule:
 
 ## Required final files
 - `task_agent_result.md`: Chinese, human-readable comparison report.
-- `paper_target_figure.json`: JSON object describing how you located the paper-side figure, with fields such as `target_figure`, `source_page`, `bbox_norm`, `confidence`, `contains_only_target`, `fallback_used`, `reason`, and `paper_image_paths`.
+- `paper_target_figure.json`: JSON object describing how you located the paper-side figure or claim evidence, with fields such as `target_figure`, `source_page` or `source_pages`, `bbox_norm`, `confidence`, `contains_only_target`, `fallback_used`, `reason`, and `paper_image_paths`. Use a single `source_page` plus one four-number `bbox_norm` for one-page figure evidence. For a claim/formula spread across multiple pages, use `source_pages` (or a `source_page` list) and either omit `bbox_norm` or provide a page-keyed object whose values are four-number boxes.
 - `task_agent_result.json`: strict JSON object with:
 ```json
 {{
@@ -854,7 +854,12 @@ def _validate_task_writer_delivery(
     warnings.extend(paper_image_warnings)
     if status in {"matched", "explained_gap"}:
         errors.extend(paper_image_errors)
-    local_images = _task_local_image_paths(sandbox, output_subdir)
+    local_images = _task_local_image_paths(
+        sandbox,
+        output_subdir,
+        result_doc=result_doc,
+        paper_images=paper_images,
+    )
     if not paper_images:
         if status in {"matched", "explained_gap"}:
             errors.append("missing writer-provided paper target image")
@@ -908,8 +913,8 @@ def _validate_paper_locator_doc(locator_doc: dict[str, Any]) -> list[str]:
     for key in ("target_figure", "confidence", "reason"):
         if not isinstance(locator_doc.get(key), str) or not str(locator_doc.get(key)).strip():
             errors.append(f"paper_target_figure.json requires non-empty {key}")
-    source_page = locator_doc.get("source_page")
-    if isinstance(source_page, bool) or not isinstance(source_page, (int, str)) or not str(source_page).strip():
+    source_page = locator_doc.get("source_pages", locator_doc.get("source_page"))
+    if not _valid_source_page_spec(source_page):
         errors.append("paper_target_figure.json requires source_page")
     if not isinstance(locator_doc.get("fallback_used"), bool):
         errors.append("paper_target_figure.json requires boolean fallback_used")
@@ -921,15 +926,44 @@ def _validate_paper_locator_doc(locator_doc: dict[str, Any]) -> list[str]:
     ):
         errors.append("paper_target_figure.json requires paper_image_paths or a crop/locator/image path")
     bbox = locator_doc.get("bbox_norm")
-    if bbox is not None:
-        if not isinstance(bbox, list) or len(bbox) != 4:
-            errors.append("paper_target_figure.json bbox_norm must be a list of four numbers")
-        else:
-            for value in bbox:
-                if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0 or value > 1:
-                    errors.append("paper_target_figure.json bbox_norm values must be numbers in [0, 1]")
-                    break
+    errors.extend(_validate_bbox_norm(bbox))
     return errors
+
+
+def _valid_source_page_spec(value: Any) -> bool:
+    if isinstance(value, list):
+        return bool(value) and all(_valid_single_source_page(item) for item in value)
+    return _valid_single_source_page(value)
+
+
+def _valid_single_source_page(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, (int, str)) and bool(str(value).strip())
+
+
+def _validate_bbox_norm(bbox: Any) -> list[str]:
+    if bbox is None:
+        return []
+    if _is_bbox_box(bbox):
+        return []
+    if isinstance(bbox, list) and bbox and all(_is_bbox_box(item) for item in bbox):
+        return []
+    if isinstance(bbox, dict) and bbox and all(
+        isinstance(key, str) and key.strip() and _is_bbox_box(value)
+        for key, value in bbox.items()
+    ):
+        return []
+    return [
+        "paper_target_figure.json bbox_norm must be a list of four numbers, "
+        "a list of boxes, or a page-keyed object of boxes"
+    ]
+
+
+def _is_bbox_box(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) == 4
+        and all(not isinstance(item, bool) and isinstance(item, (int, float)) and 0 <= item <= 1 for item in value)
+    )
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -1109,11 +1143,72 @@ def _copy_paper_image_to_output_dir(*, sandbox: Path, output_subdir: str, path: 
     return target
 
 
-def _task_local_image_paths(sandbox: Path, output_subdir: str) -> list[str]:
+def _task_local_image_paths(
+    sandbox: Path,
+    output_subdir: str,
+    *,
+    result_doc: dict[str, Any] | None = None,
+    paper_images: list[str] | None = None,
+) -> list[str]:
+    excluded = _resolved_path_keys(paper_images or [])
+    declared_paths = _string_list((result_doc or {}).get("local_image_paths"))
+    declared_images: list[str] = []
+    seen: set[str] = set()
+    for raw in declared_paths:
+        path = _resolve_writer_declared_path(sandbox=sandbox, output_subdir=output_subdir, raw_path=raw)
+        if path is None:
+            continue
+        if not _path_is_inside(path, sandbox) or not _looks_like_png(path):
+            continue
+        if _is_paper_evidence_output_image(path, sandbox=sandbox, excluded=excluded):
+            continue
+        key = str(path.resolve()).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        declared_images.append(str(path.resolve()))
+    if declared_images:
+        return declared_images
+
     output_dir = sandbox / "outputs" / output_subdir
     if not output_dir.exists():
         return []
-    return [str(path.resolve()) for path in sorted(output_dir.glob("*.png")) if path.is_file()]
+    local_images: list[str] = []
+    for path in sorted(output_dir.glob("*.png")):
+        if not path.is_file():
+            continue
+        if _is_paper_evidence_output_image(path, sandbox=sandbox, excluded=excluded):
+            continue
+        local_images.append(str(path.resolve()))
+    return local_images
+
+
+def _resolved_path_keys(paths: list[str]) -> set[str]:
+    keys: set[str] = set()
+    for raw in paths:
+        try:
+            keys.add(str(Path(raw).resolve()).lower())
+        except OSError:
+            continue
+    return keys
+
+
+def _is_paper_evidence_output_image(path: Path, *, sandbox: Path, excluded: set[str]) -> bool:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    if str(resolved).lower() in excluded:
+        return True
+    try:
+        resolved.relative_to((sandbox / "paper_evidence").resolve())
+        return True
+    except ValueError:
+        pass
+    name = path.name.lower()
+    if _is_raw_rendered_paper_page(path):
+        return True
+    return bool(re.search(r"(^|[_-])paper([_-]|$)|(^|[_-])locator([_-]|$)", name))
 
 
 def _merge_task_writer_deliveries(
@@ -1400,8 +1495,15 @@ def _render_task_writer_result_review(task_records: list[dict[str, Any]]) -> str
 
 
 def _image_comparison_markdown(*, record: dict[str, Any], result: dict[str, Any]) -> list[str]:
-    local_images = [str(path) for path in record.get("local_images", []) or [] if str(path).strip()]
     paper_images = [str(path) for path in record.get("paper_images", []) or [] if str(path).strip()]
+    paper_image_keys = _resolved_path_keys(paper_images)
+    sandbox = Path(str(record.get("sandbox") or "."))
+    local_images = [
+        str(path)
+        for path in record.get("local_images", []) or []
+        if str(path).strip()
+        and not _is_paper_evidence_output_image(Path(str(path)), sandbox=sandbox, excluded=paper_image_keys)
+    ]
     figure_label = _human_figure_label_from_record(record, result)
     paper_caption = "论文原图" if not figure_label else f"论文原图：{figure_label}"
     lines = ["### 图像对比", ""]
