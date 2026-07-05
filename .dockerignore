@@ -1,0 +1,8 @@
+.git
+.venv
+**/__pycache__
+**/*.pyc
+geng_agent/web/frontend/node_modules
+geng_agent/web/frontend/dist
+case_*
+sample_papers

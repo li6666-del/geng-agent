@@ -9,6 +9,12 @@ htmlcov/
 venv/
 build/
 dist/
+node_modules/
+*.tsbuildinfo
 *.egg-info/
 case_*/
 review_case_*/
+.test-cases/
+.env
+.env.*
+!.env.example

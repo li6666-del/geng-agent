@@ -1,7 +1,7 @@
 [project]
 name = "geng-agent"
-version = "0.1.0"
-description = "A local CLI agent for communication-paper engineering reproducibility review."
+version = "0.2.0"
+description = "A local-first system for communication-paper engineering reproducibility review."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -21,11 +21,12 @@ web = [
   "fastapi>=0.115",
   "uvicorn[standard]>=0.32",
   "python-multipart>=0.0.9",
+  "sqlalchemy>=2.0.36",
+  "alembic>=1.14",
+  "celery[redis]>=5.4",
+  "redis>=5.2",
+  "psycopg[binary]>=3.2"
 ]
-# Libraries the generated reproduction code is allowed to import. Single source of
-# truth for the allow-list is geng_agent/security.ALLOWED_REQUIREMENTS; this extra
-# makes them installable in one command. tests/test_preflight.py asserts the two
-# stay in sync. Without these, every numpy paper falls back to the local template.
 repro = [
   "numpy>=1.24",
   "scipy>=1.10",
@@ -39,7 +40,7 @@ repro = [
   "galois>=0.3",
   "networkx>=3.0",
   "h5py>=3.10",
-  "tqdm>=4.66",
+  "tqdm>=4.66"
 ]
 
 [project.scripts]
@@ -54,4 +55,11 @@ build-backend = "setuptools.build_meta"
 include = ["geng_agent*"]
 
 [tool.setuptools.package-data]
-geng_agent = ["prompts/*.md", "web/static/*"]
+geng_agent = [
+  "prompts/*.md",
+  "web/static/*",
+  "web/frontend/dist/*",
+  "web/frontend/dist/assets/*",
+  "web/migrations/*.py",
+  "web/migrations/versions/*.py"
+]
