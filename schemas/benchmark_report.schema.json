@@ -1,0 +1,277 @@
+{
+  "$defs": {
+    "BenchmarkCaseScore": {
+      "additionalProperties": false,
+      "properties": {
+        "case_id": {
+          "minLength": 1,
+          "title": "Case Id",
+          "type": "string"
+        },
+        "split": {
+          "enum": [
+            "development",
+            "regression",
+            "hidden"
+          ],
+          "title": "Split",
+          "type": "string"
+        },
+        "difficulty": {
+          "title": "Difficulty",
+          "type": "integer"
+        },
+        "negative_case": {
+          "title": "Negative Case",
+          "type": "boolean"
+        },
+        "status": {
+          "enum": [
+            "scored",
+            "pending",
+            "missing_runs"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "score": {
+          "anyOf": [
+            {
+              "maximum": 100,
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Score"
+        },
+        "stability_score": {
+          "anyOf": [
+            {
+              "maximum": 100,
+              "minimum": 0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Stability Score"
+        },
+        "qualification": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Qualification"
+        },
+        "runs": {
+          "items": {
+            "$ref": "#/$defs/BenchmarkRunScore"
+          },
+          "title": "Runs",
+          "type": "array"
+        },
+        "notes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Notes",
+          "type": "array"
+        }
+      },
+      "required": [
+        "case_id",
+        "split",
+        "difficulty",
+        "negative_case",
+        "status"
+      ],
+      "title": "BenchmarkCaseScore",
+      "type": "object"
+    },
+    "BenchmarkDimensionScore": {
+      "additionalProperties": false,
+      "properties": {
+        "dimension": {
+          "minLength": 1,
+          "title": "Dimension",
+          "type": "string"
+        },
+        "score": {
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Score",
+          "type": "number"
+        },
+        "weight": {
+          "exclusiveMinimum": 0,
+          "title": "Weight",
+          "type": "number"
+        },
+        "evidence": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Evidence",
+          "type": "array"
+        }
+      },
+      "required": [
+        "dimension",
+        "score",
+        "weight"
+      ],
+      "title": "BenchmarkDimensionScore",
+      "type": "object"
+    },
+    "BenchmarkRunScore": {
+      "additionalProperties": false,
+      "properties": {
+        "run_id": {
+          "minLength": 1,
+          "title": "Run Id",
+          "type": "string"
+        },
+        "raw_score": {
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Raw Score",
+          "type": "number"
+        },
+        "qualification": {
+          "minLength": 1,
+          "title": "Qualification",
+          "type": "string"
+        },
+        "invalid": {
+          "default": false,
+          "title": "Invalid",
+          "type": "boolean"
+        },
+        "gates": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Gates",
+          "type": "array"
+        },
+        "dimensions": {
+          "items": {
+            "$ref": "#/$defs/BenchmarkDimensionScore"
+          },
+          "title": "Dimensions",
+          "type": "array"
+        }
+      },
+      "required": [
+        "run_id",
+        "raw_score",
+        "qualification",
+        "dimensions"
+      ],
+      "title": "BenchmarkRunScore",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "1.0",
+      "default": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "suite_id": {
+      "minLength": 1,
+      "title": "Suite Id",
+      "type": "string"
+    },
+    "score": {
+      "anyOf": [
+        {
+          "maximum": 100,
+          "minimum": 0,
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Score"
+    },
+    "scored_cases": {
+      "minimum": 0,
+      "title": "Scored Cases",
+      "type": "integer"
+    },
+    "total_cases": {
+      "minimum": 0,
+      "title": "Total Cases",
+      "type": "integer"
+    },
+    "pending_cases": {
+      "minimum": 0,
+      "title": "Pending Cases",
+      "type": "integer"
+    },
+    "missing_run_cases": {
+      "minimum": 0,
+      "title": "Missing Run Cases",
+      "type": "integer"
+    },
+    "qualification_counts": {
+      "additionalProperties": {
+        "type": "integer"
+      },
+      "title": "Qualification Counts",
+      "type": "object"
+    },
+    "dimension_scores": {
+      "additionalProperties": {
+        "type": "number"
+      },
+      "title": "Dimension Scores",
+      "type": "object"
+    },
+    "cases": {
+      "items": {
+        "$ref": "#/$defs/BenchmarkCaseScore"
+      },
+      "title": "Cases",
+      "type": "array"
+    },
+    "confidence": {
+      "default": "low",
+      "enum": [
+        "high",
+        "medium",
+        "low"
+      ],
+      "title": "Confidence",
+      "type": "string"
+    }
+  },
+  "required": [
+    "suite_id",
+    "scored_cases",
+    "total_cases",
+    "pending_cases",
+    "missing_run_cases",
+    "qualification_counts",
+    "dimension_scores",
+    "cases"
+  ],
+  "title": "BenchmarkReport",
+  "type": "object"
+}

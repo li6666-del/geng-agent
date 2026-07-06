@@ -170,3 +170,13 @@ case_001/
 ## 项目定位
 
 本项目评估的是工程复现风险与证据充分性，不是学术不端检测器。模板 fallback 只是安全网；若最终产物与论文目标不一致，应明确报告为复现失败或证据不足，而不能把“成功运行模板”包装成“成功复现论文”。
+## Reproduction benchmark
+
+The offline benchmark scorer compares pipeline artifacts with hidden, expert-curated facts, tasks, implementation checks, and numerical reference curves. It reports a gated total score plus seven diagnostic dimensions.
+
+```powershell
+python -m geng_agent benchmark benchmarks/communication_v1/suite.json --validate-only
+python -m geng_agent benchmark benchmarks/communication_v1/suite.json --runs runs --out benchmark_results
+```
+
+The bundled three-paper suite is intentionally marked `gold_status=pending` until author code/results and expert annotations are curated, so unverified labels cannot influence the score. See `docs/benchmark.md` for the case contract, run layout, scoring rules, and 18-paper curation target.

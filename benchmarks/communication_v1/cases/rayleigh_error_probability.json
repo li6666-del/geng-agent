@@ -1,0 +1,19 @@
+{
+  "schema_version": "1.0",
+  "case_id": "rayleigh_error_probability_2406_16548",
+  "title": "Error probability over Rayleigh fading",
+  "paper": "../../../sample_papers/rayleigh_error_probability_2406.16548.pdf",
+  "split": "hidden",
+  "difficulty": 2,
+  "archetype": "analytical_vs_monte_carlo_error_rate",
+  "gold_status": "pending",
+  "negative_case": false,
+  "repeat_runs": 1,
+  "gold_facts": [],
+  "gold_tasks": [],
+  "implementation_checks": [],
+  "curve_checks": [],
+  "expected_missing_information": [],
+  "expected_verdicts": [],
+  "notes": "Populate author-verified facts, target curves and tolerances before changing gold_status to curated."
+}

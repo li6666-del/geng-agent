@@ -1,0 +1,399 @@
+{
+  "$defs": {
+    "BenchmarkBudgets": {
+      "additionalProperties": false,
+      "properties": {
+        "wall_clock_s": {
+          "default": 3600.0,
+          "exclusiveMinimum": 0,
+          "title": "Wall Clock S",
+          "type": "number"
+        },
+        "total_tokens": {
+          "default": 500000,
+          "exclusiveMinimum": 0,
+          "title": "Total Tokens",
+          "type": "integer"
+        }
+      },
+      "title": "BenchmarkBudgets",
+      "type": "object"
+    },
+    "BenchmarkFact": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "enum": [
+            "channel_model",
+            "modulation",
+            "coding",
+            "metric",
+            "simulation_parameter",
+            "baseline",
+            "figure_claim",
+            "algorithm",
+            "dataset",
+            "topology",
+            "hardware",
+            "other"
+          ],
+          "title": "Type",
+          "type": "string"
+        },
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "value": {
+          "anyOf": [
+            {},
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        },
+        "required": {
+          "default": true,
+          "title": "Required",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "type",
+        "name"
+      ],
+      "title": "BenchmarkFact",
+      "type": "object"
+    },
+    "BenchmarkTask": {
+      "additionalProperties": false,
+      "properties": {
+        "task_id": {
+          "minLength": 1,
+          "title": "Task Id",
+          "type": "string"
+        },
+        "figure_or_claim": {
+          "minLength": 1,
+          "title": "Figure Or Claim",
+          "type": "string"
+        },
+        "metric": {
+          "enum": [
+            "bit_error_rate",
+            "symbol_error_rate",
+            "throughput",
+            "delay",
+            "spectral_efficiency",
+            "outage_probability",
+            "energy_efficiency",
+            "accuracy",
+            "loss",
+            "other"
+          ],
+          "title": "Metric",
+          "type": "string"
+        },
+        "output_columns": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Output Columns",
+          "type": "array"
+        },
+        "baselines": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Baselines",
+          "type": "array"
+        },
+        "expected_trend": {
+          "default": "unknown",
+          "enum": [
+            "decreasing",
+            "increasing",
+            "flat",
+            "unknown"
+          ],
+          "title": "Expected Trend",
+          "type": "string"
+        },
+        "expected_artifacts": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Expected Artifacts",
+          "type": "array"
+        }
+      },
+      "required": [
+        "task_id",
+        "figure_or_claim",
+        "metric"
+      ],
+      "title": "BenchmarkTask",
+      "type": "object"
+    },
+    "CurveCheck": {
+      "additionalProperties": false,
+      "properties": {
+        "check_id": {
+          "minLength": 1,
+          "title": "Check Id",
+          "type": "string"
+        },
+        "task_id": {
+          "minLength": 1,
+          "title": "Task Id",
+          "type": "string"
+        },
+        "actual_csv": {
+          "minLength": 1,
+          "title": "Actual Csv",
+          "type": "string"
+        },
+        "reference_csv": {
+          "minLength": 1,
+          "title": "Reference Csv",
+          "type": "string"
+        },
+        "x_column": {
+          "minLength": 1,
+          "title": "X Column",
+          "type": "string"
+        },
+        "y_columns": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Y Columns",
+          "type": "array"
+        },
+        "scale": {
+          "default": "linear",
+          "enum": [
+            "linear",
+            "log10"
+          ],
+          "title": "Scale",
+          "type": "string"
+        },
+        "nmae_tolerance": {
+          "default": 0.1,
+          "exclusiveMinimum": 0,
+          "title": "Nmae Tolerance",
+          "type": "number"
+        },
+        "min_rank_correlation": {
+          "default": 0.9,
+          "maximum": 1,
+          "minimum": -1,
+          "title": "Min Rank Correlation",
+          "type": "number"
+        },
+        "weight": {
+          "default": 1.0,
+          "exclusiveMinimum": 0,
+          "title": "Weight",
+          "type": "number"
+        }
+      },
+      "required": [
+        "check_id",
+        "task_id",
+        "actual_csv",
+        "reference_csv",
+        "x_column",
+        "y_columns"
+      ],
+      "title": "CurveCheck",
+      "type": "object"
+    },
+    "StaticCodeCheck": {
+      "additionalProperties": false,
+      "properties": {
+        "check_id": {
+          "minLength": 1,
+          "title": "Check Id",
+          "type": "string"
+        },
+        "path": {
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "contains": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Contains",
+          "type": "array"
+        },
+        "absent": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Absent",
+          "type": "array"
+        },
+        "weight": {
+          "default": 1.0,
+          "exclusiveMinimum": 0,
+          "title": "Weight",
+          "type": "number"
+        }
+      },
+      "required": [
+        "check_id",
+        "path"
+      ],
+      "title": "StaticCodeCheck",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "1.0",
+      "default": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "case_id": {
+      "minLength": 1,
+      "title": "Case Id",
+      "type": "string"
+    },
+    "title": {
+      "minLength": 1,
+      "title": "Title",
+      "type": "string"
+    },
+    "paper": {
+      "minLength": 1,
+      "title": "Paper",
+      "type": "string"
+    },
+    "split": {
+      "enum": [
+        "development",
+        "regression",
+        "hidden"
+      ],
+      "title": "Split",
+      "type": "string"
+    },
+    "difficulty": {
+      "maximum": 3,
+      "minimum": 1,
+      "title": "Difficulty",
+      "type": "integer"
+    },
+    "archetype": {
+      "minLength": 1,
+      "title": "Archetype",
+      "type": "string"
+    },
+    "gold_status": {
+      "default": "curated",
+      "enum": [
+        "curated",
+        "pending"
+      ],
+      "title": "Gold Status",
+      "type": "string"
+    },
+    "negative_case": {
+      "default": false,
+      "title": "Negative Case",
+      "type": "boolean"
+    },
+    "repeat_runs": {
+      "default": 1,
+      "maximum": 3,
+      "minimum": 1,
+      "title": "Repeat Runs",
+      "type": "integer"
+    },
+    "gold_facts": {
+      "items": {
+        "$ref": "#/$defs/BenchmarkFact"
+      },
+      "title": "Gold Facts",
+      "type": "array"
+    },
+    "gold_tasks": {
+      "items": {
+        "$ref": "#/$defs/BenchmarkTask"
+      },
+      "title": "Gold Tasks",
+      "type": "array"
+    },
+    "implementation_checks": {
+      "items": {
+        "$ref": "#/$defs/StaticCodeCheck"
+      },
+      "title": "Implementation Checks",
+      "type": "array"
+    },
+    "curve_checks": {
+      "items": {
+        "$ref": "#/$defs/CurveCheck"
+      },
+      "title": "Curve Checks",
+      "type": "array"
+    },
+    "expected_missing_information": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "title": "Expected Missing Information",
+      "type": "array"
+    },
+    "expected_verdicts": {
+      "items": {
+        "enum": [
+          "fully_reproduced",
+          "mostly_reproduced",
+          "partially_reproduced",
+          "inconclusive",
+          "high_reproducibility_risk",
+          "failed_to_reproduce"
+        ],
+        "type": "string"
+      },
+      "title": "Expected Verdicts",
+      "type": "array"
+    },
+    "budgets": {
+      "$ref": "#/$defs/BenchmarkBudgets"
+    },
+    "notes": {
+      "default": "",
+      "title": "Notes",
+      "type": "string"
+    }
+  },
+  "required": [
+    "case_id",
+    "title",
+    "paper",
+    "split",
+    "difficulty",
+    "archetype"
+  ],
+  "title": "BenchmarkCase",
+  "type": "object"
+}

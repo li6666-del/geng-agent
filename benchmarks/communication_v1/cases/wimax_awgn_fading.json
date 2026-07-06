@@ -1,0 +1,19 @@
+{
+  "schema_version": "1.0",
+  "case_id": "wimax_awgn_fading_1211_4294",
+  "title": "WiMAX over AWGN and fading channels",
+  "paper": "../../../sample_papers/wimax_awgn_fading_1211.4294.pdf",
+  "split": "development",
+  "difficulty": 1,
+  "archetype": "ber_ser_channel_comparison",
+  "gold_status": "pending",
+  "negative_case": false,
+  "repeat_runs": 3,
+  "gold_facts": [],
+  "gold_tasks": [],
+  "implementation_checks": [],
+  "curve_checks": [],
+  "expected_missing_information": [],
+  "expected_verdicts": [],
+  "notes": "Populate author-verified facts, target curves and tolerances before changing gold_status to curated."
+}

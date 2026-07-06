@@ -1,0 +1,19 @@
+{
+  "schema_version": "1.0",
+  "case_id": "wimax_adaptive_modulation_0910_0819",
+  "title": "WiMAX adaptive modulation",
+  "paper": "../../../sample_papers/wimax_adaptive_modulation_0910.0819.pdf",
+  "split": "regression",
+  "difficulty": 2,
+  "archetype": "adaptive_modulation_throughput",
+  "gold_status": "pending",
+  "negative_case": false,
+  "repeat_runs": 3,
+  "gold_facts": [],
+  "gold_tasks": [],
+  "implementation_checks": [],
+  "curve_checks": [],
+  "expected_missing_information": [],
+  "expected_verdicts": [],
+  "notes": "Populate author-verified facts, target curves and tolerances before changing gold_status to curated."
+}

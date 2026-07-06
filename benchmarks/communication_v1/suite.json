@@ -1,0 +1,12 @@
+{
+  "schema_version": "1.0",
+  "suite_id": "communication-v1",
+  "title": "Communication Simulation Reproduction Benchmark v1",
+  "domain": "communication",
+  "description": "Starter suite. Cases remain excluded from scoring until hidden gold artifacts are curated.",
+  "cases": [
+    "cases/wimax_awgn_fading.json",
+    "cases/wimax_adaptive_modulation.json",
+    "cases/rayleigh_error_probability.json"
+  ]
+}

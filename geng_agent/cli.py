@@ -27,6 +27,11 @@ def build_parser() -> argparse.ArgumentParser:
         "doctor",
         help="自检本机环境（Python 版本 + 运行依赖 + 复现白名单库）；建议在输入 PDF 前先运行。",
     )
+    benchmark = subparsers.add_parser("benchmark", help="Validate or score a paper-reproduction benchmark.")
+    benchmark.add_argument("suite", type=Path, help="Path to benchmark suite.json.")
+    benchmark.add_argument("--runs", type=Path, default=None, help="Run artifacts organized as case_id/run_NN.")
+    benchmark.add_argument("--out", type=Path, default=Path("benchmark_results"), help="Benchmark report output directory.")
+    benchmark.add_argument("--validate-only", action="store_true", help="Validate suite and cases without scoring runs.")
     return parser
 
 
@@ -72,6 +77,22 @@ def _add_common_review_args(parser: argparse.ArgumentParser, *, include_resume: 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "benchmark":
+        from .benchmark import evaluate_suite, validate_suite, write_report
+        from .json_utils import pretty_json
+
+        if args.validate_only:
+            print(pretty_json(validate_suite(args.suite)))
+            return 0
+        if args.runs is None:
+            parser.error("benchmark scoring requires --runs (or use --validate-only)")
+        report = evaluate_suite(args.suite, args.runs)
+        json_path, markdown_path = write_report(report, args.out)
+        print(f"Benchmark score: {report.score if report.score is not None else 'N/A'}")
+        print(f"JSON report: {json_path}")
+        print(f"Markdown report: {markdown_path}")
+        return 0
 
     if args.command == "doctor":
         from .preflight import check_environment, format_report
