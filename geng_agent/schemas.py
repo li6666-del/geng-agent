@@ -35,13 +35,7 @@ def validate_stage(
         issues.extend(_issues_from_pydantic(exc))
 
     if stage == "repro_project_manifest":
-        issues.extend(
-            validate_manifest_business_rules(
-                data, require_all=True, require_repair_meta=False, required_files=required_files
-            )
-        )
-    elif stage == "repair_manifest":
-        issues.extend(validate_manifest_business_rules(data, require_all=False, require_repair_meta=True))
+        issues.extend(validate_manifest_business_rules(data, required_files=required_files))
 
     return _dedupe_issues(issues)
 
@@ -105,8 +99,6 @@ def validate_task_fact_refs(tasks_data: dict[str, Any], facts_data: dict[str, An
 
 def validate_manifest_business_rules(
     data: dict[str, Any],
-    require_all: bool,
-    require_repair_meta: bool,
     required_files: set[str] | None = None,
 ) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
@@ -115,7 +107,6 @@ def validate_manifest_business_rules(
         return issues
 
     seen_paths: set[str] = set()
-    manifest_paths: list[str] = []
     for index, item in enumerate(files):
         base = f"$.files[{index}]"
         if not isinstance(item, dict):
@@ -133,23 +124,11 @@ def validate_manifest_business_rules(
         if normalized in seen_paths:
             issues.append(ValidationIssue(f"{base}.path", "duplicate path"))
         seen_paths.add(normalized)
-        manifest_paths.append(normalized)
 
-    if require_all:
-        expected = required_files if required_files is not None else REQUIRED_REPRO_FILES
-        missing = sorted(expected - seen_paths)
-        for path in missing:
-            issues.append(ValidationIssue("$.files", f"missing required file: {path}"))
-
-    if require_repair_meta:
-        touched = data.get("touched_files")
-        if isinstance(touched, list):
-            for index, path in enumerate(touched):
-                if not isinstance(path, str) or not path.strip():
-                    continue
-                normalized = _normalize_manifest_path(path, f"$.touched_files[{index}]", issues)
-                if normalized is not None and normalized not in manifest_paths:
-                    issues.append(ValidationIssue(f"$.touched_files[{index}]", "must also appear in files[].path"))
+    expected = required_files if required_files is not None else REQUIRED_REPRO_FILES
+    missing = sorted(expected - seen_paths)
+    for path in missing:
+        issues.append(ValidationIssue("$.files", f"missing required file: {path}"))
 
     return issues
 

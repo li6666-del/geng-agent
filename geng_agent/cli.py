@@ -4,9 +4,22 @@ import argparse
 import sys
 from pathlib import Path
 
+from .analysis_limits import (
+    DEFAULT_ANALYSIS_AGENT_WIDTH,
+    MAX_ANALYSIS_AGENT_WIDTH,
+    normalize_analysis_agent_width,
+)
+
 # Heavy imports (pipeline, status, config) are loaded lazily inside each
 # command branch, so `geng-agent doctor` still runs on a machine that is missing
 # orchestrator dependencies — exactly the situation you need it to diagnose.
+
+
+def _analysis_agent_width_arg(value: str) -> int:
+    try:
+        return normalize_analysis_agent_width(int(value))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -27,6 +40,9 @@ def build_parser() -> argparse.ArgumentParser:
         "doctor",
         help="自检本机环境（Python 版本 + 运行依赖 + 复现白名单库）；建议在输入 PDF 前先运行。",
     )
+    benchmark = subparsers.add_parser("benchmark", help="离线汇总多个 case 的复现覆盖、结论、耗时和成本。")
+    benchmark.add_argument("cases", nargs="+", type=Path, help="一个或多个 case 输出目录。")
+    benchmark.add_argument("--out", type=Path, required=True, help="benchmark JSON/Markdown 输出目录。")
     return parser
 
 
@@ -40,25 +56,30 @@ def _add_common_review_args(parser: argparse.ArgumentParser, *, include_resume: 
     parser.add_argument("--temperature", type=float, default=0.1, help="LLM 采样温度，默认 0.1。")
     parser.add_argument("--timeout", type=float, default=120.0, help="单次 LLM 请求超时时间，单位秒。")
     parser.add_argument("--tasks-timeout", type=float, default=300.0, help="第二轮生成复现任务的单次 LLM 请求超时时间，单位秒。")
-    parser.add_argument("--project-timeout", type=float, default=1200.0, help="第三轮单个生成/审查子进程的默认超时，单位秒；Codex 自适应闭环没有总墙钟预算。")
+    parser.add_argument("--project-timeout", type=float, default=1200.0, help="第三轮单个 task writer 子进程的默认超时，单位秒；没有总墙钟预算。")
     parser.add_argument("--thinking", choices=("enabled", "disabled"), default=None, help="DeepSeek V4 Pro thinking 开关。")
     parser.add_argument("--reasoning-effort", choices=("low", "medium", "high"), default=None, help="推理模型 reasoning_effort 参数。")
     run_group = parser.add_mutually_exclusive_group()
-    run_group.add_argument("--run-repro", dest="run_repro", action="store_true", help="显式运行生成的复现代码，并启用受限返修。")
+    run_group.add_argument("--run-repro", dest="run_repro", action="store_true", help="允许每个 task writer 运行自己的 full 并进行最多 5 轮自我修正。")
     run_group.add_argument("--no-run-repro", dest="run_repro", action="store_false", help="不自动运行生成代码；这是默认行为。")
     parser.set_defaults(run_repro=False)
-    parser.add_argument("--no-result-review", action="store_true", help="在 --run-repro 成功后也不执行结果级多模态二次审查。")
+    parser.add_argument("--no-result-review", action="store_true", help="不生成 task writer 自审结果对比报告。")
     if include_resume:
         resume_group = parser.add_mutually_exclusive_group()
         resume_group.add_argument("--resume", dest="resume", action="store_true", help="复用已有阶段产物；这是默认行为。")
         resume_group.add_argument("--no-resume", dest="resume", action="store_false", help="不复用已有阶段产物，从头重新运行。")
         parser.set_defaults(resume=True)
-    parser.add_argument("--no-template-fallback", action="store_true", help="禁用本地确定性兜底；默认启用以提高端到端稳定性。")
+    parser.add_argument("--no-analysis-fallback", action="store_true", help="禁用前两阶段本地确定性兜底；默认启用以提高端到端稳定性。")
     parser.add_argument("--run-timeout", type=float, default=120.0, help="单次复现运行超时时间，单位秒。")
-    parser.add_argument("--json-repair-attempts", type=int, default=5, help="每轮 JSON 结构审查失败后的返修次数（默认 5：实跑发现最难的科学文件 src/modulation.py 偶发语法/结构错，3 次重试不够会拖垮整个逐任务项目→兜底；只在失败时才追加重试，文件一次过则无额外开销）。")
-    parser.add_argument("--facts-gap-rounds", type=int, default=10, help="第一轮事实抽取后的“查漏补缺”追加轮数（确定性覆盖校验图/表锚点 + 定向补抽遗漏事实），循环到一轮无新增为止；默认最多 10 轮，设 0 关闭。")
-    parser.add_argument("--tasks-gap-rounds", type=int, default=6, help="第二轮复现任务设计后的“查漏补缺”追加轮数（确定性校验每个可复现实验是否都有任务 + 为遗漏实验补任务），循环到全覆盖或无新增为止；默认最多 6 轮，设 0 关闭。")
-    parser.add_argument("--science-loop", action="store_true", help="开启论文思路锚点，供第三轮自治 task writer 使用。")
+    parser.add_argument("--json-repair-attempts", type=int, default=5, help="前两阶段 Codex/兼容 LLM 输出未通过 JSON schema 时的重试次数；只在结构校验失败时追加调用。")
+    parser.add_argument("--facts-gap-rounds", type=int, default=6, help="第一轮事实抽取后的查漏补缺轮数；连续两轮没有新增、补强或纠错才停止，默认最多 6 轮。")
+    parser.add_argument("--tasks-gap-rounds", type=int, default=6, help="第二轮任务查漏补缺轮数；全覆盖可立即停止，否则连续两轮无有效变化才停止，默认最多 6 轮。")
+    parser.add_argument(
+        "--analysis-agent-width",
+        type=_analysis_agent_width_arg,
+        default=DEFAULT_ANALYSIS_AGENT_WIDTH,
+        help=f"Codex 前两阶段每轮并行 analysis 子智能体数量；默认 2，设 1 回退旧单子智能体，最大 {MAX_ANALYSIS_AGENT_WIDTH}。",
+    )
     parser.add_argument(
         "--analysis-backend",
         choices=("codex", "llm"),
@@ -112,20 +133,18 @@ def main(argv: list[str] | None = None) -> int:
             output_dir=args.out,
             max_pages=args.max_pages,
             run_repro=args.run_repro,
-            repair_attempts=0,
             run_timeout=args.run_timeout,
             json_repair_attempts=args.json_repair_attempts,
             tasks_timeout=args.tasks_timeout,
             project_timeout=args.project_timeout,
             result_review=not args.no_result_review,
             resume=not args.no_resume,
-            template_fallback=not args.no_template_fallback,
+            analysis_fallback=not args.no_analysis_fallback,
             facts_gap_rounds=args.facts_gap_rounds,
             tasks_gap_rounds=args.tasks_gap_rounds,
-            science_loop=args.science_loop,
+            analysis_agent_width=args.analysis_agent_width,
             analysis_backend=args.analysis_backend,
             codex_analysis_timeout=args.codex_analysis_timeout,
-            project_backend="codex",
             codex_agent_rounds=args.codex_agent_rounds,
             codex_agent_timeout=args.codex_agent_timeout,
         )
@@ -134,8 +153,21 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Word 主报告：{result.review_docx_path}")
         print(f"复现项目：{result.repro_project_dir}")
         print(f"自动运行结果：{result.runtime_passed}")
-        print(f"结果级二次审查：{result.result_review_passed}")
+        print(f"Writer 自审对比报告：{result.result_review_passed}")
         print(f"Word 结果审查：{result.result_review_docx_path}")
+        return 0
+
+    if args.command == "benchmark":
+        from .benchmark import build_benchmark, write_benchmark_reports
+
+        report = build_benchmark(args.cases)
+        json_path, markdown_path = write_benchmark_reports(
+            report,
+            json_path=args.out / "benchmark.json",
+            markdown_path=args.out / "benchmark.md",
+        )
+        print(f"Benchmark JSON：{json_path}")
+        print(f"Benchmark Markdown：{markdown_path}")
         return 0
 
     if args.command == "status":
@@ -151,7 +183,7 @@ def main(argv: list[str] | None = None) -> int:
 
 def _warn_if_environment_incomplete() -> None:
     """Print a stderr warning at the start of review when the local
-    environment is missing libraries that lead to template fallback. Best-effort:
+    environment is missing libraries that weaken reproduction quality. Best-effort:
     never blocks the run and never raises."""
     try:
         from .preflight import check_environment, environment_warning

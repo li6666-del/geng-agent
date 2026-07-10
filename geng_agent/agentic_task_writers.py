@@ -1,19 +1,20 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 import hashlib
 import json
 import os
 import re
 import secrets
 import shutil
+import time
 from pathlib import Path
 from typing import Any
 
-from .agentic_project import (
+from .task_writer_support import (
     CODEX_PROJECT_BACKEND,
     _clear_result_review_outputs,
-    _load_cached_agentic_project,
+    _load_cached_task_writer_workflow,
     _manifest_from_project,
     _manifest_disk_paths,
     _prepare_project_workspace,
@@ -28,10 +29,9 @@ from .codex_runner import run_codex_subprocess
 from .config import get_config_value
 from .io_runtime import BACKEND_RUNTIME_API_DOC, IO_RUNTIME_API_DOC, inject_io_runtime
 from .json_utils import pretty_json
-from .llm import LLMClient
 from .manifest_utils import expected_generated_paths
 from .outputs import inspect_output_artifacts, validate_repro_project, write_json, write_text
-from .result_review import facts_for_task, paper_context_for_task, safe_label, thesis_ordering_anchor_for_task
+from .paper_evidence import facts_for_task, paper_context_for_task, safe_label, thesis_ordering_anchor_for_task
 from .schemas import validate_stage
 from .security import (
     dependency_policy_prompt_text,
@@ -43,11 +43,72 @@ from .security import (
 )
 from .stage_cleanup import _clear_stage_outputs
 from .task_scripts import build_tasks_manifest, write_task_scaffolding
+from .task_contract import build_task_contract_draft, contract_hash
+from .failure_memory import append_failure, load_failures, query_failures
+from .revision_router import classify_revision_error, parse_revision_request, validate_revision_request
+from .resource_runtime import ResourceBroker
+from .resource_scheduler import WriterConcurrencyController, build_resource_plan, detect_hardware
 
 
 TASK_WRITER_STATUSES = {"matched", "explained_gap", "failed"}
-DEFAULT_TASK_WRITER_AGENT_CONCURRENCY = 4
 MAX_TASK_WRITER_SELF_ITERATIONS = 5
+
+
+def _task_with_experiment_profile(task: dict[str, Any], experiment_index: dict[str, Any]) -> dict[str, Any]:
+    enriched = dict(task)
+    task_id = str(task.get("task_id") or "")
+    experiments = experiment_index.get("experiments") if isinstance(experiment_index, dict) else []
+    for experiment in experiments if isinstance(experiments, list) else []:
+        if not isinstance(experiment, dict) or str(experiment.get("task_id") or "") != task_id:
+            continue
+        enriched["experiment_id"] = experiment.get("experiment_id") or task_id
+        enriched["reproducibility_mode"] = experiment.get("reproducibility_mode") or "proxy_only"
+        criteria = experiment.get("acceptance_criteria")
+        if isinstance(criteria, list) and criteria:
+            enriched["acceptance_criteria"] = criteria
+        enriched["feasibility"] = experiment.get("feasibility") or {}
+        break
+    return enriched
+
+
+def _collect_revision_requests(task_records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    requests: list[dict[str, Any]] = []
+    for record in task_records:
+        request = record.get("revision_request")
+        if not isinstance(request, dict):
+            continue
+        item = dict(request)
+        category = str(item.get("category") or "code_or_runtime")
+        item["eligible_for_analysis_reentry"] = category in {"analysis_scope", "contract_error"}
+        requests.append(item)
+    return requests
+
+
+def _update_failure_memory(path: Path, task_records: list[dict[str, Any]]) -> None:
+    for record in task_records:
+        status = str(record.get("task_writer_status") or "failed")
+        errors = [str(item) for item in record.get("errors", []) if str(item)]
+        if status == "matched" and not errors:
+            continue
+        result = record.get("result_json") if isinstance(record.get("result_json"), dict) else {}
+        request = record.get("revision_request") if isinstance(record.get("revision_request"), dict) else {}
+        category = str(request.get("category") or "")
+        if not category:
+            category = classify_revision_error("; ".join(errors) or str(result.get("summary") or status)).value
+        append_failure(
+            path,
+            {
+                "task_id": str(record.get("task_id") or "unknown"),
+                "scenario": str(record.get("reproducibility_mode") or "unknown"),
+                "category": category,
+                "status": status,
+                "message": str(result.get("summary") or "; ".join(errors) or status),
+                "differences": result.get("differences") if isinstance(result.get("differences"), list) else [],
+                "repair_hypotheses": result.get("possible_causes") if isinstance(result.get("possible_causes"), list) else [],
+                "contract_hash": record.get("task_contract_hash"),
+                "evidence_files": result.get("evidence_files") if isinstance(result.get("evidence_files"), list) else [],
+            },
+        )
 
 
 def run_codex_task_writer_workflow(
@@ -62,9 +123,6 @@ def run_codex_task_writer_workflow(
     output_dir: Path,
     audit_dir: Path,
     repro_project_dir: Path,
-    client: LLMClient,
-    prompt_book: Any,
-    system_message: str,
     run_repro: bool,
     result_review: bool,
     rounds: int = MAX_TASK_WRITER_SELF_ITERATIONS,
@@ -72,6 +130,8 @@ def run_codex_task_writer_workflow(
     run_timeout: float = 120.0,
     resume: bool = True,
     agent_concurrency: int | None = None,
+    paper_memory: dict[str, Any] | None = None,
+    memory_snapshot_hash: str = "",
 ) -> dict[str, Any]:
     """Third-round autonomous per-task Codex writer workflow.
 
@@ -82,13 +142,15 @@ def run_codex_task_writer_workflow(
     output_dir.mkdir(parents=True, exist_ok=True)
     audit_dir.mkdir(parents=True, exist_ok=True)
     rounds = max(1, min(MAX_TASK_WRITER_SELF_ITERATIONS, int(rounds or MAX_TASK_WRITER_SELF_ITERATIONS)))
-    timeout = float(timeout or 1800.0)
+    timeout = max(1.0, float(timeout or 1800.0))
+    run_timeout = max(1.0, float(run_timeout or 120.0))
 
-    cached = _load_cached_agentic_project(
+    cached = _load_cached_task_writer_workflow(
         output_dir=output_dir,
         repro_project_dir=repro_project_dir,
         run_repro=run_repro,
         result_review=result_review,
+        memory_snapshot_hash=memory_snapshot_hash,
     )
     if resume and cached is not None:
         write_json(audit_dir / "03c_task_writers_resume.json", {"ok": True, "source": "cached artifacts"})
@@ -106,6 +168,21 @@ def run_codex_task_writer_workflow(
     if task_root.exists():
         shutil.rmtree(task_root)
     task_root.mkdir(parents=True, exist_ok=True)
+    resource_root = audit_dir / "03c_task_writer_resources"
+    if resource_root.exists():
+        shutil.rmtree(resource_root)
+    resource_root.mkdir(parents=True, exist_ok=True)
+    hardware_snapshot = detect_hardware()
+    resource_plan = build_resource_plan(
+        task_count=len(task_pairs),
+        requested_writer_concurrency=agent_concurrency,
+        hardware=hardware_snapshot,
+    )
+    resource_plan_path = audit_dir / "resource_plan.json"
+    resource_events_path = audit_dir / "resource_events.jsonl"
+    write_json(audit_dir / "hardware_snapshot.json", hardware_snapshot)
+    write_json(resource_plan_path, resource_plan)
+    write_text(resource_events_path, "")
     status: dict[str, Any] = {
         "backend": CODEX_PROJECT_BACKEND,
         "mode": "task_writers",
@@ -113,50 +190,48 @@ def run_codex_task_writer_workflow(
         "run_repro": bool(run_repro),
         "result_review": bool(result_review),
         "task_count": len(task_pairs),
+        "resource_plan": str(resource_plan_path),
         "rounds": [],
     }
+    writer_plan = resource_plan["writer"]
+    status["agent_concurrency"] = int(writer_plan["initial_concurrency"])
+    status["agent_concurrency_max"] = int(writer_plan["max_concurrency"])
     write_json(audit_dir / "03c_task_writers_start.json", status)
+    resource_broker = ResourceBroker(
+        plan=resource_plan,
+        events_path=resource_events_path,
+        state_path=resource_root / "resource_state.json",
+    )
+    resource_broker.start()
+    try:
+        task_records, dispatch_audit = _dispatch_task_writers(
+            task_pairs=task_pairs,
+            facts=facts,
+            experiment_index=experiment_index,
+            paper=paper,
+            paper_path=paper_path,
+            paper_context_json=paper_context_json,
+            paper_thesis=paper_thesis,
+            paper_memory=paper_memory,
+            memory_snapshot_hash=memory_snapshot_hash,
+            task_root=task_root,
+            audit_dir=audit_dir,
+            rounds=rounds,
+            timeout=timeout,
+            run_timeout=run_timeout,
+            run_repro=run_repro,
+            shared_failure_memory_path=output_dir / "failure_memory.jsonl",
+            resource_plan=resource_plan,
+            resource_plan_path=resource_plan_path,
+            resource_broker=resource_broker,
+        )
+    finally:
+        resource_broker.stop()
+    write_json(audit_dir / "writer_dispatch.json", dispatch_audit)
 
-    max_workers = _task_writer_concurrency(len(task_pairs), agent_concurrency, run_repro=run_repro)
-    status["agent_concurrency"] = max_workers
-    task_records: list[dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_index = {
-            executor.submit(
-                _run_one_task_writer,
-                index=index,
-                task=task,
-                manifest_entry=manifest_entry,
-                facts=facts,
-                experiment_index=experiment_index,
-                paper=paper,
-                paper_path=paper_path,
-                paper_context_json=paper_context_json,
-                paper_thesis=paper_thesis,
-                task_root=task_root,
-                audit_dir=audit_dir,
-                rounds=rounds,
-                timeout=timeout,
-                run_timeout=run_timeout,
-                run_repro=run_repro,
-            ): index
-            for index, (task, manifest_entry) in enumerate(task_pairs, start=1)
-        }
-        by_index: dict[int, dict[str, Any]] = {}
-        for future in as_completed(future_to_index):
-            index = future_to_index[future]
-            try:
-                by_index[index] = future.result()
-            except Exception as exc:
-                task, manifest_entry = task_pairs[index - 1]
-                task_id = str(task.get("task_id") or manifest_entry.get("task_id") or f"task_{index}")
-                by_index[index] = _failed_task_record(
-                    index=index,
-                    task_id=task_id,
-                    module=str(manifest_entry.get("module") or ""),
-                    error=f"{type(exc).__name__}: {exc}",
-                )
-        task_records = [by_index[index] for index in range(1, len(task_pairs) + 1)]
+    revision_requests = _collect_revision_requests(task_records)
+    write_json(output_dir / "revision_requests.json", {"requests": revision_requests})
+    _update_failure_memory(output_dir / "failure_memory.jsonl", task_records)
 
     _prepare_project_workspace(repro_project_dir, task_manifest)
     expected_paths = _merge_task_writer_deliveries(
@@ -180,6 +255,7 @@ def run_codex_task_writer_workflow(
         round_no=1,
     )
     manifest["_meta"]["mode"] = "task_writers"
+    manifest["_meta"]["memory_snapshot_hash"] = memory_snapshot_hash
     manifest_issues = validate_stage("repro_project_manifest", manifest, required_files=expected_paths)
     write_json(
         audit_dir / "03c_task_writers_manifest_validation.json",
@@ -236,7 +312,10 @@ def run_codex_task_writer_workflow(
             "mode": "codex_task_writer_self_review",
         }
 
-    write_json(audit_dir / "03c_task_writers_records.json", {"tasks": task_records})
+    write_json(
+        audit_dir / "03c_task_writers_records.json",
+        {"dispatch_policy": dispatch_audit, "tasks": task_records},
+    )
     status.update(
         {
             "rounds_run": 1,
@@ -254,6 +333,7 @@ def run_codex_task_writer_workflow(
                 "passed": result_review_result.get("passed"),
                 "mode": result_review_result.get("mode"),
             },
+            "revision_requests": revision_requests,
             "tasks": [
                 {
                     "task_id": record.get("task_id"),
@@ -276,12 +356,220 @@ def run_codex_task_writer_workflow(
         "result_review_doc": review_doc,
         "written_files": [str(path) for path in _manifest_disk_paths(manifest, repro_project_dir)],
         "status": status,
+        "revision_requests": revision_requests,
     }
+
+
+def _dispatch_task_writers(
+    *,
+    task_pairs: list[tuple[dict[str, Any], dict[str, Any]]],
+    facts: dict[str, Any],
+    experiment_index: dict[str, Any],
+    paper: dict[str, Any],
+    paper_path: Path,
+    paper_context_json: str,
+    paper_thesis: dict[str, Any] | None,
+    paper_memory: dict[str, Any] | None,
+    memory_snapshot_hash: str,
+    task_root: Path,
+    audit_dir: Path,
+    rounds: int,
+    timeout: float,
+    run_timeout: float,
+    run_repro: bool,
+    shared_failure_memory_path: Path,
+    resource_plan: dict[str, Any],
+    resource_plan_path: Path,
+    resource_broker: ResourceBroker | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    writer_plan = resource_plan["writer"]
+    controller = WriterConcurrencyController(writer_plan)
+    retries = max(0, int(writer_plan.get("capacity_retries") or 0))
+    retry_base = max(0.0, float(writer_plan.get("retry_base_seconds") or 0.0))
+    pending: list[dict[str, Any]] = [
+        {"index": index, "attempt": 1, "ready_at": 0.0}
+        for index in range(1, len(task_pairs) + 1)
+    ]
+    guard_tokens = {index: secrets.token_hex(16) for index in range(1, len(task_pairs) + 1)}
+    by_index: dict[int, dict[str, Any]] = {}
+    futures: dict[Future[dict[str, Any]], dict[str, Any]] = {}
+    capacity_not_before = 0.0
+    audit: dict[str, Any] = {
+        "policy": "parallel_first",
+        "parallel_attempted": len(task_pairs) > 1,
+        "task_count": len(task_pairs),
+        "runtime_capability": "parallel_subagents",
+        "runtime_limit": {
+            "initial_concurrency": controller.current,
+            "max_concurrency": controller.maximum,
+            "resource_plan": str(resource_plan_path),
+        },
+        "dispatch_batches": [],
+        "fallback_reason": (
+            f"adaptive runtime concurrency limit starts {controller.current} of {len(task_pairs)} task writers"
+            if len(task_pairs) > controller.current
+            else None
+        ),
+        "fallback_evidence_files": (
+            ["audit/resource_plan.json"] if len(task_pairs) > controller.current else []
+        ),
+        "attempts": [],
+        "concurrency_events": [],
+    }
+    audit_path = audit_dir / "writer_dispatch.json"
+
+    def flush() -> None:
+        write_json(audit_path, audit)
+
+    def failed_record(index: int, exc: Exception) -> dict[str, Any]:
+        task, manifest_entry = task_pairs[index - 1]
+        task_id = str(task.get("task_id") or manifest_entry.get("task_id") or f"task_{index}")
+        return _failed_task_record(
+            index=index,
+            task_id=task_id,
+            module=str(manifest_entry.get("module") or ""),
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+    flush()
+    with ThreadPoolExecutor(max_workers=max(1, controller.maximum)) as executor:
+        while pending or futures:
+            now = time.monotonic()
+            launched: list[dict[str, Any]] = []
+            while len(futures) < controller.current and now >= capacity_not_before:
+                ready_index = next((i for i, item in enumerate(pending) if float(item["ready_at"]) <= now), None)
+                if ready_index is None:
+                    break
+                item = pending.pop(ready_index)
+                index = int(item["index"])
+                attempt = int(item["attempt"])
+                task, manifest_entry = task_pairs[index - 1]
+                future = executor.submit(
+                    _run_one_task_writer,
+                    index=index,
+                    attempt=attempt,
+                    reuse_existing=attempt > 1,
+                    guard_token=guard_tokens[index],
+                    task=task,
+                    manifest_entry=manifest_entry,
+                    facts=facts,
+                    experiment_index=experiment_index,
+                    paper=paper,
+                    paper_path=paper_path,
+                    paper_context_json=paper_context_json,
+                    paper_thesis=paper_thesis,
+                    paper_memory=paper_memory,
+                    memory_snapshot_hash=memory_snapshot_hash,
+                    task_root=task_root,
+                    audit_dir=audit_dir,
+                    rounds=rounds,
+                    timeout=timeout,
+                    run_timeout=run_timeout,
+                    run_repro=run_repro,
+                    shared_failure_memory_path=shared_failure_memory_path,
+                    resource_broker=resource_broker,
+                )
+                futures[future] = item
+                launched.append(
+                    {
+                        "task_id": str(task.get("task_id") or manifest_entry.get("task_id") or f"task_{index}"),
+                        "index": index,
+                        "attempt": attempt,
+                    }
+                )
+            if launched:
+                audit["dispatch_batches"].append(
+                    {
+                        "batch_id": f"stage5_batch_{len(audit['dispatch_batches']) + 1:02d}",
+                        "task_ids": [item["task_id"] for item in launched],
+                        "launched_before_wait": True,
+                        "concurrency_limit": controller.current,
+                        "writer_attempts": launched,
+                        "time": time.time(),
+                    }
+                )
+                flush()
+            if not futures:
+                if pending:
+                    next_ready = max(capacity_not_before, min(float(item["ready_at"]) for item in pending))
+                    delay = max(0.0, next_ready - time.monotonic())
+                    time.sleep(min(1.0, delay) if delay > 0 else 0.05)
+                continue
+            done, _ = wait(set(futures), timeout=1.0, return_when=FIRST_COMPLETED)
+            if not done:
+                continue
+            for future in done:
+                item = futures.pop(future)
+                index = int(item["index"])
+                attempt = int(item["attempt"])
+                try:
+                    record = future.result()
+                except Exception as exc:
+                    record = failed_record(index, exc)
+                record["attempt"] = attempt
+                task_id = str(record.get("task_id") or f"task_{index}")
+                capacity_error = _task_writer_capacity_blocked(record)
+                audit["attempts"].append(
+                    {
+                        "task_id": task_id,
+                        "index": index,
+                        "attempt": attempt,
+                        "writer_error_kind": record.get("writer_error_kind"),
+                        "structural_ok": bool(record.get("structural_ok")),
+                        "completed_at": time.time(),
+                    }
+                )
+                if capacity_error and attempt <= retries:
+                    before, after = controller.record_capacity_error()
+                    delay = retry_base * (2 ** (attempt - 1))
+                    retry_ready_at = time.monotonic() + delay
+                    capacity_not_before = max(capacity_not_before, retry_ready_at)
+                    pending.append({"index": index, "attempt": attempt + 1, "ready_at": retry_ready_at})
+                    audit["concurrency_events"].append(
+                        {
+                            "event": "capacity_backoff",
+                            "task_id": task_id,
+                            "attempt": attempt,
+                            "before": before,
+                            "after": after,
+                            "retry_delay_s": delay,
+                            "scope": "global",
+                            "global_not_before_monotonic": capacity_not_before,
+                            "pending_task_count": len(pending),
+                            "time": time.time(),
+                        }
+                    )
+                else:
+                    by_index[index] = record
+                    writer_ok = bool((record.get("writer_status") or {}).get("ok"))
+                    if writer_ok:
+                        before, after = controller.record_success()
+                        if after != before:
+                            audit["concurrency_events"].append(
+                                {
+                                    "event": "stable_success_increase",
+                                    "task_id": task_id,
+                                    "before": before,
+                                    "after": after,
+                                    "time": time.time(),
+                                }
+                            )
+                    else:
+                        controller.record_other_failure()
+                flush()
+    records = [by_index[index] for index in range(1, len(task_pairs) + 1)]
+    audit["final_concurrency"] = controller.current
+    audit["completed_task_count"] = len(records)
+    flush()
+    return records, audit
 
 
 def _run_one_task_writer(
     *,
     index: int,
+    attempt: int,
+    reuse_existing: bool,
+    guard_token: str,
     task: dict[str, Any],
     manifest_entry: dict[str, Any],
     facts: dict[str, Any],
@@ -290,16 +578,22 @@ def _run_one_task_writer(
     paper_path: Path,
     paper_context_json: str,
     paper_thesis: dict[str, Any] | None,
+    paper_memory: dict[str, Any] | None,
+    memory_snapshot_hash: str,
     task_root: Path,
     audit_dir: Path,
     rounds: int,
     timeout: float,
     run_timeout: float,
     run_repro: bool,
+    shared_failure_memory_path: Path,
+    resource_broker: ResourceBroker | None,
 ) -> dict[str, Any]:
     task_id = str(task.get("task_id") or manifest_entry.get("task_id") or f"task_{index}")
     module = str(manifest_entry.get("module") or safe_label(task_id))
-    label = f"03c_task_writer_{index:02d}_{safe_label(task_id)}"
+    task = _task_with_experiment_profile(task, experiment_index)
+    base_label = f"03c_task_writer_{index:02d}_{safe_label(task_id)}"
+    label = base_label if attempt <= 1 else f"{base_label}_attempt_{attempt:02d}"
     sandbox = task_root / f"{index:02d}_{safe_label(task_id)}"
     _prepare_task_writer_sandbox(
         sandbox=sandbox,
@@ -309,7 +603,18 @@ def _run_one_task_writer(
         paper_path=paper_path,
         facts=facts,
         paper_thesis=paper_thesis,
+        paper_memory=paper_memory,
+        memory_snapshot_hash=memory_snapshot_hash,
+        shared_failure_memory_path=shared_failure_memory_path,
+        reuse_existing=reuse_existing,
     )
+    if resource_broker is None:
+        raise RuntimeError("task writer resource broker is not running")
+    broker_channel = resource_broker.register_channel(
+        task_id=task_id,
+        channel_dir=sandbox / ".geng_resource_broker",
+    )
+    timeout_state_path = sandbox / ".geng_task_writer_timeout_state.json"
     prompt = _build_task_writer_brief(
         index=index,
         task=task,
@@ -322,17 +627,25 @@ def _run_one_task_writer(
         rounds=rounds,
         run_timeout=run_timeout,
         run_repro=run_repro,
+        retry_attempt=attempt,
     )
     write_text(audit_dir / f"{label}_brief.md", prompt)
     guard = _prepare_task_writer_python_guard(
         audit_dir=audit_dir,
         label=label,
+        task_id=task_id,
         module=module,
         output_subdir=str(manifest_entry.get("output_subdir") or task_id),
         run_log=sandbox / "task_agent_runs.jsonl",
-        lock_dir=sandbox / ".task_writer_full_locks",
         allow_full=run_repro,
         run_timeout=run_timeout,
+        contract_path=sandbox / "task_contract.json",
+        memory_snapshot_hash=memory_snapshot_hash,
+        resource_channel_dir=Path(broker_channel["channel_dir"]),
+        resource_channel_token=broker_channel["token"],
+        resource_wait_timeout=float(resource_broker.plan["execution"].get("resource_wait_timeout_seconds") or 1800.0),
+        timeout_state_path=timeout_state_path,
+        guard_token=guard_token,
     )
     writer_status = run_codex_subprocess(
         role="task_writer",
@@ -342,9 +655,10 @@ def _run_one_task_writer(
         label=label,
         sandbox="workspace-write",
         timeout=timeout,
-        command_override=get_config_value("GENG_CODEX_TASK_WRITER_CMD") or get_config_value("GENG_CODEX_WRITER_CMD"),
+        command_override=get_config_value("GENG_CODEX_TASK_WRITER_CMD"),
         extra_env=guard["env"],
         path_prepend=[guard["bin_dir"]],
+        timeout_state_path=timeout_state_path,
     )
     _restore_trusted_files(sandbox, {"version": 1, "tasks": [manifest_entry]})
     return _validate_task_writer_delivery(
@@ -356,6 +670,7 @@ def _run_one_task_writer(
         run_repro=run_repro,
         trusted_run_log_path=Path(str(guard["run_log"])),
         guard_token=str(guard["guard_token"]),
+        expected_memory_snapshot_hash=memory_snapshot_hash,
     )
 
 
@@ -368,7 +683,13 @@ def _prepare_task_writer_sandbox(
     paper_path: Path,
     facts: dict[str, Any],
     paper_thesis: dict[str, Any] | None,
+    paper_memory: dict[str, Any] | None,
+    memory_snapshot_hash: str,
+    shared_failure_memory_path: Path,
+    reuse_existing: bool = False,
 ) -> None:
+    if reuse_existing and sandbox.exists():
+        return
     if sandbox.exists():
         shutil.rmtree(sandbox)
     sandbox.mkdir(parents=True, exist_ok=True)
@@ -376,6 +697,15 @@ def _prepare_task_writer_sandbox(
     inject_io_runtime(sandbox)
     write_task_scaffolding(sandbox, single_manifest)
     _write_minimal_shared_project_files(sandbox, task, manifest_entry)
+    write_json(
+        sandbox / "task_contract.json",
+        build_task_contract_draft(task, memory_snapshot_hash=memory_snapshot_hash),
+    )
+    prior_failures = query_failures(load_failures(shared_failure_memory_path, strict=False), task_id=str(task.get("task_id") or ""))
+    write_text(
+        sandbox / "failure_memory.jsonl",
+        "".join(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n" for item in prior_failures),
+    )
     _write_paper_evidence_bundle(
         repro_project_dir=sandbox,
         paper_path=paper_path,
@@ -383,6 +713,8 @@ def _prepare_task_writer_sandbox(
         facts=facts,
         tasks={"repro_tasks": [task]},
         paper_thesis=paper_thesis,
+        paper_memory=paper_memory,
+        memory_snapshot_hash=memory_snapshot_hash,
     )
 
 
@@ -427,6 +759,7 @@ def _build_task_writer_brief(
     rounds: int,
     run_timeout: float,
     run_repro: bool,
+    retry_attempt: int = 1,
 ) -> str:
     task_id = str(task.get("task_id") or manifest_entry.get("task_id") or f"task_{index}")
     module = str(manifest_entry.get("module") or "")
@@ -439,15 +772,22 @@ def _build_task_writer_brief(
         if run_repro
         else "Do not run full config because --run-repro is disabled; produce code and mark the result failed/skipped."
     )
+    retry_instruction = (
+        f"This is capacity-retry attempt {retry_attempt}. Preserve and inspect the existing sandbox, prior run log, code, and artifacts before continuing."
+        if retry_attempt > 1
+        else "This is the first writer attempt for this task."
+    )
     return f"""# Role: autonomous Codex task writer
 
 You own exactly one reproduction task. There is no separate reviewer. You must write the code, run your assigned task, compare the output to the paper evidence, revise if needed, then leave a final human-readable comparison for the host.
+
+{retry_instruction}
 
 ## Hard boundaries
 - Assigned task_id: `{task_id}`
 - Assigned module: `tasks.{module}`
 - Output directory: `outputs/{output_subdir}/`
-- You may edit only: `README.md`, `requirements.txt`, `config.json`, `config_smoke.json`, `tasks/{module}.py`, and optional `tasks/{module}_lib.py`.
+- You may edit only: `README.md`, `requirements.txt`, `config.json`, `config_smoke.json`, `task_contract.json`, `task_revision_request.json`, `tasks/{module}.py`, optional `tasks/{module}_lib.py`, your result files, and files under `outputs/{output_subdir}/`. Treat `failure_memory.jsonl` as read-only prior experience.
 - Do not edit `src/_io.py`, `src/_backend.py`, `run_experiment.py`, `tasks_manifest.json`, `tasks/__init__.py`, or any other task module.
 - Do not run `python run_experiment.py config.json`; the Python guard rejects dispatcher full runs and other task modules.
 - {full_instruction}
@@ -459,18 +799,24 @@ You own exactly one reproduction task. There is no separate reviewer. You must w
 You are not a one-shot report writer. You are the coder, runner, and reviewer for this task. Work in repeated cycles until the result is either matched, explained by a defensible gap, or genuinely failed.
 
 For each cycle:
-1. Implement or revise the task code/config.
-2. Run smoke only as a quick sanity check.
-3. Run full with `python -m tasks.{module} config.json` when `--run-repro` is enabled.
-4. Inspect the local CSV/summary/PNG and compare them with the paper evidence images/text.
-5. If the result does not match the paper claim, first assume your implementation, configuration, proxy model, axis scaling, normalization, baseline, seed, or plotting could be wrong. Form a concrete repair hypothesis, modify code or config, and run full again.
-6. Create or refresh the paper-side comparison image for this task:
+1. Before writing code, inspect and finalize `task_contract.json`. It is the authoritative mapping from paper facts to inputs, equations, outputs, invariants, backend, resource request, seed, and acceptance criteria. Keep `task_id`, `experiment_id`, and `memory_snapshot_hash` intact. Set `resources.execution_class`, CPU cores, RAM, GPU count, and VRAM conservatively; use `cpu_light` only for genuinely small analytic/plotting jobs, `cpu_heavy` for large CPU simulations, `gpu` for CUDA full runs, and `unknown` when evidence is insufficient.
+2. Implement or revise the task code/config against that contract.
+3. Run smoke only as a quick sanity check.
+4. Run full with `python -m tasks.{module} config.json` when `--run-repro` is enabled. The guard rejects full until the contract validates.
+5. Inspect the local CSV/summary/PNG and compare them with the contract and paper evidence images/text.
+6. If the result does not match the paper claim, first assume your implementation, configuration, proxy model, axis scaling, normalization, baseline, seed, or plotting could be wrong. Form a concrete repair hypothesis, modify code or config, and run full again.
+7. Create or refresh the paper-side comparison image for this task:
    - Prefer a tight crop of the exact target figure/subfigure from the rendered `paper_page_*.png` evidence.
    - If the exact crop is uncertain, create a small locator image that shows the relevant page/region with a visible red rectangle around the believed target.
    - Do not use an unannotated full `paper_page_*.png` as the final paper comparison image.
-7. Record each cycle in `task_agent_result.md`: command, return code, changed files, observed mismatch, repair hypothesis, target-paper-figure crop/locator status, and next decision.
+8. Record each cycle in `task_agent_result.md`: contract change, command, return code, changed files, observed mismatch, repair hypothesis, target-paper-figure crop/locator status, and next decision.
 
 Do not stop after the first imperfect output. A first mismatch should normally trigger at least one code/config repair and rerun. Report `explained_gap` only after you have tried plausible implementation/config/model fixes and can name the remaining gap with evidence. Report `failed` only for a real blocker such as runtime failure, missing essential paper information, timeout, dependency failure, or no valid artifacts. Report `matched` only when local artifacts support the paper trend, scale, ordering, and baseline comparison for this task.
+
+Reproducibility-mode rule from the host contract:
+- `native_full` and `scaled_full` may end as `matched` when all acceptance criteria are met (for scaled runs, state the preserved scale assumptions).
+- `proxy_only` must not claim complete reproduction; use `explained_gap` and identify what the proxy does and does not establish.
+- `environment_blocked` and `upstream_patch_required` normally end as `failed` unless the blocker is actually resolved and the contract is updated with evidence.
 
 Stopping rule:
 - If a cycle reaches `matched`, stop immediately and write the final files.
@@ -479,6 +825,7 @@ Stopping rule:
 - At cycle {rounds}, if the result is still not a complete match, write the strongest honest conclusion: `explained_gap` when artifacts exist and the remaining difference is evidenced; `failed` when the task lacks usable artifacts or is blocked.
 
 ## Required final files
+- `task_contract.json`: validated experiment contract used by every full run.
 - `task_agent_result.md`: Chinese, human-readable comparison report.
 - `paper_target_figure.json`: JSON object describing how you located the paper-side figure or claim evidence, with fields such as `target_figure`, `source_page` or `source_pages`, `bbox_norm`, `confidence`, `contains_only_target`, `fallback_used`, `reason`, and `paper_image_paths`. Use a single `source_page` plus one four-number `bbox_norm` for one-page figure evidence. For a claim/formula spread across multiple pages, use `source_pages` (or a `source_page` list) and either omit `bbox_norm` or provide a page-keyed object whose values are four-number boxes.
 - `task_agent_result.json`: strict JSON object with:
@@ -499,6 +846,7 @@ Stopping rule:
 - If `status == "explained_gap"`, `differences`, `possible_causes`, `remaining_uncertainties`, and `evidence_files` must all be non-empty.
 - If `status == "matched"`, cite the local CSV/PNG/summary and paper evidence that support the match.
 - If `status == "failed"`, explain whether the blocker is runtime, missing paper details, timeout, dependency, or modeling uncertainty.
+- Create `task_revision_request.json` only when the task or contract is impossible because the upstream analysis scope is wrong or the experiment contract is invalid. It must contain `task_id`, `scenario`, `error`, non-empty `requested_changes`, `reentry_count`, and optional category `analysis_scope|contract_error|code_or_runtime|environment`. Do not request upstream revision for an ordinary code bug that you can fix inside your five cycles.
 
 ## Paper target figure image guidance
 - You may use Python with Pillow/PyMuPDF/OpenCV-like array logic if available, but keep dependencies within the allowed whitelist.
@@ -519,6 +867,7 @@ Stopping rule:
 - `paper_evidence/index.json`
 - `paper_evidence/01_{safe_label(task_id)}/evidence.json`
 - `paper_evidence/01_{safe_label(task_id)}/context.md`
+- `failure_memory.jsonl` (prior failures for this task; read before choosing a repair hypothesis)
 
 ## Task JSON
 ```json
@@ -555,21 +904,34 @@ def _prepare_task_writer_python_guard(
     *,
     audit_dir: Path,
     label: str,
+    task_id: str,
     module: str,
     output_subdir: str,
     run_log: Path,
-    lock_dir: Path,
     allow_full: bool,
     run_timeout: float,
+    contract_path: Path,
+    memory_snapshot_hash: str,
+    resource_channel_dir: Path,
+    resource_channel_token: str,
+    resource_wait_timeout: float,
+    timeout_state_path: Path,
+    guard_token: str | None = None,
 ) -> dict[str, Any]:
     bin_dir = audit_dir / f"{label}_python_guard"
     if bin_dir.exists():
         shutil.rmtree(bin_dir)
     bin_dir.mkdir(parents=True, exist_ok=True)
     real_python = _resolve_writer_real_python()
-    guard_token = secrets.token_hex(16)
+    guard_token = guard_token or secrets.token_hex(16)
     guard_script = bin_dir / "task_writer_python_guard.py"
     write_text(guard_script, _render_task_writer_python_guard(real_python, guard_token, run_timeout))
+    shutil.copyfile(Path(__file__).with_name("resource_runtime.py"), bin_dir / "resource_runtime.py")
+    write_text(
+        bin_dir / "sitecustomize.py",
+        "from resource_runtime import enforce_torch_cuda_fraction\n"
+        "enforce_torch_cuda_fraction()\n",
+    )
     for name in ("python", "python3", "py"):
         if os.name == "nt":
             write_text(bin_dir / f"{name}.cmd", _render_writer_python_cmd_wrapper(guard_script, real_python))
@@ -581,10 +943,16 @@ def _prepare_task_writer_python_guard(
     env = {
         "GENG_WRITER_SELFTEST_MODE": "task_writer_full",
         "GENG_TASK_WRITER_MODULE": module,
+        "GENG_TASK_WRITER_TASK_ID": task_id,
         "GENG_TASK_WRITER_OUTPUT_SUBDIR": output_subdir,
         "GENG_TASK_WRITER_RUN_LOG": str(run_log),
-        "GENG_TASK_WRITER_LOCK_DIR": str(lock_dir),
+        "GENG_TASK_WRITER_BROKER_CHANNEL": str(resource_channel_dir),
+        "GENG_TASK_WRITER_BROKER_TOKEN": resource_channel_token,
+        "GENG_TASK_WRITER_RESOURCE_WAIT_TIMEOUT": str(max(1.0, float(resource_wait_timeout))),
+        "GENG_TASK_WRITER_TIMEOUT_STATE": str(timeout_state_path),
         "GENG_TASK_WRITER_ALLOW_FULL": "1" if allow_full else "0",
+        "GENG_TASK_CONTRACT_PATH": str(contract_path),
+        "GENG_TASK_MEMORY_SNAPSHOT_HASH": memory_snapshot_hash or "unavailable",
         "PYTHON": str(shim_python),
         "GENG_PYTHON": str(shim_python),
     }
@@ -604,9 +972,17 @@ def _render_task_writer_python_guard(real_python: str, guard_token: str, run_tim
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
 import time
+
+from resource_runtime import (
+    RESOURCE_LIMIT_RETURN_CODE,
+    ResourceUnavailable,
+    acquire_resource_lease,
+    run_guarded_process,
+    subprocess_environment,
+    timeout_exclusion,
+)
 
 REAL_PYTHON = {real_python!r}
 GUARD_TOKEN = {guard_token!r}
@@ -614,8 +990,13 @@ RUN_TIMEOUT_S = {float(run_timeout or 0.0)!r}
 MODULE = os.environ.get("GENG_TASK_WRITER_MODULE", "")
 OUTPUT_SUBDIR = os.environ.get("GENG_TASK_WRITER_OUTPUT_SUBDIR", "")
 RUN_LOG = Path(os.environ.get("GENG_TASK_WRITER_RUN_LOG", "task_agent_runs.jsonl"))
-LOCK_DIR = Path(os.environ.get("GENG_TASK_WRITER_LOCK_DIR", ".task_writer_locks"))
+BROKER_CHANNEL = Path(os.environ.get("GENG_TASK_WRITER_BROKER_CHANNEL", ".geng_resource_broker"))
+BROKER_TOKEN = os.environ.get("GENG_TASK_WRITER_BROKER_TOKEN", "")
+RESOURCE_WAIT_TIMEOUT_S = float(os.environ.get("GENG_TASK_WRITER_RESOURCE_WAIT_TIMEOUT", "1800"))
+TIMEOUT_STATE = Path(os.environ.get("GENG_TASK_WRITER_TIMEOUT_STATE", ".geng_task_writer_timeout_state.json"))
 ALLOW_FULL = os.environ.get("GENG_TASK_WRITER_ALLOW_FULL") == "1"
+CONTRACT_PATH = Path(os.environ.get("GENG_TASK_CONTRACT_PATH", "task_contract.json"))
+EXPECTED_MEMORY_SNAPSHOT_HASH = os.environ.get("GENG_TASK_MEMORY_SNAPSHOT_HASH", "unavailable")
 
 
 def _base(value: str) -> str:
@@ -649,40 +1030,6 @@ def _parse_allowed(args: list[str]) -> tuple[bool, str, str]:
     return False, "", "only config_smoke.json or config.json are allowed"
 
 
-def _slot_count() -> int:
-    try:
-        import torch  # type: ignore
-        cuda = bool(torch.cuda.is_available())
-    except Exception:
-        cuda = False
-    env_name = "GENG_TASK_WRITER_GPU_FULL_SLOTS" if cuda else "GENG_TASK_WRITER_CPU_FULL_SLOTS"
-    default = "1" if cuda else "2"
-    try:
-        return max(1, int(os.environ.get(env_name, default)))
-    except ValueError:
-        return int(default)
-
-
-def _acquire_full_slot() -> Path | None:
-    LOCK_DIR.mkdir(parents=True, exist_ok=True)
-    slots = _slot_count()
-    while True:
-        for index in range(slots):
-            path = LOCK_DIR / f"full_{{index}}.lock"
-            try:
-                fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                    handle.write(json.dumps({{"pid": os.getpid(), "time": time.time()}}))
-                return path
-            except FileExistsError:
-                try:
-                    if time.time() - path.stat().st_mtime > 6 * 3600:
-                        path.unlink()
-                except OSError:
-                    pass
-        time.sleep(1.0)
-
-
 def _artifact_snapshot() -> dict:
     root = Path("outputs") / OUTPUT_SUBDIR
     result = {{"output_subdir": OUTPUT_SUBDIR, "csv_files": [], "png_files": [], "summary_json_files": []}}
@@ -700,6 +1047,67 @@ def _append_run_log(record: dict) -> None:
         handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\\n")
 
 
+def _load_contract() -> tuple[dict, str]:
+    try:
+        value = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {{}}, f"cannot read task contract: {{type(exc).__name__}}: {{exc}}"
+    if not isinstance(value, dict):
+        return {{}}, "task contract must be a JSON object"
+    if value.get("schema_version") != "1.0":
+        return value, "task contract schema_version must be 1.0"
+    if value.get("task_id") != os.environ.get("GENG_TASK_WRITER_TASK_ID", value.get("task_id")):
+        return value, "task contract task_id does not match assigned task"
+    for field in ("task_id", "experiment_id", "memory_snapshot_hash"):
+        if not isinstance(value.get(field), str) or not value[field].strip():
+            return value, f"task contract requires non-empty string {{field}}"
+    if value.get("memory_snapshot_hash") != EXPECTED_MEMORY_SNAPSHOT_HASH:
+        return value, "task contract memory_snapshot_hash does not match this workflow"
+    if value.get("reproducibility_mode") not in {{"native_full", "scaled_full", "proxy_only", "environment_blocked", "upstream_patch_required"}}:
+        return value, "task contract reproducibility_mode is invalid"
+    for field in ("algorithm_steps", "acceptance_criteria"):
+        items = value.get(field)
+        if not isinstance(items, list) or not items or not all(isinstance(item, str) and item.strip() for item in items):
+            return value, f"task contract requires non-empty string list {{field}}"
+    outputs = value.get("outputs")
+    if not isinstance(outputs, list) or not outputs:
+        return value, "task contract requires non-empty outputs"
+    for item in outputs:
+        if not isinstance(item, dict) or not isinstance(item.get("path_pattern"), str) or not item["path_pattern"].strip():
+            return value, "task contract output requires path_pattern"
+        if item.get("kind") not in {{"csv", "png", "json", "text", "other"}} or not isinstance(item.get("required"), bool):
+            return value, "task contract output kind/required is invalid"
+    backend = value.get("backend")
+    if not isinstance(backend, dict) or backend.get("requested") not in {{"auto", "cpu", "gpu"}} or not isinstance(backend.get("allow_cpu_fallback"), bool):
+        return value, "task contract backend is invalid"
+    resources = value.get("resources")
+    if not isinstance(resources, dict):
+        return value, "task contract resources are required"
+    if resources.get("execution_class") not in {{"cpu_light", "cpu_heavy", "gpu", "unknown"}}:
+        return value, "task contract resources.execution_class is invalid"
+    if isinstance(resources.get("cpu_cores"), bool) or not isinstance(resources.get("cpu_cores"), int) or resources["cpu_cores"] < 1:
+        return value, "task contract resources.cpu_cores must be a positive integer"
+    for field in ("ram_gb", "vram_gb"):
+        item = resources.get(field)
+        if isinstance(item, bool) or not isinstance(item, (int, float)) or item < 0 or (field == "ram_gb" and item <= 0):
+            return value, f"task contract resources.{{field}} is invalid"
+    if isinstance(resources.get("gpu_count"), bool) or not isinstance(resources.get("gpu_count"), int) or resources["gpu_count"] < 0:
+        return value, "task contract resources.gpu_count must be a non-negative integer"
+    if resources.get("confidence") not in {{"low", "medium", "high"}}:
+        return value, "task contract resources.confidence is invalid"
+    if (backend.get("requested") == "gpu" or resources.get("execution_class") == "gpu") and resources.get("gpu_count", 0) < 1:
+        return value, "GPU task contract must request at least one GPU"
+    if isinstance(value.get("seed"), bool) or not isinstance(value.get("seed"), int):
+        return value, "task contract seed must be an integer"
+    return value, ""
+
+
+def _contract_hash(value: dict) -> str:
+    import hashlib
+    raw = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def main() -> int:
     args = sys.argv[1:]
     allowed, profile, reason = _parse_allowed(args)
@@ -711,21 +1119,91 @@ def main() -> int:
             file=sys.stderr,
         )
         return 97
-    lock = _acquire_full_slot() if profile == "full" else None
+    contract, contract_error = _load_contract()
+    if profile == "full" and contract_error:
+        print("geng-agent task-writer python guard: " + contract_error, file=sys.stderr)
+        _append_run_log({{
+            "guard": "geng_task_writer_python_guard_v1",
+            "guard_token": GUARD_TOKEN,
+            "task_module": MODULE,
+            "output_subdir": OUTPUT_SUBDIR,
+            "command": [REAL_PYTHON, *args],
+            "profile": profile,
+            "config": args[-1] if args else "",
+            "returncode": 98,
+            "timed_out": False,
+            "duration_s": 0.0,
+            "contract_error": contract_error,
+            "artifacts": _artifact_snapshot(),
+        }})
+        return 98
+    lease = None
+    allocation = {{"execution_class": "smoke", "cpu_cores": 2, "ram_gb": 1.5, "gpu_count": 0, "vram_gb": 0.0, "gpu_indices": []}}
+    resource_wait_s = 0.0
+    if profile == "full":
+        try:
+            with timeout_exclusion(TIMEOUT_STATE, "resource_wait"):
+                lease, allocation, resource_wait_s = acquire_resource_lease(
+                    channel_dir=BROKER_CHANNEL,
+                    channel_token=BROKER_TOKEN,
+                    contract=contract,
+                    task_id=os.environ.get("GENG_TASK_WRITER_TASK_ID", MODULE),
+                    wait_timeout_s=RESOURCE_WAIT_TIMEOUT_S,
+                )
+        except ResourceUnavailable as exc:
+            print("geng-agent task-writer resource scheduler: " + str(exc), file=sys.stderr)
+            _append_run_log({{
+                "guard": "geng_task_writer_python_guard_v2",
+                "guard_token": GUARD_TOKEN,
+                "task_module": MODULE,
+                "output_subdir": OUTPUT_SUBDIR,
+                "command": [REAL_PYTHON, *args],
+                "profile": profile,
+                "config": args[-1] if args else "",
+                "returncode": 99,
+                "timed_out": False,
+                "duration_s": 0.0,
+                "resource_error": str(exc),
+                "artifacts": _artifact_snapshot(),
+            }})
+            return 99
     started = time.time()
     returncode = 1
     timed_out = False
+    resource_violation = None
+    peak_resources = {{}}
+    enforcement = {{}}
     try:
         timeout = RUN_TIMEOUT_S if RUN_TIMEOUT_S > 0 else None
-        completed = subprocess.run([REAL_PYTHON, *args], check=False, timeout=timeout)
-        returncode = int(completed.returncode)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        returncode = 124
+        if profile == "full":
+            with timeout_exclusion(TIMEOUT_STATE, "full_run"):
+                completed = run_guarded_process(
+                    command=[REAL_PYTHON, *args],
+                    timeout=timeout,
+                    env=subprocess_environment(allocation, real_python=REAL_PYTHON),
+                    allocation=allocation,
+                )
+        else:
+            completed = run_guarded_process(
+                command=[REAL_PYTHON, *args],
+                timeout=timeout,
+                env=subprocess_environment(allocation, real_python=REAL_PYTHON),
+                allocation=allocation,
+            )
+        returncode = int(completed["returncode"])
+        timed_out = bool(completed.get("timed_out"))
+        resource_violation = completed.get("resource_violation")
+        peak_resources = completed.get("peak_resources") or {{}}
+        enforcement = completed.get("enforcement") or {{}}
+        if resource_violation:
+            print("geng-agent task-writer resource guard: " + str(resource_violation), file=sys.stderr)
+    except ResourceUnavailable as exc:
+        resource_violation = str(exc)
+        returncode = RESOURCE_LIMIT_RETURN_CODE
     finally:
         duration = time.time() - started
         record = {{
-            "guard": "geng_task_writer_python_guard_v1",
+            "guard": "geng_task_writer_python_guard_v2",
             "guard_token": GUARD_TOKEN,
             "task_module": MODULE,
             "output_subdir": OUTPUT_SUBDIR,
@@ -735,14 +1213,18 @@ def main() -> int:
             "returncode": returncode,
             "timed_out": timed_out,
             "duration_s": round(duration, 3),
+            "resource_wait_s": round(resource_wait_s, 3),
+            "resource_allocation": allocation,
+            "resource_violation": resource_violation,
+            "peak_resources": peak_resources,
+            "resource_enforcement": enforcement,
             "artifacts": _artifact_snapshot(),
+            "contract_path": str(CONTRACT_PATH),
+            "contract_hash": _contract_hash(contract),
         }}
         _append_run_log(record)
-        if lock is not None:
-            try:
-                lock.unlink()
-            except OSError:
-                pass
+        if lease is not None:
+            lease.release()
     return returncode
 
 
@@ -761,6 +1243,7 @@ def _validate_task_writer_delivery(
     run_repro: bool,
     trusted_run_log_path: Path,
     guard_token: str,
+    expected_memory_snapshot_hash: str,
 ) -> dict[str, Any]:
     task_id = str(task.get("task_id") or manifest_entry.get("task_id") or f"task_{index}")
     module = str(manifest_entry.get("module") or "")
@@ -807,10 +1290,68 @@ def _validate_task_writer_delivery(
     if not script_path.exists() or not script_path.is_file():
         errors.append(f"missing assigned task script: tasks/{module}.py")
 
+    contract_path = sandbox / "task_contract.json"
+    contract_doc: dict[str, Any] = {}
+    if contract_path.exists():
+        try:
+            parsed_contract = json.loads(contract_path.read_text(encoding="utf-8"))
+            if isinstance(parsed_contract, dict):
+                contract_doc = parsed_contract
+                errors.extend(
+                    f"task_contract.json {issue.path}: {issue.message}"
+                    for issue in validate_stage("task_contract", contract_doc)
+                )
+                if str(contract_doc.get("task_id") or "") != task_id:
+                    errors.append("task_contract.json task_id does not match assigned task")
+                if str(contract_doc.get("memory_snapshot_hash") or "") != (expected_memory_snapshot_hash or "unavailable"):
+                    errors.append("task_contract.json memory_snapshot_hash does not match workflow snapshot")
+            else:
+                errors.append("task_contract.json must contain an object")
+        except Exception as exc:
+            errors.append(f"task_contract.json is invalid JSON: {type(exc).__name__}: {exc}")
+    else:
+        errors.append("missing task_contract.json")
+
+    mode = str(contract_doc.get("reproducibility_mode") or "native_full")
+    if status == "matched" and mode == "proxy_only":
+        status = "explained_gap"
+        result_doc["status"] = status
+        result_doc.setdefault("differences", []).append("The execution contract classifies this task as proxy_only, so it cannot establish full paper reproduction.")
+        result_doc.setdefault("possible_causes", []).append("Required fidelity, facts, or environment evidence is incomplete in the experiment contract.")
+        result_doc.setdefault("remaining_uncertainties", []).append("Whether a native full implementation would preserve the reported scale and ordering.")
+        result_doc.setdefault("evidence_files", []).append("task_contract.json")
+        warnings.append("matched was downgraded to explained_gap because task_contract is proxy_only")
+    elif status == "matched" and mode in {"environment_blocked", "upstream_patch_required"}:
+        status = "failed"
+        result_doc["status"] = status
+        errors.append(f"matched is invalid while task contract mode is {mode}")
+
+    revision_path, revision_fallback = _task_result_file_path(sandbox, output_subdir, "task_revision_request.json")
+    revision_request: dict[str, Any] | None = None
+    if revision_path.exists():
+        try:
+            raw_revision = json.loads(revision_path.read_text(encoding="utf-8"))
+            revision_issues = validate_revision_request(raw_revision)
+            if revision_issues:
+                errors.extend(f"task_revision_request.json {item['path']}: {item['message']}" for item in revision_issues)
+            else:
+                parsed_revision = parse_revision_request(raw_revision)
+                revision_request = parsed_revision.model_dump(mode="json")
+                revision_request["category"] = classify_revision_error(parsed_revision).value
+                if revision_request["task_id"] != task_id:
+                    errors.append("task_revision_request.json task_id does not match assigned task")
+        except Exception as exc:
+            errors.append(f"task_revision_request.json is invalid: {type(exc).__name__}: {exc}")
+    if revision_fallback:
+        warnings.append("task_revision_request.json found under outputs/<task>; accepted as fallback")
+
     run_records = _read_jsonl(trusted_run_log_path)
     trusted_records = [item for item in run_records if _is_trusted_guard_record(item, guard_token, module, output_subdir)]
     full_runs = [item for item in trusted_records if item.get("profile") == "full"]
     successful_full_runs = [item for item in full_runs if item.get("returncode") == 0]
+    final_contract_hash = contract_hash(contract_doc) if contract_doc else None
+    if successful_full_runs and final_contract_hash and successful_full_runs[-1].get("contract_hash") != final_contract_hash:
+        errors.append("final task_contract.json differs from the contract used by the last successful full run")
     if run_repro and successful_full_runs and not _run_record_has_required_artifacts(successful_full_runs[-1]):
         warnings.append("trusted full run did not record required CSV/PNG/summary artifacts")
     if run_records and not trusted_records:
@@ -866,6 +1407,9 @@ def _validate_task_writer_delivery(
     if run_repro and not local_images:
         errors.append("missing local output image")
 
+    if result_doc and result_path.exists():
+        write_json(result_path, result_doc)
+
     structural_ok = not errors
     return {
         "index": index,
@@ -880,6 +1424,12 @@ def _validate_task_writer_delivery(
         "result_markdown_path": str(md_path) if md_path.exists() else None,
         "paper_locator_path": str(paper_locator_path) if paper_locator_path.exists() else None,
         "paper_locator": paper_locator_doc,
+        "task_contract_path": str(contract_path) if contract_path.exists() else None,
+        "task_contract": contract_doc,
+        "task_contract_hash": final_contract_hash,
+        "reproducibility_mode": mode,
+        "revision_request_path": str(revision_path) if revision_path.exists() else None,
+        "revision_request": revision_request,
         "run_log_path": str(trusted_run_log_path) if trusted_run_log_path.exists() else None,
         "run_records": trusted_records,
         "full_run": full_runs[-1] if full_runs else None,
@@ -1221,6 +1771,8 @@ def _merge_task_writer_deliveries(
     _write_final_shared_project_files(repro_project_dir, task_records)
     configs_dir = repro_project_dir / "configs"
     configs_dir.mkdir(parents=True, exist_ok=True)
+    contracts_dir = repro_project_dir / "contracts"
+    contracts_dir.mkdir(parents=True, exist_ok=True)
     combined_requirements: list[str] = ["numpy", "matplotlib"]
     for record in task_records:
         sandbox = Path(str(record.get("sandbox") or ""))
@@ -1246,6 +1798,11 @@ def _merge_task_writer_deliveries(
                 target = configs_dir / target_name
                 shutil.copy2(source, target)
                 expected_paths.add(f"configs/{target_name}")
+        contract_source = sandbox / "task_contract.json"
+        if contract_source.exists():
+            contract_target = contracts_dir / f"{module}.json"
+            shutil.copy2(contract_source, contract_target)
+            expected_paths.add(f"contracts/{module}.json")
         source_output = sandbox / "outputs" / output_subdir
         if source_output.exists():
             target_output = repro_project_dir / "outputs" / output_subdir
@@ -1254,7 +1811,7 @@ def _merge_task_writer_deliveries(
             shutil.copytree(source_output, target_output)
         result_dir = repro_project_dir / "outputs" / output_subdir
         result_dir.mkdir(parents=True, exist_ok=True)
-        for name in ("task_agent_result.json", "task_agent_result.md", "paper_target_figure.json"):
+        for name in ("task_agent_result.json", "task_agent_result.md", "paper_target_figure.json", "task_revision_request.json"):
             source, _ = _task_result_file_path(sandbox, output_subdir, name)
             if source.exists():
                 shutil.copy2(source, result_dir / name)
@@ -1390,6 +1947,10 @@ def _task_writer_runtime_result(
                 "writer_error_kind": record.get("writer_error_kind"),
                 "blocked_reason": record.get("blocked_reason"),
                 "full_run": record.get("full_run"),
+                "task_contract_path": record.get("task_contract_path"),
+                "task_contract_hash": record.get("task_contract_hash"),
+                "reproducibility_mode": record.get("reproducibility_mode"),
+                "revision_request": record.get("revision_request"),
                 "artifacts": record.get("artifacts"),
                 "errors": record.get("errors", []),
                 "warnings": record.get("warnings", []),
@@ -1461,6 +2022,7 @@ def _render_task_writer_result_review(task_records: list[dict[str, Any]]) -> str
             [
                 f"**Writer 结论：** `{record.get('task_writer_status', 'failed')}`",
                 f"**主持人结构验收：** {'通过' if record.get('structural_ok') else '失败'}",
+                f"**可复现模式：** `{record.get('reproducibility_mode', 'unknown')}`",
             ]
         )
         if record.get("errors"):
@@ -1622,35 +2184,9 @@ def _compact_task_writer_review(record: dict[str, Any]) -> dict[str, Any]:
 
 
 def _task_writer_concurrency(task_count: int, requested: int | None, *, run_repro: bool = False) -> int:
-    if task_count <= 0:
-        return 1
-    if requested is not None:
-        base = max(1, min(task_count, int(requested)))
-        return min(base, _task_writer_full_slot_cap()) if run_repro else base
-    raw = os.environ.get("GENG_CODEX_TASK_WRITER_CONCURRENCY")
-    if raw:
-        try:
-            base = max(1, min(task_count, int(raw)))
-            return min(base, _task_writer_full_slot_cap()) if run_repro else base
-        except ValueError:
-            pass
-    base = min(task_count, DEFAULT_TASK_WRITER_AGENT_CONCURRENCY)
-    return min(base, _task_writer_full_slot_cap()) if run_repro else base
-
-
-def _task_writer_full_slot_cap() -> int:
-    try:
-        import torch  # type: ignore
-
-        cuda = bool(torch.cuda.is_available())
-    except Exception:
-        cuda = False
-    env_name = "GENG_TASK_WRITER_GPU_FULL_SLOTS" if cuda else "GENG_TASK_WRITER_CPU_FULL_SLOTS"
-    default = "1" if cuda else "2"
-    try:
-        return max(1, int(os.environ.get(env_name, default)))
-    except ValueError:
-        return int(default)
+    del run_repro
+    plan = build_resource_plan(task_count=task_count, requested_writer_concurrency=requested)
+    return int(plan["writer"]["initial_concurrency"])
 
 
 def _task_writer_stop_class(task_records: list[dict[str, Any]]) -> str:
@@ -1699,3 +2235,7 @@ def _failed_task_record(*, index: int, task_id: str, module: str, error: str) ->
 def _task_writer_blocked_by_codex(record: dict[str, Any]) -> bool:
     kind = str(record.get("writer_error_kind") or "")
     return kind in {"codex_usage_limit", "codex_rate_limit"}
+
+
+def _task_writer_capacity_blocked(record: dict[str, Any]) -> bool:
+    return str(record.get("writer_error_kind") or "") == "codex_rate_limit"

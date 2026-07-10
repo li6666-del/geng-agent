@@ -17,8 +17,8 @@ ALLOWED_REQUIREMENTS = {
     "sklearn",
     "reedsolo",
     "pillow",
-    # Broadened scientific / communications stack so the generator is not forced into
-    # crude simplifications (which drive template fallback). All pure-computation, no
+    # Broadened scientific / communications stack so task writers are not forced into
+    # crude simplifications. All pure-computation, no
     # network/system access. Kept in sync with pyproject [repro]; actual local
     # availability is reported by preflight / dependency policy prompts.
     "pandas",

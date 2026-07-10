@@ -8,6 +8,8 @@ from typing import Annotated, Any, Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
+from .revision_router import RevisionRequest
+
 
 MAX_MANIFEST_FILES = 64
 MAX_FILE_CHARS = 2_000_000
@@ -59,25 +61,11 @@ MetricName = Literal[
 
 TrendDirection = Literal["decreasing", "increasing", "flat", "unknown"]
 AssumptionRisk = Literal["low", "medium", "high"]
-ResultCredibility = Literal["high", "medium", "low", "unknown"]
-ResultAlignment = Literal["match", "partial_match", "mismatch", "inconclusive"]
-ReviewDimension = Literal[
-    "artifact_coverage",
-    "reproduction_logic",
-    "trend_shape",
-    "metric_axis_scale",
-    "baseline_comparison",
-    "statistical_reliability",
-    "conclusion_support",
-]
-DimensionRating = Literal["strong", "acceptable", "weak", "missing", "unknown"]
-ScientificVerdict = Literal[
-    "supports_paper_claim",
-    "partially_supports_paper_claim",
-    "does_not_support_paper_claim",
-    "cannot_assess",
-]
 ExperimentIndexStatus = Literal["ready", "ready_with_limitations", "blocked"]
+ReproducibilityMode = Literal[
+    "native_full", "scaled_full", "proxy_only", "environment_blocked", "upstream_patch_required"
+]
+PaperEntityKind = Literal["section", "figure", "table", "equation", "algorithm"]
 ReproducibilityVerdict = Literal[
     "fully_reproduced",
     "mostly_reproduced",
@@ -197,6 +185,46 @@ class PaperThesisDocument(StrictModel):
     caveats: list[str]
 
 
+class PaperMemorySource(StrictModel):
+    path: str
+    format: str
+    sha256: str | None
+    page_count: int | None
+
+
+class PaperMemoryEntity(StrictModel):
+    entity_id: NonEmptyStr
+    kind: PaperEntityKind
+    label: NonEmptyStr
+    number: str | None
+    subfigure: str | None
+    page: int | None
+    chunk_ids: list[NonEmptyStr]
+    text: str
+    parent_id: str | None
+
+
+class PaperCrossReference(StrictModel):
+    from_id: NonEmptyStr
+    to_id: NonEmptyStr
+    relation: Literal["references", "contains"]
+
+
+class PaperMemoryMetadata(StrictModel):
+    builder: NonEmptyStr
+    chunk_count: int
+    entity_count: int
+
+
+class PaperMemoryDocument(StrictModel):
+    schema_version: Literal["2.0"]
+    source: PaperMemorySource
+    entities: list[PaperMemoryEntity]
+    cross_references: list[PaperCrossReference]
+    metadata: PaperMemoryMetadata
+    memory_hash: NonEmptyStr
+
+
 class ExperimentIndexItem(StrictModel):
     experiment_id: NonEmptyStr
     title: NonEmptyStr
@@ -208,10 +236,66 @@ class ExperimentIndexItem(StrictModel):
     required_facts: list[RequiredFactRef]
     status: ExperimentIndexStatus
     limitations: list[str]
+    target_entity_ids: list[str] = Field(default_factory=list)
+    subfigure: str | None = None
+    claim: str = ""
+    methods: list[str] = Field(default_factory=list)
+    baselines: list[str] = Field(default_factory=list)
+    regimes: list[str] = Field(default_factory=list)
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    reproducibility_mode: ReproducibilityMode = "native_full"
+    feasibility: dict[str, Any] = Field(default_factory=dict)
 
 
 class ExperimentIndexDocument(StrictModel):
+    schema_version: Literal["2.0"] = "2.0"
     experiments: list[ExperimentIndexItem]
+
+
+class TaskContractInput(StrictModel):
+    name: NonEmptyStr
+    source: NonEmptyStr
+    value: Any = None
+    required: bool
+
+
+class TaskContractOutput(StrictModel):
+    path_pattern: NonEmptyStr
+    kind: Literal["csv", "png", "json", "text", "other"]
+    required: bool
+
+
+class TaskContractBackend(StrictModel):
+    requested: Literal["auto", "cpu", "gpu"]
+    allow_cpu_fallback: bool
+
+
+class TaskContractResources(StrictModel):
+    execution_class: Literal["cpu_light", "cpu_heavy", "gpu", "unknown"]
+    cpu_cores: int = Field(ge=1)
+    ram_gb: float = Field(gt=0)
+    gpu_count: int = Field(ge=0)
+    vram_gb: float = Field(ge=0)
+    confidence: Literal["low", "medium", "high"]
+
+
+class TaskContractDocument(StrictModel):
+    schema_version: Literal["1.0"]
+    task_id: NonEmptyStr
+    experiment_id: NonEmptyStr
+    memory_snapshot_hash: NonEmptyStr
+    reproducibility_mode: ReproducibilityMode
+    inputs: list[TaskContractInput]
+    outputs: list[TaskContractOutput] = Field(min_length=1)
+    equations: list[str]
+    algorithm_steps: list[NonEmptyStr] = Field(min_length=1)
+    invariants: list[NonEmptyStr]
+    backend: TaskContractBackend
+    resources: TaskContractResources
+    seed: int
+    acceptance_criteria: list[NonEmptyStr] = Field(min_length=1)
+    assumptions: list[str]
 
 
 class ManifestTextFile(StrictModel):
@@ -258,92 +342,6 @@ class ReproProjectManifest(StrictModel):
     files: list[ManifestFile] = Field(min_length=1, max_length=MAX_MANIFEST_FILES)
 
 
-class ReproProjectPlanFile(StrictModel):
-    path: NonEmptyStr
-    purpose: NonEmptyStr
-    key_interfaces: list[str]
-
-
-class ReproProjectPlan(StrictModel):
-    implementation_strategy: NonEmptyStr
-    assumptions: list[str]
-    files: list[ReproProjectPlanFile] = Field(min_length=1, max_length=MAX_MANIFEST_FILES)
-
-
-class ReproProjectFile(StrictModel):
-    path: NonEmptyStr
-    content_lines: list[str]
-
-    @field_validator("content_lines")
-    @classmethod
-    def content_lines_size(cls, value: list[str]) -> list[str]:
-        if sum(len(line) + 1 for line in value) > MAX_FILE_CHARS:
-            raise ValueError(f"must be at most {MAX_FILE_CHARS} characters total")
-        return value
-
-
-class RepairManifest(StrictModel):
-    reason: NonEmptyStr
-    touched_files: list[NonEmptyStr]
-    scientific_changes: list[str]
-    files: list[ManifestFile] = Field(min_length=1, max_length=MAX_MANIFEST_FILES)
-
-
-REQUIRED_RESULT_REVIEW_DIMENSIONS = {
-    "artifact_coverage",
-    "reproduction_logic",
-    "trend_shape",
-    "metric_axis_scale",
-    "baseline_comparison",
-    "statistical_reliability",
-    "conclusion_support",
-}
-
-
-class DimensionReview(StrictModel):
-    dimension: ReviewDimension
-    rating: DimensionRating
-    finding: NonEmptyStr
-    evidence: list[NonEmptyStr] = Field(min_length=1)
-
-
-class ExperimentResultReview(StrictModel):
-    task_id: NonEmptyStr
-    local_result_credibility: ResultCredibility
-    paper_alignment: ResultAlignment
-    scientific_verdict: ScientificVerdict
-    dimension_reviews: list[DimensionReview] = Field(min_length=len(REQUIRED_RESULT_REVIEW_DIMENSIONS))
-    paper_result_summary: NonEmptyStr
-    local_result_summary: NonEmptyStr
-    differences: list[str]
-    possible_causes: list[str]
-    evidence: list[NonEmptyStr]
-    limitations: list[str]
-    confidence: Confidence
-
-    @field_validator("dimension_reviews")
-    @classmethod
-    def dimension_reviews_cover_required_rubric(cls, value: list[DimensionReview]) -> list[DimensionReview]:
-        dimensions = [item.dimension for item in value]
-        dimension_set = set(dimensions)
-        missing = sorted(REQUIRED_RESULT_REVIEW_DIMENSIONS - dimension_set)
-        extra_duplicates = sorted({dimension for dimension in dimensions if dimensions.count(dimension) > 1})
-        if missing:
-            raise ValueError(f"must include all required dimensions; missing: {', '.join(missing)}")
-        if extra_duplicates:
-            raise ValueError(f"must not repeat dimensions: {', '.join(extra_duplicates)}")
-        return value
-
-
-class ResultReviewDocument(StrictModel):
-    overall_result_credibility: ResultCredibility
-    overall_alignment: ResultAlignment
-    experiment_reviews: list[ExperimentResultReview] = Field(min_length=1)
-    cross_experiment_findings: list[str]
-    recommended_human_checks: list[str]
-    note: NonEmptyStr
-
-
 class ReproducibilityVerdictDocument(StrictModel):
     verdict: ReproducibilityVerdict
     confidence: Confidence
@@ -357,13 +355,11 @@ SCHEMA_MODELS: dict[str, type[BaseModel]] = {
     "engineering_facts": EngineeringFactsDocument,
     "repro_tasks": ReproTasksDocument,
     "paper_thesis": PaperThesisDocument,
+    "paper_memory": PaperMemoryDocument,
     "experiment_index": ExperimentIndexDocument,
+    "task_contract": TaskContractDocument,
+    "task_revision_request": RevisionRequest,
     "repro_project_manifest": ReproProjectManifest,
-    "repro_project_plan": ReproProjectPlan,
-    "repro_project_file": ReproProjectFile,
-    "repair_manifest": RepairManifest,
-    "result_review_experiment": ExperimentResultReview,
-    "result_review": ResultReviewDocument,
     "reproducibility_verdict": ReproducibilityVerdictDocument,
 }
 
@@ -372,13 +368,11 @@ SCHEMA_FILENAMES: dict[str, str] = {
     "engineering_facts": "engineering_facts.schema.json",
     "repro_tasks": "repro_tasks.schema.json",
     "paper_thesis": "paper_thesis.schema.json",
+    "paper_memory": "paper_memory.schema.json",
     "experiment_index": "experiment_index.schema.json",
+    "task_contract": "task_contract.schema.json",
+    "task_revision_request": "task_revision_request.schema.json",
     "repro_project_manifest": "repro_project_manifest.schema.json",
-    "repro_project_plan": "repro_project_plan.schema.json",
-    "repro_project_file": "repro_project_file.schema.json",
-    "repair_manifest": "repair_manifest.schema.json",
-    "result_review_experiment": "result_review_experiment.schema.json",
-    "result_review": "result_review.schema.json",
     "reproducibility_verdict": "reproducibility_verdict.schema.json",
 }
 

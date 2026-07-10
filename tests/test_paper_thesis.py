@@ -3,9 +3,9 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from geng_agent.pipeline import ReviewPipeline, _thesis_anchor_text
+from geng_agent.pipeline import ReviewPipeline
 from geng_agent.prompts import PromptBook
-from geng_agent.result_review import (
+from geng_agent.paper_evidence import (
     thesis_comparisons_for_task,
     thesis_ordering_anchor_for_task,
 )
@@ -71,27 +71,6 @@ class PaperThesisPromptTests(unittest.TestCase):
             self.assertIn(needle, prompt)
         # the mechanism must be prose, NOT a transcribed bound (that was the round-1 noise trap)
         self.assertIn("不要转写", prompt)
-
-
-class ThesisAnchorTests(unittest.TestCase):
-    def test_anchor_carries_claim_mechanism_and_ordering(self) -> None:
-        anchor = _thesis_anchor_text(GOOD_THESIS)
-        self.assertIn("复现靶子", anchor)
-        self.assertIn(GOOD_THESIS["central_claim"], anchor)
-        self.assertIn(GOOD_THESIS["mechanism"], anchor)
-        self.assertIn("STAB > ZF > MRT", anchor)          # the checkable ordering
-        self.assertIn("用户密集、高多普勒、高发射功率", anchor)  # its regime
-        self.assertIn("方法排序反", anchor)                # all-reversed is a failure signal
-
-    def test_anchor_is_empty_without_thesis(self) -> None:
-        # None / blank thesis -> no anchor -> codegen prompts stay byte-for-byte unchanged.
-        self.assertEqual(_thesis_anchor_text(None), "")
-        self.assertEqual(_thesis_anchor_text({"central_claim": "", "mechanism": "  "}), "")
-
-    def test_anchor_without_comparisons_still_carries_mechanism(self) -> None:
-        anchor = _thesis_anchor_text({**GOOD_THESIS, "comparisons": []})
-        self.assertIn(GOOD_THESIS["mechanism"], anchor)
-        self.assertNotIn("论文断言的方法排序", anchor)  # no ordering block when no comparisons
 
 
 class ThesisOrderingMatchTests(unittest.TestCase):

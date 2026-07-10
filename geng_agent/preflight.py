@@ -3,8 +3,8 @@
 Goal: BEFORE a user feeds in a PDF, make the local requirements explicit and
 checkable on whatever machine is running geng-agent — which Python version and
 which libraries must be installed. A misconfigured machine (no numpy, wrong
-Python) silently turns every paper into a template fallback, so this module is
-the up-front gate that surfaces it instead.
+Python) weakens or blocks task-writer reproduction, so this module surfaces it
+before a paper run starts.
 
 Two distinct dependency classes, both required on a new machine:
   1. orchestrator deps  -> needed to even start geng-agent (parse PDF, render
@@ -12,7 +12,7 @@ Two distinct dependency classes, both required on a new machine:
   2. repro whitelist     -> the third-party libs the *generated* reproduction
      code is allowed to import. Single source of truth is
      security.ALLOWED_REQUIREMENTS; if these are absent the generator is told
-     "don't use numpy" and the runner blocks execution -> fallback.
+     "don't use numpy" and the task writer cannot deliver a valid full run.
 
 This module only inspects (importlib.util.find_spec / importlib.metadata); it
 never imports the heavy packages, so `geng-agent doctor` still runs on a machine
@@ -34,7 +34,7 @@ REQUIRED_PYTHON: tuple[int, int] = (3, 11)
 # (pip/PyPI name, import name, human purpose). Mirrors pyproject [project.dependencies].
 ORCHESTRATOR_DEPENDENCIES: tuple[tuple[str, str, str], ...] = (
     ("pypdf", "pypdf", "解析 PDF 文本"),
-    ("pymupdf", "fitz", "把论文页面渲染成 PNG 供多模态审查"),
+    ("pymupdf", "fitz", "把论文页面渲染成 PNG 供 Codex 事实抽取和 task writer 审查"),
     ("pydantic", "pydantic", "JSON 结构校验"),
     ("python-docx", "docx", "生成 Word 报告"),
     ("pillow", "PIL", "图像处理（也供复现代码使用）"),
@@ -83,7 +83,7 @@ class EnvironmentReport:
     def fatal(self) -> bool:
         """True when the machine cannot do a real reproduction: wrong Python, a
         missing orchestrator dep (CLI won't start), or a missing critical repro
-        lib (generation poisoned + runner blocks -> guaranteed fallback)."""
+        lib (task writers cannot complete a faithful full run)."""
         return (
             (not self.python_ok)
             or bool(self.missing_orchestrator)
@@ -178,7 +178,7 @@ def format_report(report: EnvironmentReport) -> str:
         version = f" {item.version}" if item.version else ""
         lines.append(f"  [{_mark(item.installed)}] {item.package}{version}  - {item.purpose}")
     lines.append("")
-    lines.append("二、复现代码使用的白名单库（缺关键项几乎必然吃兜底）:")
+    lines.append("二、复现代码使用的白名单库（缺关键项会阻碍 task writer 完成 full 运行）:")
     for item in report.repro:
         version = f" {item.version}" if item.version else ""
         tag = "关键" if item.critical else "可选"
@@ -214,7 +214,7 @@ def environment_warning(report: EnvironmentReport) -> str | None:
         problems.append("缺关键复现库: " + ", ".join(item.package for item in report.missing_repro_critical))
     if report.missing_repro_optional:
         problems.append("缺可选复现库: " + ", ".join(item.package for item in report.missing_repro_optional))
-    header = "[警告] 环境自检未通过（继续运行，但很可能吃兜底）:" if report.fatal else "[提示] 复现环境不完整:"
+    header = "[警告] 环境自检未通过（继续运行，但 task writer 很可能无法完成 full）:" if report.fatal else "[提示] 复现环境不完整:"
     command = remedy_command(report)
     tail = f"\n  修复: {command}\n  详情: geng-agent doctor" if command else "\n  详情: geng-agent doctor"
     return f"{header}\n  " + "; ".join(problems) + tail

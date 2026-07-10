@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -8,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from .analysis_limits import DEFAULT_ANALYSIS_AGENT_WIDTH, normalize_analysis_agent_width
 from .documents import load_paper
 from .agentic_analysis import CODEX_ANALYSIS_BACKEND, run_codex_json_stage
 from .experiment_index import build_local_experiment_index
@@ -26,13 +26,11 @@ from .facts_normalize import (
 from .heuristic_fallbacks import build_fallback_engineering_facts, build_fallback_repro_tasks
 from .json_utils import parse_json_object, pretty_json
 from .llm import LLMClient
-from .io_runtime import inject_io_runtime
-from .task_scripts import build_tasks_manifest, write_task_scaffolding
-from .outputs import validate_repro_project, write_file_manifest, write_json, write_text
+from .outputs import validate_repro_project, write_json, write_text
+from .paper_memory import load_or_build_paper_memory, paper_memory_summary, write_memory_manifest
 from .prompts import PromptBook
-from .result_review import run_result_review
-from .runner import build_json_retry_prompt, run_repro_with_repair
 from .schema_models import response_format_for_stage
+from .semantic_merge import analysis_role_prompt, semantic_conflicts
 from .schemas import (
     ValidationIssue,
     format_issues,
@@ -40,10 +38,9 @@ from .schemas import (
     validate_stage,
     validate_task_fact_refs,
 )
-from .security import reconcile_whitelisted_requirements
-from .template_project import build_template_repro_project_manifest
 from .tasks_normalize import finalize_repro_tasks, recover_truncated_repro_tasks
 from .verdict import derive_reproducibility_verdict
+from .provenance import build_automation_provenance
 
 # --- re-exported helpers (split out of this module; imported here so existing
 # `from geng_agent.pipeline import ...` call sites and the ReviewPipeline methods
@@ -55,35 +52,15 @@ from .pipeline_helpers import (
     _read_json_file,
     _remove_path_inside,
     _temporary_client_timeout,
+    build_json_retry_prompt,
     summarize_bad_output,
     wrap_untrusted,
 )
 from .stage_cleanup import (
-    _clear_project_code_files,
     _clear_stage_audit,
     _clear_stage_outputs,
 )
-from .manifest_utils import (
-    REPRO_PROJECT_FILE_LIMITS,
-    REPRO_PROJECT_FILE_ORDER,
-    _content_type_issues,
-    _generated_files_context,
-    _manifest_path_slug,
-    _manifest_paths,
-    _normalize_manifest_path_for_pipeline,
-    _ordered_project_paths,
-    _recover_manifest_from_audit,
-    _validate_project_file,
-    _validate_project_plan_paths,
-    expected_generated_paths,
-    normalize_repro_project_file_candidate,
-    normalize_repro_project_manifest_candidate,
-)
 from .runtime_status import (
-    _assess_partial_success,
-    _inspect_cached_outputs,
-    _load_cached_result_review_status,
-    _load_cached_runtime_result,
     _load_result_review_document,
     _load_valid_stage_cache,
     _paper_cache_matches,
@@ -118,6 +95,22 @@ SYSTEM_MESSAGE = (
 )
 
 
+def _stage_item_count(schema_stage: str, doc: dict[str, Any]) -> int | None:
+    if schema_stage == "engineering_facts":
+        items = doc.get("engineering_facts")
+    elif schema_stage == "repro_tasks":
+        items = doc.get("repro_tasks")
+    else:
+        return None
+    return len(items) if isinstance(items, list) else 0
+
+
+def _clear_ensemble_candidate_outputs(output_dir: Path, output_path: Path) -> None:
+    pattern = f"{output_path.stem}_agent_*{output_path.suffix}"
+    for path in output_path.parent.glob(pattern):
+        _remove_path_inside(output_dir, path)
+
+
 @dataclass(frozen=True)
 class PipelineResult:
     output_dir: Path
@@ -131,157 +124,6 @@ class PipelineResult:
     reproducibility_verdict: dict[str, Any] | None = None
     review_docx_path: Path | None = None
     result_review_docx_path: Path | None = None
-
-
-def _per_task_plan_override(task_scripts: list[str]) -> str:
-    """Appended to the plan prompt in per-task mode: plan the shared science + one thin
-    tasks/<module>.py per repro_task, and NOT run_experiment.py (harness-injected)."""
-    listed = "\n".join(f"- {script}" for script in task_scripts)
-    return (
-        "\n\n# 【按任务拆分覆盖｜优先级最高】\n"
-        "本次改用“每任务一脚本”布局，覆盖上文关于 run_experiment.py 的规划要求：\n"
-        "- 不要规划 run_experiment.py（本地会注入一个确定性分发器）。\n"
-        "- 必须规划下列每任务脚本，每个是对应复现任务的“薄驱动”（只复现该任务、调用 src/_io 写产物）：\n"
-        f"{listed}\n"
-        "- src/*.py 只放纯科学计算（信道/预编码/指标/编排），**不要在 src/ 里 import matplotlib 或画图、不要写 main/落盘**；画图与产物落盘一律在 tasks/<id>.py 里走 _io。\n"
-        "- 最终 files 必须恰好是：README.md、requirements.txt、config.json、config_smoke.json、"
-        "src/channel.py、src/modulation.py、src/metrics.py、src/simulation.py，外加上面列出的每个 tasks/*.py；"
-        "不要多、不要少、不要包含 run_experiment.py 或 src/_io.py。\n"
-    )
-
-
-def _available_src_symbols(files: list[dict[str, Any]]) -> dict[str, list[str]]:
-    """Top-level def/class/constant names exposed by each ALREADY-generated src/*.py, so a
-    per-task script can be handed the EXACT symbols it may import. The model otherwise guesses
-    names that don't exist (observed: importing zf_precoder/stab_sum_rate that src.modulation
-    never defined -> ImportError sank 2/3 tasks)."""
-    symbols: dict[str, list[str]] = {}
-    for item in files:
-        path = str(item.get("path", ""))
-        if not (path.startswith("src/") and path.endswith(".py")) or path == "src/_io.py":
-            continue
-        content = "\n".join(str(line) for line in item.get("content_lines", []) if isinstance(item.get("content_lines"), list))
-        try:
-            tree = ast.parse(content)
-        except SyntaxError:
-            continue
-        names: list[str] = []
-        for node in tree.body:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                if not node.name.startswith("_"):
-                    names.append(node.name)
-            elif isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if isinstance(target, ast.Name) and not target.id.startswith("_"):
-                        names.append(target.id)
-        if names:
-            module = path[: -len(".py")].replace("/", ".")  # src/modulation.py -> src.modulation
-            symbols[module] = names
-    return symbols
-
-
-def _per_task_file_override(task_id: str, tasks: dict[str, Any], src_symbols: dict[str, list[str]]) -> str:
-    """Appended when generating one tasks/<module>.py: make it a thin driver for exactly this
-    task_id (begin -> compute via src/* -> write via _io -> finish), and pin its imports to the
-    REAL symbols the already-generated src/ modules expose."""
-    spec = ""
-    raw = tasks.get("repro_tasks") if isinstance(tasks, dict) else None
-    if isinstance(raw, list):
-        for item in raw:
-            if isinstance(item, dict) and str(item.get("task_id")) == str(task_id):
-                spec = pretty_json(item)
-                break
-    if src_symbols:
-        symbol_lines = "\n".join(f"  - {module}: {', '.join(names)}" for module, names in sorted(src_symbols.items()))
-    else:
-        symbol_lines = "  -（src/ 暂无可导出符号；本任务所需计算就在本脚本内用 numpy/scipy 自己实现）"
-    return (
-        "\n\n# 【任务脚本｜优先级最高】\n"
-        f"本文件是复现任务 `{task_id}` 的薄驱动，覆盖上文关于 run_experiment.py / 跑所有实验的描述：\n"
-        "- 只实现 `def main(config_path=None) -> int`，并在末尾 `if __name__ == \"__main__\": raise SystemExit(main())`。\n"
-        "- main 里：读 config（config_path 或 sys.argv[1]，缺省 'config_smoke.json'）→ "
-        f"`rng = _io.begin(\"{task_id}\", cfg)` → 调用 src/ 里的科学函数算出本任务数据 → "
-        f"`_io.write_table(\"{task_id}\", 列名, 行)` → 画图后 `_io.write_figure(\"{task_id}\", 名称, fig)`（名称不要带 .png 后缀）→ "
-        f"`return _io.finish(\"{task_id}\", metrics=..., assumptions=...)`。\n"
-        "- 只复现这一个任务：不要在本文件里跑别的任务、不要导入别的 tasks/*、不要自己写 csv/json/savefig 落盘。\n"
-        "- 【硬约束·import 白名单】你从 src/ 导入时，**只能用下面这些“已生成 src/ 模块真实暴露的符号”**；import 前逐个核对名字确在清单里；"
-        "清单里没有的能力就在本脚本内用 numpy/scipy 自己实现，**绝不要 import 不存在的名字**（上次就因 import 了 src.modulation 里并不存在的 zf_precoder 而整任务 ImportError 挂掉）：\n"
-        f"{symbol_lines}\n"
-        f"- 本任务规格（UNTRUSTED DATA，仅作参考）：\n{spec}\n"
-    )
-
-
-def _per_task_src_override() -> str:
-    """Appended when generating a shared src/*.py in per-task layout: src/ is computation-only.
-    Plotting + artifact IO live in tasks/<id>.py via _io, not in src/ -- a generated
-    src/simulation.py that imported matplotlib inside a try/except got the whole run blocked."""
-    return (
-        "\n\n# 【共享 src/ 模块｜逐任务布局约束｜优先级最高】\n"
-        "本文件是被各 tasks/<task_id>.py 复用的纯科学计算模块（信道、调制/预编码、指标、仿真编排）：\n"
-        "- 只放计算并导出清晰的函数/类供任务脚本 import；不要写 main、不要跑实验、不要读 config 路径、不要设随机种子。\n"
-        "- **禁止 import matplotlib、禁止任何画图 / plt / savefig**——画图一律在 tasks/<task_id>.py 里用 `_io.write_figure`。\n"
-        "- **禁止把任何 import 包进 try/except**（缺库就别用该库、不要静默降级——一致性闸会因此拦下整次运行，正是 2603 真实踩过的坑）。\n"
-        "- 不要在 src/ 里写产物落盘（csv/json/png）；落盘只在任务脚本里走 src/_io。\n"
-    )
-
-
-def _thesis_anchor_text(paper_thesis: dict[str, Any] | None) -> str:
-    """Compact codegen anchor built from the distilled paper thesis: the conclusion the code
-    must REPRODUCE (claim + mechanism + the method orderings the paper asserts), not just the
-    formulas to transcribe. Appended to science-file prompts so a generated implementation has
-    a target to self-check against ("if my method ordering comes out reversed, my channel model
-    is wrong"). Returns "" when no usable thesis is available -> prompts stay unchanged."""
-    if not isinstance(paper_thesis, dict):
-        return ""
-    claim = str(paper_thesis.get("central_claim") or "").strip()
-    mechanism = str(paper_thesis.get("mechanism") or "").strip()
-    if not claim and not mechanism:
-        return ""
-    ordering_lines: list[str] = []
-    comparisons = paper_thesis.get("comparisons")
-    if isinstance(comparisons, list):
-        for item in comparisons:
-            if not isinstance(item, dict):
-                continue
-            ordering = str(item.get("expected_ordering") or "").strip()
-            if not ordering:
-                continue
-            regime = str(item.get("regime") or "").strip()
-            note = str(item.get("mechanism_note") or "").strip()
-            segment = f"  - {ordering}"
-            if regime:
-                segment += f"（成立条件：{regime}）"
-            if note:
-                segment += f"；之所以是这个排序，是因为{note}"
-            ordering_lines.append(segment)
-    ordering_block = (
-        "\n论文断言的方法排序（复现必须命中；命不中几乎一定是你的信道/模型构造错了）：\n"
-        + "\n".join(ordering_lines)
-        if ordering_lines
-        else ""
-    )
-    return (
-        "\n\n# 【论文思路·复现靶子｜优先级最高】\n"
-        "你要复现的不是公式，而是下面这个结论。把它当作实现的自检靶：\n"
-        f"- 核心主张：{claim}\n"
-        f"- 起作用的机制：{mechanism}\n"
-        f"{ordering_block}\n"
-        "硬约束：\n"
-        "- 实现要让上述机制**真实成立**（例如优势若来自空时/多普勒维度的去相关与条件数改善，就必须把该维度如实建出来），"
-        "不要只把闭式公式抄上去就交差。\n"
-        "- 若你的实现会让方法排序与论文相反，先怀疑是信道/模型构造错了，回头检查，**不要硬凑参数**去对齐。\n"
-        "- 全 0 / 全常数 / 方法排序反 都是失败信号，不是“也能跑”。\n"
-        "- 以上仅为**设计约束**，只能体现在代码的计算逻辑里：**不要把本节说明文字写进注释或字符串，也不要在代码里输出任何思考/推导过程**，直接写干净、可直接运行的 Python。\n"
-    )
-
-
-def _inject_task_scaffolding(manifest: dict[str, Any], repro_project_dir: Path) -> None:
-    """If the manifest carries a per-task tasks_manifest, drop in the harness-owned
-    run_experiment.py dispatcher, tasks/__init__.py and tasks_manifest.json. No-op otherwise."""
-    meta = manifest.get("_meta") if isinstance(manifest, dict) else None
-    tasks_manifest = meta.get("tasks_manifest") if isinstance(meta, dict) else None
-    if isinstance(tasks_manifest, dict) and tasks_manifest.get("tasks"):
-        write_task_scaffolding(repro_project_dir, tasks_manifest)
 
 
 class ReviewPipeline:
@@ -342,18 +184,17 @@ class ReviewPipeline:
         output_dir: Path,
         max_pages: int | None = None,
         run_repro: bool = False,
-        repair_attempts: int = 2,
         run_timeout: float = 120.0,
         json_repair_attempts: int = 3,
         tasks_timeout: float = 300.0,
         project_timeout: float = 1200.0,
         result_review: bool = True,
-        template_fallback: bool = True,
-        facts_gap_rounds: int = 10,
+        analysis_fallback: bool = True,
+        facts_gap_rounds: int = 6,
         tasks_gap_rounds: int = 6,
+        analysis_agent_width: int = DEFAULT_ANALYSIS_AGENT_WIDTH,
         analysis_backend: str | None = None,
         codex_analysis_timeout: float | None = None,
-        project_backend: str = "llm",
         codex_agent_rounds: int = 5,
         codex_agent_timeout: float | None = None,
     ) -> PipelineResult:
@@ -380,19 +221,18 @@ class ReviewPipeline:
             output_dir=output_dir,
             max_pages=max_pages,
             run_repro=run_repro,
-            repair_attempts=repair_attempts,
             run_timeout=run_timeout,
             json_repair_attempts=json_repair_attempts,
             tasks_timeout=tasks_timeout,
             project_timeout=project_timeout,
             result_review=result_review,
             resume=True,
-            template_fallback=template_fallback,
+            analysis_fallback=analysis_fallback,
             facts_gap_rounds=facts_gap_rounds,
             tasks_gap_rounds=tasks_gap_rounds,
+            analysis_agent_width=analysis_agent_width,
             analysis_backend=analysis_backend,
             codex_analysis_timeout=codex_analysis_timeout,
-            project_backend=project_backend,
             codex_agent_rounds=codex_agent_rounds,
             codex_agent_timeout=codex_agent_timeout,
         )
@@ -403,21 +243,18 @@ class ReviewPipeline:
         output_dir: Path,
         max_pages: int | None = None,
         run_repro: bool = False,
-        repair_attempts: int = 2,
         run_timeout: float = 120.0,
         json_repair_attempts: int = 3,
         tasks_timeout: float = 300.0,
         project_timeout: float = 1200.0,
         result_review: bool = True,
         resume: bool = True,
-        template_fallback: bool = True,
-        facts_gap_rounds: int = 10,
+        analysis_fallback: bool = True,
+        facts_gap_rounds: int = 6,
         tasks_gap_rounds: int = 6,
-        per_task_layout: bool = False,
-        science_loop: bool = False,
+        analysis_agent_width: int = DEFAULT_ANALYSIS_AGENT_WIDTH,
         analysis_backend: str | None = None,
         codex_analysis_timeout: float | None = None,
-        project_backend: str = "llm",
         codex_agent_rounds: int = 5,
         codex_agent_timeout: float | None = None,
     ) -> PipelineResult:
@@ -426,13 +263,12 @@ class ReviewPipeline:
         audit_dir = output_dir / "audit"
         audit_dir.mkdir(parents=True, exist_ok=True)
         if analysis_backend is None:
-            analysis_backend = CODEX_ANALYSIS_BACKEND if self.client is None or project_backend == "codex" else "llm"
+            analysis_backend = CODEX_ANALYSIS_BACKEND
         if analysis_backend not in {CODEX_ANALYSIS_BACKEND, "llm"}:
             raise ValueError(f"unknown analysis_backend: {analysis_backend}")
+        analysis_agent_width = normalize_analysis_agent_width(analysis_agent_width)
         if analysis_backend == "llm" and self.client is None:
             raise ValueError("analysis_backend='llm' requires an LLM client")
-        if project_backend == "llm" and self.client is None:
-            raise ValueError("project_backend='llm' requires an LLM client")
 
         run_start = time.perf_counter()
         cost_marks: list[dict[str, Any]] = []
@@ -455,13 +291,27 @@ class ReviewPipeline:
             max_pages=max_pages,
             resume=resume,
         )
+        paper_memory = load_or_build_paper_memory(
+            paper=paper,
+            source_path=paper_path,
+            output_dir=output_dir,
+            resume=resume,
+        )
+        paper_memory_issues = validate_stage("paper_memory", paper_memory)
+        if paper_memory_issues:
+            raise RuntimeError(f"paper_memory failed schema validation: {format_issues(paper_memory_issues)}")
         valid_chunk_ids = {
             str(chunk.get("chunk_id"))
             for chunk in paper.get("chunks", [])
             if isinstance(chunk, dict) and chunk.get("chunk_id")
         }
 
-        paper_context_raw = _paper_context_for_prompt(paper["chunks"])
+        paper_context_raw = pretty_json(
+            {
+                "paper_chunks": json.loads(_paper_context_for_prompt(paper["chunks"])),
+                "paper_memory": paper_memory_summary(paper_memory),
+            }
+        )
         paper_context = wrap_untrusted("paper_chunks_json", paper_context_raw)
 
         # Render paper pages once so fact-extraction (round 1) and code-generation (round 3)
@@ -480,7 +330,7 @@ class ReviewPipeline:
             paper_chunks_json=paper_context,
         )
         if analysis_backend == CODEX_ANALYSIS_BACKEND or self.extraction_client_2 is None:
-            facts = self._load_or_create_stage_json(
+            facts = self._load_or_create_ensemble_stage_json(
                 output_path=output_dir / "engineering_facts.json",
                 output_dir=output_dir,
                 audit_dir=audit_dir,
@@ -491,7 +341,8 @@ class ReviewPipeline:
                 max_attempts=json_repair_attempts + 1,
                 resume=resume,
                 images=paper_images,
-                extra_validation=lambda parsed: (
+                candidate_extra_validation=lambda parsed: validate_fact_sources(parsed, valid_chunk_ids, valid_pages),
+                final_extra_validation=lambda parsed: (
                     validate_fact_sources(parsed, valid_chunk_ids, valid_pages)
                     + engineering_facts_floor_issues(parsed)
                 ),
@@ -499,12 +350,14 @@ class ReviewPipeline:
                 truncation_recovery=recover_truncated_engineering_facts,
                 backend=analysis_backend,
                 codex_timeout=codex_analysis_timeout,
+                agent_width=analysis_agent_width,
+                merge_func=merge_engineering_facts,
                 fallback_factory=(
                     (lambda exc: build_fallback_engineering_facts(
                         paper=paper,
                         reason=f"{analysis_backend} engineering fact extraction failed after retries: {exc}",
                     ))
-                    if template_fallback
+                    if analysis_fallback
                     else None
                 ),
             )
@@ -522,7 +375,7 @@ class ReviewPipeline:
                 audit_dir=audit_dir,
                 resume=resume,
                 max_attempts=json_repair_attempts + 1,
-                template_fallback=template_fallback,
+                analysis_fallback=analysis_fallback,
             )
 
         # Round-1 recall hardening: deterministically check figure/table coverage and run a
@@ -539,39 +392,35 @@ class ReviewPipeline:
             resume=resume,
             max_attempts=json_repair_attempts + 1,
             max_rounds=facts_gap_rounds,
+            analysis_agent_width=analysis_agent_width,
             analysis_backend=analysis_backend,
             codex_analysis_timeout=codex_analysis_timeout,
         )
+        write_json(output_dir / "fact_conflicts.json", {"conflicts": semantic_conflicts(facts, "fact")})
 
         _mark("facts")
 
-        # Round-1.5 (science loop): distill the paper's THESIS -- central claim, the mechanism
-        # that makes the proposed method work, and the head-to-head orderings it asserts. This
-        # is the anchor the downstream codegen and result-review check against, so a
-        # reproduction targets the paper's conclusion (e.g. "STAB beats ZF in a dense regime,
-        # because the space-time channel is better conditioned") rather than transcribing
-        # formulas blind. Non-fatal + opt-in (--science-loop); None when disabled or on failure.
-        paper_thesis = None
-        if science_loop:
-            paper_thesis = self._load_or_create_paper_thesis(
-                output_dir=output_dir,
-                audit_dir=audit_dir,
-                facts=facts,
-                paper_context=paper_context,
-                paper_images=paper_images,
-                resume=resume,
-                max_attempts=json_repair_attempts + 1,
-                analysis_backend=analysis_backend,
-                codex_analysis_timeout=codex_analysis_timeout,
-            )
-            _mark("thesis")
+        # Stage 1 is mandatory: every downstream task writer receives the paper's
+        # central claim, mechanism, ordering comparisons, and caveats.
+        paper_thesis = self._load_or_create_paper_thesis(
+            output_dir=output_dir,
+            audit_dir=audit_dir,
+            facts=facts,
+            paper_context=paper_context,
+            paper_images=paper_images,
+            resume=resume,
+            max_attempts=json_repair_attempts + 1,
+            analysis_backend=analysis_backend,
+            codex_analysis_timeout=codex_analysis_timeout,
+        )
+        _mark("thesis")
 
         prompt_2 = self.prompt_book.render(
             "build_repro_tasks.md",
             engineering_facts_json=wrap_untrusted("engineering_facts_json", pretty_json(facts)),
             paper_context_json=paper_context,
         )
-        tasks = self._load_or_create_stage_json(
+        tasks = self._load_or_create_ensemble_stage_json(
             output_path=output_dir / "repro_tasks.json",
             output_dir=output_dir,
             audit_dir=audit_dir,
@@ -581,19 +430,22 @@ class ReviewPipeline:
             schema_stage="repro_tasks",
             max_attempts=json_repair_attempts + 1,
             resume=resume,
-            extra_validation=lambda parsed: validate_task_fact_refs(parsed, facts),
+            candidate_extra_validation=lambda parsed: validate_task_fact_refs(parsed, facts),
+            final_extra_validation=lambda parsed: validate_task_fact_refs(parsed, facts),
             candidate_normalizer=lambda parsed: finalize_repro_tasks(parsed, facts),
             truncation_recovery=recover_truncated_repro_tasks,
             request_timeout=tasks_timeout,
             backend=analysis_backend,
             codex_timeout=codex_analysis_timeout,
+            agent_width=analysis_agent_width,
+            merge_func=merge_repro_tasks,
             fallback_factory=(
                 (lambda exc: build_fallback_repro_tasks(
                     facts=facts,
                     paper=paper,
                     reason=f"{analysis_backend} reproduction task generation failed after retries: {exc}",
                 ))
-                if template_fallback
+                if analysis_fallback
                 else None
             ),
         )
@@ -610,9 +462,11 @@ class ReviewPipeline:
             max_attempts=json_repair_attempts + 1,
             max_rounds=tasks_gap_rounds,
             tasks_timeout=tasks_timeout,
+            analysis_agent_width=analysis_agent_width,
             analysis_backend=analysis_backend,
             codex_analysis_timeout=codex_analysis_timeout,
         )
+        write_json(output_dir / "task_conflicts.json", {"conflicts": semantic_conflicts(tasks, "task")})
         _mark("tasks")
         experiment_index = self._load_or_create_experiment_index(
             output_dir=output_dir,
@@ -620,18 +474,28 @@ class ReviewPipeline:
             facts=facts,
             tasks=tasks,
             paper=paper,
+            paper_memory=paper_memory,
             resume=resume,
         )
-
         _mark("experiment_index")
         repro_project_dir = output_dir / "repro_project"
-        if project_backend not in {"codex", "llm"}:
-            raise ValueError(f"unknown project_backend: {project_backend}")
+        from .agentic_task_writers import run_codex_task_writer_workflow
 
-        if project_backend == "codex":
-            from .agentic_task_writers import run_codex_task_writer_workflow
-
-            per_task_layout = True
+        analysis_revision_history: list[dict[str, Any]] = []
+        agentic_result: dict[str, Any] | None = None
+        max_analysis_reentries = 2
+        for revision_round in range(max_analysis_reentries + 1):
+            memory_manifest = write_memory_manifest(
+                output_dir,
+                {
+                    "paper_chunks": output_dir / "paper_chunks.json",
+                    "paper_memory": output_dir / "paper_memory.json",
+                    "engineering_facts": output_dir / "engineering_facts.json",
+                    "paper_thesis": output_dir / "paper_thesis.json",
+                    "repro_tasks": output_dir / "repro_tasks.json",
+                    "experiment_index": output_dir / "experiment_index.json",
+                },
+            )
             agentic_result = run_codex_task_writer_workflow(
                 facts=facts,
                 tasks=tasks,
@@ -640,145 +504,90 @@ class ReviewPipeline:
                 paper_path=paper_path,
                 paper_context_json=paper_context,
                 paper_thesis=paper_thesis,
+                paper_memory=paper_memory,
+                memory_snapshot_hash=str(memory_manifest.get("snapshot_hash") or ""),
                 output_dir=output_dir,
                 audit_dir=audit_dir,
                 repro_project_dir=repro_project_dir,
-                client=self.client,
-                prompt_book=self.prompt_book,
-                system_message=SYSTEM_MESSAGE,
                 run_repro=run_repro,
                 result_review=result_review,
                 rounds=codex_agent_rounds,
                 timeout=codex_agent_timeout or project_timeout or 1800.0,
                 run_timeout=run_timeout,
-                resume=resume,
+                resume=resume and revision_round == 0,
             )
-            manifest = agentic_result["manifest"]
-            written_files = [Path(path) for path in agentic_result.get("written_files", [])]
-            validation = validate_repro_project(repro_project_dir)
-            scientific_check = build_scientific_check(tasks)
-            template_fallback_now = False
-            runtime_result = agentic_result["runtime_result"]
-            result_review_result = agentic_result["result_review_result"]
-            _mark("generation")
-            _mark("runtime")
-            _mark("result_review")
-        else:
-            manifest = self._load_or_create_repro_manifest(
-                output_dir=output_dir,
-                resume=resume,
-                audit_dir=audit_dir,
-                max_attempts=json_repair_attempts + 1,
-                allow_final_loose_manifest=True,
-                facts=facts,
-                tasks=tasks,
-                paper_context_json=paper_context,
-                template_fallback=template_fallback,
-                project_timeout=project_timeout,
-                images=paper_images,
-                per_task_layout=per_task_layout,
-                paper_thesis=paper_thesis,
-            )
-            written_files = self._ensure_repro_project_from_manifest(
-                manifest=manifest,
-                output_dir=output_dir,
-                repro_project_dir=repro_project_dir,
-                resume=resume,
-            )
-            validation = validate_repro_project(repro_project_dir)
-            if template_fallback and (not validation.get("required_files_present") or not validation.get("python_compiles")):
-                manifest, written_files = self._write_template_repro_project(
-                    facts=facts,
+            requests = [
+                item
+                for item in agentic_result.get("revision_requests", [])
+                if isinstance(item, dict) and item.get("eligible_for_analysis_reentry") is True
+            ]
+            if not requests or revision_round >= max_analysis_reentries:
+                break
+            try:
+                revised_facts, revised_tasks, changed_facts, changed_tasks = self._revise_analysis_from_requests(
                     tasks=tasks,
+                    facts=facts,
+                    requests=requests,
+                    paper_context=paper_context,
+                    paper_images=paper_images,
                     output_dir=output_dir,
                     audit_dir=audit_dir,
-                    repro_project_dir=repro_project_dir,
-                    reason="generated project failed local validation",
+                    revision_round=revision_round + 1,
+                    max_attempts=json_repair_attempts + 1,
+                    tasks_timeout=tasks_timeout,
+                    analysis_backend=analysis_backend,
+                    codex_analysis_timeout=codex_analysis_timeout,
+                    analysis_agent_width=analysis_agent_width,
+                    valid_chunk_ids=valid_chunk_ids,
+                    valid_pages=valid_pages,
                 )
-                validation = validate_repro_project(repro_project_dir)
-            scientific_check = build_scientific_check(tasks)
-            template_fallback_now = bool((manifest.get("_meta") or {}).get("template_fallback_used"))
-            _mark("generation")
-
-            # Bug A: keep requirements.txt consistent with the whitelisted+installed imports the
-            # generated code actually uses, so a forgotten declaration (e.g. code imports
-            # scipy.linalg but omits scipy) is not refused by the runner's dependency-consistency
-            # gate. Only whitelisted+installed packages are added; anything else stays blocked.
-            reconciled = reconcile_whitelisted_requirements(repro_project_dir)
-            if reconciled:
-                write_json(audit_dir / "requirements_reconciled.json", {"added": reconciled})
-
-            if run_repro:
-                runtime_result = self._load_or_run_repro(
-                    output_dir=output_dir,
-                    repro_project_dir=repro_project_dir,
-                    repair_attempts=repair_attempts,
-                    run_timeout=run_timeout,
-                    resume=resume,
+            except Exception as exc:
+                write_json(
+                    audit_dir / f"02c_revision_round_{revision_round + 1}_error.json",
+                    {"ok": False, "error": f"{type(exc).__name__}: {exc}", "requests": requests},
                 )
-                manifest_meta = manifest.get("_meta") if isinstance(manifest.get("_meta"), dict) else {}
-                if runtime_result.get("passed") is not True and not manifest_meta.get("template_fallback_used"):
-                    partial = _assess_partial_success(runtime_result)
-                    if partial["has_partial_output"]:
-                        # A single failed experiment should not sink the whole run: the
-                        # generated project produced usable partial outputs, so keep it (and
-                        # surface the risk) instead of masking everything with a template.
-                        runtime_result["partial_success"] = partial
-                        runtime_result["template_fallback_skipped"] = True
-                        write_json(output_dir / "runtime_result.json", runtime_result)
-                    elif template_fallback:
-                        # Preserve the failed generated-project run before the template
-                        # overwrites runtime_result.json and repro_project/.
-                        write_json(output_dir / "runtime_result_pre_fallback.json", runtime_result)
-                        manifest, written_files = self._write_template_repro_project(
-                            facts=facts,
-                            tasks=tasks,
-                            output_dir=output_dir,
-                            audit_dir=audit_dir,
-                            repro_project_dir=repro_project_dir,
-                            reason="generated project did not pass guarded execution after repair attempts",
-                        )
-                        validation = validate_repro_project(repro_project_dir)
-                        runtime_result = self._load_or_run_repro(
-                            output_dir=output_dir,
-                            repro_project_dir=repro_project_dir,
-                            repair_attempts=repair_attempts,
-                            run_timeout=run_timeout,
-                            resume=False,
-                        )
-                        runtime_result["template_fallback_used"] = True
-                        write_json(output_dir / "runtime_result.json", runtime_result)
-            else:
-                runtime_result = {
-                    "enabled": False,
-                    "passed": None,
-                    "attempts": [],
-                    "reason": "automatic execution is disabled by default; pass --run-repro to enable the guarded runner",
+                break
+            analysis_revision_history.append(
+                {
+                    "round": revision_round + 1,
+                    "request_count": len(requests),
+                    "changed_facts": changed_facts,
+                    "changed_tasks": changed_tasks,
                 }
-            _mark("runtime")
-
-            result_review_result = self._run_result_review_if_ready(
-                enabled=result_review,
-                run_repro=run_repro,
-                runtime_result=runtime_result,
-                template_fallback_used=bool(
-                    runtime_result.get("template_fallback_used")
-                    or (manifest.get("_meta") or {}).get("template_fallback_used")
-                ),
-                paper_path=paper_path,
-                paper=paper,
-                facts=facts,
-                tasks=tasks,
-                paper_context_json=paper_context,
-                repro_project_dir=repro_project_dir,
+            )
+            if changed_facts + changed_tasks <= 0:
+                break
+            facts = revised_facts
+            tasks = revised_tasks
+            write_json(output_dir / "engineering_facts.json", facts)
+            write_json(output_dir / "fact_conflicts.json", {"conflicts": semantic_conflicts(facts, "fact")})
+            write_json(output_dir / "repro_tasks.json", tasks)
+            write_json(output_dir / "task_conflicts.json", {"conflicts": semantic_conflicts(tasks, "task")})
+            experiment_index = self._load_or_create_experiment_index(
                 output_dir=output_dir,
                 audit_dir=audit_dir,
-                max_attempts=json_repair_attempts + 1,
-                resume=resume,
-                paper_thesis=paper_thesis,
+                facts=facts,
+                tasks=tasks,
+                paper=paper,
+                paper_memory=paper_memory,
+                resume=False,
             )
-            _mark("result_review")
-
+        if agentic_result is None:
+            raise RuntimeError("task-writer workflow produced no result")
+        write_json(
+            audit_dir / "02c_analysis_revision_history.json",
+            {"max_reentries": max_analysis_reentries, "rounds": analysis_revision_history},
+        )
+        agentic_result.setdefault("status", {})["analysis_revision_history"] = analysis_revision_history
+        manifest = agentic_result["manifest"]
+        written_files = [Path(path) for path in agentic_result.get("written_files", [])]
+        validation = validate_repro_project(repro_project_dir)
+        scientific_check = build_scientific_check(tasks)
+        runtime_result = agentic_result["runtime_result"]
+        result_review_result = agentic_result["result_review_result"]
+        _mark("generation")
+        _mark("runtime")
+        _mark("result_review")
         validation = validate_repro_project(repro_project_dir)
         risk_report = build_risk_report(
             facts,
@@ -786,7 +595,6 @@ class ReviewPipeline:
             validation,
             runtime_result=runtime_result,
             scientific_check=scientific_check,
-            manifest_meta=manifest.get("_meta") if isinstance(manifest.get("_meta"), dict) else {},
             result_review_result=result_review_result,
             paper_format=paper.get("format") if isinstance(paper, dict) else None,
         )
@@ -798,7 +606,6 @@ class ReviewPipeline:
             risk_report=risk_report,
             runtime_result=runtime_result,
             result_review=result_review_document,
-            manifest=manifest,
         )
         verdict_issues = validate_stage("reproducibility_verdict", reproducibility_verdict)
         if verdict_issues:
@@ -855,14 +662,50 @@ class ReviewPipeline:
             by_model=self._usage_by_model(),
         )
         run_cost["analysis_backend"] = analysis_backend
-        run_cost["project_backend"] = project_backend
-        if project_backend == "codex":
-            run_cost["codex_agent_mode"] = "task-writers"
+        run_cost["project_backend"] = "codex"
+        run_cost["codex_agent_mode"] = "task-writers"
         if analysis_backend == CODEX_ANALYSIS_BACKEND:
             run_cost["codex_analysis_timeout_s"] = codex_analysis_timeout or 600.0
+            run_cost["analysis_agent_width"] = analysis_agent_width
         write_json(
             output_dir / "run_cost.json",
             run_cost,
+        )
+        final_memory_manifest = write_memory_manifest(
+            output_dir,
+            {
+                "paper_chunks": output_dir / "paper_chunks.json",
+                "paper_memory": output_dir / "paper_memory.json",
+                "engineering_facts": output_dir / "engineering_facts.json",
+                "paper_thesis": output_dir / "paper_thesis.json",
+                "repro_tasks": output_dir / "repro_tasks.json",
+                "experiment_index": output_dir / "experiment_index.json",
+                "repro_project_manifest": output_dir / "repro_project_manifest.json",
+                "runtime_result": output_dir / "runtime_result.json",
+                "result_review": output_dir / "result_review.md",
+                "risk_report": output_dir / "risk_report.json",
+            },
+        )
+        write_json(
+            output_dir / "automation_provenance.json",
+            build_automation_provenance(
+                output_dir=output_dir,
+                paper_path=paper_path,
+                memory_manifest=final_memory_manifest,
+                facts=facts,
+                tasks=tasks,
+                experiment_index=experiment_index,
+                runtime_result=runtime_result,
+                agentic_status=agentic_result.get("status", {}),
+                settings={
+                    "analysis_backend": analysis_backend,
+                    "analysis_agent_width": analysis_agent_width,
+                    "facts_gap_rounds": facts_gap_rounds,
+                    "tasks_gap_rounds": tasks_gap_rounds,
+                    "task_writer_rounds": codex_agent_rounds,
+                    "max_analysis_reentries": max_analysis_reentries,
+                },
+            ),
         )
 
         result_review_json_path = output_dir / "result_review.json"
@@ -995,6 +838,183 @@ class ReviewPipeline:
         write_json(output_path, parsed)
         return parsed
 
+    def _load_or_create_ensemble_stage_json(
+        self,
+        *,
+        output_path: Path,
+        output_dir: Path,
+        audit_dir: Path,
+        prompt: str,
+        stage_label: str,
+        cleanup_stage: str,
+        schema_stage: str,
+        max_attempts: int,
+        resume: bool,
+        agent_width: int,
+        merge_func: Callable[[dict[str, Any], dict[str, Any]], tuple[dict[str, Any], int]],
+        candidate_extra_validation: Callable[[dict[str, Any]], list[ValidationIssue]] | None = None,
+        final_extra_validation: Callable[[dict[str, Any]], list[ValidationIssue]] | None = None,
+        request_timeout: float | None = None,
+        fallback_factory: Callable[[Exception], dict[str, Any] | None] | None = None,
+        candidate_normalizer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        truncation_recovery: Callable[[str], dict[str, Any] | None] | None = None,
+        images: list | None = None,
+        client: Any = None,
+        backend: str = "llm",
+        codex_timeout: float | None = None,
+    ) -> dict[str, Any]:
+        width = normalize_analysis_agent_width(agent_width)
+        if backend != CODEX_ANALYSIS_BACKEND or width <= 1:
+            return self._load_or_create_stage_json(
+                output_path=output_path,
+                output_dir=output_dir,
+                audit_dir=audit_dir,
+                prompt=prompt,
+                stage_label=stage_label,
+                cleanup_stage=cleanup_stage,
+                schema_stage=schema_stage,
+                max_attempts=max_attempts,
+                resume=resume,
+                extra_validation=final_extra_validation or candidate_extra_validation,
+                request_timeout=request_timeout,
+                fallback_factory=fallback_factory,
+                candidate_normalizer=candidate_normalizer,
+                truncation_recovery=truncation_recovery,
+                images=images,
+                client=client,
+                backend=backend,
+                codex_timeout=codex_timeout,
+            )
+
+        if resume and output_path.exists():
+            cached = _load_valid_stage_cache(
+                path=output_path,
+                audit_dir=audit_dir,
+                stage_label=stage_label,
+                schema_stage=schema_stage,
+                extra_validation=final_extra_validation,
+            )
+            if cached is not None:
+                return cached
+
+        _clear_stage_outputs(output_dir, cleanup_stage)
+        _clear_ensemble_candidate_outputs(output_dir, output_path)
+        write_text(audit_dir / f"{stage_label}.md", prompt)
+        candidate_results: list[tuple[int, dict[str, Any]]] = []
+        candidate_errors: list[dict[str, Any]] = []
+
+        def _candidate_path(index: int) -> Path:
+            return output_path.with_name(f"{output_path.stem}_agent_{index}{output_path.suffix}")
+
+        def _run_candidate(index: int) -> dict[str, Any]:
+            return self._load_or_create_stage_json(
+                output_path=_candidate_path(index),
+                output_dir=output_dir,
+                audit_dir=audit_dir,
+                prompt=analysis_role_prompt(prompt, schema_stage, index),
+                stage_label=f"{stage_label}_agent_{index}",
+                cleanup_stage=f"{cleanup_stage}_ensemble",
+                schema_stage=schema_stage,
+                max_attempts=max_attempts,
+                resume=False,
+                extra_validation=candidate_extra_validation,
+                request_timeout=request_timeout,
+                fallback_factory=None,
+                candidate_normalizer=candidate_normalizer,
+                truncation_recovery=truncation_recovery,
+                images=images,
+                client=client,
+                backend=backend,
+                codex_timeout=codex_timeout,
+            )
+
+        with ThreadPoolExecutor(max_workers=width) as pool:
+            futures = {pool.submit(_run_candidate, index): index for index in range(1, width + 1)}
+            for future, index in futures.items():
+                try:
+                    candidate = future.result()
+                    candidate_results.append((index, candidate))
+                except Exception as exc:
+                    candidate_errors.append(
+                        {
+                            "agent": index,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+
+        try:
+            if not candidate_results:
+                raise RuntimeError(f"{stage_label} all {width} Codex analysis agents failed: {candidate_errors}")
+
+            first_index, merged = candidate_results[0]
+            added_by_agent: dict[str, int | None] = {
+                f"agent_{first_index}": _stage_item_count(schema_stage, merged)
+            }
+            for agent_index, candidate in candidate_results[1:]:
+                merged, added = merge_func(merged, candidate)
+                added_by_agent[f"agent_{agent_index}"] = added
+            if candidate_normalizer is not None:
+                merged = candidate_normalizer(merged)
+
+            issues = validate_stage(schema_stage, merged)
+            if final_extra_validation is not None:
+                issues.extend(final_extra_validation(merged))
+            if issues:
+                raise RuntimeError(f"{stage_label} ensemble did not pass validation: {format_issues(issues)}")
+        except Exception as exc:
+            if fallback_factory is None:
+                write_json(
+                    audit_dir / f"{stage_label}_ensemble_summary.json",
+                    {
+                        "ok": False,
+                        "agent_width": width,
+                        "successful_agents": len(candidate_results),
+                        "failed_agents": candidate_errors,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                )
+                raise
+            merged = fallback_factory(exc)
+            if merged is None:
+                raise
+            issues = validate_stage(schema_stage, merged)
+            if final_extra_validation is not None:
+                issues.extend(final_extra_validation(merged))
+            if issues:
+                raise RuntimeError(f"{stage_label} local fallback did not pass validation: {format_issues(issues)}") from exc
+            write_json(
+                audit_dir / f"local_fallback_{stage_label}.json",
+                {
+                    "ok": True,
+                    "reason": merged.get("_meta", {}).get("fallback_reason"),
+                    "fallback": merged.get("_meta", {}),
+                },
+            )
+            added_by_agent = {}
+
+        meta = dict(merged.get("_meta", {})) if isinstance(merged.get("_meta"), dict) else {}
+        meta.update(
+            {
+                "analysis_backend": CODEX_ANALYSIS_BACKEND,
+                "analysis_stage_label": stage_label,
+                "analysis_agent_width": width,
+            }
+        )
+        merged["_meta"] = meta
+        write_json(output_path, merged)
+        write_json(
+            audit_dir / f"{stage_label}_ensemble_summary.json",
+            {
+                "ok": True,
+                "agent_width": width,
+                "successful_agents": len(candidate_results),
+                "failed_agents": candidate_errors,
+                "added_by_agent": added_by_agent,
+                "total_items": _stage_item_count(schema_stage, merged),
+            },
+        )
+        return merged
+
     def _load_or_create_paper_thesis(
         self,
         *,
@@ -1024,7 +1044,7 @@ class ReviewPipeline:
                 audit_dir=audit_dir,
                 prompt=prompt,
                 stage_label="01c_extract_paper_thesis",
-                cleanup_stage="paper_thesis",  # unknown stage -> clears nothing (keeps facts)
+                cleanup_stage="paper_thesis",
                 schema_stage="paper_thesis",
                 max_attempts=max_attempts,
                 resume=resume,
@@ -1052,11 +1072,11 @@ class ReviewPipeline:
         audit_dir: Path,
         resume: bool,
         max_attempts: int,
-        template_fallback: bool,
+        analysis_fallback: bool,
     ) -> dict[str, Any]:
         """Round-1 cross-model ensemble: run the primary and the secondary multimodal model
         on the SAME extraction prompt+images in parallel, then union the two fact sets by
-        (type, name). The primary keeps the full safety net (floor check + template fallback);
+        (type, name). The primary keeps the full safety net (floor check + local analysis fallback);
         the secondary is best-effort (no floor, no fallback) so a secondary failure just
         leaves the primary result. Both reuse the same validation/normalization/repair path
         via the threaded ``client`` parameter."""
@@ -1097,7 +1117,7 @@ class ReviewPipeline:
         with ThreadPoolExecutor(max_workers=2) as pool:
             fut_primary = pool.submit(
                 _extract, self.client, primary_path, "01_extract_engineering_facts",
-                with_floor=True, with_fallback=template_fallback,
+                with_floor=True, with_fallback=analysis_fallback,
             )
             fut_secondary = pool.submit(
                 _extract, self.extraction_client_2, output_dir / "engineering_facts_model2.json",
@@ -1152,6 +1172,7 @@ class ReviewPipeline:
         resume: bool,
         max_attempts: int,
         max_rounds: int,
+        analysis_agent_width: int = DEFAULT_ANALYSIS_AGENT_WIDTH,
         analysis_backend: str = "llm",
         codex_analysis_timeout: float | None = None,
     ) -> dict[str, Any]:
@@ -1167,6 +1188,7 @@ class ReviewPipeline:
         if max_rounds <= 0:
             return facts
         chunks = paper.get("chunks", []) if isinstance(paper, dict) else []
+        dry_streak = 0
         for round_no in range(1, max_rounds + 1):
             coverage = compute_fact_coverage(chunks, facts.get("engineering_facts", []))
             write_json(audit_dir / f"facts_coverage_round_{round_no}.json", coverage)
@@ -1181,7 +1203,7 @@ class ReviewPipeline:
                 coverage_report_json=wrap_untrusted("coverage_report_json", pretty_json(coverage)),
             )
             try:
-                gap_doc = self._load_or_create_stage_json(
+                gap_doc = self._load_or_create_ensemble_stage_json(
                     output_path=output_dir / f"engineering_facts_gap_round_{round_no}.json",
                     output_dir=output_dir,
                     audit_dir=audit_dir,
@@ -1192,7 +1214,10 @@ class ReviewPipeline:
                     max_attempts=max_attempts,
                     resume=resume,
                     # No floor check: an empty gap result (nothing missing) is a valid outcome.
-                    extra_validation=lambda parsed: validate_fact_sources(
+                    candidate_extra_validation=lambda parsed: validate_fact_sources(
+                        parsed, valid_chunk_ids, valid_pages
+                    ),
+                    final_extra_validation=lambda parsed: validate_fact_sources(
                         parsed, valid_chunk_ids, valid_pages
                     ),
                     candidate_normalizer=lambda parsed: finalize_engineering_facts(
@@ -1202,6 +1227,8 @@ class ReviewPipeline:
                     images=paper_images,
                     backend=analysis_backend,
                     codex_timeout=codex_analysis_timeout,
+                    agent_width=analysis_agent_width,
+                    merge_func=merge_engineering_facts,
                     fallback_factory=None,
                 )
             except Exception as exc:
@@ -1219,7 +1246,11 @@ class ReviewPipeline:
             gap_meta["max_rounds"] = max_rounds
             terminal_stop = None
             if added == 0:
-                terminal_stop = "no_new_facts"
+                dry_streak += 1
+            else:
+                dry_streak = 0
+            if dry_streak >= 2:
+                terminal_stop = "two_semantic_dry_rounds"
             elif round_no >= max_rounds:
                 terminal_stop = "max_rounds"
             if terminal_stop is not None:
@@ -1236,10 +1267,11 @@ class ReviewPipeline:
                     "uncovered_figures_before": coverage.get("uncovered_figures"),
                     "uncovered_tables_before": coverage.get("uncovered_tables"),
                     "max_rounds": max_rounds,
+                    "semantic_dry_streak": dry_streak,
                     "stop_reason": terminal_stop,
                 },
             )
-            if added == 0:
+            if dry_streak >= 2:
                 break
         return facts
 
@@ -1255,6 +1287,7 @@ class ReviewPipeline:
         max_attempts: int,
         max_rounds: int,
         tasks_timeout: float,
+        analysis_agent_width: int = DEFAULT_ANALYSIS_AGENT_WIDTH,
         analysis_backend: str = "llm",
         codex_analysis_timeout: float | None = None,
     ) -> dict[str, Any]:
@@ -1268,6 +1301,7 @@ class ReviewPipeline:
         scheduled to reproduce twice."""
         if max_rounds <= 0:
             return tasks
+        dry_streak = 0
         for round_no in range(1, max_rounds + 1):
             coverage = compute_task_coverage(facts, tasks)
             write_json(audit_dir / f"tasks_coverage_round_{round_no}.json", coverage)
@@ -1305,7 +1339,7 @@ class ReviewPipeline:
                 paper_context_json=paper_context,
             )
             try:
-                gap_doc = self._load_or_create_stage_json(
+                gap_doc = self._load_or_create_ensemble_stage_json(
                     output_path=output_dir / f"repro_tasks_gap_round_{round_no}.json",
                     output_dir=output_dir,
                     audit_dir=audit_dir,
@@ -1315,12 +1349,15 @@ class ReviewPipeline:
                     schema_stage="repro_tasks",
                     max_attempts=max_attempts,
                     resume=resume,
-                    extra_validation=lambda parsed: validate_task_fact_refs(parsed, facts),
+                    candidate_extra_validation=lambda parsed: validate_task_fact_refs(parsed, facts),
+                    final_extra_validation=lambda parsed: validate_task_fact_refs(parsed, facts),
                     candidate_normalizer=lambda parsed: finalize_repro_tasks(parsed, facts),
                     truncation_recovery=recover_truncated_repro_tasks,
                     request_timeout=tasks_timeout,
                     backend=analysis_backend,
                     codex_timeout=codex_analysis_timeout,
+                    agent_width=analysis_agent_width,
+                    merge_func=merge_repro_tasks,
                     fallback_factory=None,
                 )
             except Exception as exc:
@@ -1351,7 +1388,11 @@ class ReviewPipeline:
             gap_meta["max_rounds"] = max_rounds
             terminal_stop = None
             if added == 0:
-                terminal_stop = "no_new_tasks"
+                dry_streak += 1
+            else:
+                dry_streak = 0
+            if dry_streak >= 2:
+                terminal_stop = "two_semantic_dry_rounds"
             elif round_no >= max_rounds:
                 terminal_stop = "max_rounds"
             if terminal_stop is not None:
@@ -1368,12 +1409,130 @@ class ReviewPipeline:
                     "uncovered_figures_before": coverage.get("uncovered_figures"),
                     "uncovered_tables_before": coverage.get("uncovered_tables"),
                     "max_rounds": max_rounds,
+                    "semantic_dry_streak": dry_streak,
                     "stop_reason": terminal_stop,
                 },
             )
-            if added == 0:
+            if dry_streak >= 2:
                 break
         return tasks
+
+    def _revise_analysis_from_requests(
+        self,
+        *,
+        tasks: dict[str, Any],
+        facts: dict[str, Any],
+        requests: list[dict[str, Any]],
+        paper_context: str,
+        paper_images: list[Any],
+        output_dir: Path,
+        audit_dir: Path,
+        revision_round: int,
+        max_attempts: int,
+        tasks_timeout: float,
+        analysis_backend: str,
+        codex_analysis_timeout: float | None,
+        analysis_agent_width: int,
+        valid_chunk_ids: set[str],
+        valid_pages: set[int],
+    ) -> tuple[dict[str, Any], dict[str, Any], int, int]:
+        affected = {str(item.get("task_id") or "") for item in requests if str(item.get("task_id") or "")}
+        revised_facts = facts
+        changed_facts = 0
+        scope_requests = [item for item in requests if str(item.get("category") or "") == "analysis_scope"]
+        if scope_requests:
+            fact_prompt = self.prompt_book.render(
+                "revise_engineering_facts.md",
+                existing_facts_json=wrap_untrusted("existing_facts_json", pretty_json(facts)),
+                revision_requests_json=wrap_untrusted("revision_requests_json", pretty_json(scope_requests)),
+                paper_context_json=paper_context,
+            )
+            fact_candidate = self._load_or_create_ensemble_stage_json(
+                output_path=output_dir / f"engineering_facts_revision_round_{revision_round}.json",
+                output_dir=output_dir,
+                audit_dir=audit_dir,
+                prompt=fact_prompt,
+                stage_label=f"01d_revision_round_{revision_round}",
+                cleanup_stage="facts_revision",
+                schema_stage="engineering_facts",
+                max_attempts=max_attempts,
+                resume=False,
+                images=paper_images,
+                candidate_extra_validation=lambda parsed: validate_fact_sources(parsed, valid_chunk_ids, valid_pages),
+                final_extra_validation=lambda parsed: validate_fact_sources(parsed, valid_chunk_ids, valid_pages),
+                candidate_normalizer=lambda parsed: finalize_engineering_facts(parsed, valid_chunk_ids, valid_pages),
+                truncation_recovery=recover_truncated_engineering_facts,
+                backend=analysis_backend,
+                codex_timeout=codex_analysis_timeout,
+                agent_width=analysis_agent_width,
+                merge_func=merge_engineering_facts,
+                fallback_factory=None,
+            )
+            revised_facts, changed_facts = merge_engineering_facts(facts, fact_candidate)
+        prompt = self.prompt_book.render(
+            "revise_repro_tasks.md",
+            existing_tasks_json=wrap_untrusted("existing_tasks_json", pretty_json(tasks)),
+            revision_requests_json=wrap_untrusted("revision_requests_json", pretty_json(requests)),
+            engineering_facts_json=wrap_untrusted("engineering_facts_json", pretty_json(revised_facts)),
+            paper_context_json=paper_context,
+        )
+        candidate = self._load_or_create_ensemble_stage_json(
+            output_path=output_dir / f"repro_tasks_revision_round_{revision_round}.json",
+            output_dir=output_dir,
+            audit_dir=audit_dir,
+            prompt=prompt,
+            stage_label=f"02c_revision_round_{revision_round}",
+            cleanup_stage="tasks_revision",
+            schema_stage="repro_tasks",
+            max_attempts=max_attempts,
+            resume=False,
+            candidate_extra_validation=lambda parsed: validate_task_fact_refs(parsed, revised_facts),
+            final_extra_validation=lambda parsed: validate_task_fact_refs(parsed, revised_facts),
+            candidate_normalizer=lambda parsed: finalize_repro_tasks(parsed, revised_facts),
+            truncation_recovery=recover_truncated_repro_tasks,
+            request_timeout=tasks_timeout,
+            images=paper_images,
+            backend=analysis_backend,
+            codex_timeout=codex_analysis_timeout,
+            agent_width=analysis_agent_width,
+            merge_func=merge_repro_tasks,
+            fallback_factory=None,
+        )
+        replacements = {
+            str(item.get("task_id")): item
+            for item in candidate.get("repro_tasks", [])
+            if isinstance(item, dict) and str(item.get("task_id") or "") in affected
+        }
+        original_tasks = tasks.get("repro_tasks") if isinstance(tasks.get("repro_tasks"), list) else []
+        revised_items: list[dict[str, Any]] = []
+        changed = 0
+        for item in original_tasks:
+            if not isinstance(item, dict):
+                continue
+            replacement = replacements.get(str(item.get("task_id") or ""))
+            if replacement is None:
+                revised_items.append(item)
+                continue
+            if json.dumps(item, ensure_ascii=False, sort_keys=True, default=str) != json.dumps(
+                replacement, ensure_ascii=False, sort_keys=True, default=str
+            ):
+                changed += 1
+            revised_items.append(replacement)
+        revised = dict(tasks)
+        revised["repro_tasks"] = revised_items
+        meta = dict(revised.get("_meta", {})) if isinstance(revised.get("_meta"), dict) else {}
+        history = list(meta.get("analysis_revisions", [])) if isinstance(meta.get("analysis_revisions"), list) else []
+        history.append(
+            {
+                "round": revision_round,
+                "requested_task_ids": sorted(affected),
+                "returned_task_ids": sorted(replacements),
+                "changed_tasks": changed,
+            }
+        )
+        meta["analysis_revisions"] = history
+        revised["_meta"] = meta
+        return revised_facts, revised, changed_facts, changed
 
     def _load_or_create_experiment_index(
         self,
@@ -1383,6 +1542,7 @@ class ReviewPipeline:
         facts: dict[str, Any],
         tasks: dict[str, Any],
         paper: dict[str, Any],
+        paper_memory: dict[str, Any] | None = None,
         resume: bool,
     ) -> dict[str, Any]:
         output_path = output_dir / "experiment_index.json"
@@ -1397,7 +1557,7 @@ class ReviewPipeline:
             if cached is not None:
                 return cached
 
-        experiment_index = build_local_experiment_index(facts, tasks, paper)
+        experiment_index = build_local_experiment_index(facts, tasks, paper, paper_memory)
         issues = validate_stage("experiment_index", experiment_index)
         if issues:
             raise RuntimeError(f"{stage_label} failed local validation: {format_issues(issues)}")
@@ -1412,299 +1572,6 @@ class ReviewPipeline:
         )
         return experiment_index
 
-    def _load_or_create_repro_manifest(
-        self,
-        *,
-        output_dir: Path,
-        audit_dir: Path,
-        max_attempts: int,
-        resume: bool,
-        allow_final_loose_manifest: bool,
-        facts: dict[str, Any],
-        tasks: dict[str, Any],
-        paper_context_json: str,
-        template_fallback: bool,
-        project_timeout: float | None,
-        images: list | None = None,
-        per_task_layout: bool = False,
-        paper_thesis: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        output_path = output_dir / "repro_project_manifest.json"
-        stage_label = "03_generate_repro_project"
-        if resume and output_path.exists():
-            # Per-task manifests have a different required-file set (no run_experiment.py, plus
-            # tasks/*.py). Validate the cache against the SAME set the generation path uses —
-            # otherwise a valid per-task manifest always fails resume validation and the whole
-            # (expensive) codegen silently re-runs in the same output dir.
-            cache_required: set[str] | None = None
-            if per_task_layout:
-                cached_manifest_tasks = build_tasks_manifest(tasks)
-                cache_required = expected_generated_paths(
-                    [t["script"] for t in cached_manifest_tasks["tasks"]]
-                )
-            cached = _load_valid_stage_cache(
-                path=output_path,
-                audit_dir=audit_dir,
-                stage_label=stage_label,
-                schema_stage="repro_project_manifest",
-                required_files=cache_required,
-            )
-            if cached is not None:
-                return cached
-
-        if resume:
-            recovered = _recover_manifest_from_audit(audit_dir)
-            if recovered is not None:
-                write_json(output_path, recovered)
-                write_json(audit_dir / f"resume_recovered_{stage_label}.json", {"ok": True, "source": "audit raw output"})
-                return recovered
-
-        _clear_stage_outputs(output_dir, "manifest")
-        try:
-            manifest = self._call_chunked_repro_project_generation(
-                facts=facts,
-                tasks=tasks,
-                paper_context_json=paper_context_json,
-                audit_dir=audit_dir,
-                max_attempts=max_attempts,
-                request_timeout=project_timeout,
-                images=images,
-                per_task_layout=per_task_layout,
-                paper_thesis=paper_thesis,
-            )
-        except Exception as exc:
-            if not template_fallback:
-                raise
-            manifest = build_template_repro_project_manifest(
-                facts=facts,
-                tasks=tasks,
-                reason=f"LLM project manifest generation failed: {exc}",
-            )
-            write_json(
-                audit_dir / f"template_fallback_{stage_label}.json",
-                {
-                    "ok": True,
-                    "reason": manifest.get("_meta", {}).get("template_fallback_reason"),
-                    "template": manifest.get("_meta", {}).get("template_name"),
-                },
-            )
-        write_json(output_path, manifest)
-        return manifest
-
-    def _call_chunked_repro_project_generation(
-        self,
-        *,
-        facts: dict[str, Any],
-        tasks: dict[str, Any],
-        paper_context_json: str,
-        audit_dir: Path,
-        max_attempts: int,
-        request_timeout: float | None,
-        images: list | None = None,
-        per_task_layout: bool = False,
-        paper_thesis: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        facts_json = wrap_untrusted("engineering_facts_json", pretty_json(facts))
-        tasks_json = wrap_untrusted("repro_tasks_json", pretty_json(tasks))
-        thesis_anchor = _thesis_anchor_text(paper_thesis)  # "" unless --science-loop yielded a thesis
-
-        # Per-task layout: the model generates the shared science + one tasks/<module>.py per
-        # repro_task; run_experiment.py / tasks_manifest.json / src/_io.py are harness-injected.
-        task_manifest = build_tasks_manifest(tasks) if per_task_layout else None
-        task_scripts = [t["script"] for t in task_manifest["tasks"]] if task_manifest else None
-        task_id_by_script = (
-            {t["script"]: t["task_id"] for t in task_manifest["tasks"]} if task_manifest else {}
-        )
-        plan_expected = expected_generated_paths(task_scripts) if per_task_layout else None
-
-        plan_prompt = self.prompt_book.render(
-            "generate_repro_project_plan.md",
-            engineering_facts_json=facts_json,
-            repro_tasks_json=tasks_json,
-            paper_context_json=paper_context_json,
-        )
-        if per_task_layout:
-            plan_prompt += _per_task_plan_override(task_scripts)
-        plan_prompt += thesis_anchor  # reproduce the paper's CONCLUSION, not just its formulas
-        plan_label = "03a_generate_repro_project_plan"
-        write_text(audit_dir / f"{plan_label}.md", plan_prompt)
-        plan = self._call_validated_json(
-            prompt=plan_prompt,
-            stage_label=plan_label,
-            schema_stage="repro_project_plan",
-            audit_dir=audit_dir,
-            max_attempts=max_attempts,
-            extra_validation=(
-                (lambda candidate: _validate_project_plan_paths(candidate, plan_expected))
-                if per_task_layout
-                else _validate_project_plan_paths
-            ),
-            request_timeout=request_timeout,
-            images=images,
-        )
-        write_json(audit_dir / "03a_generate_repro_project_plan.json", plan)
-
-        files: list[dict[str, Any]] = []
-        for index, path in enumerate(_ordered_project_paths(plan, task_scripts), start=1):
-            file_label = f"03b_generate_repro_project_file_{index:02d}_{_manifest_path_slug(path)}"
-            file_prompt = self.prompt_book.render(
-                "generate_repro_project_file.md",
-                target_path=path,
-                project_plan_json=wrap_untrusted("project_plan_json", pretty_json(plan)),
-                generated_files_context_json=wrap_untrusted("generated_files_context_json", _generated_files_context(files)),
-                engineering_facts_json=facts_json,
-                repro_tasks_json=tasks_json,
-                paper_context_json=paper_context_json,
-                review_feedback_json="",
-            )
-            if per_task_layout and path in task_id_by_script:
-                file_prompt += _per_task_file_override(task_id_by_script[path], tasks, _available_src_symbols(files))
-            elif per_task_layout and path.startswith("src/") and path.endswith(".py"):
-                file_prompt += _per_task_src_override()
-            # Anchor every science-bearing file (src/*, tasks/*, run_experiment.py) to the
-            # paper's thesis: the conclusion to reproduce, not just the formula to copy.
-            if path.endswith(".py") and path != "src/_io.py":
-                file_prompt += thesis_anchor
-            write_text(audit_dir / f"{file_label}.md", file_prompt)
-            parsed = self._call_validated_json(
-                prompt=file_prompt,
-                stage_label=file_label,
-                schema_stage="repro_project_file",
-                audit_dir=audit_dir,
-                max_attempts=max_attempts,
-                extra_validation=lambda candidate, expected=path: _validate_project_file(candidate, expected),
-                candidate_normalizer=normalize_repro_project_file_candidate,
-                request_timeout=request_timeout,
-                # Per-file code generation goes to the (possibly text-only) generation
-                # client when configured; no images here (they go to the plan 03a only).
-                client=self.client,
-            )
-            files.append({"path": parsed["path"], "content_lines": parsed["content_lines"]})
-            write_json(
-                audit_dir / f"partial_{file_label}.json",
-                {
-                    "ok": True,
-                    "path": parsed["path"],
-                    "line_count": len(parsed.get("content_lines", [])),
-                    "generated_files": [item["path"] for item in files],
-                },
-            )
-
-        manifest = {
-            "files": files,
-            "_meta": {
-                "chunked_generation_used": True,
-                "chunked_generation_stage": "03_generate_repro_project",
-                "project_plan": {
-                    "implementation_strategy": plan.get("implementation_strategy"),
-                    "assumptions": plan.get("assumptions", []),
-                },
-                "generated_paths": [item["path"] for item in files],
-                **({"tasks_manifest": task_manifest} if task_manifest else {}),
-            },
-        }
-        issues = validate_stage("repro_project_manifest", manifest, required_files=plan_expected)
-        write_json(
-            audit_dir / "validation_03_generate_repro_project_chunked_manifest.json",
-            {"ok": not issues, "errors": [issue.as_dict() for issue in issues]},
-        )
-        if issues:
-            raise RuntimeError(f"chunked repro project manifest did not pass validation: {format_issues(issues)}")
-        write_json(audit_dir / "03_generate_repro_project_chunked_manifest.json", manifest)
-        return manifest
-
-    def _write_template_repro_project(
-        self,
-        *,
-        facts: dict[str, Any],
-        tasks: dict[str, Any],
-        output_dir: Path,
-        audit_dir: Path,
-        repro_project_dir: Path,
-        reason: str,
-    ) -> tuple[dict[str, Any], list[Path]]:
-        _clear_stage_outputs(output_dir, "project")
-        manifest = build_template_repro_project_manifest(facts=facts, tasks=tasks, reason=reason)
-        write_json(output_dir / "repro_project_manifest.json", manifest)
-        write_json(
-            audit_dir / "template_fallback_03_generate_repro_project.json",
-            {
-                "ok": True,
-                "reason": manifest.get("_meta", {}).get("template_fallback_reason"),
-                "template": manifest.get("_meta", {}).get("template_name"),
-            },
-        )
-        # Bug B: atomically replace the on-disk project. Without this, orphan files from the
-        # earlier free-form generation (e.g. a stray src/precoding.py or a syntax-errored
-        # channel.py) survive the template write and are what actually get run/reviewed,
-        # making the manifest, the disk, and template_fallback_used mutually inconsistent.
-        _clear_project_code_files(repro_project_dir)
-        written_files = write_file_manifest(manifest, repro_project_dir)
-        inject_io_runtime(repro_project_dir)
-        return manifest, written_files
-
-    def _ensure_repro_project_from_manifest(
-        self,
-        *,
-        manifest: dict[str, Any],
-        output_dir: Path,
-        repro_project_dir: Path,
-        resume: bool,
-    ) -> list[Path]:
-        if resume and repro_project_dir.exists():
-            validation = validate_repro_project(repro_project_dir)
-            if validation.get("required_files_present") and validation.get("python_compiles"):
-                inject_io_runtime(repro_project_dir)
-                _inject_task_scaffolding(manifest, repro_project_dir)
-                return _manifest_paths(manifest, repro_project_dir)
-
-        _clear_stage_outputs(output_dir, "project")
-        written = write_file_manifest(manifest, repro_project_dir)
-        # Drop the trusted src/_io.py runtime in so generated code can delegate all
-        # artifact serialization/self-check to deterministic code instead of re-deriving
-        # it (and getting it wrong) per file. Idempotent; runs before code review / run.
-        inject_io_runtime(repro_project_dir)
-        # Per-task layout: drop in the harness-owned run_experiment.py dispatcher,
-        # tasks/__init__.py and tasks_manifest.json (no-op for the legacy single-script layout).
-        _inject_task_scaffolding(manifest, repro_project_dir)
-        return written
-
-    def _load_or_run_repro(
-        self,
-        *,
-        output_dir: Path,
-        repro_project_dir: Path,
-        repair_attempts: int,
-        run_timeout: float,
-        resume: bool,
-    ) -> dict[str, Any]:
-        if resume:
-            cached_runtime = _load_cached_runtime_result(output_dir, repro_project_dir)
-            if cached_runtime is not None:
-                return cached_runtime
-
-        _clear_stage_outputs(output_dir, "runtime")
-        try:
-            runtime_result = run_repro_with_repair(
-                repro_project_dir=repro_project_dir,
-                client=self.client,
-                prompt_book=self.prompt_book,
-                system_message=SYSTEM_MESSAGE,
-                max_repair_attempts=repair_attempts,
-                timeout_seconds=run_timeout,
-            )
-        except Exception as exc:
-            runtime_result = {
-                "enabled": True,
-                "passed": False,
-                "repair_backend": "llm",
-                "pipeline_error": str(exc),
-                "attempts": [],
-                "artifacts": {},
-            }
-        write_json(output_dir / "runtime_result.json", runtime_result)
-        return runtime_result
-
     def _render_paper_images(self, *, paper_path: Path, paper: dict[str, Any]) -> list:
         """Render every page of a PDF paper to images for multimodal prompting, so the
         figures/diagrams/axis-labels/in-figure values that plain text extraction drops are
@@ -1718,7 +1585,7 @@ class ReviewPipeline:
         if self.client is not None and not hasattr(self.client, "complete_multimodal"):
             return []
         try:
-            from .result_review import render_pdf_pages_for_llm
+            from .paper_evidence import render_pdf_pages_for_llm
 
             # No token budget concern here; render all pages up to a generous safety cap.
             return render_pdf_pages_for_llm(paper_path, pages=None, max_pages=60)
@@ -1752,7 +1619,6 @@ class ReviewPipeline:
         audit_dir: Path,
         max_attempts: int,
         extra_validation: Callable[[dict[str, Any]], list[ValidationIssue]] | None = None,
-        allow_final_loose_manifest: bool = False,
         request_timeout: float | None = None,
         candidate_normalizer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         truncation_recovery: Callable[[str], dict[str, Any] | None] | None = None,
@@ -1788,9 +1654,8 @@ class ReviewPipeline:
             write_text(audit_dir / f"raw_{stage_label}_attempt_{attempt}.txt", raw)
             write_text(audit_dir / f"raw_{stage_label}.txt", raw)
 
-            allow_loose = allow_final_loose_manifest and attempt == max_attempts
             try:
-                parsed = parse_json_object(raw, allow_loose_manifest=allow_loose)
+                parsed = parse_json_object(raw)
             except Exception as exc:
                 recovered = truncation_recovery(raw) if truncation_recovery is not None else None
                 if recovered is None:
@@ -1803,8 +1668,6 @@ class ReviewPipeline:
                     continue
                 parsed = recovered
 
-            if schema_stage == "repro_project_manifest":
-                parsed = normalize_repro_project_manifest_candidate(parsed)
             if candidate_normalizer is not None:
                 parsed = candidate_normalizer(parsed)
 
@@ -1826,79 +1689,6 @@ class ReviewPipeline:
             current_prompt = build_json_retry_prompt(prompt, summarize_bad_output(pretty_json(parsed)), last_errors)
 
         raise RuntimeError(f"{stage_label} did not pass JSON validation after {max_attempts} attempts: {last_errors}")
-
-    def _run_result_review_if_ready(
-        self,
-        *,
-        enabled: bool,
-        run_repro: bool,
-        runtime_result: dict[str, Any],
-        template_fallback_used: bool,
-        paper_path: Path,
-        paper: dict[str, Any],
-        facts: dict[str, Any],
-        tasks: dict[str, Any],
-        paper_context_json: str,
-        repro_project_dir: Path,
-        output_dir: Path,
-        audit_dir: Path,
-        max_attempts: int,
-        resume: bool,
-        paper_thesis: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        if not run_repro:
-            return {"enabled": False, "passed": None, "reason": "skipped because --run-repro was not requested"}
-        if not enabled:
-            return {"enabled": False, "passed": None, "reason": "disabled by --no-result-review"}
-        if template_fallback_used:
-            # A template fallback project is a generic, paper-agnostic simulation. Comparing
-            # its plots/metrics against the paper would manufacture a misleading
-            # result-alignment signal, so we refuse to review it and let the verdict fall to
-            # inconclusive instead. (P0-1: a fallback is a failure, not a success to dress up.)
-            return {
-                "enabled": False,
-                "passed": None,
-                "reason": "skipped because a template fallback project was used; reviewing a generic template against the paper is not meaningful",
-            }
-        partial = runtime_result.get("partial_success")
-        has_partial = isinstance(partial, dict) and partial.get("has_partial_output")
-        if not runtime_result.get("passed") and not has_partial:
-            return {"enabled": False, "passed": None, "reason": "skipped because guarded reproduction produced no usable output"}
-        # Run the per-experiment review on a fully-passed OR a partial run: it objectively
-        # judges which experiments reproduced and which did not, so one failed experiment does
-        # not negate the whole reproduction (it is recorded and the rest are still assessed).
-
-        if resume:
-            cached_status = _load_cached_result_review_status(output_dir)
-            if cached_status is not None:
-                return cached_status
-
-        _clear_stage_outputs(output_dir, "result_review")
-        try:
-            return run_result_review(
-                client=self.client,
-                prompt_book=self.prompt_book,
-                system_message=SYSTEM_MESSAGE,
-                paper_path=paper_path.expanduser().resolve(),
-                paper=paper,
-                facts=facts,
-                tasks=tasks,
-                paper_context_json=paper_context_json,
-                repro_project_dir=repro_project_dir,
-                output_dir=output_dir,
-                audit_dir=audit_dir,
-                max_attempts=max_attempts,
-                paper_thesis=paper_thesis,
-            )
-        except Exception as exc:
-            result = {
-                "enabled": True,
-                "passed": False,
-                "error": str(exc),
-                "reason": "result-level multimodal review failed",
-            }
-            write_json(output_dir / "result_review_error.json", result)
-            return result
 
     def _generate_docx_reports(
         self,
@@ -1983,4 +1773,3 @@ class ReviewPipeline:
                 error_path.unlink()
 
         return result
-

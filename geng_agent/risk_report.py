@@ -119,7 +119,6 @@ def build_risk_report(
     validation: dict[str, Any],
     runtime_result: dict[str, Any] | None = None,
     scientific_check: dict[str, Any] | None = None,
-    manifest_meta: dict[str, Any] | None = None,
     result_review_result: dict[str, Any] | None = None,
     paper_format: str | None = None,
 ) -> dict[str, Any]:
@@ -137,7 +136,7 @@ def build_risk_report(
     if paper_format == "pdf":
         findings.append({
             "type": "pdf_images_lost",
-            "message": "PDF 转 text chunks 时，嵌入的图片、图表、坐标轴、星座图等视觉信息已丢失。source_kind=figure 的事实仅能通过后续多模态页面 PNG 部分补偿（① facts 抽取、③a 计划、④ 结果审查阶段）。逐文件代码生成等阶段看不到图片内容，强烈建议人工对照原始 PDF 核对所有图相关结论。",
+            "message": "PDF 转 text chunks 时，嵌入的图片、图表、坐标轴、星座图等视觉信息会丢失。source_kind=figure 的事实通过多模态页面 PNG 和任务级论文证据包补偿，仍建议人工核对关键图结论。",
             "severity": "high",
             "mitigation": "多模态模型在支持阶段会收到页面渲染 PNG；非 PDF 或无图论文不受此影响。",
             "always_injected_for_pdfs": True,
@@ -148,16 +147,17 @@ def build_risk_report(
     if assumptions:
         findings.append({"type": "assumptions_required", "message": "复现任务需要使用假设参数。", "count": len(assumptions)})
     if not validation.get("required_files_present"):
-        findings.append({"type": "generated_project_incomplete", "message": "LLM 生成的复现项目缺少必要文件。", "missing_files": validation.get("missing_files", [])})
+        findings.append({"type": "generated_project_incomplete", "message": "Codex task writer 交付的复现项目缺少必要文件。", "missing_files": validation.get("missing_files", [])})
     if not validation.get("python_compiles"):
-        findings.append({"type": "generated_code_compile_error", "message": "LLM 生成的 Python 文件存在语法错误。", "compile_errors": validation.get("compile_errors", [])})
+        findings.append({"type": "generated_code_compile_error", "message": "Codex task writer 交付的 Python 文件存在语法错误。", "compile_errors": validation.get("compile_errors", [])})
     if runtime_result and runtime_result.get("enabled") and not runtime_result.get("passed"):
         findings.append(
             {
                 "type": "generated_project_runtime_failed",
-                "message": "生成的复现项目自动运行失败，已记录结构化日志。",
-                "repair_attempts_used": runtime_result.get("repair_attempts_used"),
-                "logs_dir": runtime_result.get("logs_dir"),
+                "message": "部分 Codex task writer 未完成可验收的 full 运行或交付。",
+                "coverage": runtime_result.get("coverage"),
+                "delivery_coverage": runtime_result.get("delivery_coverage"),
+                "per_task": runtime_result.get("per_task", []),
                 "pipeline_error": runtime_result.get("pipeline_error"),
             }
         )
@@ -176,19 +176,8 @@ def build_risk_report(
         findings.append(
             {
                 "type": "generated_project_partial_success",
-                "message": "生成项目未整体通过，但产出了部分有效结果；已保留生成项目而非退模板，失败的实验需人工核对。",
+                "message": "任务级项目未整体通过，但产出了部分有效结果；已保留可验收任务产物，失败任务需人工核对。",
                 "valid_csv_files": partial_success.get("valid_csv_files", []),
-            }
-        )
-    if manifest_meta and manifest_meta.get("loose_recovery_used"):
-        findings.append({"type": "loose_json_recovery_used", "message": "文件 manifest 曾使用宽松恢复，代码内容需要人工抽查。"})
-    if manifest_meta and manifest_meta.get("template_fallback_used"):
-        findings.append(
-            {
-                "type": "template_fallback_used",
-                "message": "自由生成复现项目不稳定，本次使用了本地确定性模板兜底。",
-                "reason": manifest_meta.get("template_fallback_reason"),
-                "template": manifest_meta.get("template_name"),
             }
         )
     stage_fallbacks = _local_stage_fallbacks(facts, tasks)
@@ -229,7 +218,7 @@ def build_risk_report(
     if scientific_check and scientific_check.get("issues"):
         findings.append({"type": "scientific_check_issues", "message": "复现任务缺少部分通信实验语义约束。", "count": len(scientific_check["issues"])})
     if result_review_result and result_review_result.get("enabled") and not result_review_result.get("passed"):
-        findings.append({"type": "result_review_failed", "message": "结果级多模态审查未完成。", "error": result_review_result.get("error")})
+        findings.append({"type": "result_review_failed", "message": "任务级 writer 自审报告未完成。", "error": result_review_result.get("error")})
 
     dimensions = build_risk_dimensions(
         missing=missing if isinstance(missing, list) else [],
@@ -239,7 +228,6 @@ def build_risk_report(
         scientific_check=scientific_check or {},
         tasks=tasks,
         result_review_result=result_review_result or {},
-        manifest_meta=manifest_meta or {},
         stage_fallback_used=bool(stage_fallbacks),
     )
     return {
@@ -263,7 +251,6 @@ def build_risk_dimensions(
     scientific_check: dict[str, Any],
     tasks: dict[str, Any],
     result_review_result: dict[str, Any],
-    manifest_meta: dict[str, Any],
     stage_fallback_used: bool = False,
 ) -> dict[str, dict[str, Any]]:
     runtime_enabled = bool(runtime_result.get("enabled"))
@@ -274,8 +261,6 @@ def build_risk_dimensions(
     requirement_warnings = runtime_result.get("requirements_warnings", []) if isinstance(runtime_result, dict) else []
     result_review_enabled = bool(result_review_result.get("enabled"))
     result_review_passed = result_review_result.get("passed")
-    template_fallback_used = bool(manifest_meta.get("template_fallback_used"))
-
     return {
         "information_completeness": _dimension(
             "high" if stage_fallback_used or len(missing) >= 5 else "medium" if missing or assumptions else "low",
@@ -283,7 +268,7 @@ def build_risk_dimensions(
         ),
         "implementation_fidelity": _dimension(
             "high"
-            if not validation.get("required_files_present") or not validation.get("python_compiles") or template_fallback_used
+            if not validation.get("required_files_present") or not validation.get("python_compiles")
             else "medium"
             if scientific_issues
             else "low",
@@ -291,7 +276,6 @@ def build_risk_dimensions(
                 f"required_files_present={validation.get('required_files_present')}",
                 f"python_compiles={validation.get('python_compiles')}",
                 f"scientific_issues={len(scientific_issues)}",
-                f"template_fallback_used={template_fallback_used}",
             ],
         ),
         "runtime_reliability": _dimension(
@@ -309,13 +293,11 @@ def build_risk_dimensions(
                 result_review_enabled,
                 result_review_passed,
                 scientific_issues,
-                template_fallback_used,
             ),
             [
                 f"result_review_enabled={result_review_enabled}",
                 f"result_review_passed={result_review_passed}",
                 f"scientific_issues={len(scientific_issues)}",
-                f"template_fallback_used={template_fallback_used}",
             ],
         ),
         "baseline_fairness": _dimension("high" if _count_missing_baselines(tasks) else "low", [f"tasks_without_baseline={_count_missing_baselines(tasks)}"]),
@@ -352,12 +334,7 @@ def _result_alignment_level(
     result_review_enabled: bool,
     result_review_passed: Any,
     scientific_issues: list[Any],
-    template_fallback_used: bool = False,
 ) -> str:
-    if template_fallback_used:
-        # A generic template was run, not the paper's method: its outputs cannot align
-        # with the paper, regardless of whether the template itself executed cleanly.
-        return "high"
     if not runtime_enabled:
         return "medium"
     if runtime_enabled and not runtime_passed:

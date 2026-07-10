@@ -16,33 +16,6 @@ class ReproducibilityVerdictTests(unittest.TestCase):
         self.assertEqual(verdict["confidence"], "high")
         self.assertTrue(any("did not pass" in reason for reason in verdict["reasons"]))
 
-    def test_template_fallback_caps_positive_verdict_at_inconclusive(self) -> None:
-        # A template fallback means the paper's own code never ran; even a clean
-        # match/high-credibility result (from the generic template) must not be reported
-        # as reproduced. P0-1: cap to inconclusive, not partially_reproduced.
-        verdict = derive_reproducibility_verdict(
-            risk_report={"risk_level": "low"},
-            runtime_result={"enabled": True, "passed": True},
-            result_review={"overall_alignment": "match", "overall_result_credibility": "high"},
-            manifest={"_meta": {"template_fallback_used": True}},
-        )
-
-        self.assertEqual(verdict["verdict"], "inconclusive")
-        self.assertEqual(verdict["confidence"], "low")
-        self.assertTrue(any("template_fallback_used=true" in reason for reason in verdict["reasons"]))
-
-    def test_template_fallback_also_caps_would_be_positive_partial(self) -> None:
-        # partial_match + medium credibility would otherwise yield a reproduced-family
-        # verdict; with a template fallback it must still drop to inconclusive.
-        verdict = derive_reproducibility_verdict(
-            risk_report={"risk_level": "medium"},
-            runtime_result={"enabled": True, "passed": True},
-            result_review={"overall_alignment": "partial_match", "overall_result_credibility": "medium"},
-            manifest={"_meta": {"template_fallback_used": True}},
-        )
-
-        self.assertEqual(verdict["verdict"], "inconclusive")
-
     def test_partial_output_yields_partially_reproduced(self) -> None:
         # One experiment failing must not negate the whole run: partial output + a passing
         # per-experiment review -> partially_reproduced, not failed_to_reproduce.

@@ -11,8 +11,7 @@ from .codex_runner import run_codex_subprocess
 from .json_utils import parse_json_object, pretty_json
 from .llm import LLMImage
 from .outputs import write_json, write_text
-from .pipeline_helpers import summarize_bad_output
-from .runner import build_json_retry_prompt
+from .pipeline_helpers import build_json_retry_prompt, summarize_bad_output
 from .schema_models import model_for_stage
 from .schemas import ValidationIssue, format_issues, validate_stage
 

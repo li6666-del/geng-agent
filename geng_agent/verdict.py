@@ -17,16 +17,13 @@ def derive_reproducibility_verdict(
     risk_report: dict[str, Any] | None = None,
     runtime_result: dict[str, Any] | None = None,
     result_review: dict[str, Any] | None = None,
-    manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Derive a compact final reproducibility verdict from pipeline artifacts."""
     risk_report = risk_report if isinstance(risk_report, dict) else {}
     runtime_result = runtime_result if isinstance(runtime_result, dict) else {}
     result_review = result_review if isinstance(result_review, dict) else {}
-    manifest = manifest if isinstance(manifest, dict) else {}
 
     reasons: list[str] = []
-    template_fallback_used = _template_fallback_used(risk_report, runtime_result, manifest)
     risk_level = _risk_level(risk_report)
 
     if runtime_result.get("passed") is False and not _has_partial_output(runtime_result):
@@ -74,31 +71,22 @@ def derive_reproducibility_verdict(
             "按部分复现处理：逐实验核对哪些已复现、哪些缺失或失败；尽量补齐失败的实验后重跑，再追求更完整的结论。",
         )
 
-    if template_fallback_used:
-        reasons.append("template_fallback_used=true limits the strength of any reproduction claim")
-
     if not result_review:
         reasons.append("result_review is missing")
-        return _limited_by_template(
-            _result(
-                "inconclusive",
-                "low",
-                reasons,
-                "Run result-level review before making a reproduction claim.",
-            ),
-            template_fallback_used,
+        return _result(
+            "inconclusive",
+            "low",
+            reasons,
+            "Run result-level review before making a reproduction claim.",
         )
 
     if result_review.get("passed") is False:
         reasons.append("result_review failed")
-        return _limited_by_template(
-            _result(
-                "inconclusive",
-                "medium",
-                reasons,
-                "Inspect result_review_error.json and rerun the multimodal result review.",
-            ),
-            template_fallback_used,
+        return _result(
+            "inconclusive",
+            "medium",
+            reasons,
+            "Inspect result_review_error.json and rerun the task-writer report assembly.",
         )
 
     alignment = _normalized_label(
@@ -137,39 +125,27 @@ def derive_reproducibility_verdict(
         else:
             verdict = "partially_reproduced"
             confidence = "medium"
-        return _limited_by_template(
-            _result(verdict, confidence, reasons, _positive_action(verdict)),
-            template_fallback_used,
-        )
+        return _result(verdict, confidence, reasons, _positive_action(verdict))
 
     if alignment in {"close", "partial_match", "mostly_match", "match"} and credibility in {"high", "medium"}:
         verdict = "mostly_reproduced" if risk_level in {"", "low", "medium"} else "partially_reproduced"
         confidence = "medium" if risk_level != "high" else "low"
-        return _limited_by_template(
-            _result(verdict, confidence, reasons, _positive_action(verdict)),
-            template_fallback_used,
-        )
+        return _result(verdict, confidence, reasons, _positive_action(verdict))
 
     if alignment in {"partial", "partial_match"} or credibility == "medium":
-        return _limited_by_template(
-            _result(
-                "partially_reproduced",
-                "medium" if risk_level != "high" else "low",
-                reasons,
-                "Treat the run as partial evidence; document gaps and rerun with full parameters where possible.",
-            ),
-            template_fallback_used,
+        return _result(
+            "partially_reproduced",
+            "medium" if risk_level != "high" else "low",
+            reasons,
+            "Treat the run as partial evidence; document gaps and rerun with full parameters where possible.",
         )
 
     reasons.append("result review did not contain enough positive alignment evidence")
-    return _limited_by_template(
-        _result(
-            "inconclusive",
-            "low",
-            reasons,
-            "Collect stronger result evidence and rerun result-level review.",
-        ),
-        template_fallback_used,
+    return _result(
+        "inconclusive",
+        "low",
+        reasons,
+        "Collect stronger result evidence and rerun result-level review.",
     )
 
 
@@ -184,41 +160,12 @@ def _result(verdict: str, confidence: str, reasons: list[str], recommended_actio
     }
 
 
-def _limited_by_template(result: dict[str, Any], template_fallback_used: bool) -> dict[str, Any]:
-    if not template_fallback_used:
-        return result
-    if result["verdict"] in {"fully_reproduced", "mostly_reproduced", "partially_reproduced"}:
-        result = dict(result)
-        result["verdict"] = "inconclusive"
-        result["confidence"] = _min_confidence(result["confidence"], "low")
-        result["recommended_action"] = (
-            "Template fallback was used: the paper's own reproduction code did not run, so the result evidence comes from a generic template, not the paper's method. Treat as inconclusive and reproduce the paper's method manually before any positive claim."
-        )
-    return result
-
-
 def _has_partial_output(runtime_result: dict[str, Any]) -> bool:
     """True when a not-fully-passing run still produced usable per-experiment outputs (kept
-    instead of falling back to a template). Lets the verdict treat it as partial reproduction
-    rather than total failure."""
+    by task writers). Lets the verdict treat it as partial reproduction rather than total
+    failure."""
     partial = runtime_result.get("partial_success")
     return isinstance(partial, dict) and bool(partial.get("has_partial_output"))
-
-
-def _template_fallback_used(
-    risk_report: dict[str, Any],
-    runtime_result: dict[str, Any],
-    manifest: dict[str, Any],
-) -> bool:
-    if runtime_result.get("template_fallback_used"):
-        return True
-    meta = manifest.get("_meta") if isinstance(manifest.get("_meta"), dict) else {}
-    if meta.get("template_fallback_used"):
-        return True
-    for finding in risk_report.get("findings", []):
-        if isinstance(finding, dict) and finding.get("type") == "template_fallback_used":
-            return True
-    return False
 
 
 def _risk_level(risk_report: dict[str, Any]) -> str:
@@ -244,13 +191,6 @@ def _risk_level(risk_report: dict[str, Any]) -> str:
 
 def _normalized_label(value: Any) -> str:
     return str(value).strip().lower().replace("-", "_") if value is not None else ""
-
-
-def _min_confidence(current: str, cap: str) -> str:
-    order = {"low": 0, "medium": 1, "high": 2}
-    current_level = order.get(current, 0)
-    cap_level = order.get(cap, 0)
-    return min(order, key=lambda key: abs(order[key] - min(current_level, cap_level)))
 
 
 def _positive_action(verdict: str) -> str:

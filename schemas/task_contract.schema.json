@@ -1,0 +1,262 @@
+{
+  "$defs": {
+    "TaskContractBackend": {
+      "additionalProperties": false,
+      "properties": {
+        "requested": {
+          "enum": [
+            "auto",
+            "cpu",
+            "gpu"
+          ],
+          "title": "Requested",
+          "type": "string"
+        },
+        "allow_cpu_fallback": {
+          "title": "Allow Cpu Fallback",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "requested",
+        "allow_cpu_fallback"
+      ],
+      "title": "TaskContractBackend",
+      "type": "object"
+    },
+    "TaskContractInput": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "source": {
+          "minLength": 1,
+          "title": "Source",
+          "type": "string"
+        },
+        "value": {
+          "default": null,
+          "title": "Value"
+        },
+        "required": {
+          "title": "Required",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "source",
+        "required"
+      ],
+      "title": "TaskContractInput",
+      "type": "object"
+    },
+    "TaskContractResources": {
+      "additionalProperties": false,
+      "properties": {
+        "execution_class": {
+          "enum": [
+            "cpu_light",
+            "cpu_heavy",
+            "gpu",
+            "unknown"
+          ],
+          "title": "Execution Class",
+          "type": "string"
+        },
+        "cpu_cores": {
+          "minimum": 1,
+          "title": "Cpu Cores",
+          "type": "integer"
+        },
+        "ram_gb": {
+          "exclusiveMinimum": 0,
+          "title": "Ram Gb",
+          "type": "number"
+        },
+        "gpu_count": {
+          "minimum": 0,
+          "title": "Gpu Count",
+          "type": "integer"
+        },
+        "vram_gb": {
+          "minimum": 0,
+          "title": "Vram Gb",
+          "type": "number"
+        },
+        "confidence": {
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "title": "Confidence",
+          "type": "string"
+        }
+      },
+      "required": [
+        "execution_class",
+        "cpu_cores",
+        "ram_gb",
+        "gpu_count",
+        "vram_gb",
+        "confidence"
+      ],
+      "title": "TaskContractResources",
+      "type": "object"
+    },
+    "TaskContractOutput": {
+      "additionalProperties": false,
+      "properties": {
+        "path_pattern": {
+          "minLength": 1,
+          "title": "Path Pattern",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "csv",
+            "png",
+            "json",
+            "text",
+            "other"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "required": {
+          "title": "Required",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "path_pattern",
+        "kind",
+        "required"
+      ],
+      "title": "TaskContractOutput",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "task_id": {
+      "minLength": 1,
+      "title": "Task Id",
+      "type": "string"
+    },
+    "experiment_id": {
+      "minLength": 1,
+      "title": "Experiment Id",
+      "type": "string"
+    },
+    "memory_snapshot_hash": {
+      "minLength": 1,
+      "title": "Memory Snapshot Hash",
+      "type": "string"
+    },
+    "reproducibility_mode": {
+      "enum": [
+        "native_full",
+        "scaled_full",
+        "proxy_only",
+        "environment_blocked",
+        "upstream_patch_required"
+      ],
+      "title": "Reproducibility Mode",
+      "type": "string"
+    },
+    "inputs": {
+      "items": {
+        "$ref": "#/$defs/TaskContractInput"
+      },
+      "title": "Inputs",
+      "type": "array"
+    },
+    "outputs": {
+      "items": {
+        "$ref": "#/$defs/TaskContractOutput"
+      },
+      "minItems": 1,
+      "title": "Outputs",
+      "type": "array"
+    },
+    "equations": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Equations",
+      "type": "array"
+    },
+    "algorithm_steps": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "minItems": 1,
+      "title": "Algorithm Steps",
+      "type": "array"
+    },
+    "invariants": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "title": "Invariants",
+      "type": "array"
+    },
+    "backend": {
+      "$ref": "#/$defs/TaskContractBackend"
+    },
+    "resources": {
+      "$ref": "#/$defs/TaskContractResources"
+    },
+    "seed": {
+      "title": "Seed",
+      "type": "integer"
+    },
+    "acceptance_criteria": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "minItems": 1,
+      "title": "Acceptance Criteria",
+      "type": "array"
+    },
+    "assumptions": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Assumptions",
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "task_id",
+    "experiment_id",
+    "memory_snapshot_hash",
+    "reproducibility_mode",
+    "inputs",
+    "outputs",
+    "equations",
+    "algorithm_steps",
+    "invariants",
+    "backend",
+    "resources",
+    "seed",
+    "acceptance_criteria",
+    "assumptions"
+  ],
+  "title": "TaskContractDocument",
+  "type": "object"
+}

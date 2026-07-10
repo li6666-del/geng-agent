@@ -4,7 +4,9 @@ import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
+from geng_agent.agentic_analysis import CODEX_ANALYSIS_BACKEND
 from geng_agent.facts_coverage import (
     compute_fact_coverage,
     compute_task_coverage,
@@ -30,9 +32,9 @@ class EnumerateAnchorsTests(unittest.TestCase):
         anchors = enumerate_paper_anchors([_chunk("Figs. 3 and 4, 5 compare the curves.")])
         self.assertEqual(anchors["figures"], ["3", "4", "5"])
 
-    def test_subfigure_letter_collapses_to_number(self) -> None:
+    def test_subfigure_letters_remain_distinct(self) -> None:
         anchors = enumerate_paper_anchors([_chunk("Fig. 7a and Fig. 7b show two regimes.")])
-        self.assertEqual(anchors["figures"], ["7"])
+        self.assertEqual(anchors["figures"], ["7:a", "7:b"])
 
     def test_year_like_number_is_not_a_figure(self) -> None:
         # "Fig. 2020" must not register figure 20 / 2 (two-digit cap + word boundary).
@@ -207,18 +209,19 @@ class GapFinderIntegrationTests(unittest.TestCase):
                 facts=base, paper=paper, paper_context="ctx", paper_images=[],
                 valid_chunk_ids={"c1"}, valid_pages=set(),
                 output_dir=out_dir, audit_dir=out_dir / "audit",
-                resume=False, max_attempts=2, max_rounds=2,
+                resume=False, max_attempts=2, max_rounds=3,
             )
 
             names = {f["name"] for f in result["engineering_facts"]}
             self.assertIn("alpha_ST_threshold", names)   # gap fact added
             self.assertIn("Fig.7 sum-rate", names)       # base fact preserved
-            # round 1 adds 1, round 2 returns nothing -> dry -> stop (exactly 2 gap calls)
-            self.assertEqual(client.calls, 2)
+            # round 1 adds 1; two consecutive semantic dry rounds are required to stop.
+            self.assertEqual(client.calls, 3)
             written = json.loads((out_dir / "engineering_facts.json").read_text(encoding="utf-8"))
             self.assertEqual(written["_meta"]["gap_finder"]["round_1_added"], 1)
             self.assertEqual(written["_meta"]["gap_finder"]["round_2_added"], 0)
-            self.assertEqual(written["_meta"]["gap_finder"]["stop_reason"], "no_new_facts")
+            self.assertEqual(written["_meta"]["gap_finder"]["round_3_added"], 0)
+            self.assertEqual(written["_meta"]["gap_finder"]["stop_reason"], "two_semantic_dry_rounds")
 
     def test_gap_finder_runs_until_six_round_cap_when_always_adding(self) -> None:
         base = {
@@ -260,6 +263,62 @@ class GapFinderIntegrationTests(unittest.TestCase):
             )
         self.assertEqual(client.calls, 0)
         self.assertEqual(out, base)
+
+    def test_codex_gap_finder_uses_parallel_width_and_stops_after_deduped_dry_round(self) -> None:
+        base = {
+            "paper_domain": "communication",
+            "paper_repro_type": "other",
+            "engineering_facts": [],
+            "missing_information": [],
+        }
+        paper = {"chunks": [{"chunk_id": "c1", "text": "Fig. 7 shows BER versus SNR.", "page": 1, "section": "S"}]}
+        gap_fact = {
+            "type": "figure_claim",
+            "name": "Figure 7 BER",
+            "value": {},
+            "source": {"source_kind": "text", "chunk_id": "c1", "page": 1, "section": "S", "quote": "Fig. 7 shows BER", "figure_ref": ""},
+            "confidence": "high",
+            "used_for_reproduction": True,
+        }
+        returned_docs = [
+            {"paper_domain": "communication", "paper_repro_type": "other", "engineering_facts": [gap_fact], "missing_information": []},
+            {"paper_domain": "communication", "paper_repro_type": "other", "engineering_facts": [gap_fact], "missing_information": []},
+            {"paper_domain": "communication", "paper_repro_type": "other", "engineering_facts": [gap_fact], "missing_information": []},
+        ]
+        calls: list[dict] = []
+
+        def fake_gap_stage(**kwargs):
+            calls.append(kwargs)
+            return returned_docs[len(calls) - 1]
+
+        with TemporaryDirectory() as d:
+            out_dir = Path(d)
+            (out_dir / "audit").mkdir()
+            pipe = ReviewPipeline(client=None)
+            with patch.object(pipe, "_load_or_create_ensemble_stage_json", side_effect=fake_gap_stage):
+                result = pipe._augment_facts_with_gap_finder(
+                    facts=base,
+                    paper=paper,
+                    paper_context="ctx",
+                    paper_images=[],
+                    valid_chunk_ids={"c1"},
+                    valid_pages=set(),
+                    output_dir=out_dir,
+                    audit_dir=out_dir / "audit",
+                    resume=False,
+                    max_attempts=1,
+                    max_rounds=6,
+                    analysis_agent_width=2,
+                    analysis_backend=CODEX_ANALYSIS_BACKEND,
+                )
+
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(all(call["agent_width"] == 2 for call in calls))
+        self.assertEqual(len(result["engineering_facts"]), 1)
+        self.assertEqual(result["_meta"]["gap_finder"]["round_1_added"], 1)
+        self.assertEqual(result["_meta"]["gap_finder"]["round_2_added"], 0)
+        self.assertEqual(result["_meta"]["gap_finder"]["round_3_added"], 0)
+        self.assertEqual(result["_meta"]["gap_finder"]["stop_reason"], "two_semantic_dry_rounds")
 
 
 def _fclaim(name: str) -> dict:
@@ -321,7 +380,7 @@ class MergeReproTasksTests(unittest.TestCase):
             {"task_id": "reproduce_fig_7", "figure_or_claim": "Fig. 7"},   # new -> keep
         ]}
         merged, added = merge_repro_tasks(base, addition)
-        self.assertEqual(added, 1)
+        self.assertEqual(added, 2)  # one new task plus one newly recorded task-id conflict
         self.assertEqual({t["figure_or_claim"] for t in merged["repro_tasks"]}, {"Fig. 4", "Fig. 7"})
 
 
@@ -395,6 +454,63 @@ class TasksGapFinderIntegrationTests(unittest.TestCase):
             )
         self.assertEqual(client.calls, 0)  # already covered -> no LLM call
 
+    def test_codex_task_gap_finder_uses_parallel_width(self) -> None:
+        facts = {"paper_domain": "communication", "paper_repro_type": "signal_chain", "engineering_facts": [
+            _fclaim("Figure 4: Empirical CDF of sum rate"),
+            _fclaim("Figure 7: Average sum rate vs transmit power"),
+        ], "missing_information": []}
+        base = {"repro_tasks": [{
+            "task_id": "reproduce_fig_4", "target": "CDF of sum rate", "metric": "spectral_efficiency",
+            "metric_formula": "spectral_efficiency = log2(1+SINR)", "figure_or_claim": "Fig. 4",
+            "expected_artifacts": ["outputs/results.csv", "outputs/fig4.png", "outputs/summary.json"],
+            "output_columns": ["sum_rate"],
+            "expected_trend": {"x_axis": "sum_rate", "y_axis": "cdf", "direction": "increasing", "reason": "cdf"},
+            "comparison": {"baselines": ["ZF"], "curve_groups": ["UPA"], "tolerance": "qualitative trend"},
+            "required_facts": [{"type": "figure_claim", "name": "Figure 4: Empirical CDF of sum rate"}],
+            "assumptions": [], "risk_if_unreproducible": "core",
+        }]}
+        calls: list[dict] = []
+
+        def fake_gap_stage(**kwargs):
+            calls.append(kwargs)
+            return {"repro_tasks": [{
+                "task_id": "reproduce_fig_7",
+                "target": "sum rate vs transmit power",
+                "metric": "spectral_efficiency",
+                "metric_formula": "spectral_efficiency = log2(1+SINR)",
+                "figure_or_claim": "Fig. 7",
+                "expected_artifacts": ["outputs/results.csv", "outputs/fig7.png", "outputs/summary.json"],
+                "output_columns": ["transmit_power_dbm", "sum_rate"],
+                "expected_trend": {"x_axis": "transmit_power_dbm", "y_axis": "sum_rate", "direction": "increasing", "reason": "more power -> higher rate"},
+                "comparison": {"baselines": ["ZF"], "curve_groups": ["STAB+SDS"], "tolerance": "qualitative trend"},
+                "required_facts": [{"type": "figure_claim", "name": "Figure 7: Average sum rate vs transmit power"}],
+                "assumptions": [],
+                "risk_if_unreproducible": "core sum-rate curve cannot be checked",
+            }]}
+
+        with TemporaryDirectory() as d:
+            out_dir = Path(d)
+            (out_dir / "audit").mkdir()
+            pipe = ReviewPipeline(client=None)
+            with patch.object(pipe, "_load_or_create_ensemble_stage_json", side_effect=fake_gap_stage):
+                result = pipe._augment_tasks_with_gap_finder(
+                    tasks=base,
+                    facts=facts,
+                    paper_context="ctx",
+                    output_dir=out_dir,
+                    audit_dir=out_dir / "audit",
+                    resume=False,
+                    max_attempts=1,
+                    max_rounds=6,
+                    tasks_timeout=120.0,
+                    analysis_agent_width=2,
+                    analysis_backend=CODEX_ANALYSIS_BACKEND,
+                )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["agent_width"], 2)
+        self.assertEqual({task["figure_or_claim"] for task in result["repro_tasks"]}, {"Fig. 4", "Fig. 7"})
+
 
 class _OtherMetricGapLLM:
     """Returns a task for the uncovered Fig.7 but with metric=other -> the gate must reject it."""
@@ -447,7 +563,7 @@ class TaskGapMetricGateTests(unittest.TestCase):
             )
             figs = {t["figure_or_claim"] for t in result["repro_tasks"]}
             self.assertEqual(figs, {"Fig. 4"})  # the metric=other Fig.7 task was rejected, not added
-            self.assertEqual(result["_meta"]["gap_finder"]["stop_reason"], "no_new_tasks")
+            self.assertEqual(result["_meta"]["gap_finder"]["stop_reason"], "two_semantic_dry_rounds")
             self.assertTrue((Path(d) / "audit" / "tasks_gap_round_1_rejected.json").exists())
 
 

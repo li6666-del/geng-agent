@@ -13,7 +13,12 @@ def _clear_stage_outputs(output_dir: Path, stage: str) -> None:
     stage_outputs = {
         "paper": [
             "paper_chunks.json",
+            "paper_memory.json",
+            "memory_manifest.json",
             "engineering_facts.json",
+            "fact_conflicts.json",
+            "task_conflicts.json",
+            "paper_thesis.json",
             "repro_tasks.json",
             "experiment_index.json",
             "repro_project_manifest.json",
@@ -28,9 +33,16 @@ def _clear_stage_outputs(output_dir: Path, stage: str) -> None:
             "result_review.docx",
             "result_review_error.json",
             "docx_generation_error.json",
+            "failure_memory.jsonl",
+            "revision_requests.json",
+            "automation_provenance.json",
         ],
         "facts": [
+            "memory_manifest.json",
             "engineering_facts.json",
+            "fact_conflicts.json",
+            "task_conflicts.json",
+            "paper_thesis.json",
             "repro_tasks.json",
             "experiment_index.json",
             "repro_project_manifest.json",
@@ -45,8 +57,30 @@ def _clear_stage_outputs(output_dir: Path, stage: str) -> None:
             "result_review.docx",
             "result_review_error.json",
             "docx_generation_error.json",
+            "failure_memory.jsonl",
+            "revision_requests.json",
+            "automation_provenance.json",
+        ],
+        "paper_thesis": [
+            "memory_manifest.json",
+            "paper_thesis.json",
+            "repro_project_manifest.json",
+            "repro_project",
+            "runtime_result.json",
+            "risk_report.json",
+            "generated_files.json",
+            "review.md",
+            "review.docx",
+            "result_review.json",
+            "result_review.md",
+            "result_review.docx",
+            "result_review_error.json",
+            "docx_generation_error.json",
+            "automation_provenance.json",
         ],
         "tasks": [
+            "memory_manifest.json",
+            "task_conflicts.json",
             "repro_tasks.json",
             "experiment_index.json",
             "repro_project_manifest.json",
@@ -61,6 +95,9 @@ def _clear_stage_outputs(output_dir: Path, stage: str) -> None:
             "result_review.docx",
             "result_review_error.json",
             "docx_generation_error.json",
+            "failure_memory.jsonl",
+            "revision_requests.json",
+            "automation_provenance.json",
         ],
         "experiment_index": [
             "experiment_index.json",
@@ -76,6 +113,8 @@ def _clear_stage_outputs(output_dir: Path, stage: str) -> None:
             "result_review.docx",
             "result_review_error.json",
             "docx_generation_error.json",
+            "revision_requests.json",
+            "automation_provenance.json",
         ],
         "manifest": [
             "repro_project_manifest.json",
@@ -90,6 +129,8 @@ def _clear_stage_outputs(output_dir: Path, stage: str) -> None:
             "result_review.docx",
             "result_review_error.json",
             "docx_generation_error.json",
+            "revision_requests.json",
+            "automation_provenance.json",
         ],
         "project": [
             "repro_project",
@@ -103,6 +144,7 @@ def _clear_stage_outputs(output_dir: Path, stage: str) -> None:
             "result_review.docx",
             "result_review_error.json",
             "docx_generation_error.json",
+            "automation_provenance.json",
         ],
         "runtime": [
             "runtime_result.json",
@@ -117,6 +159,7 @@ def _clear_stage_outputs(output_dir: Path, stage: str) -> None:
             "docx_generation_error.json",
             "repro_project/outputs",
             "repro_project/repair_logs",
+            "automation_provenance.json",
         ],
         "result_review": [
             "result_review.json",
@@ -131,6 +174,7 @@ def _clear_stage_outputs(output_dir: Path, stage: str) -> None:
             "review.docx",
             "result_review.docx",
             "docx_generation_error.json",
+            "automation_provenance.json",
         ],
     }
     for rel_path in stage_outputs.get(stage, []):
@@ -145,6 +189,7 @@ def _clear_stage_audit(output_dir: Path, stage: str) -> None:
     stage_numbers = {
         "paper": ["01", "02", "03", "04"],
         "facts": ["01", "02", "03", "04"],
+        "paper_thesis": ["01c", "03"],
         "tasks": ["02", "03", "04"],
         "experiment_index": ["02", "03", "04"],
         "manifest": ["03", "04"],
@@ -169,9 +214,8 @@ def _clear_stage_audit(output_dir: Path, stage: str) -> None:
 
 def _clear_project_code_files(repro_project_dir: Path) -> None:
     """Remove stale generated code/config from the repro project before a fresh manifest is
-    written, preserving only the scratch dirs (outputs/, repair_logs/). Used to make a
-    template fallback an ATOMIC replacement so orphan files from an earlier generation can't
-    survive and silently become the thing that runs."""
+    written, preserving only the scratch dirs (outputs/, repair_logs/). This prevents orphan
+    files from an earlier task-writer run from silently becoming the code that executes."""
     if not repro_project_dir.exists():
         return
     preserve = {"outputs", "repair_logs"}

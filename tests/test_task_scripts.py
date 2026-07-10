@@ -8,12 +8,7 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from geng_agent.io_runtime import inject_io_runtime, io_slug
-from geng_agent.manifest_utils import (
-    SHARED_GENERATED_FILES,
-    _ordered_project_paths,
-    _validate_project_plan_paths,
-    expected_generated_paths,
-)
+from geng_agent.manifest_utils import expected_generated_paths
 from geng_agent.outputs import _valid_csv, _valid_png, _valid_summary_json
 from geng_agent.security import static_scan_repro_project
 from geng_agent.task_scripts import (
@@ -314,7 +309,7 @@ class EndToEndDispatcherTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, msg=completed.stderr[-2000:])
 
 
-class PlanPathContractTests(unittest.TestCase):
+class GeneratedPathContractTests(unittest.TestCase):
     def test_expected_paths_are_shared_plus_task_scripts(self) -> None:
         scripts = [t["script"] for t in build_tasks_manifest(_tasks_doc("reproduce_fig_7", "reproduce_fig_4"))["tasks"]]
         expected = expected_generated_paths(scripts)
@@ -324,29 +319,6 @@ class PlanPathContractTests(unittest.TestCase):
         # harness-injected files are NOT in the model-generated set
         self.assertNotIn("run_experiment.py", expected)
         self.assertNotIn("src/_io.py", expected)
-
-    def test_plan_validation_accepts_shared_plus_tasks_and_flags_missing(self) -> None:
-        scripts = [t["script"] for t in build_tasks_manifest(_tasks_doc("reproduce_fig_7"))["tasks"]]
-        expected = expected_generated_paths(scripts)
-        ok_plan = {"files": [{"path": p} for p in expected]}
-        self.assertEqual(_validate_project_plan_paths(ok_plan, expected), [])
-        missing_task = {"files": [{"path": p} for p in SHARED_GENERATED_FILES]}
-        issues = _validate_project_plan_paths(missing_task, expected)
-        self.assertTrue(any("tasks/reproduce_fig_7.py" in issue.message for issue in issues))
-
-    def test_ordering_puts_task_scripts_after_shared_science(self) -> None:
-        scripts = [t["script"] for t in build_tasks_manifest(_tasks_doc("reproduce_fig_7"))["tasks"]]
-        plan = {"files": [{"path": p} for p in expected_generated_paths(scripts)]}
-        order = _ordered_project_paths(plan, scripts)
-        self.assertNotIn("run_experiment.py", order)
-        self.assertLess(order.index("src/simulation.py"), order.index("tasks/reproduce_fig_7.py"))
-
-    def test_legacy_ordering_and_validation_unchanged(self) -> None:
-        # No task_scripts/expected_paths -> exact legacy behaviour (the single-script contract).
-        legacy_plan = {"files": [{"path": p} for p in ("README.md", "run_experiment.py", "src/channel.py")]}
-        self.assertIn("run_experiment.py", _ordered_project_paths(legacy_plan))
-        self.assertTrue(_validate_project_plan_paths({"files": []}))  # missing required files flagged
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,7 +3,6 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
 
 from geng_agent.pipeline import (
     ReviewPipeline,
@@ -83,28 +82,10 @@ class BuildRunCostTests(unittest.TestCase):
         self.assertEqual(cost["by_stage"], [])
 
 
-class TemplateFallbackRiskTests(unittest.TestCase):
-    def test_result_alignment_level_forces_high_on_template(self) -> None:
-        # template fallback -> high regardless of an otherwise-clean run
-        self.assertEqual(_result_alignment_level(True, True, True, True, [], True), "high")
-        # the clean control path is low
+class RiskDimensionTests(unittest.TestCase):
+    def test_result_alignment_level_tracks_runtime_and_review(self) -> None:
         self.assertEqual(_result_alignment_level(True, True, True, True, []), "low")
-        # runtime failure is still high
         self.assertEqual(_result_alignment_level(True, False, True, True, []), "high")
-
-    def test_template_fallback_pushes_fidelity_and_alignment_high(self) -> None:
-        dims = build_risk_dimensions(
-            missing=[],
-            assumptions=[],
-            validation={"required_files_present": True, "python_compiles": True},
-            runtime_result={"enabled": True, "passed": True},
-            scientific_check={},
-            tasks={},
-            result_review_result={"enabled": False, "passed": None},
-            manifest_meta={"template_fallback_used": True},
-        )
-        self.assertEqual(dims["implementation_fidelity"]["level"], "high")
-        self.assertEqual(dims["result_alignment"]["level"], "high")
 
     def test_clean_run_keeps_low_dimensions(self) -> None:
         dims = build_risk_dimensions(
@@ -115,7 +96,6 @@ class TemplateFallbackRiskTests(unittest.TestCase):
             scientific_check={},
             tasks={},
             result_review_result={"enabled": True, "passed": True},
-            manifest_meta={},
         )
         self.assertEqual(dims["implementation_fidelity"]["level"], "low")
         self.assertEqual(dims["result_alignment"]["level"], "low")
@@ -133,7 +113,6 @@ class TemplateFallbackRiskTests(unittest.TestCase):
             scientific_check={},
             tasks={},
             result_review_result={"enabled": True, "passed": True},
-            manifest_meta={},
         )
 
         self.assertEqual(dims["runtime_reliability"]["level"], "low")
@@ -166,79 +145,6 @@ class UsageRollupTests(unittest.TestCase):
         main = _UsageClient("main", [{"model": "main", "total_tokens": 15}])
         pipe = ReviewPipeline(main, extraction_client_2=main)
         self.assertEqual(pipe._cumulative_usage()["llm_calls"], 1)
-
-
-class ResultReviewSkipsTemplateTests(unittest.TestCase):
-    def test_result_review_skipped_when_template_fallback_used(self) -> None:
-        pipe = ReviewPipeline(_UsageClient("m", []))
-        result = pipe._run_result_review_if_ready(
-            enabled=True,
-            run_repro=True,
-            runtime_result={"enabled": True, "passed": True, "template_fallback_used": True},
-            template_fallback_used=True,
-            paper_path=Path("paper.pdf"),
-            paper={},
-            facts={},
-            tasks={},
-            paper_context_json="[]",
-            repro_project_dir=Path("."),
-            output_dir=Path("."),
-            audit_dir=Path("."),
-            max_attempts=1,
-            resume=False,
-        )
-        self.assertFalse(result["enabled"])
-        self.assertIsNone(result["passed"])
-        self.assertIn("template", result["reason"])
-
-
-class ResultReviewPartialTests(unittest.TestCase):
-    def test_runs_on_partial_output(self) -> None:
-        # A not-fully-passing run that produced partial outputs should still get the
-        # per-experiment result review (so one failed experiment doesn't negate the rest).
-        pipe = ReviewPipeline(_UsageClient("m", []))
-        runtime = {"enabled": True, "passed": False, "partial_success": {"has_partial_output": True}}
-        stub = {"enabled": True, "passed": True, "mode": "stub"}
-        with TemporaryDirectory() as tmp, patch("geng_agent.pipeline.run_result_review", return_value=stub) as mocked:
-            result = pipe._run_result_review_if_ready(
-                enabled=True,
-                run_repro=True,
-                runtime_result=runtime,
-                template_fallback_used=False,
-                paper_path=Path("paper.pdf"),
-                paper={},
-                facts={},
-                tasks={},
-                paper_context_json="[]",
-                repro_project_dir=Path(tmp),
-                output_dir=Path(tmp),
-                audit_dir=Path(tmp) / "audit",
-                max_attempts=1,
-                resume=False,
-            )
-        self.assertTrue(mocked.called)
-        self.assertEqual(result.get("mode"), "stub")
-
-    def test_skipped_when_no_usable_output(self) -> None:
-        pipe = ReviewPipeline(_UsageClient("m", []))
-        result = pipe._run_result_review_if_ready(
-            enabled=True,
-            run_repro=True,
-            runtime_result={"enabled": True, "passed": False},
-            template_fallback_used=False,
-            paper_path=Path("paper.pdf"),
-            paper={},
-            facts={},
-            tasks={},
-            paper_context_json="[]",
-            repro_project_dir=Path("."),
-            output_dir=Path("."),
-            audit_dir=Path("."),
-            max_attempts=1,
-            resume=False,
-        )
-        self.assertFalse(result["enabled"])
-        self.assertIn("no usable output", result["reason"])
 
 
 if __name__ == "__main__":

@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from geng_agent.config import build_llm_client, get_cases_root
+from geng_agent.codex_runner import split_command
+from geng_agent.config import get_cases_root, get_config_value
 from geng_agent.web import jobs
 from geng_agent.web.stages import build_stage_progress
 
@@ -24,17 +26,16 @@ def index() -> FileResponse:
 
 @app.get("/api/health")
 def health() -> dict:
-    llm_ok = True
-    llm_error = None
-    try:
-        build_llm_client()
-    except Exception as exc:
-        llm_ok = False
-        llm_error = str(exc)
+    raw_cmd = get_config_value("GENG_CODEX_CMD") or "codex"
+    argv = split_command(raw_cmd)
+    codex_path = shutil.which(argv[0]) if argv else None
+    codex_ok = codex_path is not None
     active = jobs.active_run()
     return {
-        "ok": llm_ok,
-        "llm_error": llm_error,
+        "ok": codex_ok,
+        "codex_command": raw_cmd,
+        "codex_path": codex_path,
+        "codex_error": None if codex_ok else f"Codex CLI not found: {raw_cmd}",
         "cases_root": str(get_cases_root()),
         "active_run_id": active.run_id if active else None,
     }

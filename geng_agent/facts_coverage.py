@@ -8,8 +8,8 @@ targeted LLM gap-finder re-query only the omissions:
 1. anchor coverage -- enumerate the figures/tables the paper *references* (from chunk
    text) and compare against the anchors the extracted facts actually *cover*, so the
    gap-finder gets concrete targets instead of "look again".
-2. stable merge/dedup -- accumulate gap-pass facts into the base by (type, name) so
-   repeated rounds converge and a resume re-merge adds zero.
+2. semantic merge/dedup -- preserve subfigures, enrich incomplete records, retain
+   conflicts for later adjudication, and converge under repeated resume merges.
 
 No I/O, no LLM, no randomness here -- everything is unit-testable in isolation.
 """
@@ -20,10 +20,16 @@ import json
 import re
 from typing import Any
 
+from .semantic_merge import semantic_merge_engineering_facts, semantic_merge_repro_tasks
 
-# A figure reference: "Fig 7", "Fig. 7", "Figure 7", "Figs 3", "Fig 7a" (subfigure letter
-# dropped for coverage). Two-digit cap avoids matching years ("Fig. 2020" -> no match).
-_FIG_TOKEN = re.compile(r"\bfig(?:ure)?s?\.?\s*(\d{1,2})[a-z]?\b", re.IGNORECASE)
+
+# Keep subfigure identity: Fig. 9(a) and Fig. 9(b) are different experiments.  The
+# attached-letter branch has no leading whitespace, which avoids treating the first
+# letter of the following prose word as a subfigure.
+_FIG_TOKEN = re.compile(
+    r"\bfig(?:ure)?s?\.?\s*(\d{1,2})(?!\d)(?:\s*\(([a-z])\)|([a-z])\b)?",
+    re.IGNORECASE,
+)
 # A table reference. The KEYWORD is case-insensitive but the NUMBER is case-sensitive so a
 # bare roman branch can't swallow ordinary words ("Table is shown" must NOT become Table I).
 _TABLE_TOKEN = re.compile(r"(?i:\btables?\.?\s*)(\d{1,2}|[IVX]{1,5})\b")
@@ -50,8 +56,32 @@ def _scan_anchors(text: str, token_re: re.Pattern) -> set[str]:
     return found
 
 
+def _scan_figure_anchors(text: str) -> set[str]:
+    found: set[str] = set()
+    for match in _FIG_TOKEN.finditer(text):
+        number = _norm_anchor(match.group(1))
+        subfigure = (match.group(2) or match.group(3) or "").lower()
+        found.add(f"{number}:{subfigure}" if subfigure else number)
+        tail = text[match.end(): match.end() + 30]
+        list_match = _LIST_TAIL.match(tail)
+        if list_match:
+            found.update(_norm_anchor(num) for num in _LIST_NUM.findall(list_match.group(0)))
+    return found
+
+
+def _prefer_subfigure_anchors(anchors: set[str]) -> set[str]:
+    parents_with_children = {anchor.split(":", 1)[0] for anchor in anchors if ":" in anchor}
+    return {anchor for anchor in anchors if anchor not in parents_with_children}
+
+
 def _sorted_anchors(anchors: set[str]) -> list[str]:
-    return sorted(anchors, key=lambda a: (0, int(a)) if a.isdigit() else (1, a))
+    def key(anchor: str) -> tuple[int, int, str]:
+        number, _, subfigure = anchor.partition(":")
+        if number.isdigit():
+            return (0, int(number), subfigure)
+        return (1, 0, anchor)
+
+    return sorted(anchors, key=key)
 
 
 def enumerate_paper_anchors(chunks: list[dict[str, Any]] | None) -> dict[str, list[str]]:
@@ -64,9 +94,9 @@ def enumerate_paper_anchors(chunks: list[dict[str, Any]] | None) -> dict[str, li
         text = str(chunk.get("text", ""))
         if not text:
             continue
-        figures |= _scan_anchors(text, _FIG_TOKEN)
+        figures |= _scan_figure_anchors(text)
         tables |= _scan_anchors(text, _TABLE_TOKEN)
-    return {"figures": _sorted_anchors(figures), "tables": _sorted_anchors(tables)}
+    return {"figures": _sorted_anchors(_prefer_subfigure_anchors(figures)), "tables": _sorted_anchors(tables)}
 
 
 def _fact_text_blob(fact: dict[str, Any]) -> str:
@@ -97,9 +127,9 @@ def facts_referenced_anchors(facts: list[dict[str, Any]] | None) -> dict[str, se
         blob = _fact_text_blob(fact)
         if not blob:
             continue
-        figures |= _scan_anchors(blob, _FIG_TOKEN)
+        figures |= _scan_figure_anchors(blob)
         tables |= _scan_anchors(blob, _TABLE_TOKEN)
-    return {"figures": figures, "tables": tables}
+    return {"figures": _prefer_subfigure_anchors(figures), "tables": tables}
 
 
 def compute_fact_coverage(
@@ -111,6 +141,7 @@ def compute_fact_coverage(
     fig_set, tab_set = set(anchors["figures"]), set(anchors["tables"])
     uncovered_figures = _sorted_anchors(fig_set - referenced["figures"])
     uncovered_tables = _sorted_anchors(tab_set - referenced["tables"])
+    detail_coverage = _figure_detail_coverage(fig_set, facts or [])
     return {
         "paper_figures": anchors["figures"],
         "paper_tables": anchors["tables"],
@@ -119,56 +150,47 @@ def compute_fact_coverage(
         "uncovered_figures": uncovered_figures,
         "uncovered_tables": uncovered_tables,
         "fully_covered": not uncovered_figures and not uncovered_tables,
+        "figure_detail_coverage": detail_coverage,
+        "fully_detailed": all(not item["missing_dimensions"] for item in detail_coverage),
     }
 
 
-def _norm_name(value: Any) -> str:
-    return re.sub(r"[\s\-_]+", "", str(value).strip().lower())
+_DETAIL_PATTERNS: dict[str, re.Pattern[str]] = {
+    "axes_metrics": re.compile(r"\b(x[- ]?axis|y[- ]?axis|versus|vs\.?|ber|ser|snr|rate|throughput|delay|cdf|accuracy|loss)\b", re.I),
+    "methods_baselines": re.compile(r"\b(baseline|benchmark|scheme|method|algorithm|receiver|detector|compared?\s+with)\b", re.I),
+    "parameters_regime": re.compile(r"\b(parameter|setting|regime|scenario|channel|antenna|user|snr|db|rho|alpha|beta|lambda)\b", re.I),
+    "numeric_values": re.compile(r"(?<![A-Za-z])[-+]?\d+(?:\.\d+)?(?:e[-+]?\d+)?", re.I),
+    "trend_claim": re.compile(r"\b(increas|decreas|outperform|higher|lower|better|worse|monotonic|saturat|gain|gap|trend)\w*\b", re.I),
+}
 
 
-def _fact_key(fact: dict[str, Any]) -> tuple[str, str]:
-    return (str(fact.get("type", "")).strip().lower(), _norm_name(fact.get("name", "")))
+def _figure_detail_coverage(figures: set[str], facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for anchor in _sorted_anchors(figures):
+        blobs = [
+            _fact_text_blob(fact)
+            for fact in facts
+            if anchor in _scan_figure_anchors(_fact_text_blob(fact))
+        ]
+        joined = " ".join(blobs)
+        present = ["target_identity"] if blobs else []
+        present.extend(name for name, pattern in _DETAIL_PATTERNS.items() if pattern.search(joined))
+        dimensions = ["target_identity", *_DETAIL_PATTERNS]
+        rows.append(
+            {
+                "figure": anchor,
+                "present_dimensions": present,
+                "missing_dimensions": [name for name in dimensions if name not in present],
+            }
+        )
+    return rows
 
 
 def merge_engineering_facts(
     base: dict[str, Any], addition: dict[str, Any]
 ) -> tuple[dict[str, Any], int]:
-    """Append non-duplicate facts + missing_information from ``addition`` into a copy of
-    ``base``. Dedup key = (type, normalized name). Returns (merged_doc, added_fact_count).
-    Stable + idempotent: merging the same addition twice adds zero the second time."""
-    merged = dict(base) if isinstance(base, dict) else {}
-
-    base_facts_raw = merged.get("engineering_facts")
-    base_facts = list(base_facts_raw) if isinstance(base_facts_raw, list) else []
-    seen = {_fact_key(f) for f in base_facts if isinstance(f, dict)}
-    added = 0
-    add_facts = addition.get("engineering_facts") if isinstance(addition, dict) else None
-    for fact in add_facts if isinstance(add_facts, list) else []:
-        if not isinstance(fact, dict):
-            continue
-        key = _fact_key(fact)
-        if key in seen:
-            continue
-        seen.add(key)
-        base_facts.append(fact)
-        added += 1
-    merged["engineering_facts"] = base_facts
-
-    base_missing_raw = merged.get("missing_information")
-    base_missing = list(base_missing_raw) if isinstance(base_missing_raw, list) else []
-    miss_seen = {_norm_name(m.get("name", "")) for m in base_missing if isinstance(m, dict)}
-    add_missing = addition.get("missing_information") if isinstance(addition, dict) else None
-    for item in add_missing if isinstance(add_missing, list) else []:
-        if not isinstance(item, dict):
-            continue
-        key_name = _norm_name(item.get("name", ""))
-        if not key_name or key_name in miss_seen:
-            continue
-        miss_seen.add(key_name)
-        base_missing.append(item)
-    merged["missing_information"] = base_missing
-
-    return merged, added
+    """Semantic, provenance-preserving fact merge; the count is any effective delta."""
+    return semantic_merge_engineering_facts(base, addition)
 
 
 # --- round-2 task coverage: every reproducible experiment (a figure_claim fact) needs a
@@ -227,9 +249,9 @@ def experiment_anchors_from_facts(facts: list[dict[str, Any]] | None) -> dict[st
         blob = _fact_text_blob(fact)
         if not _is_experiment_blob(blob):
             continue
-        figures |= _scan_anchors(blob, _FIG_TOKEN)
+        figures |= _scan_figure_anchors(blob)
         tables |= _scan_anchors(blob, _TABLE_TOKEN)
-    return {"figures": figures, "tables": tables}
+    return {"figures": _prefer_subfigure_anchors(figures), "tables": tables}
 
 
 def _task_anchors(tasks: list[dict[str, Any]] | None) -> dict[str, set[str]]:
@@ -239,9 +261,9 @@ def _task_anchors(tasks: list[dict[str, Any]] | None) -> dict[str, set[str]]:
         if not isinstance(task, dict):
             continue
         blob = " ".join(str(task.get(k, "")) for k in ("figure_or_claim", "target"))
-        figures |= _scan_anchors(blob, _FIG_TOKEN)
+        figures |= _scan_figure_anchors(blob)
         tables |= _scan_anchors(blob, _TABLE_TOKEN)
-    return {"figures": figures, "tables": tables}
+    return {"figures": _prefer_subfigure_anchors(figures), "tables": tables}
 
 
 def compute_task_coverage(facts: dict[str, Any] | None, tasks: dict[str, Any] | None) -> dict[str, Any]:
@@ -264,29 +286,5 @@ def compute_task_coverage(facts: dict[str, Any] | None, tasks: dict[str, Any] | 
 
 
 def merge_repro_tasks(base: dict[str, Any], addition: dict[str, Any]) -> tuple[dict[str, Any], int]:
-    """Append non-duplicate tasks from ``addition``. Dedup by task_id OR normalized
-    figure_or_claim, so the same experiment is never scheduled to reproduce twice."""
-    merged = dict(base) if isinstance(base, dict) else {}
-    base_tasks_raw = merged.get("repro_tasks")
-    base_tasks = list(base_tasks_raw) if isinstance(base_tasks_raw, list) else []
-    seen_ids = {_norm_name(t.get("task_id", "")) for t in base_tasks if isinstance(t, dict) and t.get("task_id")}
-    seen_figs = {_norm_name(t.get("figure_or_claim", "")) for t in base_tasks if isinstance(t, dict) and t.get("figure_or_claim")}
-    added = 0
-    add_tasks = addition.get("repro_tasks") if isinstance(addition, dict) else None
-    for task in add_tasks if isinstance(add_tasks, list) else []:
-        if not isinstance(task, dict):
-            continue
-        tid = _norm_name(task.get("task_id", ""))
-        fig = _norm_name(task.get("figure_or_claim", ""))
-        if tid and tid in seen_ids:
-            continue
-        if fig and fig in seen_figs:
-            continue
-        if tid:
-            seen_ids.add(tid)
-        if fig:
-            seen_figs.add(fig)
-        base_tasks.append(task)
-        added += 1
-    merged["repro_tasks"] = base_tasks
-    return merged, added
+    """Semantic experiment merge preserving subfigures, regimes, and baseline sets."""
+    return semantic_merge_repro_tasks(base, addition)

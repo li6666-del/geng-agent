@@ -9,7 +9,8 @@ dependencies = [
   "pydantic>=2.7",
   "pillow>=10",
   "pymupdf>=1.24",
-  "python-docx>=1.1"
+  "python-docx>=1.1",
+  "psutil>=5.9"
 ]
 
 [project.optional-dependencies]
@@ -21,7 +22,8 @@ web = [
 # Libraries the generated reproduction code is allowed to import. Single source of
 # truth for the allow-list is geng_agent/security.ALLOWED_REQUIREMENTS; this extra
 # makes them installable in one command. tests/test_preflight.py asserts the two
-# stay in sync. Without these, every numpy paper falls back to the local template.
+# stay in sync. Missing critical packages prevents task writers from completing a
+# faithful full run for papers that need them.
 repro = [
   "numpy>=1.24",
   "scipy>=1.10",

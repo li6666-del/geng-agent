@@ -10,7 +10,9 @@ from .schemas import validate_stage
 
 STAGES = [
     ("paper", "paper_chunks.json", None),
+    ("paper_memory", "paper_memory.json", "paper_memory"),
     ("engineering_facts", "engineering_facts.json", "engineering_facts"),
+    ("paper_thesis", "paper_thesis.json", "paper_thesis"),
     ("repro_tasks", "repro_tasks.json", "repro_tasks"),
     ("experiment_index", "experiment_index.json", "experiment_index"),
     ("repro_project_manifest", "repro_project_manifest.json", "repro_project_manifest"),
@@ -24,13 +26,15 @@ STAGES = [
 
 RESUME_LABELS = {
     "paper": "01_extract_engineering_facts",
+    "paper_memory": "01_build_paper_memory",
     "engineering_facts": "01_extract_engineering_facts",
+    "paper_thesis": "01c_extract_paper_thesis",
     "repro_tasks": "02_build_repro_tasks",
     "experiment_index": "02b_build_experiment_index",
-    "repro_project_manifest": "03_generate_repro_project",
-    "repro_project": "write_repro_project_files",
-    "runtime": "run_repro_project",
-    "result_review": "04_review_reproduction_results",
+    "repro_project_manifest": "03c_task_writer_workflow",
+    "repro_project": "03c_task_writer_workflow",
+    "runtime": "03c_task_writer_workflow",
+    "result_review": "03c_task_writer_result_review",
     "review": "render_reports",
     "review_docx": "render_reports",
     "result_review_docx": "render_reports",
@@ -159,7 +163,7 @@ def _required_files_for_stage(name: str, data: dict[str, Any]) -> set[str] | Non
     if name != "repro_project_manifest":
         return None
     meta = data.get("_meta") if isinstance(data, dict) else None
-    if not isinstance(meta, dict) or not meta.get("agentic_project_used"):
+    if not isinstance(meta, dict) or meta.get("mode") != "task_writers":
         return None
     generated = meta.get("generated_paths")
     if isinstance(generated, list) and all(isinstance(item, str) for item in generated):

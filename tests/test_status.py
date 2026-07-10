@@ -16,6 +16,29 @@ class StatusTests(unittest.TestCase):
             case.mkdir()
             write_json(case / "paper_chunks.json", {"source_path": str(root / "paper.md"), "chunks": [{"chunk_id": "text_c1", "text": "AWGN"}]})
             write_json(
+                case / "paper_memory.json",
+                {
+                    "schema_version": "2.0",
+                    "source": {"path": str(root / "paper.md"), "format": "md", "sha256": None, "page_count": None},
+                    "entities": [
+                        {
+                            "entity_id": "section:text_c1",
+                            "kind": "section",
+                            "label": "text_c1",
+                            "number": None,
+                            "subfigure": None,
+                            "page": None,
+                            "chunk_ids": ["text_c1"],
+                            "text": "AWGN",
+                            "parent_id": None,
+                        }
+                    ],
+                    "cross_references": [],
+                    "metadata": {"builder": "test", "chunk_count": 1, "entity_count": 1},
+                    "memory_hash": "test-hash",
+                },
+            )
+            write_json(
                 case / "engineering_facts.json",
                 {
                     "paper_domain": "communication",
@@ -31,6 +54,17 @@ class StatusTests(unittest.TestCase):
                         }
                     ],
                     "missing_information": [],
+                },
+            )
+            write_json(
+                case / "paper_thesis.json",
+                {
+                    "central_claim": "AWGN 下 BER 随 SNR 增加而下降。",
+                    "proposed_method": "基准通信链路",
+                    "mechanism": "噪声相对功率降低会减少判决错误。",
+                    "comparisons": [],
+                    "headline_shape": "BER 单调下降。",
+                    "caveats": [],
                 },
             )
             write_json(
@@ -82,12 +116,12 @@ class StatusTests(unittest.TestCase):
             status = inspect_case_status(case)
 
             self.assertEqual(status["next_stage"], "repro_project_manifest")
-            self.assertEqual(status["resume_from"], "03_generate_repro_project")
+            self.assertEqual(status["resume_from"], "03c_task_writer_workflow")
             self.assertIn("python -m geng_agent review", status["suggested_command"])
             self.assertIn(str(root / "paper.md"), status["suggested_command"])
             self.assertIn("--run-repro", status["suggested_command"])
 
-    def test_status_accepts_agentic_manifest_required_files(self) -> None:
+    def test_status_accepts_task_writer_manifest_required_files(self) -> None:
         with TemporaryDirectory() as temp_dir:
             case = Path(temp_dir) / "case"
             case.mkdir()
@@ -96,7 +130,7 @@ class StatusTests(unittest.TestCase):
                 case / "repro_project_manifest.json",
                 {
                     "files": [{"path": path, "content_lines": ["x"]} for path in files],
-                    "_meta": {"agentic_project_used": True, "generated_paths": files},
+                    "_meta": {"backend": "codex", "mode": "task_writers", "generated_paths": files},
                 },
             )
 
@@ -147,13 +181,13 @@ class StatusTests(unittest.TestCase):
             )
             write_json(
                 case / "result_review_error.json",
-                {"enabled": True, "passed": False, "reason": "Codex result reviewer failed", "error": "empty JSON"},
+                {"enabled": True, "passed": False, "reason": "task writer report assembly failed", "error": "empty report"},
             )
 
             stage = next(item for item in inspect_case_status(case)["stages"] if item["stage"] == "result_review")
 
             self.assertFalse(stage["ok"])
-            self.assertIn("Codex result reviewer failed", stage["reason"])
+            self.assertIn("task writer report assembly failed", stage["reason"])
 
     def test_status_accepts_markdown_result_review(self) -> None:
         with TemporaryDirectory() as temp_dir:

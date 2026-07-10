@@ -144,9 +144,8 @@ def _run_pipeline(record: RunRecord) -> None:
             run_repro=True,
             result_review=True,
             resume=False,
-            template_fallback=True,
+            analysis_fallback=True,
             analysis_backend="codex",
-            project_backend="codex",
             codex_agent_rounds=5,
         )
         with _lock:

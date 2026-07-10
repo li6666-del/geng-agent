@@ -3,7 +3,9 @@ from __future__ import annotations
 # 面向用户的流水线步骤（合并 Word 导出为「报告」一步）
 DISPLAY_STAGES: list[tuple[str, str]] = [
     ("paper", "论文解析"),
+    ("paper_memory", "论文记忆"),
     ("engineering_facts", "工程事实"),
+    ("paper_thesis", "论文主张"),
     ("repro_tasks", "复现任务"),
     ("experiment_index", "实验索引"),
     ("repro_project_manifest", "复现清单"),

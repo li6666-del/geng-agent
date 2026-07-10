@@ -79,6 +79,80 @@
           },
           "title": "Limitations",
           "type": "array"
+        },
+        "target_entity_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Target Entity Ids",
+          "type": "array"
+        },
+        "subfigure": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Subfigure"
+        },
+        "claim": {
+          "default": "",
+          "title": "Claim",
+          "type": "string"
+        },
+        "methods": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Methods",
+          "type": "array"
+        },
+        "baselines": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Baselines",
+          "type": "array"
+        },
+        "regimes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Regimes",
+          "type": "array"
+        },
+        "parameters": {
+          "additionalProperties": true,
+          "title": "Parameters",
+          "type": "object"
+        },
+        "acceptance_criteria": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Acceptance Criteria",
+          "type": "array"
+        },
+        "reproducibility_mode": {
+          "default": "native_full",
+          "enum": [
+            "native_full",
+            "scaled_full",
+            "proxy_only",
+            "environment_blocked",
+            "upstream_patch_required"
+          ],
+          "title": "Reproducibility Mode",
+          "type": "string"
+        },
+        "feasibility": {
+          "additionalProperties": true,
+          "title": "Feasibility",
+          "type": "object"
         }
       },
       "required": [
@@ -131,6 +205,12 @@
   },
   "additionalProperties": false,
   "properties": {
+    "schema_version": {
+      "const": "2.0",
+      "default": "2.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
     "experiments": {
       "items": {
         "$ref": "#/$defs/ExperimentIndexItem"

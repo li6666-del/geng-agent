@@ -497,9 +497,9 @@
         const res = await fetch("/api/health");
         const data = await res.json();
         if (!data.ok) {
-          $("health-hint").textContent = "LLM 未配置：" + (data.llm_error || "请设置 GENG_LLM_API_KEY 与 GENG_LLM_MODEL");
+          $("health-hint").textContent = "Codex CLI 不可用：" + (data.codex_error || "请安装 Codex CLI 或设置 GENG_CODEX_CMD");
         } else {
-          $("health-hint").textContent = "输出目录：" + data.cases_root;
+          $("health-hint").textContent = "Codex：" + data.codex_path + "；输出目录：" + data.cases_root;
         }
         if (data.active_run_id) {
           $("start-btn").disabled = true;

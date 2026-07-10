@@ -95,7 +95,8 @@ def render_review_markdown(
                 lines.append(
                     f"- `{experiment.get('experiment_id', 'experiment')}`: task `{experiment.get('task_id')}`, "
                     f"metric `{experiment.get('metric')}`, figure/table `{experiment.get('figure_or_table')}`, "
-                    f"status `{experiment.get('status')}`, pages {experiment.get('source_pages', [])}"
+                    f"status `{experiment.get('status')}`, mode `{experiment.get('reproducibility_mode', 'unknown')}`, "
+                    f"pages {experiment.get('source_pages', [])}"
                 )
     else:
         lines.append("- experiment_index.json was not generated.")
@@ -185,8 +186,8 @@ def _format_runtime_status(runtime_result: dict[str, Any]) -> str:
     warning_count = _runtime_requirement_warning_count(runtime_result)
     if runtime_result.get("passed"):
         warning_note = f"，有 {warning_count} 条依赖告警" if warning_count else ""
-        return f"通过{warning_note}，自动修复次数 {runtime_result.get('repair_attempts_used', 0)}"
-    return f"失败，日志目录 `{runtime_result.get('logs_dir', 'unknown')}`"
+        return f"通过{warning_note}，任务 full 覆盖 {runtime_result.get('coverage', '未记录')}"
+    return f"未全部通过，任务 full 覆盖 {runtime_result.get('coverage', '未记录')}"
 
 
 def _runtime_requirement_warning_count(runtime_result: dict[str, Any]) -> int:

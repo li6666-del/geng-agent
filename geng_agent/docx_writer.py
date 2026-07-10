@@ -180,10 +180,11 @@ def write_review_docx(
                         experiment.get("metric"),
                         experiment.get("figure_or_table"),
                         experiment.get("status"),
+                        experiment.get("reproducibility_mode"),
                         _join_items(experiment.get("source_pages")),
                     ]
                 )
-        _add_table(document, ["Experiment", "Task", "Metric", "Figure/Table", "Status", "Pages"], rows)
+        _add_table(document, ["Experiment", "Task", "Metric", "Figure/Table", "Status", "Mode", "Pages"], rows)
     else:
         _add_note(document, "experiment_index.json was not generated.")
 
@@ -223,9 +224,10 @@ def write_review_docx(
             ("Python 语法可编译", validation.get("python_compiles")),
             ("自动运行已启用", runtime_result.get("enabled")),
             ("自动运行是否通过", runtime_result.get("passed")),
-            ("自动修复次数", runtime_result.get("repair_attempts_used", 0)),
+            ("任务 full 运行覆盖", runtime_result.get("coverage", "未记录")),
+            ("任务交付覆盖", runtime_result.get("delivery_coverage", "未记录")),
+            ("主持人是否重复 full", runtime_result.get("host_repeated_full", False)),
             ("依赖告警数", _runtime_requirement_warning_count(runtime_result)),
-            ("运行日志目录", runtime_result.get("logs_dir", "未生成")),
         ],
     )
     requirement_warnings = _runtime_requirement_warnings(runtime_result)
