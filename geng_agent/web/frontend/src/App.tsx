@@ -13,6 +13,7 @@ import {
   FlaskConical,
   Image as ImageIcon,
   LoaderCircle,
+  ListChecks,
   Radio,
   RefreshCw,
   Route,
@@ -24,20 +25,20 @@ import { api, connectEvents } from "./api";
 import type { Artifact, CaseDetail, CaseSummary, EventPayload, Phase, PhaseState } from "./types";
 
 const phaseCopy: Record<string, { kicker: string; description: string; icon: typeof BookOpenText }> = {
-  paper_analysis: { kicker: "CHAPTER I · READ", description: "把论文拆成可引用的文本、图表与工程事实。", icon: BookOpenText },
-  repro_design: { kicker: "CHAPTER II · CHART", description: "将论文主张编排为可以执行和验收的复现任务。", icon: Route },
-  project_build: { kicker: "CHAPTER III · BUILD", description: "生成代码、配置、依赖与可审计的工程清单。", icon: Code2 },
-  execution: { kicker: "CHAPTER IV · RUN", description: "在安全边界内运行实验，记录失败、修正与部分成果。", icon: FlaskConical },
-  evidence_review: { kicker: "CHAPTER V · VERIFY", description: "对照论文证据，汇总风险并生成可交付报告。", icon: ScrollText },
+  paper_analysis: { kicker: "阶段 1 / 5", description: "提取论文文本、图表、关键参数与工程事实。", icon: BookOpenText },
+  repro_design: { kicker: "阶段 2 / 5", description: "将论文主张转化为可执行、可验收的复现任务。", icon: Route },
+  project_build: { kicker: "阶段 3 / 5", description: "生成代码、配置、依赖与可审计的工程清单。", icon: Code2 },
+  execution: { kicker: "阶段 4 / 5", description: "运行实验并记录执行结果、异常与修正过程。", icon: FlaskConical },
+  evidence_review: { kicker: "阶段 5 / 5", description: "对照原论文证据，评估复现结果并生成审查报告。", icon: ScrollText },
 };
 
 const stateText: Record<PhaseState, string> = {
-  waiting: "等待启航",
-  running: "航行中",
+  waiting: "等待处理",
+  running: "处理中",
   partial: "已有阶段产物",
-  success: "已抵达",
-  failed: "遇到阻断",
-  cancelled: "已停止",
+  success: "已完成",
+  failed: "处理失败",
+  cancelled: "已取消",
 };
 
 function formatDate(value: string | null | undefined) {
@@ -106,19 +107,19 @@ function CaseLibrary() {
   return (
     <main className="library-shell">
       <header className="masthead">
-        <div className="wordmark"><span>耿</span>同学 Agent</div>
-        <div className="edition">REPRODUCIBILITY LOG · 01</div>
+        <div className="wordmark"><span>RP</span>论文复现工作台</div>
+        <div className="edition">五阶段过程与产物追踪</div>
       </header>
       <section className="hero-grid">
         <div className="hero-copy">
-          <p className="eyebrow">通信论文工程复现</p>
-          <h1>让每一次复现，<br /><em>留下完整航迹。</em></h1>
-          <p className="hero-lead">从论文解构到证据审查，实时看见代码如何生成、实验如何修正，以及结论由哪些产物支撑。</p>
+          <p className="eyebrow">论文工程复现系统</p>
+          <h1>论文复现流程<br /><em>分阶段可视化</em></h1>
+          <p className="hero-lead">从论文解构、复现设计、工程构建、实验执行到证据审查，持续展示处理进度、执行记录与阶段产物。</p>
           <div className="hero-note"><Radio size={16} /> 当前服务支持多人排队，计算资源受控分配</div>
         </div>
         <form className="departure-card" onSubmit={submit}>
-          <div className="card-index">NEW VOYAGE</div>
-          <h2>发起一次复现</h2>
+          <div className="card-index">新建任务</div>
+          <h2>提交论文复现</h2>
           <label className="upload-field">
             <input name="pdf_file" type="file" accept="application/pdf,.pdf" required onChange={(event) => setFileName(event.target.files?.[0]?.name || "")} />
             <Upload size={24} />
@@ -127,13 +128,13 @@ function CaseLibrary() {
           </label>
           <label className="text-label">案例名称（可选）<input name="display_name" maxLength={255} placeholder="例如：WiMAX 自适应调制复现" /></label>
           {error && <p className="form-error" role="alert">{error}</p>}
-          <button className="primary-button" disabled={submitting}>{submitting ? <LoaderCircle className="spin" /> : <ChevronRight />} {submitting ? "正在归档…" : "开始航行"}</button>
+          <button className="primary-button" disabled={submitting}>{submitting ? <LoaderCircle className="spin" /> : <ChevronRight />} {submitting ? "正在创建任务…" : "开始复现"}</button>
         </form>
       </section>
       <section className="case-library">
-        <div className="section-heading"><div><p className="eyebrow">ARCHIVE</p><h2>案例航海图</h2></div><button className="ghost-button" onClick={() => void load()}><RefreshCw size={16} /> 刷新</button></div>
+        <div className="section-heading"><div><p className="eyebrow">案例管理</p><h2>论文复现案例</h2></div><button className="ghost-button" onClick={() => void load()}><RefreshCw size={16} /> 刷新</button></div>
         {loading ? <div className="skeleton-list"><i /><i /><i /></div> : cases.length === 0 ? (
-          <div className="empty-state"><Box /><h3>档案柜还是空的</h3><p>上传第一篇论文，五阶段航线会在这里持续生长。</p></div>
+          <div className="empty-state"><Box /><h3>暂无复现案例</h3><p>上传论文后，系统将在此展示五个复现阶段的进度与产物。</p></div>
         ) : (
           <div className="case-grid">{cases.map((item, index) => <button key={item.id} className="case-ticket" onClick={() => navigate(`/cases/${item.id}`)}>
             <span className="ticket-number">{String(index + 1).padStart(2, "0")}</span>
@@ -197,7 +198,7 @@ function CaseVoyage({ caseId }: { caseId: string }) {
     return grouped;
   }, [detail?.artifacts]);
 
-  if (!detail) return <main className="loading-page"><LoaderCircle className="spin" /><p>{error || "正在翻开航行日志…"}</p></main>;
+  if (!detail) return <main className="loading-page"><LoaderCircle className="spin" /><p>{error || "正在加载复现任务…"}</p></main>;
   const job = detail.job;
   const completed = detail.phases.filter((phase) => phase.state === "success").length;
 
@@ -212,7 +213,7 @@ function CaseVoyage({ caseId }: { caseId: string }) {
     <main className="voyage-shell">
       <header className="voyage-header">
         <button className="back-button" onClick={() => navigate("/")}><ArrowLeft size={17} /> 案例档案</button>
-        <div className="voyage-title"><p className="eyebrow">REPRODUCTION VOYAGE</p><h1>{detail.display_name}</h1><p>{formatDate(detail.created_at)} · 航程 {completed}/5</p></div>
+        <div className="voyage-title"><p className="eyebrow">论文复现进度</p><h1>{detail.display_name}</h1><p>{formatDate(detail.created_at)} · 已完成 {completed}/5 个阶段</p></div>
         <div className="header-actions">
           <span className={`connection ${connected ? "online" : ""}`}><i />{connected ? "实时连接" : "正在重连"}</span>
           {job && ["queued", "running", "cancel_requested"].includes(job.status) && <button className="danger-ghost" onClick={() => void cancel()}><CircleStop size={16} /> 停止</button>}
@@ -221,8 +222,8 @@ function CaseVoyage({ caseId }: { caseId: string }) {
       </header>
       {error && <div className="global-alert" role="alert">{error}</div>}
       <div className="voyage-layout">
-        <aside className="route-rail" aria-label="五阶段航线">
-          <div className="rail-caption"><Route size={18} /> 航线进度</div>
+        <aside className="route-rail" aria-label="五阶段复现进度">
+          <div className="rail-caption"><ListChecks size={18} /> 阶段进度</div>
           <div className="rail-line"><i style={{ height: `${Math.max(0, (completed / 5) * 100)}%` }} /></div>
           {detail.phases.map((phase) => <button key={phase.id} className={`rail-stop state-${phase.state}`} onClick={() => phaseRefs.current[phase.id]?.scrollIntoView({ behavior: "smooth", block: "start" })}>
             <span>{phase.state === "success" ? <Check size={14} /> : phase.index}</span><div><strong>{phase.label}</strong><small>{stateText[phase.state]}</small></div>
@@ -242,8 +243,8 @@ function CaseVoyage({ caseId }: { caseId: string }) {
           />)}
         </div>
         <aside className="live-notes">
-          <div className="notes-title"><Radio size={15} /> 实时记录</div>
-          {events.length === 0 ? <p className="quiet">等待下一条航行记录…</p> : events.slice(-8).reverse().map((event) => <div className="event-note" key={event.id}><time>{formatDate(event.created_at)}</time><p>{event.message || event.type}</p></div>)}
+          <div className="notes-title"><Radio size={15} /> 执行记录</div>
+          {events.length === 0 ? <p className="quiet">暂无新的执行记录</p> : events.slice(-8).reverse().map((event) => <div className="event-note" key={event.id}><time>{formatDate(event.created_at)}</time><p>{event.message || event.type}</p></div>)}
         </aside>
       </div>
       {selected && <ArtifactDrawer artifact={selected} onClose={() => setSelected(null)} />}
@@ -264,9 +265,9 @@ function PhaseChapter({ phase, artifacts, events, setRef, onArtifact, caseId, jo
       <div className="chapter-state"><i />{stateText[phase.state]}</div>
     </header>
     <div className="step-strip">{phase.steps.map((step) => <span key={step} className={events.some((event) => event.step === step) ? "observed" : ""}>{step.replaceAll("_", " ")}</span>)}</div>
-    {phase.state === "running" && <div className="running-band"><LoaderCircle className="spin" /><div><strong>{events.at(-1)?.message || "智能体正在处理这一章节"}</strong><small>页面可以安全关闭，任务与事件已持久化</small></div></div>}
+    {phase.state === "running" && <div className="running-band"><LoaderCircle className="spin" /><div><strong>{events.at(-1)?.message || "系统正在处理本阶段"}</strong><small>任务状态与执行记录已持久化，可稍后返回查看</small></div></div>}
     {jobError && <details className="error-detail"><summary>查看阻断原因</summary><strong>{jobError.code}</strong><pre>{jobError.message}</pre></details>}
-    {artifacts.length > 0 ? <div className="artifact-grid">{artifacts.slice(0, 12).map((artifact) => <ArtifactCard key={artifact.id} artifact={artifact} onOpen={() => onArtifact(artifact)} />)}</div> : <div className="chapter-empty"><span>本章产物将在此归档</span><small>JSON、代码、图像、CSV 与报告都会保留来源和校验摘要。</small></div>}
+    {artifacts.length > 0 ? <div className="artifact-grid">{artifacts.slice(0, 12).map((artifact) => <ArtifactCard key={artifact.id} artifact={artifact} onOpen={() => onArtifact(artifact)} />)}</div> : <div className="chapter-empty"><span>本阶段暂无产物</span><small>生成的 JSON、代码、图像、CSV 与报告将在此展示。</small></div>}
     {artifacts.length > 0 && <div className="chapter-footer"><span>{artifacts.length} 份产物</span><ExportButton caseId={caseId} phase={phase.id} compact /></div>}
   </section>;
 }
@@ -296,7 +297,7 @@ function ExportButton({ caseId, phase, compact = false }: { caseId: string; phas
       alert(reason instanceof Error ? reason.message : "导出失败");
     } finally { setBusy(false); }
   }
-  return <button className={compact ? "text-button" : "download-button"} disabled={busy} onClick={() => void start()}>{busy ? <LoaderCircle className="spin" size={15} /> : <ArrowDownToLine size={15} />}{compact ? "打包本章" : "下载整案"}</button>;
+  return <button className={compact ? "text-button" : "download-button"} disabled={busy} onClick={() => void start()}>{busy ? <LoaderCircle className="spin" size={15} /> : <ArrowDownToLine size={15} />}{compact ? "下载本阶段" : "下载全部产物"}</button>;
 }
 
 function ArtifactDrawer({ artifact, onClose }: { artifact: Artifact; onClose: () => void }) {
