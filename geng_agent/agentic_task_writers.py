@@ -52,6 +52,7 @@ from .resource_scheduler import WriterConcurrencyController, build_resource_plan
 
 TASK_WRITER_STATUSES = {"matched", "explained_gap", "failed"}
 MAX_TASK_WRITER_SELF_ITERATIONS = 5
+MAX_TASK_WRITER_HOST_REPAIR_ATTEMPTS = 2
 
 
 def _task_with_experiment_profile(task: dict[str, Any], experiment_index: dict[str, Any]) -> dict[str, Any]:
@@ -145,6 +146,12 @@ def run_codex_task_writer_workflow(
     timeout = max(1.0, float(timeout or 1800.0))
     run_timeout = max(1.0, float(run_timeout or 120.0))
 
+    task_manifest = build_tasks_manifest(tasks)
+    task_items = [task for task in tasks.get("repro_tasks", []) if isinstance(task, dict)]
+    manifest_entries = [entry for entry in task_manifest.get("tasks", []) if isinstance(entry, dict)]
+    task_pairs = list(zip(task_items, manifest_entries))
+    expected_paths = expected_generated_paths([item["script"] for item in manifest_entries])
+
     cached = _load_cached_task_writer_workflow(
         output_dir=output_dir,
         repro_project_dir=repro_project_dir,
@@ -152,20 +159,25 @@ def run_codex_task_writer_workflow(
         result_review=result_review,
         memory_snapshot_hash=memory_snapshot_hash,
     )
-    if resume and cached is not None:
+    cached_runtime_passed = bool((cached or {}).get("runtime_result", {}).get("passed"))
+    if resume and cached is not None and (not run_repro or cached_runtime_passed):
         write_json(audit_dir / "03c_task_writers_resume.json", {"ok": True, "source": "cached artifacts"})
         return cached
+    resume_records = (
+        _load_task_writer_resume_records(
+            audit_dir=audit_dir,
+            task_pairs=task_pairs,
+            expected_memory_snapshot_hash=memory_snapshot_hash,
+        )
+        if resume
+        else {}
+    )
 
-    _clear_stage_outputs(output_dir, "manifest")
+    _clear_stage_outputs(output_dir, "manifest", preserve_audit=bool(resume_records))
     _clear_result_review_outputs(output_dir)
-    task_manifest = build_tasks_manifest(tasks)
-    task_items = [task for task in tasks.get("repro_tasks", []) if isinstance(task, dict)]
-    manifest_entries = [entry for entry in task_manifest.get("tasks", []) if isinstance(entry, dict)]
-    task_pairs = list(zip(task_items, manifest_entries))
-    expected_paths = expected_generated_paths([item["script"] for item in manifest_entries])
 
     task_root = audit_dir / "03c_task_writer_sandboxes"
-    if task_root.exists():
+    if task_root.exists() and not resume_records:
         shutil.rmtree(task_root)
     task_root.mkdir(parents=True, exist_ok=True)
     resource_root = audit_dir / "03c_task_writer_resources"
@@ -224,6 +236,7 @@ def run_codex_task_writer_workflow(
             resource_plan=resource_plan,
             resource_plan_path=resource_plan_path,
             resource_broker=resource_broker,
+            initial_records_by_index=resume_records,
         )
     finally:
         resource_broker.stop()
@@ -361,6 +374,71 @@ def run_codex_task_writer_workflow(
     }
 
 
+def _load_task_writer_resume_records(
+    *,
+    audit_dir: Path,
+    task_pairs: list[tuple[dict[str, Any], dict[str, Any]]],
+    expected_memory_snapshot_hash: str,
+) -> dict[int, dict[str, Any]]:
+    path = audit_dir / "03c_task_writers_records.json"
+    if not path.exists():
+        return {}
+    try:
+        document = json.loads(path.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return {}
+    raw_records = document.get("tasks") if isinstance(document, dict) else None
+    if not isinstance(raw_records, list):
+        return {}
+    expected_by_id = {
+        str(task.get("task_id") or entry.get("task_id") or f"task_{index}"): index
+        for index, (task, entry) in enumerate(task_pairs, start=1)
+    }
+    records: dict[int, dict[str, Any]] = {}
+    for record in raw_records:
+        if not isinstance(record, dict):
+            continue
+        task_id = str(record.get("task_id") or "")
+        index = expected_by_id.get(task_id)
+        if index is None:
+            continue
+        expected_sandbox = audit_dir / "03c_task_writer_sandboxes" / f"{index:02d}_{safe_label(task_id)}"
+        sandbox = Path(str(record.get("sandbox") or ""))
+        if not sandbox.exists() or sandbox.resolve() != expected_sandbox.resolve():
+            continue
+        contract_path = sandbox / "task_contract.json"
+        try:
+            parsed_contract = json.loads(contract_path.read_text(encoding="utf-8-sig"))
+        except Exception:
+            continue
+        contract = parsed_contract if isinstance(parsed_contract, dict) else {}
+        if str(contract.get("task_id") or "") != task_id:
+            continue
+        if str(contract.get("memory_snapshot_hash") or "") != (expected_memory_snapshot_hash or "unavailable"):
+            continue
+        records[index] = record
+    return records
+
+
+def _guard_token_from_record(record: dict[str, Any] | None) -> str | None:
+    if not isinstance(record, dict):
+        return None
+    run_records = record.get("run_records") if isinstance(record.get("run_records"), list) else []
+    for item in reversed(run_records):
+        if isinstance(item, dict) and isinstance(item.get("guard_token"), str) and item["guard_token"]:
+            return item["guard_token"]
+    raw_run_log = str(record.get("run_log_path") or "")
+    if not raw_run_log:
+        return None
+    run_log = Path(raw_run_log)
+    if not run_log.is_file():
+        return None
+    for item in reversed(_read_jsonl(run_log)):
+        if isinstance(item.get("guard_token"), str) and item["guard_token"]:
+            return item["guard_token"]
+    return None
+
+
 def _dispatch_task_writers(
     *,
     task_pairs: list[tuple[dict[str, Any], dict[str, Any]]],
@@ -382,17 +460,37 @@ def _dispatch_task_writers(
     resource_plan: dict[str, Any],
     resource_plan_path: Path,
     resource_broker: ResourceBroker | None,
+    initial_records_by_index: dict[int, dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     writer_plan = resource_plan["writer"]
     controller = WriterConcurrencyController(writer_plan)
     retries = max(0, int(writer_plan.get("capacity_retries") or 0))
     retry_base = max(0.0, float(writer_plan.get("retry_base_seconds") or 0.0))
-    pending: list[dict[str, Any]] = [
-        {"index": index, "attempt": 1, "ready_at": 0.0}
+    existing = dict(initial_records_by_index or {})
+    by_index: dict[int, dict[str, Any]] = {
+        index: record for index, record in existing.items() if _task_writer_runtime_task_passed(record)
+    }
+    pending: list[dict[str, Any]] = []
+    for index in range(1, len(task_pairs) + 1):
+        if index in by_index:
+            continue
+        previous = existing.get(index)
+        previous_attempt = max(1, int((previous or {}).get("attempt") or 1)) if previous else 0
+        previous_writer_ok = bool(((previous or {}).get("writer_status") or {}).get("ok"))
+        pending.append(
+            {
+                "index": index,
+                "attempt": previous_attempt + 1 if previous else 1,
+                "ready_at": 0.0,
+                "capacity_retry": 0,
+                "reuse_existing": bool(previous),
+                "resume_record": previous if previous_writer_ok else None,
+            }
+        )
+    guard_tokens = {
+        index: _guard_token_from_record(existing.get(index)) or secrets.token_hex(16)
         for index in range(1, len(task_pairs) + 1)
-    ]
-    guard_tokens = {index: secrets.token_hex(16) for index in range(1, len(task_pairs) + 1)}
-    by_index: dict[int, dict[str, Any]] = {}
+    }
     futures: dict[Future[dict[str, Any]], dict[str, Any]] = {}
     capacity_not_before = 0.0
     audit: dict[str, Any] = {
@@ -416,6 +514,10 @@ def _dispatch_task_writers(
         ),
         "attempts": [],
         "concurrency_events": [],
+        "reused_task_ids": [str(record.get("task_id") or "") for record in by_index.values()],
+        "repair_task_ids": [
+            str(task_pairs[int(item["index"]) - 1][0].get("task_id") or "") for item in pending
+        ],
     }
     audit_path = audit_dir / "writer_dispatch.json"
 
@@ -444,12 +546,14 @@ def _dispatch_task_writers(
                 item = pending.pop(ready_index)
                 index = int(item["index"])
                 attempt = int(item["attempt"])
+                capacity_retry = int(item.get("capacity_retry") or 0)
                 task, manifest_entry = task_pairs[index - 1]
                 future = executor.submit(
                     _run_one_task_writer,
                     index=index,
                     attempt=attempt,
-                    reuse_existing=attempt > 1,
+                    reuse_existing=bool(item.get("reuse_existing")) or attempt > 1,
+                    resume_record=item.get("resume_record"),
                     guard_token=guard_tokens[index],
                     task=task,
                     manifest_entry=manifest_entry,
@@ -476,6 +580,7 @@ def _dispatch_task_writers(
                         "task_id": str(task.get("task_id") or manifest_entry.get("task_id") or f"task_{index}"),
                         "index": index,
                         "attempt": attempt,
+                        "capacity_retry": capacity_retry,
                     }
                 )
             if launched:
@@ -503,6 +608,7 @@ def _dispatch_task_writers(
                 item = futures.pop(future)
                 index = int(item["index"])
                 attempt = int(item["attempt"])
+                capacity_retry = int(item.get("capacity_retry") or 0)
                 try:
                     record = future.result()
                 except Exception as exc:
@@ -520,17 +626,27 @@ def _dispatch_task_writers(
                         "completed_at": time.time(),
                     }
                 )
-                if capacity_error and attempt <= retries:
+                if capacity_error and capacity_retry < retries:
                     before, after = controller.record_capacity_error()
-                    delay = retry_base * (2 ** (attempt - 1))
+                    delay = retry_base * (2**capacity_retry)
                     retry_ready_at = time.monotonic() + delay
                     capacity_not_before = max(capacity_not_before, retry_ready_at)
-                    pending.append({"index": index, "attempt": attempt + 1, "ready_at": retry_ready_at})
+                    pending.append(
+                        {
+                            "index": index,
+                            "attempt": attempt + 1,
+                            "ready_at": retry_ready_at,
+                            "capacity_retry": capacity_retry + 1,
+                            "reuse_existing": True,
+                            "resume_record": None,
+                        }
+                    )
                     audit["concurrency_events"].append(
                         {
                             "event": "capacity_backoff",
                             "task_id": task_id,
                             "attempt": attempt,
+                            "capacity_retry": capacity_retry + 1,
                             "before": before,
                             "after": after,
                             "retry_delay_s": delay,
@@ -572,6 +688,7 @@ def _run_one_task_writer(
     index: int,
     attempt: int,
     reuse_existing: bool,
+    resume_record: dict[str, Any] | None,
     guard_token: str,
     task: dict[str, Any],
     manifest_entry: dict[str, Any],
@@ -598,6 +715,8 @@ def _run_one_task_writer(
     base_label = f"03c_task_writer_{index:02d}_{safe_label(task_id)}"
     label = base_label if attempt <= 1 else f"{base_label}_attempt_{attempt:02d}"
     sandbox = task_root / f"{index:02d}_{safe_label(task_id)}"
+    output_subdir = str(manifest_entry.get("output_subdir") or task_id)
+    run_log = sandbox / "task_agent_runs.jsonl"
     _prepare_task_writer_sandbox(
         sandbox=sandbox,
         task=task,
@@ -618,29 +737,183 @@ def _run_one_task_writer(
         channel_dir=sandbox / ".geng_resource_broker",
     )
     timeout_state_path = sandbox / ".geng_task_writer_timeout_state.json"
-    prompt = _build_task_writer_brief(
+    writer_status_history = list((resume_record or {}).get("writer_status_history") or [])
+    repair_history = list((resume_record or {}).get("host_repair_history") or [])
+    if resume_record is None:
+        prompt = _build_task_writer_brief(
+            index=index,
+            task=task,
+            manifest_entry=manifest_entry,
+            facts=facts,
+            experiment_index=experiment_index,
+            paper=paper,
+            paper_context_json=paper_context_json,
+            paper_thesis=paper_thesis,
+            rounds=rounds,
+            run_timeout=run_timeout,
+            run_repro=run_repro,
+            retry_attempt=attempt,
+        )
+        writer_status = _run_task_writer_codex_session(
+            label=label,
+            prompt=prompt,
+            sandbox=sandbox,
+            audit_dir=audit_dir,
+            task_id=task_id,
+            module=module,
+            output_subdir=output_subdir,
+            run_log=run_log,
+            allow_full=run_repro,
+            run_timeout=run_timeout,
+            memory_snapshot_hash=memory_snapshot_hash,
+            broker_channel=broker_channel,
+            resource_broker=resource_broker,
+            timeout_state_path=timeout_state_path,
+            guard_token=guard_token,
+            timeout=timeout,
+        )
+        writer_status_history.append({"label": label, "repair_kind": "initial", "status": writer_status})
+    else:
+        writer_status = resume_record.get("writer_status") if isinstance(resume_record.get("writer_status"), dict) else {}
+
+    _restore_trusted_files(sandbox, {"version": 1, "tasks": [manifest_entry]})
+    record, deterministic_actions = _host_repair_and_validate_task_writer(
         index=index,
         task=task,
         manifest_entry=manifest_entry,
-        facts=facts,
-        experiment_index=experiment_index,
-        paper=paper,
-        paper_context_json=paper_context_json,
-        paper_thesis=paper_thesis,
-        rounds=rounds,
-        run_timeout=run_timeout,
+        sandbox=sandbox,
+        writer_status=writer_status,
         run_repro=run_repro,
-        retry_attempt=attempt,
+        run_log=run_log,
+        guard_token=guard_token,
+        expected_memory_snapshot_hash=memory_snapshot_hash,
     )
+    if deterministic_actions:
+        repair_history.append(
+            {
+                "repair_kind": "deterministic",
+                "attempt": 0,
+                "actions": deterministic_actions,
+                "remaining_errors": record.get("errors", []),
+            }
+        )
+
+    for repair_no in range(1, MAX_TASK_WRITER_HOST_REPAIR_ATTEMPTS + 1):
+        if _task_writer_runtime_task_passed(record) or _task_writer_blocked_by_codex(record):
+            break
+        repair_kind = _classify_task_writer_repair(record)
+        repair_label = f"{label}_host_repair_{repair_no:02d}_{repair_kind}"
+        repair_prompt = _build_task_writer_host_repair_brief(
+            task_id=task_id,
+            module=module,
+            output_subdir=output_subdir,
+            repair_kind=repair_kind,
+            errors=record.get("errors", []),
+            warnings=record.get("warnings", []),
+            rounds=rounds,
+            full_enabled=run_repro,
+        )
+        metadata_snapshot = (
+            _snapshot_metadata_repair_state(sandbox=sandbox, output_subdir=output_subdir)
+            if repair_kind == "metadata"
+            else None
+        )
+        scope_actions: list[dict[str, Any]] = []
+        try:
+            writer_status = _run_task_writer_codex_session(
+                label=repair_label,
+                prompt=repair_prompt,
+                sandbox=sandbox,
+                audit_dir=audit_dir,
+                task_id=task_id,
+                module=module,
+                output_subdir=output_subdir,
+                run_log=run_log,
+                allow_full=bool(run_repro and repair_kind == "execution"),
+                run_timeout=run_timeout,
+                memory_snapshot_hash=memory_snapshot_hash,
+                broker_channel=broker_channel,
+                resource_broker=resource_broker,
+                timeout_state_path=timeout_state_path,
+                guard_token=guard_token,
+                timeout=timeout,
+            )
+        finally:
+            if metadata_snapshot is not None:
+                scope_actions = _restore_metadata_repair_state(
+                    sandbox=sandbox,
+                    output_subdir=output_subdir,
+                    snapshot=metadata_snapshot,
+                )
+        writer_status_history.append(
+            {"label": repair_label, "repair_kind": repair_kind, "status": writer_status}
+        )
+        _restore_trusted_files(sandbox, {"version": 1, "tasks": [manifest_entry]})
+        record, deterministic_actions = _host_repair_and_validate_task_writer(
+            index=index,
+            task=task,
+            manifest_entry=manifest_entry,
+            sandbox=sandbox,
+            writer_status=writer_status,
+            run_repro=run_repro,
+            run_log=run_log,
+            guard_token=guard_token,
+            expected_memory_snapshot_hash=memory_snapshot_hash,
+        )
+        repair_history.append(
+            {
+                "repair_kind": repair_kind,
+                "attempt": repair_no,
+                "full_allowed": bool(run_repro and repair_kind == "execution"),
+                "actions": [*scope_actions, *deterministic_actions],
+                "remaining_errors": record.get("errors", []),
+            }
+        )
+        if not writer_status.get("ok"):
+            break
+
+    record["writer_status_history"] = writer_status_history
+    record["host_repair_history"] = repair_history
+    record["attempt"] = attempt
+    write_json(
+        audit_dir / f"{label}_host_repairs.json",
+        {
+            "task_id": task_id,
+            "structural_ok": record.get("structural_ok"),
+            "history": repair_history,
+        },
+    )
+    return record
+
+
+def _run_task_writer_codex_session(
+    *,
+    label: str,
+    prompt: str,
+    sandbox: Path,
+    audit_dir: Path,
+    task_id: str,
+    module: str,
+    output_subdir: str,
+    run_log: Path,
+    allow_full: bool,
+    run_timeout: float,
+    memory_snapshot_hash: str,
+    broker_channel: dict[str, str],
+    resource_broker: ResourceBroker,
+    timeout_state_path: Path,
+    guard_token: str,
+    timeout: float,
+) -> dict[str, Any]:
     write_text(audit_dir / f"{label}_brief.md", prompt)
     guard = _prepare_task_writer_python_guard(
         audit_dir=audit_dir,
         label=label,
         task_id=task_id,
         module=module,
-        output_subdir=str(manifest_entry.get("output_subdir") or task_id),
-        run_log=sandbox / "task_agent_runs.jsonl",
-        allow_full=run_repro,
+        output_subdir=output_subdir,
+        run_log=run_log,
+        allow_full=allow_full,
         run_timeout=run_timeout,
         contract_path=sandbox / "task_contract.json",
         memory_snapshot_hash=memory_snapshot_hash,
@@ -650,7 +923,7 @@ def _run_one_task_writer(
         timeout_state_path=timeout_state_path,
         guard_token=guard_token,
     )
-    writer_status = run_codex_subprocess(
+    return run_codex_subprocess(
         role="task_writer",
         work_dir=sandbox,
         prompt=prompt,
@@ -663,18 +936,420 @@ def _run_one_task_writer(
         path_prepend=[guard["bin_dir"]],
         timeout_state_path=timeout_state_path,
     )
-    _restore_trusted_files(sandbox, {"version": 1, "tasks": [manifest_entry]})
-    return _validate_task_writer_delivery(
+
+
+def _host_repair_and_validate_task_writer(
+    *,
+    index: int,
+    task: dict[str, Any],
+    manifest_entry: dict[str, Any],
+    sandbox: Path,
+    writer_status: dict[str, Any],
+    run_repro: bool,
+    run_log: Path,
+    guard_token: str,
+    expected_memory_snapshot_hash: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Apply host-owned normalizations, then perform task-local structural gates."""
+    output_subdir = str(manifest_entry.get("output_subdir") or task.get("task_id") or "task")
+    actions = _apply_deterministic_task_writer_repairs(sandbox=sandbox, output_subdir=output_subdir)
+
+    requirements_path = sandbox / "requirements.txt"
+    requirements_before = requirements_path.read_bytes() if requirements_path.is_file() else None
+    added_requirements = reconcile_whitelisted_requirements(sandbox)
+    requirements_after = requirements_path.read_bytes() if requirements_path.is_file() else None
+    if requirements_after != requirements_before:
+        actions.append(
+            {
+                "kind": "requirements_reconciled",
+                "file": "requirements.txt",
+                "packages_added": added_requirements,
+            }
+        )
+
+    record = _validate_task_writer_delivery(
         index=index,
         task=task,
         manifest_entry=manifest_entry,
         sandbox=sandbox,
         writer_status=writer_status,
         run_repro=run_repro,
-        trusted_run_log_path=Path(str(guard["run_log"])),
-        guard_token=str(guard["guard_token"]),
-        expected_memory_snapshot_hash=memory_snapshot_hash,
+        trusted_run_log_path=run_log,
+        guard_token=guard_token,
+        expected_memory_snapshot_hash=expected_memory_snapshot_hash,
     )
+    validation = validate_repro_project(sandbox)
+    requirement_issues = validate_requirements(sandbox)
+    blocking_requirements, requirement_warnings = split_requirement_issues(requirement_issues)
+    security_issues = static_scan_repro_project(sandbox)
+
+    errors = list(record.get("errors") or [])
+    warnings = list(record.get("warnings") or [])
+    errors.extend(f"missing required project file: {path}" for path in validation.get("missing_files", []))
+    errors.extend(
+        f"python compile error in {item.get('file')}: {item.get('error')}"
+        for item in validation.get("compile_errors", [])
+        if isinstance(item, dict)
+    )
+    errors.extend(_format_host_issue("blocking requirement issue", item) for item in blocking_requirements)
+    errors.extend(_format_host_issue("security issue", item) for item in security_issues)
+    warnings.extend(_format_host_issue("requirement warning", item) for item in requirement_warnings)
+
+    record["errors"] = _dedupe_text(errors)
+    record["warnings"] = _dedupe_text(warnings)
+    record["structural_ok"] = not record["errors"]
+    record["sandbox_validation"] = {
+        "project": validation,
+        "blocking_requirement_issues": blocking_requirements,
+        "requirement_warnings": requirement_warnings,
+        "security_issues": security_issues,
+    }
+    return record, actions
+
+
+def _apply_deterministic_task_writer_repairs(*, sandbox: Path, output_subdir: str) -> list[dict[str, Any]]:
+    """Repair serialization-only defects without invoking Codex or running Python."""
+    actions: list[dict[str, Any]] = []
+    normalized_project_files = _normalize_project_text_bom(sandbox)
+    if normalized_project_files:
+        actions.append({"kind": "utf8_bom_removed", "files": normalized_project_files})
+
+    metadata_names = (
+        "task_agent_result.json",
+        "task_agent_result.md",
+        "paper_target_figure.json",
+        "task_revision_request.json",
+    )
+    metadata_paths: list[Path] = []
+    for name in metadata_names:
+        metadata_paths.extend((sandbox / name, sandbox / "outputs" / output_subdir / name))
+
+    output_bom_files: list[str] = []
+    for path in dict.fromkeys(metadata_paths):
+        if not path.is_file():
+            continue
+        raw = path.read_bytes()
+        if b"\xef\xbb\xbf" not in raw:
+            continue
+        path.write_bytes(raw.replace(b"\xef\xbb\xbf", b""))
+        output_bom_files.append(_relative_display_path(path, sandbox))
+    if output_bom_files:
+        actions.append({"kind": "utf8_bom_removed", "files": output_bom_files})
+
+    for filename in ("task_agent_result.json", "paper_target_figure.json", "task_revision_request.json"):
+        for path in (sandbox / filename, sandbox / "outputs" / output_subdir / filename):
+            changes = _normalize_task_writer_json_file(
+                path=path,
+                sandbox=sandbox,
+                output_subdir=output_subdir,
+                filename=filename,
+            )
+            if changes:
+                actions.append(
+                    {
+                        "kind": "json_metadata_normalized",
+                        "file": _relative_display_path(path, sandbox),
+                        "changes": changes,
+                    }
+                )
+    return actions
+
+
+def _normalize_task_writer_json_file(
+    *,
+    path: Path,
+    sandbox: Path,
+    output_subdir: str,
+    filename: str,
+) -> list[str]:
+    if not path.is_file():
+        return []
+    try:
+        document = json.loads(path.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return []
+    if not isinstance(document, dict):
+        return []
+
+    changes: list[str] = []
+    list_path_keys = {"evidence_files", "local_image_paths", "paper_image_paths"}
+    scalar_path_keys = {"crop_path", "locator_path", "image_path"}
+    for key in list_path_keys:
+        value = document.get(key)
+        if not isinstance(value, list):
+            continue
+        normalized = [
+            _normalize_writer_declared_path_text(
+                sandbox=sandbox,
+                output_subdir=output_subdir,
+                raw_path=item,
+            )
+            if isinstance(item, str)
+            else item
+            for item in value
+        ]
+        if normalized != value:
+            document[key] = normalized
+            changes.append(f"normalized {key} paths")
+    for key in scalar_path_keys:
+        value = document.get(key)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        normalized = _normalize_writer_declared_path_text(
+            sandbox=sandbox,
+            output_subdir=output_subdir,
+            raw_path=value,
+        )
+        if normalized != value:
+            document[key] = normalized
+            changes.append(f"normalized {key} path")
+
+    if filename == "paper_target_figure.json":
+        confidence = document.get("confidence")
+        score = _confidence_score(confidence)
+        if score is not None:
+            label = "low" if score < 0.5 else "medium" if score < 0.8 else "high"
+            if confidence != label:
+                document["confidence"] = label
+                document.setdefault("confidence_score", score)
+                changes.append("normalized confidence to low/medium/high")
+        for key in ("source_page", "source_pages"):
+            value = document.get(key)
+            if isinstance(value, float) and value.is_integer():
+                document[key] = int(value)
+                changes.append(f"normalized {key} integer")
+            elif isinstance(value, list):
+                normalized_pages = [int(item) if isinstance(item, float) and item.is_integer() else item for item in value]
+                if normalized_pages != value:
+                    document[key] = normalized_pages
+                    changes.append(f"normalized {key} integers")
+
+    if changes:
+        write_json(path, document)
+    return changes
+
+
+def _normalize_writer_declared_path_text(*, sandbox: Path, output_subdir: str, raw_path: str) -> str:
+    raw = str(raw_path).strip().strip('"')
+    if not raw:
+        return raw
+    resolved = _resolve_writer_declared_path(sandbox=sandbox, output_subdir=output_subdir, raw_path=raw)
+    candidate = resolved or Path(raw)
+    if candidate.is_absolute() and _path_is_inside(candidate, sandbox):
+        return candidate.resolve().relative_to(sandbox.resolve()).as_posix()
+    return raw.replace("\\", "/")
+
+
+def _confidence_score(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        score = float(value)
+    elif isinstance(value, str):
+        try:
+            score = float(value.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    return score if 0 <= score <= 1 else None
+
+
+def _relative_display_path(path: Path, root: Path) -> str:
+    try:
+        return path.resolve().relative_to(root.resolve()).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def _snapshot_metadata_repair_state(*, sandbox: Path, output_subdir: str) -> dict[str, bytes]:
+    snapshot: dict[str, bytes] = {}
+    for path in sandbox.rglob("*"):
+        if (
+            not path.is_file()
+            or not _metadata_repair_path_is_protected(path, sandbox, output_subdir)
+            or _metadata_repair_path_is_mutable(path, sandbox, output_subdir)
+        ):
+            continue
+        snapshot[path.relative_to(sandbox).as_posix()] = path.read_bytes()
+    return snapshot
+
+
+def _restore_metadata_repair_state(
+    *,
+    sandbox: Path,
+    output_subdir: str,
+    snapshot: dict[str, bytes],
+) -> list[dict[str, Any]]:
+    restored: list[str] = []
+    removed: list[str] = []
+    for path in list(sandbox.rglob("*")):
+        if (
+            not path.is_file()
+            or not _metadata_repair_path_is_protected(path, sandbox, output_subdir)
+            or _metadata_repair_path_is_mutable(path, sandbox, output_subdir)
+        ):
+            continue
+        relative = path.relative_to(sandbox).as_posix()
+        if relative not in snapshot:
+            path.unlink()
+            removed.append(relative)
+    for relative, content in snapshot.items():
+        path = sandbox / Path(relative)
+        if not path.is_file() or path.read_bytes() != content:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+            restored.append(relative)
+    if not restored and not removed:
+        return []
+    return [
+        {
+            "kind": "metadata_scope_enforced",
+            "restored_files": restored,
+            "removed_unapproved_files": removed,
+        }
+    ]
+
+
+def _metadata_repair_path_is_mutable(path: Path, sandbox: Path, output_subdir: str) -> bool:
+    relative = path.relative_to(sandbox)
+    if ".geng_resource_broker" in relative.parts or "__pycache__" in relative.parts:
+        return True
+    if path.name in {
+        "task_agent_result.json",
+        "task_agent_result.md",
+        "paper_target_figure.json",
+        "task_revision_request.json",
+        "task_agent_runs.jsonl",
+        ".geng_task_writer_timeout_state.json",
+    }:
+        return True
+    output_root = sandbox / "outputs" / output_subdir
+    if _path_is_inside(path, output_root) and path.suffix.lower() == ".png":
+        name = path.stem.lower()
+        return any(token in name for token in ("paper", "crop", "locator"))
+    return False
+
+
+def _metadata_repair_path_is_protected(path: Path, sandbox: Path, output_subdir: str) -> bool:
+    relative = path.relative_to(sandbox)
+    if relative.parts and relative.parts[0] in {"tasks", "src", "configs"}:
+        return path.suffix.lower() in {".py", ".json"}
+    if len(relative.parts) == 1:
+        return (
+            path.name in {"requirements.txt", "task_contract.json", "tasks_manifest.json", "run_experiment.py"}
+            or path.name.startswith("config")
+        )
+    output_root = sandbox / "outputs" / output_subdir
+    if not _path_is_inside(path, output_root):
+        return False
+    if path.suffix.lower() in {".csv", ".png"}:
+        return True
+    return path.suffix.lower() == ".json" and path.name.startswith("summary")
+
+
+def _format_host_issue(prefix: str, issue: Any) -> str:
+    if not isinstance(issue, dict):
+        return f"{prefix}: {issue}"
+    location = str(issue.get("file") or "")
+    line = str(issue.get("line") or "")
+    if line:
+        location = f"{location}:{line}" if location else f"line {line}"
+    message = str(issue.get("message") or issue.get("error") or issue)
+    return f"{prefix}{f' in {location}' if location else ''}: {message}"
+
+
+def _dedupe_text(items: list[Any]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        text = str(item).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
+
+
+def _classify_task_writer_repair(record: dict[str, Any]) -> str:
+    error_text = "\n".join(str(item).lower() for item in record.get("errors", []))
+    execution_markers = (
+        "missing assigned task script",
+        "missing valid local",
+        "missing local output image",
+        "invalid artifact",
+        "task_contract",
+        "full run",
+        "compile error",
+        "syntax error",
+        "missing required project file",
+        "blocking requirement issue",
+        "security issue",
+        "dependency",
+    )
+    if any(marker in error_text for marker in execution_markers):
+        return "execution"
+    metadata_markers = (
+        "task_agent_result",
+        "paper_target_figure",
+        "paper image path",
+        "paper target image",
+        "confidence",
+        "source_page",
+        "bbox_norm",
+        "task_revision_request",
+    )
+    if any(marker in error_text for marker in metadata_markers):
+        return "metadata"
+    return "execution" if str(record.get("task_writer_status") or "") == "failed" else "metadata"
+
+
+def _build_task_writer_host_repair_brief(
+    *,
+    task_id: str,
+    module: str,
+    output_subdir: str,
+    repair_kind: str,
+    errors: list[Any],
+    warnings: list[Any],
+    rounds: int,
+    full_enabled: bool,
+) -> str:
+    error_lines = "\n".join(f"- {item}" for item in errors) or "- none"
+    warning_lines = "\n".join(f"- {item}" for item in warnings) or "- none"
+    if repair_kind == "metadata":
+        repair_instructions = f"""This is a metadata-only repair. Do not run full and do not run `python -m tasks.{module} config.json`.
+Do not change scientific code, generated data, or valid images. Correct only missing or malformed result/report/locator fields and in-sandbox path references. The guard has full disabled for this session."""
+    elif full_enabled:
+        repair_instructions = f"""This is a task-local execution repair. Inspect the existing code, data, contract, run log, and artifacts; preserve everything already valid.
+Fix only this assigned task. Run `python -m tasks.{module} config_smoke.json` as a quick gate, then you must rerun `python -m tasks.{module} config.json` after correcting code, data, artifacts, or full evidence. Never run the dispatcher or another task. Iterate up to {rounds} cycles, stopping as soon as this task has valid evidence and a defensible final status."""
+    else:
+        repair_instructions = f"""This is a task-local code repair while full execution is disabled for the workflow. Fix only `tasks.{module}` and its private configuration, but do not run full. Use smoke only for syntax and shape checks, and report the final status as failed/skipped when full evidence cannot be produced."""
+    return f"""# Host-directed repair for one task
+
+Continue in the existing sandbox. This is not a fresh task and other tasks must not be touched or rerun.
+
+- Assigned task_id: `{task_id}`
+- Assigned module: `tasks.{module}`
+- Assigned output directory: `outputs/{output_subdir}/`
+- Repair class: `{repair_kind}`
+
+{repair_instructions}
+
+## Host validation errors to clear
+{error_lines}
+
+## Host warnings to preserve or clean up when relevant
+{warning_lines}
+
+## Required final delivery
+- Keep `task_agent_result.json` and `task_agent_result.md` complete and readable.
+- A `matched` result needs non-empty `evidence_files`.
+- An `explained_gap` result needs non-empty `differences`, `possible_causes`, `remaining_uncertainties`, and `evidence_files`.
+- Keep `paper_target_figure.json` and its writer-created crop/locator image valid.
+- Use relative POSIX-style paths inside the sandbox.
+- Finish only this repair; do not recreate the project or touch another task.
+"""
 
 
 def _prepare_task_writer_sandbox(

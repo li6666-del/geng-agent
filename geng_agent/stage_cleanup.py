@@ -9,7 +9,7 @@ that stage starts clean, plus atomic clearing of generated project code."""
 from .pipeline_helpers import _remove_path_inside
 
 
-def _clear_stage_outputs(output_dir: Path, stage: str) -> None:
+def _clear_stage_outputs(output_dir: Path, stage: str, *, preserve_audit: bool = False) -> None:
     stage_outputs = {
         "paper": [
             "paper_chunks.json",
@@ -179,7 +179,8 @@ def _clear_stage_outputs(output_dir: Path, stage: str) -> None:
     }
     for rel_path in stage_outputs.get(stage, []):
         _remove_path_inside(output_dir, output_dir / rel_path)
-    _clear_stage_audit(output_dir, stage)
+    if not preserve_audit:
+        _clear_stage_audit(output_dir, stage)
 
 
 def _clear_stage_audit(output_dir: Path, stage: str) -> None:

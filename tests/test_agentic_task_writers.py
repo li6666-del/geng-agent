@@ -6,15 +6,17 @@ import sys
 import textwrap
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from geng_agent.agentic_task_writers import (
+    _apply_deterministic_task_writer_repairs,
     _dispatch_task_writers,
     _is_trusted_guard_record,
     _normalize_project_text_bom,
     _prepare_task_writer_python_guard,
+    _run_one_task_writer,
     _task_local_image_paths,
     _task_paper_image_paths,
     _task_writer_concurrency,
@@ -26,6 +28,7 @@ from geng_agent.task_writer_support import _load_cached_task_writer_workflow
 from geng_agent.task_contract import build_task_contract_draft, contract_hash
 from geng_agent.resource_runtime import ResourceBroker
 from geng_agent.resource_scheduler import build_resource_plan
+from geng_agent.stage_cleanup import _clear_stage_outputs
 
 
 PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
@@ -70,14 +73,16 @@ def _write_mock_task_writer(temp: Path, *, result_location: str = "root") -> str
             proj = Path(args[args.index("--cd") + 1])
             last = Path(args[args.index("--output-last-message") + 1])
             prompt = sys.stdin.read() if args and args[-1] == "-" else ""
-            with Path(__file__).with_name("task_writer_prompts.txt").open("a", encoding="utf-8") as handle:
-                handle.write("---PROMPT---\n" + prompt + "\n")
 
             manifest = json.loads((proj / "tasks_manifest.json").read_text(encoding="utf-8"))
             task = manifest["tasks"][0]
             task_id = task["task_id"]
             module = task["module"]
             output_subdir = task["output_subdir"]
+            Path(__file__).with_name(f"task_writer_prompt_{task_id}.txt").write_text(
+                "---PROMPT---\n" + prompt + "\n",
+                encoding="utf-8",
+            )
             result_location = "__RESULT_LOCATION__"
 
             contract = json.loads((proj / "task_contract.json").read_text(encoding="utf-8"))
@@ -527,6 +532,315 @@ class TaskWriterWorkflowTests(unittest.TestCase):
             self.assertFalse(script.read_bytes().startswith(b"\xef\xbb\xbf"))
             self.assertEqual(requirements.read_text(encoding="utf-8"), "numpy\nmatplotlib\n")
 
+    def test_host_deterministic_repairs_normalize_bom_confidence_and_paths(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            sandbox = Path(temp_dir)
+            output_dir = sandbox / "outputs" / "demo_task"
+            output_dir.mkdir(parents=True)
+            for name in ("results.csv", "curve.png", "paper_crop.png"):
+                (output_dir / name).write_bytes(b"content")
+
+            result = {
+                "task_id": "demo_task",
+                "status": "matched",
+                "evidence_files": [str((output_dir / "results.csv").resolve())],
+                "local_image_paths": [str((output_dir / "curve.png").resolve())],
+                "paper_image_paths": [str((output_dir / "paper_crop.png").resolve())],
+            }
+            locator = {
+                "target_figure": "Fig. 1",
+                "reason": "target",
+                "confidence": "0.86",
+                "source_page": 3.0,
+                "fallback_used": False,
+                "contains_only_target": True,
+                "paper_image_paths": [str((output_dir / "paper_crop.png").resolve())],
+            }
+            (output_dir / "task_agent_result.json").write_bytes(
+                b"\xef\xbb\xbf" + json.dumps(result).encode("utf-8")
+            )
+            (output_dir / "task_agent_result.md").write_bytes(b"\xef\xbb\xbf# report\n")
+            (output_dir / "paper_target_figure.json").write_bytes(
+                b"\xef\xbb\xbf" + json.dumps(locator).encode("utf-8")
+            )
+
+            actions = _apply_deterministic_task_writer_repairs(
+                sandbox=sandbox,
+                output_subdir="demo_task",
+            )
+
+            normalized_result = json.loads(
+                (output_dir / "task_agent_result.json").read_text(encoding="utf-8")
+            )
+            normalized_locator = json.loads(
+                (output_dir / "paper_target_figure.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(normalized_result["evidence_files"], ["outputs/demo_task/results.csv"])
+            self.assertEqual(normalized_result["local_image_paths"], ["outputs/demo_task/curve.png"])
+            self.assertEqual(normalized_locator["paper_image_paths"], ["outputs/demo_task/paper_crop.png"])
+            self.assertEqual(normalized_locator["confidence"], "high")
+            self.assertEqual(normalized_locator["confidence_score"], 0.86)
+            self.assertEqual(normalized_locator["source_page"], 3)
+            self.assertFalse((output_dir / "task_agent_result.md").read_bytes().startswith(b"\xef\xbb\xbf"))
+            self.assertTrue(any(item["kind"] == "json_metadata_normalized" for item in actions))
+
+    def test_resume_dispatch_never_reruns_a_passed_task(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            passed_sandbox = root / "sandboxes" / "01_task_1"
+            failed_sandbox = root / "sandboxes" / "02_task_2"
+            passed_sandbox.mkdir(parents=True)
+            failed_sandbox.mkdir(parents=True)
+            passed = {
+                "index": 1,
+                "task_id": "task_1",
+                "module": "task_1",
+                "sandbox": str(passed_sandbox),
+                "structural_ok": True,
+                "task_writer_status": "matched",
+                "writer_status": {"ok": True},
+            }
+            failed = {
+                "index": 2,
+                "task_id": "task_2",
+                "module": "task_2",
+                "sandbox": str(failed_sandbox),
+                "structural_ok": False,
+                "task_writer_status": "failed",
+                "writer_status": {"ok": True},
+                "errors": ["missing valid local CSV artifact"],
+            }
+            calls: list[dict] = []
+
+            def fake_writer(**kwargs):
+                calls.append(kwargs)
+                return {
+                    "index": 2,
+                    "task_id": "task_2",
+                    "module": "task_2",
+                    "sandbox": str(failed_sandbox),
+                    "structural_ok": True,
+                    "task_writer_status": "matched",
+                    "writer_status": {"ok": True},
+                }
+
+            pairs = [
+                ({"task_id": f"task_{index}"}, {"task_id": f"task_{index}", "module": f"task_{index}"})
+                for index in (1, 2)
+            ]
+            plan = {
+                "writer": {
+                    "minimum_concurrency": 1,
+                    "initial_concurrency": 2,
+                    "max_concurrency": 2,
+                    "successes_before_increase": 3,
+                    "capacity_retries": 0,
+                    "retry_base_seconds": 0.0,
+                }
+            }
+            with patch("geng_agent.agentic_task_writers._run_one_task_writer", side_effect=fake_writer):
+                records, audit = _dispatch_task_writers(
+                    task_pairs=pairs,
+                    facts={},
+                    experiment_index={},
+                    paper={},
+                    paper_path=root / "paper.pdf",
+                    paper_context_json="{}",
+                    paper_thesis=None,
+                    paper_memory=None,
+                    memory_snapshot_hash="memory",
+                    task_root=root / "sandboxes",
+                    audit_dir=root / "audit",
+                    rounds=5,
+                    timeout=30,
+                    run_timeout=30,
+                    run_repro=True,
+                    shared_failure_memory_path=root / "failure_memory.jsonl",
+                    resource_plan=plan,
+                    resource_plan_path=root / "resource_plan.json",
+                    resource_broker=None,
+                    initial_records_by_index={1: passed, 2: failed},
+                )
+
+            self.assertEqual([item["task_id"] for item in records], ["task_1", "task_2"])
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0]["index"], 2)
+            self.assertTrue(calls[0]["reuse_existing"])
+            self.assertIs(calls[0]["resume_record"], failed)
+            self.assertEqual(audit["reused_task_ids"], ["task_1"])
+            self.assertEqual(audit["repair_task_ids"], ["task_2"])
+
+    def test_resume_cleanup_preserves_task_sandboxes_but_removes_final_project(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            sandbox_marker = output_dir / "audit" / "03c_task_writer_sandboxes" / "01_demo" / "marker.txt"
+            sandbox_marker.parent.mkdir(parents=True)
+            sandbox_marker.write_text("keep", encoding="utf-8")
+            final_marker = output_dir / "repro_project" / "marker.txt"
+            final_marker.parent.mkdir(parents=True)
+            final_marker.write_text("remove", encoding="utf-8")
+
+            _clear_stage_outputs(output_dir, "manifest", preserve_audit=True)
+
+            self.assertTrue(sandbox_marker.exists())
+            self.assertFalse((output_dir / "repro_project").exists())
+
+    def test_resume_metadata_repair_reuses_sandbox_and_disables_full(self) -> None:
+        record = self._run_mocked_resume_repair(
+            first_errors=["missing or too-short task_agent_result.md"],
+            expected_full_allowed=False,
+        )
+        self.assertTrue(record["structural_ok"])
+
+    def test_resume_execution_repair_reuses_sandbox_and_allows_task_full(self) -> None:
+        record = self._run_mocked_resume_repair(
+            first_errors=["missing valid local CSV artifact"],
+            expected_full_allowed=True,
+        )
+        self.assertTrue(record["structural_ok"])
+
+    def test_resume_deterministic_success_does_not_wake_writer(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            task_root = root / "sandboxes"
+            sandbox = task_root / "01_demo_task"
+            sandbox.mkdir(parents=True)
+            audit_dir = root / "audit"
+            audit_dir.mkdir()
+            broker = MagicMock()
+            broker.register_channel.return_value = {}
+            passed = {
+                "index": 1,
+                "task_id": "demo_task",
+                "module": "demo_task",
+                "structural_ok": True,
+                "task_writer_status": "matched",
+                "errors": [],
+                "warnings": [],
+            }
+
+            with (
+                patch("geng_agent.agentic_task_writers._prepare_task_writer_sandbox"),
+                patch("geng_agent.agentic_task_writers._restore_trusted_files"),
+                patch(
+                    "geng_agent.agentic_task_writers._host_repair_and_validate_task_writer",
+                    return_value=(passed, [{"kind": "utf8_bom_removed"}]),
+                ),
+                patch("geng_agent.agentic_task_writers._run_task_writer_codex_session") as run_session,
+            ):
+                result = _run_one_task_writer(
+                    index=1,
+                    attempt=2,
+                    reuse_existing=True,
+                    resume_record={"writer_status": {"ok": True}},
+                    guard_token="token",
+                    task={"task_id": "demo_task"},
+                    manifest_entry={"task_id": "demo_task", "module": "demo_task", "output_subdir": "demo_task"},
+                    facts={},
+                    experiment_index={},
+                    paper={},
+                    paper_path=root / "paper.pdf",
+                    paper_context_json="{}",
+                    paper_thesis=None,
+                    paper_memory=None,
+                    memory_snapshot_hash="memory",
+                    task_root=task_root,
+                    audit_dir=audit_dir,
+                    rounds=5,
+                    timeout=30,
+                    run_timeout=30,
+                    run_repro=True,
+                    shared_failure_memory_path=root / "failure_memory.jsonl",
+                    resource_broker=broker,
+                )
+
+            run_session.assert_not_called()
+            self.assertTrue(result["structural_ok"])
+            self.assertEqual(result["host_repair_history"][0]["repair_kind"], "deterministic")
+
+    def _run_mocked_resume_repair(self, *, first_errors: list[str], expected_full_allowed: bool) -> dict:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            task_root = root / "sandboxes"
+            sandbox = task_root / "01_demo_task"
+            (sandbox / "tasks").mkdir(parents=True)
+            task_script = sandbox / "tasks" / "demo_task.py"
+            task_script.write_text("ORIGINAL = True\n", encoding="utf-8")
+            audit_dir = root / "audit"
+            audit_dir.mkdir()
+            broker = MagicMock()
+            broker.register_channel.return_value = {}
+            invalid = {
+                "index": 1,
+                "task_id": "demo_task",
+                "module": "demo_task",
+                "structural_ok": False,
+                "task_writer_status": "failed",
+                "result_json": {},
+                "errors": first_errors,
+                "warnings": [],
+            }
+            passed = {
+                "index": 1,
+                "task_id": "demo_task",
+                "module": "demo_task",
+                "structural_ok": True,
+                "task_writer_status": "matched",
+                "errors": [],
+                "warnings": [],
+            }
+
+            def fake_repair_session(**kwargs):
+                task_script.write_text("CHANGED = True\n", encoding="utf-8")
+                return {"ok": True}
+
+            with (
+                patch("geng_agent.agentic_task_writers._prepare_task_writer_sandbox") as prepare_sandbox,
+                patch("geng_agent.agentic_task_writers._restore_trusted_files"),
+                patch(
+                    "geng_agent.agentic_task_writers._host_repair_and_validate_task_writer",
+                    side_effect=[(invalid, []), (passed, [])],
+                ),
+                patch(
+                    "geng_agent.agentic_task_writers._run_task_writer_codex_session",
+                    side_effect=fake_repair_session,
+                ) as run_session,
+            ):
+                result = _run_one_task_writer(
+                    index=1,
+                    attempt=2,
+                    reuse_existing=True,
+                    resume_record={"writer_status": {"ok": True}},
+                    guard_token="token",
+                    task={"task_id": "demo_task"},
+                    manifest_entry={"task_id": "demo_task", "module": "demo_task", "output_subdir": "demo_task"},
+                    facts={},
+                    experiment_index={},
+                    paper={},
+                    paper_path=root / "paper.pdf",
+                    paper_context_json="{}",
+                    paper_thesis=None,
+                    paper_memory=None,
+                    memory_snapshot_hash="memory",
+                    task_root=task_root,
+                    audit_dir=audit_dir,
+                    rounds=5,
+                    timeout=30,
+                    run_timeout=30,
+                    run_repro=True,
+                    shared_failure_memory_path=root / "failure_memory.jsonl",
+                    resource_broker=broker,
+                )
+
+            prepare_sandbox.assert_called_once()
+            self.assertTrue(prepare_sandbox.call_args.kwargs["reuse_existing"])
+            run_session.assert_called_once()
+            self.assertEqual(run_session.call_args.kwargs["sandbox"], sandbox)
+            self.assertEqual(run_session.call_args.kwargs["allow_full"], expected_full_allowed)
+            expected_script = "CHANGED = True\n" if expected_full_allowed else "ORIGINAL = True\n"
+            self.assertEqual(task_script.read_text(encoding="utf-8"), expected_script)
+            return result
+
     def test_dispatch_retries_capacity_error_and_preserves_sandbox(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -598,6 +912,7 @@ class TaskWriterWorkflowTests(unittest.TestCase):
             self.assertEqual(len(first_task_calls), 2)
             self.assertFalse(first_task_calls[0]["reuse_existing"])
             self.assertTrue(first_task_calls[1]["reuse_existing"])
+            self.assertIsNone(first_task_calls[1]["resume_record"])
             self.assertEqual(first_task_calls[0]["guard_token"], first_task_calls[1]["guard_token"])
             self.assertEqual(audit["concurrency_events"][0]["event"], "capacity_backoff")
 
@@ -836,7 +1151,10 @@ class TaskWriterWorkflowTests(unittest.TestCase):
             self.assertIn("### A1. match_task", review_md)
             self.assertNotIn("### Writer 自审正文", review_md)
 
-            prompts = (temp / "task_writer_prompts.txt").read_text(encoding="utf-8")
+            prompts = "\n".join(
+                path.read_text(encoding="utf-8")
+                for path in sorted(temp.glob("task_writer_prompt_*.txt"))
+            )
             self.assertEqual(prompts.count("---PROMPT---"), 2)
             self.assertIn("Assigned task_id: `match_task`", prompts)
             self.assertIn("Do not run `python run_experiment.py config.json`", prompts)
