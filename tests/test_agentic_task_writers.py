@@ -12,6 +12,8 @@ from tempfile import TemporaryDirectory
 
 from geng_agent.agentic_task_writers import (
     _dispatch_task_writers,
+    _is_trusted_guard_record,
+    _normalize_project_text_bom,
     _prepare_task_writer_python_guard,
     _task_local_image_paths,
     _task_paper_image_paths,
@@ -379,7 +381,7 @@ class TaskWriterGuardTests(unittest.TestCase):
             contract_path = project / "task_contract.json"
             contract_path.write_text(
                 json.dumps(build_task_contract_draft({"task_id": "demo_task", "target": "demo"}, memory_snapshot_hash="test")),
-                encoding="utf-8",
+                encoding="utf-8-sig",
             )
             broker, channel = _start_test_resource_broker(temp, task_id="demo_task")
             shim = _prepare_task_writer_python_guard(
@@ -425,7 +427,7 @@ class TaskWriterGuardTests(unittest.TestCase):
             self.assertEqual(records[-1]["guard_token"], shim["guard_token"])
             self.assertEqual(
                 records[-1]["contract_hash"],
-                contract_hash(json.loads(contract_path.read_text(encoding="utf-8"))),
+                contract_hash(json.loads(contract_path.read_text(encoding="utf-8-sig"))),
             )
             self.assertFalse((project / "task_agent_runs.jsonl").exists())
 
@@ -510,6 +512,21 @@ class TaskWriterGuardTests(unittest.TestCase):
 
 
 class TaskWriterWorkflowTests(unittest.TestCase):
+    def test_project_merge_normalizes_utf8_bom_before_scans(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "tasks").mkdir()
+            script = root / "tasks" / "demo.py"
+            requirements = root / "requirements.txt"
+            script.write_text("print('ok')\n", encoding="utf-8-sig")
+            requirements.write_bytes(b"numpy\n\xef\xbb\xbfmatplotlib\n")
+
+            normalized = _normalize_project_text_bom(root)
+
+            self.assertEqual(set(normalized), {"requirements.txt", "tasks/demo.py"})
+            self.assertFalse(script.read_bytes().startswith(b"\xef\xbb\xbf"))
+            self.assertEqual(requirements.read_text(encoding="utf-8"), "numpy\nmatplotlib\n")
+
     def test_dispatch_retries_capacity_error_and_preserves_sandbox(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -657,6 +674,54 @@ class TaskWriterWorkflowTests(unittest.TestCase):
             self.assertEqual(len(records), 3)
             self.assertGreaterEqual(starts[(3, 1)] - capacity_time[0], 0.25)
             self.assertEqual(audit["concurrency_events"][0]["scope"], "global")
+
+    def test_dispatch_does_not_scale_up_for_structurally_invalid_delivery(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            record = {
+                "index": 1,
+                "task_id": "task_1",
+                "module": "task_1",
+                "structural_ok": False,
+                "task_writer_status": "explained_gap",
+                "writer_error_kind": None,
+                "writer_status": {"ok": True},
+            }
+            plan = {
+                "writer": {
+                    "minimum_concurrency": 1,
+                    "initial_concurrency": 1,
+                    "max_concurrency": 2,
+                    "successes_before_increase": 1,
+                    "capacity_retries": 0,
+                    "retry_base_seconds": 0.0,
+                }
+            }
+            with patch("geng_agent.agentic_task_writers._run_one_task_writer", return_value=record):
+                _records, audit = _dispatch_task_writers(
+                    task_pairs=[({"task_id": "task_1"}, {"task_id": "task_1", "module": "task_1"})],
+                    facts={},
+                    experiment_index={},
+                    paper={},
+                    paper_path=root / "paper.pdf",
+                    paper_context_json="{}",
+                    paper_thesis=None,
+                    paper_memory=None,
+                    memory_snapshot_hash="memory",
+                    task_root=root / "sandboxes",
+                    audit_dir=root / "audit",
+                    rounds=5,
+                    timeout=30,
+                    run_timeout=30,
+                    run_repro=True,
+                    shared_failure_memory_path=root / "failure_memory.jsonl",
+                    resource_plan=plan,
+                    resource_plan_path=root / "resource_plan.json",
+                    resource_broker=None,
+                )
+
+            self.assertEqual(audit["final_concurrency"], 1)
+            self.assertFalse(any(item["event"] == "stable_success_increase" for item in audit["concurrency_events"]))
 
     def test_task_writer_runtime_treats_requirement_warnings_as_nonblocking(self) -> None:
         runtime = _task_writer_runtime_result(
@@ -910,6 +975,31 @@ class TaskWriterWorkflowTests(unittest.TestCase):
         )
 
         self.assertEqual(errors, [])
+
+    def test_paper_locator_doc_accepts_numeric_confidence_score(self) -> None:
+        errors = _validate_paper_locator_doc(
+            {
+                "target_figure": "Fig. 7",
+                "source_page": 9,
+                "bbox_norm": [0.1, 0.2, 0.8, 0.9],
+                "confidence": 0.72,
+                "contains_only_target": False,
+                "fallback_used": True,
+                "reason": "Red-box locator used for a multi-figure page.",
+                "paper_image_paths": ["outputs/reproduce_fig_7/paper_target_locator.png"],
+            }
+        )
+
+        self.assertEqual(errors, [])
+
+    def test_trusted_guard_accepts_current_v2_records(self) -> None:
+        base = {
+            "guard_token": "token",
+            "task_module": "demo",
+            "output_subdir": "demo",
+        }
+        self.assertTrue(_is_trusted_guard_record({**base, "guard": "geng_task_writer_python_guard_v1"}, "token", "demo", "demo"))
+        self.assertTrue(_is_trusted_guard_record({**base, "guard": "geng_task_writer_python_guard_v2"}, "token", "demo", "demo"))
 
     def test_task_writer_local_images_exclude_paper_target_outputs(self) -> None:
         with TemporaryDirectory() as temp_dir:

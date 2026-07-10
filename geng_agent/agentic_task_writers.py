@@ -241,6 +241,7 @@ def run_codex_task_writer_workflow(
         task_records=task_records,
     )
     _restore_trusted_files(repro_project_dir, task_manifest)
+    _normalize_project_text_bom(repro_project_dir)
     final_task_manifest = _task_manifest_with_configs(task_manifest)
     write_json(repro_project_dir / "tasks_manifest.json", final_task_manifest)
     reconcile_whitelisted_requirements(repro_project_dir)
@@ -541,7 +542,9 @@ def _dispatch_task_writers(
                     )
                 else:
                     by_index[index] = record
-                    writer_ok = bool((record.get("writer_status") or {}).get("ok"))
+                    writer_ok = bool((record.get("writer_status") or {}).get("ok")) and bool(
+                        record.get("structural_ok")
+                    )
                     if writer_ok:
                         before, after = controller.record_success()
                         if after != before:
@@ -1049,7 +1052,7 @@ def _append_run_log(record: dict) -> None:
 
 def _load_contract() -> tuple[dict, str]:
     try:
-        value = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+        value = json.loads(CONTRACT_PATH.read_text(encoding="utf-8-sig"))
     except Exception as exc:
         return {{}}, f"cannot read task contract: {{type(exc).__name__}}: {{exc}}"
     if not isinstance(value, dict):
@@ -1254,7 +1257,7 @@ def _validate_task_writer_delivery(
     result_doc: dict[str, Any] = {}
     if result_path.exists():
         try:
-            parsed = json.loads(result_path.read_text(encoding="utf-8"))
+            parsed = json.loads(result_path.read_text(encoding="utf-8-sig"))
             if isinstance(parsed, dict):
                 result_doc = parsed
             else:
@@ -1294,7 +1297,7 @@ def _validate_task_writer_delivery(
     contract_doc: dict[str, Any] = {}
     if contract_path.exists():
         try:
-            parsed_contract = json.loads(contract_path.read_text(encoding="utf-8"))
+            parsed_contract = json.loads(contract_path.read_text(encoding="utf-8-sig"))
             if isinstance(parsed_contract, dict):
                 contract_doc = parsed_contract
                 errors.extend(
@@ -1372,7 +1375,7 @@ def _validate_task_writer_delivery(
     paper_locator_doc: dict[str, Any] = {}
     if paper_locator_path.exists():
         try:
-            parsed_locator = json.loads(paper_locator_path.read_text(encoding="utf-8"))
+            parsed_locator = json.loads(paper_locator_path.read_text(encoding="utf-8-sig"))
             if isinstance(parsed_locator, dict):
                 paper_locator_doc = parsed_locator
             else:
@@ -1460,9 +1463,18 @@ def _non_empty_list(value: Any) -> bool:
 
 def _validate_paper_locator_doc(locator_doc: dict[str, Any]) -> list[str]:
     errors: list[str] = []
-    for key in ("target_figure", "confidence", "reason"):
+    for key in ("target_figure", "reason"):
         if not isinstance(locator_doc.get(key), str) or not str(locator_doc.get(key)).strip():
             errors.append(f"paper_target_figure.json requires non-empty {key}")
+    confidence = locator_doc.get("confidence")
+    confidence_is_text = isinstance(confidence, str) and bool(confidence.strip())
+    confidence_is_score = (
+        not isinstance(confidence, bool)
+        and isinstance(confidence, (int, float))
+        and 0 <= float(confidence) <= 1
+    )
+    if not confidence_is_text and not confidence_is_score:
+        errors.append("paper_target_figure.json requires non-empty confidence or a score in [0, 1]")
     source_page = locator_doc.get("source_pages", locator_doc.get("source_page"))
     if not _valid_source_page_spec(source_page):
         errors.append("paper_target_figure.json requires source_page")
@@ -1534,7 +1546,7 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 def _is_trusted_guard_record(record: dict[str, Any], guard_token: str, module: str, output_subdir: str) -> bool:
     return (
-        record.get("guard") == "geng_task_writer_python_guard_v1"
+        record.get("guard") in {"geng_task_writer_python_guard_v1", "geng_task_writer_python_guard_v2"}
         and record.get("guard_token") == guard_token
         and record.get("task_module") == module
         and record.get("output_subdir") == output_subdir
@@ -1866,6 +1878,24 @@ def _read_requirement_names(path: Path) -> list[str]:
             continue
         names.append(line)
     return names
+
+
+def _normalize_project_text_bom(project_dir: Path) -> list[str]:
+    """Remove UTF-8 BOMs introduced by Windows shell writers before host scans."""
+    normalized: list[str] = []
+    text_suffixes = {".py", ".json", ".md", ".txt", ".csv", ".toml", ".yaml", ".yml"}
+    for path in project_dir.rglob("*"):
+        relative = path.relative_to(project_dir)
+        if relative.parts and relative.parts[0] in {"outputs", "paper_evidence"}:
+            continue
+        if not path.is_file() or (path.suffix.lower() not in text_suffixes and path.name != "requirements.txt"):
+            continue
+        raw = path.read_bytes()
+        if b"\xef\xbb\xbf" not in raw:
+            continue
+        path.write_bytes(raw.replace(b"\xef\xbb\xbf", b""))
+        normalized.append(relative.as_posix())
+    return normalized
 
 
 def _format_requirements(requirements: list[str]) -> str:
