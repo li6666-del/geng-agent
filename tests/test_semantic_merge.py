@@ -2,7 +2,6 @@ import unittest
 
 from geng_agent.facts_coverage import compute_task_coverage
 from geng_agent.semantic_merge import (
-    analysis_role_prompt,
     canonical_figure_ref,
     semantic_merge_engineering_facts,
     semantic_merge_repro_tasks,
@@ -45,14 +44,6 @@ class SemanticMergeTests(unittest.TestCase):
         tasks = {"repro_tasks": [{"task_id": "fig9a", "figure_or_claim": "Fig. 9(a)", "target": "BER"}]}
         coverage = compute_task_coverage(facts, tasks)
         self.assertEqual(coverage["uncovered_figures"], ["9:b"])
-
-    def test_specialist_roles_are_heterogeneous(self) -> None:
-        first = analysis_role_prompt("base", "engineering_facts", 1)
-        second = analysis_role_prompt("base", "engineering_facts", 2)
-        self.assertNotEqual(first, second)
-        self.assertIn("text/formula", first)
-        self.assertIn("visual/experiment", second)
-
 
 if __name__ == "__main__":
     unittest.main()

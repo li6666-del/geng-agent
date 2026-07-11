@@ -142,11 +142,9 @@ def _run_pipeline(record: RunRecord) -> None:
             paper_path=record.paper_path,
             output_dir=record.case_dir,
             run_repro=True,
-            result_review=True,
             resume=False,
             analysis_fallback=True,
             analysis_backend="codex",
-            codex_agent_rounds=5,
         )
         with _lock:
             record.status = "succeeded"

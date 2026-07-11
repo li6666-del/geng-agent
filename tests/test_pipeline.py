@@ -8,7 +8,6 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from geng_agent.agentic_analysis import CODEX_ANALYSIS_BACKEND
-from geng_agent.facts_coverage import merge_engineering_facts, merge_repro_tasks
 from geng_agent.pipeline import ReviewPipeline
 
 
@@ -70,26 +69,19 @@ def task(task_id: str, figure_or_claim: str) -> dict:
 
 
 class PipelineTests(unittest.TestCase):
-    def test_facts_gap_rounds_default_is_six(self) -> None:
-        self.assertEqual(inspect.signature(ReviewPipeline.run).parameters["facts_gap_rounds"].default, 6)
-        self.assertEqual(inspect.signature(ReviewPipeline.run_stage).parameters["facts_gap_rounds"].default, 6)
-        self.assertEqual(inspect.signature(ReviewPipeline.run).parameters["analysis_agent_width"].default, 2)
-        self.assertEqual(inspect.signature(ReviewPipeline.run_stage).parameters["analysis_agent_width"].default, 2)
+    def test_analysis_width_and_round_caps_are_not_public_pipeline_options(self) -> None:
+        run_params = inspect.signature(ReviewPipeline.run).parameters
+        stage_params = inspect.signature(ReviewPipeline.run_stage).parameters
+        for name in ("facts_gap_rounds", "tasks_gap_rounds", "analysis_agent_width", "codex_agent_rounds", "result_review"):
+            self.assertNotIn(name, run_params)
+            self.assertNotIn(name, stage_params)
 
-    def test_codex_analysis_ensemble_merges_and_dedupes_facts(self) -> None:
-        candidates = {
-            "01_extract_engineering_facts_agent_1": fact_doc(
-                fact("simulation_parameter", "SNR range"),
-                fact("metric", "BER"),
-            ),
-            "01_extract_engineering_facts_agent_2": fact_doc(
-                fact("simulation_parameter", "snr  range"),
-                fact("channel_model", "Rayleigh"),
-            ),
-        }
+    def test_codex_analysis_uses_one_fact_specialist(self) -> None:
+        candidate = fact_doc(fact("simulation_parameter", "SNR range"), fact("metric", "BER"))
 
         def fake_stage(**kwargs):
-            return candidates[kwargs["stage_label"]]
+            self.assertEqual(kwargs["stage_label"], "01_extract_engineering_facts")
+            return candidate
 
         with TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
@@ -97,7 +89,7 @@ class PipelineTests(unittest.TestCase):
             audit.mkdir()
             pipe = ReviewPipeline(client=None)
             with patch.object(pipe, "_load_or_create_stage_json", side_effect=fake_stage) as mocked:
-                merged = pipe._load_or_create_ensemble_stage_json(
+                merged = pipe._load_or_create_analysis_stage_json(
                     output_path=base / "engineering_facts.json",
                     output_dir=base,
                     audit_dir=audit,
@@ -107,50 +99,27 @@ class PipelineTests(unittest.TestCase):
                     schema_stage="engineering_facts",
                     max_attempts=1,
                     resume=False,
-                    agent_width=2,
-                    merge_func=merge_engineering_facts,
                     backend=CODEX_ANALYSIS_BACKEND,
                 )
 
-            self.assertEqual(mocked.call_count, 2)
-            prompts = [call.kwargs["prompt"] for call in mocked.call_args_list]
-            self.assertNotEqual(prompts[0], prompts[1])
-            self.assertIn("text/formula specialist", prompts[0])
-            self.assertIn("visual/experiment specialist", prompts[1])
-            self.assertEqual(
-                [f["name"] for f in merged["engineering_facts"]],
-                ["SNR range", "BER", "Rayleigh"],
-            )
-            self.assertEqual(merged["_meta"]["analysis_agent_width"], 2)
-            summary = json.loads((audit / "01_extract_engineering_facts_ensemble_summary.json").read_text(encoding="utf-8"))
-            self.assertTrue(summary["ok"])
-            self.assertEqual(summary["added_by_agent"]["agent_1"], 2)
-            self.assertEqual(summary["added_by_agent"]["agent_2"], 1)
-            self.assertEqual(summary["total_items"], 3)
+            self.assertEqual(mocked.call_count, 1)
+            self.assertEqual([f["name"] for f in merged["engineering_facts"]], ["SNR range", "BER"])
 
-    def test_codex_analysis_ensemble_resume_clears_stale_candidate_cache(self) -> None:
-        candidates = {
-            "01_extract_engineering_facts_agent_1": fact_doc(fact("metric", "BER")),
-            "01_extract_engineering_facts_agent_2": fact_doc(fact("channel_model", "Rayleigh")),
-        }
+    def test_single_specialist_resume_is_forwarded(self) -> None:
         calls: list[dict] = []
 
         def fake_stage(**kwargs):
             calls.append(kwargs)
-            self.assertFalse(kwargs["output_path"].exists())
-            self.assertFalse(kwargs["resume"])
-            return candidates[kwargs["stage_label"]]
+            self.assertTrue(kwargs["resume"])
+            return fact_doc(fact("metric", "BER"))
 
         with TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
             audit = base / "audit"
             audit.mkdir()
-            stale_candidate = base / "engineering_facts_agent_1.json"
-            stale_candidate.write_text(json.dumps(fact_doc(fact("metric", "STALE"))), encoding="utf-8")
-
             pipe = ReviewPipeline(client=None)
             with patch.object(pipe, "_load_or_create_stage_json", side_effect=fake_stage):
-                merged = pipe._load_or_create_ensemble_stage_json(
+                merged = pipe._load_or_create_analysis_stage_json(
                     output_path=base / "engineering_facts.json",
                     output_dir=base,
                     audit_dir=audit,
@@ -160,29 +129,18 @@ class PipelineTests(unittest.TestCase):
                     schema_stage="engineering_facts",
                     max_attempts=1,
                     resume=True,
-                    agent_width=2,
-                    merge_func=merge_engineering_facts,
                     backend=CODEX_ANALYSIS_BACKEND,
                 )
 
-            self.assertEqual(len(calls), 2)
-            self.assertFalse(stale_candidate.exists())
-            self.assertNotIn("STALE", {f["name"] for f in merged["engineering_facts"]})
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(merged["engineering_facts"][0]["name"], "BER")
 
-    def test_codex_analysis_ensemble_merges_and_dedupes_tasks(self) -> None:
-        candidates = {
-            "02_build_repro_tasks_agent_1": task_doc(
-                task("reproduce_fig_4", "Fig. 4"),
-                task("reproduce_fig_7", "Fig. 7"),
-            ),
-            "02_build_repro_tasks_agent_2": task_doc(
-                task("reproduce_fig_4b", "Fig. 4"),
-                task("reproduce_fig_9a", "Fig. 9(a)"),
-            ),
-        }
+    def test_codex_analysis_uses_one_task_design_specialist(self) -> None:
+        candidate = task_doc(task("reproduce_fig_4", "Fig. 4"), task("reproduce_fig_7", "Fig. 7"))
 
         def fake_stage(**kwargs):
-            return candidates[kwargs["stage_label"]]
+            self.assertEqual(kwargs["stage_label"], "02_build_repro_tasks")
+            return candidate
 
         with TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
@@ -190,7 +148,7 @@ class PipelineTests(unittest.TestCase):
             audit.mkdir()
             pipe = ReviewPipeline(client=None)
             with patch.object(pipe, "_load_or_create_stage_json", side_effect=fake_stage):
-                merged = pipe._load_or_create_ensemble_stage_json(
+                merged = pipe._load_or_create_analysis_stage_json(
                     output_path=base / "repro_tasks.json",
                     output_dir=base,
                     audit_dir=audit,
@@ -200,17 +158,13 @@ class PipelineTests(unittest.TestCase):
                     schema_stage="repro_tasks",
                     max_attempts=1,
                     resume=False,
-                    agent_width=2,
-                    merge_func=merge_repro_tasks,
                     backend=CODEX_ANALYSIS_BACKEND,
                 )
 
             self.assertEqual(
                 [t["figure_or_claim"] for t in merged["repro_tasks"]],
-                ["Fig. 4", "Fig. 7", "Fig. 9(a)"],
+                ["Fig. 4", "Fig. 7"],
             )
-            summary = json.loads((audit / "02_build_repro_tasks_ensemble_summary.json").read_text(encoding="utf-8"))
-            self.assertEqual(summary["added_by_agent"], {"agent_1": 2, "agent_2": 1})
 
     def test_pipeline_api_is_codex_only_and_thesis_is_mandatory(self) -> None:
         run_params = inspect.signature(ReviewPipeline.run).parameters
@@ -222,14 +176,33 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("paper_thesis = self._load_or_create_paper_thesis(", source)
         self.assertNotIn("if science_loop", source)
 
-    def test_analysis_agent_width_rejects_unbounded_parallelism(self) -> None:
+    def test_single_reporter_runs_after_all_task_writers(self) -> None:
+        source = inspect.getsource(ReviewPipeline.run)
+        self.assertLess(
+            source.index("run_codex_task_writer_workflow("),
+            source.index("run_codex_reporter_workflow("),
+        )
+        self.assertNotIn("render_review_markdown(", source)
+
+    def test_analysis_agent_width_is_not_a_pipeline_option(self) -> None:
+        self.assertNotIn("analysis_agent_width", inspect.signature(ReviewPipeline.run).parameters)
+
+    def test_report_renderer_creates_all_three_word_reports(self) -> None:
         with TemporaryDirectory() as temp_dir:
-            with self.assertRaisesRegex(ValueError, "analysis_agent_width must be between 1 and 8"):
-                ReviewPipeline(client=None).run(
-                    Path(temp_dir) / "paper.md",
-                    Path(temp_dir) / "case",
-                    analysis_agent_width=9,
-                )
+            root = Path(temp_dir)
+            for name in ("review.md", "reproduction_report.md", "result_review.md"):
+                (root / name).write_text("## task_1\n\n报告正文。\n", encoding="utf-8")
+
+            result = ReviewPipeline()._generate_docx_reports(
+                output_dir=root,
+                result_review_result={"passed": True},
+            )
+
+            self.assertTrue(result["review_docx"]["passed"])
+            self.assertTrue(result["reproduction_report_docx"]["passed"])
+            self.assertTrue(result["result_review_docx"]["passed"])
+            for name in ("review.docx", "reproduction_report.docx", "result_review.docx"):
+                self.assertTrue((root / name).exists())
 
 
 if __name__ == "__main__":

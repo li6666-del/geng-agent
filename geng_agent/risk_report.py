@@ -218,7 +218,7 @@ def build_risk_report(
     if scientific_check and scientific_check.get("issues"):
         findings.append({"type": "scientific_check_issues", "message": "复现任务缺少部分通信实验语义约束。", "count": len(scientific_check["issues"])})
     if result_review_result and result_review_result.get("enabled") and not result_review_result.get("passed"):
-        findings.append({"type": "result_review_failed", "message": "任务级 writer 自审报告未完成。", "error": result_review_result.get("error")})
+        findings.append({"type": "writer_results_incomplete", "message": "至少一个任务 writer 未完成最终科学结论。", "error": result_review_result.get("error")})
 
     dimensions = build_risk_dimensions(
         missing=missing if isinstance(missing, list) else [],

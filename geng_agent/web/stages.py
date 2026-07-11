@@ -11,8 +11,9 @@ DISPLAY_STAGES: list[tuple[str, str]] = [
     ("repro_project_manifest", "复现清单"),
     ("repro_project", "复现代码"),
     ("runtime", "运行复现"),
-    ("result_review", "结果审查"),
-    ("review", "风险报告"),
+    ("reproduction_report", "本地复现报告"),
+    ("result_review", "论文对比报告"),
+    ("review", "主审查报告"),
 ]
 
 

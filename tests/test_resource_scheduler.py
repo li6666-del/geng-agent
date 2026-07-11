@@ -42,17 +42,17 @@ def _cpu_contract() -> dict:
 
 
 class ResourcePlanTests(unittest.TestCase):
-    def test_plan_starts_two_writers_and_keeps_full_resources_separate(self) -> None:
+    def test_plan_starts_all_writers_and_keeps_full_resources_separate(self) -> None:
         plan = build_resource_plan(task_count=7, hardware=_hardware())
-        self.assertEqual(plan["writer"]["initial_concurrency"], 2)
-        self.assertEqual(plan["writer"]["max_concurrency"], 4)
+        self.assertEqual(plan["writer"]["initial_concurrency"], 7)
+        self.assertEqual(plan["writer"]["max_concurrency"], 7)
         self.assertEqual(plan["execution"]["gpus"][0]["max_full_jobs"], 1)
         self.assertGreaterEqual(plan["execution"]["ram_budget_gb"], 3.0)
 
-    def test_explicit_writer_limit_is_respected_without_gpu_capping(self) -> None:
+    def test_legacy_writer_limit_does_not_reduce_parallel_launch(self) -> None:
         plan = build_resource_plan(task_count=7, requested_writer_concurrency=3, hardware=_hardware())
-        self.assertEqual(plan["writer"]["initial_concurrency"], 3)
-        self.assertEqual(plan["writer"]["max_concurrency"], 3)
+        self.assertEqual(plan["writer"]["initial_concurrency"], 7)
+        self.assertEqual(plan["writer"]["max_concurrency"], 7)
 
     def test_controller_increases_after_stability_and_halves_on_capacity(self) -> None:
         controller = WriterConcurrencyController(

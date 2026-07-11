@@ -19,7 +19,6 @@ from .paper_evidence import (
     select_paper_pages_for_task,
     thesis_ordering_anchor_for_task,
 )
-from .runtime_status import _load_cached_result_review_status
 from .security import redact_text
 from .stage_cleanup import _clear_project_code_files
 from .task_scripts import write_task_scaffolding
@@ -66,16 +65,6 @@ def _render_writer_python_sh_wrapper(guard_script: Path, real_python: str) -> st
 
 def _sh_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
-
-
-def _clear_result_review_outputs(output_dir: Path) -> None:
-    for name in ("result_review.json", "result_review.md", "result_review_error.json", "result_review.docx"):
-        path = output_dir / name
-        try:
-            if path.exists():
-                path.unlink()
-        except OSError:
-            pass
 
 
 def _write_paper_evidence_bundle(
@@ -126,7 +115,7 @@ def _write_paper_evidence_bundle(
             "use_policy": [
                 "Use this task evidence as the primary implementation reference.",
                 "If a needed parameter is missing, record an explicit assumption in code output summaries.",
-                "Create a task-specific paper figure crop or red-box locator for the final report.",
+                "Compare local outputs with the paper evidence and record only the final scientific conclusion.",
                 "Do not hard-code curves to match the paper pages; implement the scientific model.",
             ],
         }
@@ -369,7 +358,6 @@ def _load_cached_task_writer_workflow(
     output_dir: Path,
     repro_project_dir: Path,
     run_repro: bool,
-    result_review: bool,
     memory_snapshot_hash: str = "",
 ) -> dict[str, Any] | None:
     manifest_path = output_dir / "repro_project_manifest.json"
@@ -404,24 +392,22 @@ def _load_cached_task_writer_workflow(
         except Exception:
             return None
 
-    review_result: dict[str, Any] = {"enabled": False, "passed": None, "reason": "not run"}
-    review_doc = None
-    if run_repro and result_review:
-        review_result = _load_cached_result_review_status(output_dir) or {}
-        if not review_result:
-            return None
-        review_md_path = output_dir / "result_review.md"
-        markdown = review_md_path.read_text(encoding="utf-8", errors="replace")
-        review_doc = {
-            "_meta": {"markdown_review": True, "mode": "task_writer_self_review"},
-            "markdown": markdown,
-        }
-
     return {
         "manifest": manifest,
         "runtime_result": runtime_result,
-        "result_review_result": review_result,
-        "result_review_doc": review_doc,
+        "task_records": _cached_task_records(output_dir),
         "written_files": [str(path) for path in _manifest_disk_paths(manifest, repro_project_dir)],
         "status": {"backend": CODEX_PROJECT_BACKEND, "mode": "task_writers", "cached": True},
     }
+
+
+def _cached_task_records(output_dir: Path) -> list[dict[str, Any]]:
+    path = output_dir / "audit" / "03c_task_writers_records.json"
+    if not path.exists():
+        return []
+    try:
+        document = json.loads(path.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return []
+    records = document.get("tasks") if isinstance(document, dict) else None
+    return [item for item in records if isinstance(item, dict)] if isinstance(records, list) else []

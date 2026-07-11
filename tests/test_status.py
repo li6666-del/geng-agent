@@ -180,7 +180,7 @@ class StatusTests(unittest.TestCase):
                 },
             )
             write_json(
-                case / "result_review_error.json",
+                case / "reporter_error.json",
                 {"enabled": True, "passed": False, "reason": "task writer report assembly failed", "error": "empty report"},
             )
 

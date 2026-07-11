@@ -18,9 +18,11 @@ STAGES = [
     ("repro_project_manifest", "repro_project_manifest.json", "repro_project_manifest"),
     ("repro_project", "repro_project", None),
     ("runtime", "runtime_result.json", None),
+    ("reproduction_report", "reproduction_report.md", None),
     ("result_review", "result_review.md", None),
     ("review", "review.md", None),
     ("review_docx", "review.docx", None),
+    ("reproduction_report_docx", "reproduction_report.docx", None),
     ("result_review_docx", "result_review.docx", None),
 ]
 
@@ -34,9 +36,11 @@ RESUME_LABELS = {
     "repro_project_manifest": "03c_task_writer_workflow",
     "repro_project": "03c_task_writer_workflow",
     "runtime": "03c_task_writer_workflow",
-    "result_review": "03c_task_writer_result_review",
-    "review": "render_reports",
+    "reproduction_report": "04_codex_reporter",
+    "result_review": "04_codex_reporter",
+    "review": "04_codex_reporter",
     "review_docx": "render_reports",
+    "reproduction_report_docx": "render_reports",
     "result_review_docx": "render_reports",
 }
 
@@ -48,13 +52,8 @@ def inspect_case_status(output_dir: Path) -> dict[str, Any]:
     for name, rel_path, schema_stage in STAGES:
         status = inspect_stage(output_dir, name, rel_path, schema_stage)
         stage_status.append(status)
-        if next_stage is None and not status["ok"] and name not in {"result_review", "result_review_docx"}:
+        if next_stage is None and not status["ok"]:
             next_stage = name
-
-    runtime = next((item for item in stage_status if item["stage"] == "runtime"), None)
-    result_review = next((item for item in stage_status if item["stage"] == "result_review"), None)
-    if runtime and runtime["ok"] and result_review and not result_review["ok"]:
-        next_stage = "result_review"
 
     latest_audit = latest_audit_items(output_dir / "audit")
     return {
@@ -71,8 +70,8 @@ def inspect_case_status(output_dir: Path) -> dict[str, Any]:
 def inspect_stage(output_dir: Path, name: str, rel_path: str, schema_stage: str | None) -> dict[str, Any]:
     path = output_dir / rel_path
     if not path.exists():
-        if name == "result_review":
-            error_path = output_dir / "result_review_error.json"
+        if name in {"review", "reproduction_report", "result_review"}:
+            error_path = output_dir / "reporter_error.json"
             if error_path.exists():
                 try:
                     error_data = read_json(error_path)
@@ -109,8 +108,8 @@ def inspect_stage(output_dir: Path, name: str, rel_path: str, schema_stage: str 
         except Exception as exc:
             return {"stage": name, "ok": False, "path": str(path), "reason": f"invalid json: {exc}"}
 
-    if name == "result_review":
-        error_path = output_dir / "result_review_error.json"
+    if name in {"review", "reproduction_report", "result_review"}:
+        error_path = output_dir / "reporter_error.json"
         if error_path.exists() and error_path.stat().st_mtime >= path.stat().st_mtime:
             try:
                 error_data = read_json(error_path)
@@ -128,21 +127,6 @@ def inspect_stage(output_dir: Path, name: str, rel_path: str, schema_stage: str 
     if schema_stage:
         try:
             data = read_json(path)
-            if name == "result_review":
-                error_path = output_dir / "result_review_error.json"
-                if error_path.exists() and error_path.stat().st_mtime >= path.stat().st_mtime:
-                    try:
-                        error_data = read_json(error_path)
-                        reason = error_data.get("reason") or error_data.get("error") or "result review failed"
-                    except Exception:
-                        reason = "result review failed"
-                    return {
-                        "stage": name,
-                        "ok": False,
-                        "path": str(path),
-                        "reason": str(reason),
-                        "error_path": str(error_path),
-                    }
             required_files = _required_files_for_stage(name, data)
             issues = validate_stage(schema_stage, data, required_files=required_files)
             ok = not issues

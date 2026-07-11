@@ -43,19 +43,6 @@ class PromptTests(unittest.TestCase):
                 coverage_report_json="{}",
                 paper_context_json="[]",
             ),
-            "task_revision": book.render(
-                "revise_repro_tasks.md",
-                existing_tasks_json="{}",
-                revision_requests_json="[]",
-                engineering_facts_json="{}",
-                paper_context_json="[]",
-            ),
-            "fact_revision": book.render(
-                "revise_engineering_facts.md",
-                existing_facts_json="{}",
-                revision_requests_json="[]",
-                paper_context_json="[]",
-            ),
         }
 
         for name, prompt in rendered.items():

@@ -7,7 +7,12 @@ import unittest
 
 from docx import Document
 
-from geng_agent.docx_writer import write_result_review_docx, write_result_review_markdown_docx, write_review_docx
+from geng_agent.docx_writer import (
+    write_markdown_report_docx,
+    write_result_review_docx,
+    write_result_review_markdown_docx,
+    write_review_docx,
+)
 
 
 TINY_PNG = base64.b64decode(
@@ -169,10 +174,6 @@ class DocxWriterTests(unittest.TestCase):
                     f"| ![本地复现图]({image_path}) | ![论文原图：Fig. 1]({paper_image_path}) |\n\n"
                     "### 简短审查结论\n\n"
                     "- 本地曲线趋势一致。\n"
-                    "\n## 附录：Writer 自审原文\n\n"
-                    "### A1. reproduce_fig_1\n\n"
-                    "# raw writer title\n\n"
-                    "cycle details\n"
                 ),
                 status={
                     "passed": True,
@@ -194,9 +195,29 @@ class DocxWriterTests(unittest.TestCase):
             self.assertIn("本地曲线趋势一致", text)
             self.assertIn("本地复现图", table_text)
             self.assertIn("论文原图：Fig. 1", table_text)
-            self.assertIn("raw writer title", text)
+            self.assertNotIn("附录", text)
             self.assertEqual(len(document.tables), 1)
             self.assertEqual(len(document.inline_shapes), 2)
+
+    def test_generic_report_docx_resolves_relative_report_assets(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            asset = root / "report_assets" / "task_1" / "paper_target.png"
+            asset.parent.mkdir(parents=True)
+            asset.write_bytes(TINY_PNG)
+            path = root / "reproduction_report.docx"
+
+            write_markdown_report_docx(
+                path,
+                markdown_text="## task_1\n\n![论文原图](report_assets/task_1/paper_target.png)\n",
+                title="本地复现报告",
+                subtitle="参数与假设",
+                base_dir=root,
+            )
+
+            document = Document(path)
+            self.assertEqual(len(document.inline_shapes), 1)
+            self.assertIn("本地复现报告", "\n".join(paragraph.text for paragraph in document.paragraphs))
 
     def test_write_result_review_markdown_docx_records_missing_images(self) -> None:
         with TemporaryDirectory() as temp_dir:

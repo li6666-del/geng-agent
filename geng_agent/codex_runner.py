@@ -16,10 +16,11 @@ from .security import codex_safe_env, redact_text
 
 
 MAX_TRANSCRIPT_CHARS = 200_000
-DEFAULT_GENG_CODEX_MODEL = "gpt-5.6-luna"
+DEFAULT_GENG_CODEX_MODEL = "gpt-5.5"
 DEFAULT_GENG_CODEX_REASONING_EFFORT = {
     "analysis": "high",
     "task_writer": "medium",
+    "reporter": "high",
 }
 
 
@@ -317,7 +318,15 @@ def split_command(raw: str) -> list[str]:
 def _resolve_reasoning_effort(role: str, explicit: str | None) -> str | None:
     value = explicit
     if not value:
-        role_name = "TASK_WRITER" if role == "task_writer" else "ANALYSIS" if role == "analysis" else ""
+        role_name = (
+            "TASK_WRITER"
+            if role == "task_writer"
+            else "ANALYSIS"
+            if role == "analysis"
+            else "REPORTER"
+            if role == "reporter"
+            else ""
+        )
         if role_name:
             value = get_config_value(f"GENG_CODEX_{role_name}_REASONING_EFFORT")
     if not value:

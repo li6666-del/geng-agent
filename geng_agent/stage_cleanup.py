@@ -33,8 +33,6 @@ def _clear_stage_outputs(output_dir: Path, stage: str, *, preserve_audit: bool =
             "result_review.docx",
             "result_review_error.json",
             "docx_generation_error.json",
-            "failure_memory.jsonl",
-            "revision_requests.json",
             "automation_provenance.json",
         ],
         "facts": [
@@ -57,8 +55,6 @@ def _clear_stage_outputs(output_dir: Path, stage: str, *, preserve_audit: bool =
             "result_review.docx",
             "result_review_error.json",
             "docx_generation_error.json",
-            "failure_memory.jsonl",
-            "revision_requests.json",
             "automation_provenance.json",
         ],
         "paper_thesis": [
@@ -95,8 +91,6 @@ def _clear_stage_outputs(output_dir: Path, stage: str, *, preserve_audit: bool =
             "result_review.docx",
             "result_review_error.json",
             "docx_generation_error.json",
-            "failure_memory.jsonl",
-            "revision_requests.json",
             "automation_provenance.json",
         ],
         "experiment_index": [
@@ -113,7 +107,6 @@ def _clear_stage_outputs(output_dir: Path, stage: str, *, preserve_audit: bool =
             "result_review.docx",
             "result_review_error.json",
             "docx_generation_error.json",
-            "revision_requests.json",
             "automation_provenance.json",
         ],
         "manifest": [
@@ -129,7 +122,6 @@ def _clear_stage_outputs(output_dir: Path, stage: str, *, preserve_audit: bool =
             "result_review.docx",
             "result_review_error.json",
             "docx_generation_error.json",
-            "revision_requests.json",
             "automation_provenance.json",
         ],
         "project": [
@@ -177,7 +169,21 @@ def _clear_stage_outputs(output_dir: Path, stage: str, *, preserve_audit: bool =
             "automation_provenance.json",
         ],
     }
-    for rel_path in stage_outputs.get(stage, []):
+    report_outputs = [
+        "review.md",
+        "review.docx",
+        "reproduction_report.md",
+        "reproduction_report.docx",
+        "result_review.md",
+        "result_review.docx",
+        "report_assets",
+        "reporter_error.json",
+        "docx_generation_error.json",
+    ]
+    outputs = list(stage_outputs.get(stage, []))
+    if stage in stage_outputs:
+        outputs.extend(report_outputs)
+    for rel_path in dict.fromkeys(outputs):
         _remove_path_inside(output_dir, output_dir / rel_path)
     if not preserve_audit:
         _clear_stage_audit(output_dir, stage)
@@ -196,6 +202,7 @@ def _clear_stage_audit(output_dir: Path, stage: str) -> None:
         "manifest": ["03", "04"],
         "project": ["04"],
         "result_review": ["04"],
+        "reports": ["04"],
     }.get(stage, [])
     for number in stage_numbers:
         patterns = [

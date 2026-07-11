@@ -215,13 +215,12 @@ class GapFinderIntegrationTests(unittest.TestCase):
             names = {f["name"] for f in result["engineering_facts"]}
             self.assertIn("alpha_ST_threshold", names)   # gap fact added
             self.assertIn("Fig.7 sum-rate", names)       # base fact preserved
-            # round 1 adds 1; two consecutive semantic dry rounds are required to stop.
-            self.assertEqual(client.calls, 3)
+            # Round 1 adds one fact; the first zero-addition round confirms convergence.
+            self.assertEqual(client.calls, 2)
             written = json.loads((out_dir / "engineering_facts.json").read_text(encoding="utf-8"))
             self.assertEqual(written["_meta"]["gap_finder"]["round_1_added"], 1)
             self.assertEqual(written["_meta"]["gap_finder"]["round_2_added"], 0)
-            self.assertEqual(written["_meta"]["gap_finder"]["round_3_added"], 0)
-            self.assertEqual(written["_meta"]["gap_finder"]["stop_reason"], "two_semantic_dry_rounds")
+            self.assertEqual(written["_meta"]["gap_finder"]["stop_reason"], "semantic_dry_round")
 
     def test_gap_finder_runs_until_six_round_cap_when_always_adding(self) -> None:
         base = {
@@ -248,7 +247,7 @@ class GapFinderIntegrationTests(unittest.TestCase):
             self.assertEqual(len(result["engineering_facts"]), 6)
             self.assertEqual(result["_meta"]["gap_finder"]["rounds_run"], 6)
             self.assertEqual(result["_meta"]["gap_finder"]["max_rounds"], 6)
-            self.assertEqual(result["_meta"]["gap_finder"]["stop_reason"], "max_rounds")
+            self.assertEqual(result["_meta"]["gap_finder"]["stop_reason"], "explicit_test_limit")
 
     def test_zero_rounds_is_a_noop(self) -> None:
         base = {"paper_domain": "communication", "paper_repro_type": "other",
@@ -264,7 +263,7 @@ class GapFinderIntegrationTests(unittest.TestCase):
         self.assertEqual(client.calls, 0)
         self.assertEqual(out, base)
 
-    def test_codex_gap_finder_uses_parallel_width_and_stops_after_deduped_dry_round(self) -> None:
+    def test_codex_gap_finder_uses_one_specialist_and_stops_after_deduped_dry_round(self) -> None:
         base = {
             "paper_domain": "communication",
             "paper_repro_type": "other",
@@ -295,7 +294,7 @@ class GapFinderIntegrationTests(unittest.TestCase):
             out_dir = Path(d)
             (out_dir / "audit").mkdir()
             pipe = ReviewPipeline(client=None)
-            with patch.object(pipe, "_load_or_create_ensemble_stage_json", side_effect=fake_gap_stage):
+            with patch.object(pipe, "_load_or_create_analysis_stage_json", side_effect=fake_gap_stage):
                 result = pipe._augment_facts_with_gap_finder(
                     facts=base,
                     paper=paper,
@@ -308,17 +307,15 @@ class GapFinderIntegrationTests(unittest.TestCase):
                     resume=False,
                     max_attempts=1,
                     max_rounds=6,
-                    analysis_agent_width=2,
                     analysis_backend=CODEX_ANALYSIS_BACKEND,
                 )
 
-        self.assertEqual(len(calls), 3)
-        self.assertTrue(all(call["agent_width"] == 2 for call in calls))
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all("agent_width" not in call for call in calls))
         self.assertEqual(len(result["engineering_facts"]), 1)
         self.assertEqual(result["_meta"]["gap_finder"]["round_1_added"], 1)
         self.assertEqual(result["_meta"]["gap_finder"]["round_2_added"], 0)
-        self.assertEqual(result["_meta"]["gap_finder"]["round_3_added"], 0)
-        self.assertEqual(result["_meta"]["gap_finder"]["stop_reason"], "two_semantic_dry_rounds")
+        self.assertEqual(result["_meta"]["gap_finder"]["stop_reason"], "semantic_dry_round")
 
 
 def _fclaim(name: str) -> dict:
@@ -436,9 +433,9 @@ class TasksGapFinderIntegrationTests(unittest.TestCase):
             )
             figs = {t["figure_or_claim"] for t in result["repro_tasks"]}
             self.assertEqual(figs, {"Fig. 4", "Fig. 7"})   # gap task added
-            self.assertEqual(client.calls, 1)              # 1 gap call; then fully covered -> stop
+            self.assertEqual(client.calls, 2)              # one add, then one zero-addition confirmation
             self.assertEqual(result["_meta"]["gap_finder"]["round_1_added"], 1)
-            self.assertEqual(result["_meta"]["gap_finder"]["stop_reason"], "coverage_complete")
+            self.assertEqual(result["_meta"]["gap_finder"]["stop_reason"], "semantic_dry_round")
             self.assertTrue((out_dir / "repro_tasks.json").exists())
 
     def test_no_gap_call_when_already_fully_covered(self) -> None:
@@ -452,9 +449,9 @@ class TasksGapFinderIntegrationTests(unittest.TestCase):
                 tasks=base, facts=facts, paper_context="", output_dir=Path(d), audit_dir=Path(d) / "audit",
                 resume=False, max_attempts=2, max_rounds=3, tasks_timeout=120.0,
             )
-        self.assertEqual(client.calls, 0)  # already covered -> no LLM call
+        self.assertEqual(client.calls, 2)  # coverage no longer bypasses the task-design expert
 
-    def test_codex_task_gap_finder_uses_parallel_width(self) -> None:
+    def test_codex_task_gap_finder_uses_one_specialist(self) -> None:
         facts = {"paper_domain": "communication", "paper_repro_type": "signal_chain", "engineering_facts": [
             _fclaim("Figure 4: Empirical CDF of sum rate"),
             _fclaim("Figure 7: Average sum rate vs transmit power"),
@@ -492,7 +489,7 @@ class TasksGapFinderIntegrationTests(unittest.TestCase):
             out_dir = Path(d)
             (out_dir / "audit").mkdir()
             pipe = ReviewPipeline(client=None)
-            with patch.object(pipe, "_load_or_create_ensemble_stage_json", side_effect=fake_gap_stage):
+            with patch.object(pipe, "_load_or_create_analysis_stage_json", side_effect=fake_gap_stage):
                 result = pipe._augment_tasks_with_gap_finder(
                     tasks=base,
                     facts=facts,
@@ -503,12 +500,11 @@ class TasksGapFinderIntegrationTests(unittest.TestCase):
                     max_attempts=1,
                     max_rounds=6,
                     tasks_timeout=120.0,
-                    analysis_agent_width=2,
                     analysis_backend=CODEX_ANALYSIS_BACKEND,
                 )
 
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["agent_width"], 2)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all("agent_width" not in call for call in calls))
         self.assertEqual({task["figure_or_claim"] for task in result["repro_tasks"]}, {"Fig. 4", "Fig. 7"})
 
 
@@ -563,7 +559,7 @@ class TaskGapMetricGateTests(unittest.TestCase):
             )
             figs = {t["figure_or_claim"] for t in result["repro_tasks"]}
             self.assertEqual(figs, {"Fig. 4"})  # the metric=other Fig.7 task was rejected, not added
-            self.assertEqual(result["_meta"]["gap_finder"]["stop_reason"], "two_semantic_dry_rounds")
+            self.assertEqual(result["_meta"]["gap_finder"]["stop_reason"], "semantic_dry_round")
             self.assertTrue((Path(d) / "audit" / "tasks_gap_round_1_rejected.json").exists())
 
 

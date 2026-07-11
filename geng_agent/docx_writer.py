@@ -377,20 +377,35 @@ def write_result_review_markdown_docx(
 ) -> Path:
     """Create the human-readable result review Word report from Markdown."""
 
-    document = Document()
-    _setup_document(document)
-    _add_title(
-        document,
-        "复现结果二次审查报告",
-        "由自治 task writer 汇总生成的人工阅读版结果对比报告",
+    return write_markdown_report_docx(
+        path,
+        markdown_text=markdown_text,
+        title="复现结果二次审查报告",
+        subtitle="本地复现结果与论文证据的人工阅读版对比报告",
+        base_dir=path.parent,
     )
 
-    _add_markdown_body(document, markdown_text)
+
+def write_markdown_report_docx(
+    path: Path,
+    *,
+    markdown_text: str,
+    title: str,
+    subtitle: str,
+    base_dir: Path | None = None,
+) -> Path:
+    """Render a Codex-authored Markdown report without rewriting its content."""
+
+    document = Document()
+    _setup_document(document)
+    _add_title(document, title, subtitle)
+
+    _add_markdown_body(document, markdown_text, base_dir=base_dir)
     _add_disclaimer(document)
     return _save(document, path)
 
 
-def _add_markdown_body(document: DocumentObject, markdown_text: str) -> None:
+def _add_markdown_body(document: DocumentObject, markdown_text: str, *, base_dir: Path | None = None) -> None:
     lines = markdown_text.splitlines()
     index = 0
     in_appendix = False
@@ -402,12 +417,17 @@ def _add_markdown_body(document: DocumentObject, markdown_text: str) -> None:
             continue
         table = _parse_markdown_image_table(lines, index)
         if table:
-            _add_image_comparison_table(document, table["headers"], table["rows"])
+            _add_image_comparison_table(document, table["headers"], table["rows"], base_dir=base_dir)
             index += table["consumed"]
             continue
         image_match = re.fullmatch(r"!\[([^\]]*)\]\((.*)\)", line)
         if image_match:
-            _add_markdown_image(document, image_match.group(1).strip(), image_match.group(2).strip())
+            _add_markdown_image(
+                document,
+                image_match.group(1).strip(),
+                image_match.group(2).strip(),
+                base_dir=base_dir,
+            )
         elif line.startswith("### "):
             _add_heading(document, line[4:].strip(), 3 if not in_appendix else 3)
         elif line.startswith("## "):
@@ -470,7 +490,13 @@ def _split_markdown_table_row(row: str) -> list[str]:
     return [cell.strip() for cell in row.strip().strip("|").split("|")]
 
 
-def _add_image_comparison_table(document: DocumentObject, headers: list[str], rows: list[list[str]]) -> None:
+def _add_image_comparison_table(
+    document: DocumentObject,
+    headers: list[str],
+    rows: list[list[str]],
+    *,
+    base_dir: Path | None = None,
+) -> None:
     table = document.add_table(rows=1, cols=2)
     table.style = "Table Grid"
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
@@ -488,18 +514,18 @@ def _add_image_comparison_table(document: DocumentObject, headers: list[str], ro
             _clear_cell(cell)
             _set_cell_margins(cell, top=120, start=120, bottom=120, end=120)
             cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
-            _add_markdown_image_to_cell(cell, value)
+            _add_markdown_image_to_cell(cell, value, base_dir=base_dir)
     document.add_paragraph()
 
 
-def _add_markdown_image_to_cell(cell: _Cell, value: str) -> None:
+def _add_markdown_image_to_cell(cell: _Cell, value: str, *, base_dir: Path | None = None) -> None:
     image_match = re.fullmatch(r"!\[([^\]]*)\]\((.*)\)", value.strip())
     if not image_match:
         _add_cell_paragraph(cell, _clean_markdown_inline(value) or "无可用图片", align=WD_ALIGN_PARAGRAPH.CENTER)
         return
     caption = image_match.group(1).strip()
     raw_path = image_match.group(2).strip()
-    image_path = Path(raw_path.strip().strip("<>"))
+    image_path = _resolve_markdown_image_path(raw_path, base_dir)
     if not image_path.exists():
         _add_cell_paragraph(cell, f"图片缺失：{raw_path}", align=WD_ALIGN_PARAGRAPH.CENTER, italic=True)
         return
@@ -538,8 +564,14 @@ def _clear_cell(cell: _Cell) -> None:
     cell.text = ""
 
 
-def _add_markdown_image(document: DocumentObject, caption: str, raw_path: str) -> None:
-    image_path = Path(raw_path.strip().strip("<>"))
+def _add_markdown_image(
+    document: DocumentObject,
+    caption: str,
+    raw_path: str,
+    *,
+    base_dir: Path | None = None,
+) -> None:
+    image_path = _resolve_markdown_image_path(raw_path, base_dir)
     if not image_path.exists():
         _add_note(document, f"图片缺失：{raw_path}")
         return
@@ -557,6 +589,13 @@ def _add_markdown_image(document: DocumentObject, caption: str, raw_path: str) -
             _set_run_font(caption_run, BODY_FONT, Pt(9))
     except Exception as exc:
         _add_note(document, f"图片插入失败：{raw_path}（{type(exc).__name__}: {exc}）")
+
+
+def _resolve_markdown_image_path(raw_path: str, base_dir: Path | None) -> Path:
+    path = Path(raw_path.strip().strip("<>"))
+    if path.is_absolute() or base_dir is None:
+        return path
+    return base_dir / path
 
 
 def _setup_document(document: DocumentObject) -> None:

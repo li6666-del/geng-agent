@@ -147,20 +147,12 @@ def canonical_task_key(task: dict[str, Any]) -> tuple[str, str, str, str]:
     anchor = canonical_figure_ref(
         " ".join(str(task.get(key) or "") for key in ("figure_or_claim", "target", "task_id"))
     )
-    comparison = task.get("comparison") if isinstance(task.get("comparison"), dict) else {}
-    baselines = comparison.get("baselines") if isinstance(comparison.get("baselines"), list) else []
-    assumptions = task.get("assumptions") if isinstance(task.get("assumptions"), list) else []
-    regime = " ".join(
-        str(item.get("name") or "") + "=" + str(item.get("default_value") or "")
-        for item in assumptions
-        if isinstance(item, dict)
-    )
     identity = experiment_id or anchor or _normalize(task.get("figure_or_claim"))
     return (
         identity,
         _normalize(task.get("metric")),
-        _normalize(regime),
-        "|".join(sorted(_normalize(item) for item in baselines if _normalize(item))),
+        "",
+        "",
     )
 
 
@@ -173,28 +165,6 @@ def canonical_figure_ref(text: str) -> str:
         if ref not in matches:
             matches.append(ref)
     return "|".join(matches)
-
-
-def analysis_role_prompt(base_prompt: str, schema_stage: str, agent_index: int) -> str:
-    if schema_stage == "engineering_facts":
-        role = (
-            "You are the text/formula specialist. Prioritize system models, equations, variable definitions, "
-            "algorithm steps, channel assumptions, and numeric parameters. Do not assume another agent will fill gaps."
-            if agent_index % 2 == 1
-            else "You are the visual/experiment specialist. Prioritize figures and subfigures, axes, legends, curves, "
-            "baselines, simulation regimes, tables, reported trends, and numeric anchors. Distinguish Fig. 9(a) from Fig. 9(b)."
-        )
-    elif schema_stage == "repro_tasks":
-        role = (
-            "You are the experiment coverage architect. Design concrete tasks for every reproducible numeric experiment, "
-            "with exact figure/subfigure identity, metric, baselines, artifacts, and required facts."
-            if agent_index % 2 == 1
-            else "You are the feasibility critic. Design only executable scientific tasks; reject conceptual diagrams, "
-            "identify missing parameters and environment constraints, and make acceptance criteria and baseline fairness explicit."
-        )
-    else:
-        role = "Provide an independent, evidence-grounded analysis of this structured stage."
-    return f"{base_prompt}\n\n# Assigned specialist role\n{role}"
 
 
 def semantic_conflicts(document: dict[str, Any], kind: str) -> list[dict[str, Any]]:

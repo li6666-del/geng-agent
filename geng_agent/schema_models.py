@@ -8,9 +8,6 @@ from typing import Annotated, Any, Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
-from .revision_router import RevisionRequest
-
-
 MAX_MANIFEST_FILES = 64
 MAX_FILE_CHARS = 2_000_000
 
@@ -358,7 +355,6 @@ SCHEMA_MODELS: dict[str, type[BaseModel]] = {
     "paper_memory": PaperMemoryDocument,
     "experiment_index": ExperimentIndexDocument,
     "task_contract": TaskContractDocument,
-    "task_revision_request": RevisionRequest,
     "repro_project_manifest": ReproProjectManifest,
     "reproducibility_verdict": ReproducibilityVerdictDocument,
 }
@@ -371,7 +367,6 @@ SCHEMA_FILENAMES: dict[str, str] = {
     "paper_memory": "paper_memory.schema.json",
     "experiment_index": "experiment_index.schema.json",
     "task_contract": "task_contract.schema.json",
-    "task_revision_request": "task_revision_request.schema.json",
     "repro_project_manifest": "repro_project_manifest.schema.json",
     "reproducibility_verdict": "reproducibility_verdict.schema.json",
 }

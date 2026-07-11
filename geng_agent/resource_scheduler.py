@@ -11,8 +11,6 @@ from typing import Any
 from .config import get_config_value
 
 
-DEFAULT_WRITER_INITIAL_CONCURRENCY = 2
-DEFAULT_WRITER_MAX_CONCURRENCY = 4
 DEFAULT_WRITER_SUCCESS_WINDOW = 3
 DEFAULT_WRITER_CAPACITY_RETRIES = 2
 DEFAULT_WRITER_RETRY_BASE_SECONDS = 60.0
@@ -60,19 +58,10 @@ def build_resource_plan(
     writer_ram_gb = max(0.25, _config_float("GENG_RESOURCE_WRITER_RAM_GB", 0.75))
     memory_writer_cap = max(1, int(ram_budget_gb // writer_ram_gb))
 
-    explicit = requested_writer_concurrency
-    if explicit is None:
-        legacy = get_config_value("GENG_CODEX_TASK_WRITER_CONCURRENCY")
-        explicit = _parse_positive_int(legacy)
-    configured_max = _config_int("GENG_CODEX_TASK_WRITER_MAX_CONCURRENCY", DEFAULT_WRITER_MAX_CONCURRENCY)
-    if explicit is not None:
-        writer_max = min(max(1, explicit), max(1, task_count or 1), memory_writer_cap)
-        writer_initial = writer_max
-        writer_source = "explicit"
-    else:
-        writer_max = min(max(1, configured_max), max(1, task_count or 1), memory_writer_cap)
-        writer_initial = min(writer_max, DEFAULT_WRITER_INITIAL_CONCURRENCY if task_count > 1 else 1)
-        writer_source = "adaptive"
+    del requested_writer_concurrency
+    writer_max = max(1, task_count or 1)
+    writer_initial = writer_max
+    writer_source = "all_tasks_parallel"
 
     physical_cores = max(1, int(cpu.get("physical_cores") or cpu.get("logical_processors") or 1))
     cpu_budget = max(1, int(math.floor(physical_cores * 0.75)))
@@ -132,8 +121,8 @@ def build_resource_plan(
             ),
         },
         "reasons": [
-            f"writer concurrency is independent from full execution slots ({writer_source})",
-            f"memory cap={memory_writer_cap} from available={available_gb:.2f}GB reserve={reserve_gb:.2f}GB",
+            "all task writers launch together; completed code enters the full-run resource queue immediately",
+            f"estimated writer memory cap={memory_writer_cap} is observational only; available={available_gb:.2f}GB reserve={reserve_gb:.2f}GB",
             f"execution budget={cpu_budget} physical CPU cores and {ram_budget_gb:.2f}GB RAM",
             f"detected GPU count={len(planned_gpus)}; default max full jobs per GPU={gpu_slots}",
         ],

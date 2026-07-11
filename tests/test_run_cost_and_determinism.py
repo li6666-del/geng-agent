@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -123,28 +124,17 @@ class RiskDimensionTests(unittest.TestCase):
 class UsageRollupTests(unittest.TestCase):
     def test_cumulative_and_by_model_rollup(self) -> None:
         main = _UsageClient("main", [{"model": "main", "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}])
-        secondary = _UsageClient(
-            "sec",
-            [
-                {"model": "sec", "prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
-                {"model": "sec"},  # provider omitted usage -> counts as a call, 0 tokens
-            ],
-        )
-        pipe = ReviewPipeline(main, extraction_client_2=secondary)
+        pipe = ReviewPipeline(main)
 
         cum = pipe._cumulative_usage()
-        self.assertEqual(cum["llm_calls"], 3)
-        self.assertEqual(cum["total_tokens"], 25)
+        self.assertEqual(cum["llm_calls"], 1)
+        self.assertEqual(cum["total_tokens"], 15)
 
         by_model = pipe._usage_by_model()
-        self.assertEqual(by_model["sec"]["llm_calls"], 2)
-        self.assertEqual(by_model["sec"]["total_tokens"], 10)
         self.assertEqual(by_model["main"]["total_tokens"], 15)
 
-    def test_same_client_for_secondary_extraction_is_not_double_counted(self) -> None:
-        main = _UsageClient("main", [{"model": "main", "total_tokens": 15}])
-        pipe = ReviewPipeline(main, extraction_client_2=main)
-        self.assertEqual(pipe._cumulative_usage()["llm_calls"], 1)
+    def test_pipeline_accepts_only_one_analysis_client(self) -> None:
+        self.assertEqual(list(inspect.signature(ReviewPipeline).parameters), ["client", "prompt_book"])
 
 
 if __name__ == "__main__":

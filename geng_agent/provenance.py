@@ -58,7 +58,7 @@ def build_automation_provenance(
             "agent_concurrency": agentic_status.get("agent_concurrency"),
             "agent_concurrency_max": agentic_status.get("agent_concurrency_max"),
             "resource_plan": agentic_status.get("resource_plan"),
-            "rounds_requested": agentic_status.get("rounds_requested"),
+            "stop_rule": agentic_status.get("stop_rule"),
             "analysis_revision_history": agentic_status.get("analysis_revision_history", []),
             "tasks": [
                 {

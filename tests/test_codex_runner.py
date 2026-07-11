@@ -8,7 +8,8 @@ from geng_agent.codex_runner import DEFAULT_GENG_CODEX_MODEL, run_codex_subproce
 
 
 class CodexRunnerModelTests(unittest.TestCase):
-    def test_project_subprocess_defaults_to_luna(self) -> None:
+    def test_project_subprocess_defaults_to_gpt_5_5(self) -> None:
+        self.assertEqual(DEFAULT_GENG_CODEX_MODEL, "gpt-5.5")
         with patch("geng_agent.codex_runner.shutil.which", return_value="codex"), patch(
             "geng_agent.codex_runner.subprocess.run"
         ) as run, patch("geng_agent.codex_runner.write_json"), patch("geng_agent.codex_runner.write_text"):

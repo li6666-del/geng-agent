@@ -7,13 +7,14 @@
 ## 当前能力
 
 - 解析 PDF/TXT/Markdown 论文，构建带稳定实体 ID、子图、公式、表格、章节和交叉引用的 `paper_memory.json`。
-- 由两个异构 Codex analysis 子智能体并行抽取工程事实，本地语义合并会补全字段、保留冲突，并在连续两轮无有效新增后停止。
+- 由一个 Codex 事实专家抽取工程事实，并把每轮合并结果作为下一轮输入，持续迭代到首轮没有语义新增。
 - 无条件抽取论文核心主张、作用机制、方法排序和限制，生成 `paper_thesis.json` 作为后续复现锚点。
 - 将论文图表拆成可运行的复现实验任务；`experiment_index.json` 记录目标实体、子图、参数、baseline、验收标准和 `native_full/scaled_full/proxy_only/blocked` 可复现性模式。
-- 第三阶段采用任务级自治 writer：一个任务一个 Codex writer，独立写代码；传 `--run-repro` 时通过 guard 跑本任务 full、对照论文图、自我修正，最多 5 轮。
-- 不再启动独立 reviewer；每个 writer 自己给出 `matched`、`explained_gap` 或 `failed`，主持人只做结构验收、依赖/安全检查、产物合并和报告生成。
-- writer full 前必须完成 `task_contract.json`；Python guard 校验契约并把契约哈希写入可信运行记录。失败会进入去重的 `failure_memory.jsonl`，仅分析范围或契约错误允许最多两次上游修订回流。
-- 生成主报告 `review.md/docx`、结果对比报告 `result_review.md/docx`、运行结果、风险报告和完整 audit 证据链。
+- 第三阶段采用任务级自治 writer：一个任务一个 Codex writer，任务数就是启动并发数；writer 写完代码后立即申请本任务 full 资源并开始运行。
+- 不再启动独立 reviewer；每个 writer 自己持续修改、运行和对照论文，直到给出 `matched`、有证据的 `explained_gap` 或真实 `failed`，没有迭代轮数上限。
+- 主持人不做 JSON、BOM、路径、字段、合同哈希或产物格式验收，也不二次唤醒 writer；只收集 writer 的最终科学结果。
+- writer 全部结束后启动一个专用 Codex reporter，统一定位/裁切论文原图、组织语言和排版。
+- 固定生成主审查报告 `review.md/docx`、本地复现报告 `reproduction_report.md/docx` 和论文对比报告 `result_review.md/docx`；对比报告不附带 writer 迭代流水账。
 - 提供极简 Web UI，可上传 PDF 或填写 PDF 链接并实时查看阶段进度。
 
 ## 工作流
@@ -22,18 +23,19 @@
 论文 PDF
   -> 文本、页面图像、图表位置解析
   -> 构建 paper_memory.json 与 memory_manifest.json
-  -> 两个异构 Codex analysis 抽取 engineering_facts.json
-  -> 本地语义合并、冲突保留、source 回指校验、连续两轮无新增停止
+  -> 单个 Codex 事实专家迭代抽取 engineering_facts.json
+  -> 每轮读取上一轮合并产物，语义合并、去重，首轮无新增即停止
   -> Codex analysis 抽取 paper_thesis.json
-  -> Codex analysis 生成 repro_tasks.json
-  -> 本地任务引用、子图、指标、趋势、baseline 与覆盖率校验
+  -> 单个 Codex 任务设计专家迭代生成 repro_tasks.json
+  -> 同图、同指标、可共享仿真的曲线与 baseline 合并为一个任务，首轮无新增即停止
   -> experiment_index v2 可复现性分级
   -> 为每个复现任务创建独立 sandbox
   -> 每个 writer 先完成 task_contract，再写代码、运行本任务 full 并自审对比论文
   -> Python guard 限制 writer 只能运行自己的任务，校验 contract 并记录可信运行日志
-  -> 失败记忆去重；必要时有界回流修订任务分析
-  -> 主持人合并任务代码、图片、CSV/summary、自审结论和审计材料
-  -> 输出 result_review.md/docx、risk_report.json、review.md/docx
+  -> 所有任务 writer 同时启动；各自写完即进入 full 资源队列
+  -> 主持人收集任务代码、本地图、CSV/summary 和最终科学结论
+  -> 单个 Codex reporter 定位并裁切每个任务的论文原图，统一组织三份报告
+  -> 输出 review、reproduction_report、result_review 的 Markdown/Word 版本
 ```
 
 ## 安装
@@ -63,9 +65,11 @@ python -m geng_agent doctor
 
 ## 论文目标图定位
 
-系统会为每个复现任务准备论文文本、相关页截图和事实证据；第三阶段的 task writer 负责从这些证据中定位目标图或子图，并交付面向报告的论文侧图片。
+系统会为每个复现任务准备论文文本、相关页截图和事实证据；task writer 使用它们完成科学核对，但不再承担论文图片定位与报告排版。
 
-writer 必须生成 `paper_target_figure.json`，至少记录 `target_figure`、`source_page`、`confidence`、`contains_only_target`、`fallback_used`、`reason` 和 `paper_image_paths`，并在 `task_agent_result.json.paper_image_paths` 中列出自己创建的 `outputs/<task>/paper_target_crop.png` 或带红框的 `outputs/<task>/paper_target_locator.png`。主持人只做结构验收和报告合并，不再依赖外部图表抽取工具，也不会把裸 `paper_page_*.png` 整页截图当作最终论文原图。
+全部 writer 完成后，专用 reporter 读取 `task_agent_result.json`、任务 contract、本地 PNG/CSV/summary 和任务相关论文页，为每个任务生成紧凑的 `report_assets/<task_id>/paper_target.png`。对于子图任务，裁切必须保留完整坐标轴、图例、曲线和子图标签，不能用整页截图替代。
+
+reporter 在隔离工作区内运行；它失败、超时或缺少三份报告中的任何一份时会生成 `reporter_error.json`，不会静默回退到旧的主持人拼接报告。
 
 ## Codex 配置
 
@@ -80,12 +84,13 @@ set GENG_CODEX_CMD=codex
 ```bash
 set GENG_CODEX_ANALYSIS_CMD=codex
 set GENG_CODEX_TASK_WRITER_CMD=codex
+set GENG_CODEX_REPORTER_CMD=codex
 ```
 
-项目启动的 Codex 子智能体默认使用 `gpt-5.6-luna`，不跟随桌面 Codex 的全局默认模型。需要临时覆盖时可设置：
+项目启动的 Codex 子智能体默认使用 `gpt-5.5`，不跟随桌面 Codex 的全局默认模型。需要临时覆盖时可设置：
 
 ```bash
-set GENG_CODEX_MODEL=gpt-5.6-sol
+set GENG_CODEX_MODEL=gpt-5.6-luna
 ```
 
 analysis 子智能体默认使用 `high` 推理强度，task writer 默认使用 `medium`，避免继承桌面配置中的 `xhigh` 后出现不必要的超长推理。可分别覆盖：
@@ -93,18 +98,18 @@ analysis 子智能体默认使用 `high` 推理强度，task writer 默认使用
 ```bash
 set GENG_CODEX_ANALYSIS_REASONING_EFFORT=high
 set GENG_CODEX_TASK_WRITER_REASONING_EFFORT=medium
+set GENG_CODEX_REPORTER_REASONING_EFFORT=high
 ```
 
-task writer 默认采用资源感知并发：所有任务先进入队列，初始同时运行 2 个 writer；连续稳定完成后逐步增加，默认最多 4 个；出现 Codex rate-limit/model-capacity 时并发减半，并对整个 writer 队列执行统一冷却后保留 sandbox 重试。writer 推理并发与本地 full 并发彼此独立。常用硬上限：
+task writer 采用全任务并发：有多少复现任务就同时启动多少个 writer。writer 推理并发与本地 full 并发彼此独立；任何 writer 写完代码后立刻向资源 broker 申请 full，CPU/GPU full 仍按硬件预算排队。常用运行资源上限：
 
 ```bash
-set GENG_CODEX_TASK_WRITER_MAX_CONCURRENCY=4
 set GENG_TASK_WRITER_GPU_FULL_SLOTS=1
 set GENG_TASK_WRITER_CPU_FULL_SLOTS=2
 set GENG_RESOURCE_RAM_RESERVE_GB=4
 ```
 
-兼容变量 `GENG_CODEX_TASK_WRITER_CONCURRENCY` 会把 writer 并发固定为指定值。每次运行都会重新探测 CPU、可用内存、GPU、显存和 Torch/CUDA，并写入 `audit/hardware_snapshot.json`、`audit/resource_plan.json`、`audit/resource_events.jsonl` 和 `audit/writer_dispatch.json`。单个 writer 的 Codex 超时只累计模型推理和代码修改时间；等待资源和受控 full 运行由各自的有限超时管理，不会重复占用 Codex 活跃时间预算。
+每次运行都会重新探测 CPU、可用内存、GPU、显存和 Torch/CUDA，并写入 `audit/hardware_snapshot.json`、`audit/resource_plan.json`、`audit/resource_events.jsonl` 和 `audit/writer_dispatch.json`。硬件信息只限制 full 资源租约，不减少 writer 启动数量。单个 writer 的 Codex 超时仍用于处理断网、挂死或外部阻塞；它不是科学迭代轮数上限。
 
 旧 LLM analysis 兼容路径必须显式开启：
 
@@ -138,13 +143,10 @@ python -m geng_agent review paper.pdf --out case_001 --run-repro
 
 ```text
 --analysis-backend codex     前两阶段 backend，默认 codex；llm 为旧兼容路径
---facts-gap-rounds 6         事实抽取查漏补缺最多 6 轮，连续两轮无新增提前停止
---tasks-gap-rounds 6         任务拆解查漏补缺最多 6 轮
 --codex-analysis-timeout 600 前两阶段单个 Codex 子进程超时
---codex-agent-rounds 5       每个任务 writer 最大自我修正轮数
 --codex-agent-timeout 1800   单个任务 writer 子进程超时
+--codex-reporter-timeout 1800 最终报告 Codex 子进程超时
 --run-timeout 120            单次任务运行超时
---no-result-review           关闭结果对比报告生成
 --no-resume                  不复用已有阶段产物，从头运行
 ```
 
@@ -193,8 +195,9 @@ case_001/
   paper_thesis.json
   repro_project_manifest.json
   runtime_result.json
-  failure_memory.jsonl
-  revision_requests.json
+  report_assets/
+  reproduction_report.md
+  reproduction_report.docx
   automation_provenance.json
   risk_report.json
   review.md
@@ -206,6 +209,8 @@ case_001/
     02_*.md/json/txt
     03c_task_writer_sandboxes/
     03c_task_writers_*.json
+    04_reporter_*.json/md/txt
+    04_reporter_workspace/
   repro_project/
     README.md
     requirements.txt
@@ -219,9 +224,10 @@ case_001/
 其中：
 
 - `review.md/docx`：主报告，概述事实、任务、运行、风险和结果审查状态。
-- `result_review.md/docx`：面向人工阅读的逐任务复现对比报告，包含本地复现图、论文图/子图、writer 自审结论、关键差异和证据文件。
-- `runtime_result.json`：主持人结构验收、依赖、安全扫描、任务运行和产物统计。
-- `automation_provenance.json`：记忆快照、分析收敛、冲突、任务契约、运行证据和修订回流的哈希化来源链。
+- `reproduction_report.md/docx`：逐任务记录本地代码实际采用的关键参数、随机种子、后端、统计设置和显式假设。
+- `result_review.md/docx`：逐任务并排展示本地复现图和 reporter 裁切的论文原图，并给出最终差异、原因与不确定性；不包含 writer 自我迭代附录。
+- `runtime_result.json`：writer 自报完成状态、任务运行记录和产物汇总；不代表主持人格式验收。
+- `automation_provenance.json`：记忆快照、分析收敛、冲突、任务契约和运行证据的哈希化来源链。
 - `risk_report.json`：可复现性风险、缺失信息、前两阶段兜底、运行异常和审计摘要。
 - `audit/`：Codex prompt、stdout/stderr、JSON 校验、运行日志、图片证据等完整审计链。
 
@@ -233,11 +239,10 @@ case_001/
 2. 生成符合契约的本任务复现代码和配置。
 3. 在 `--run-repro` 开启时，通过 guard 校验契约并运行自己的 full。
 4. 对照论文证据自审结果。
-5. 不匹配时继续修改、重跑和再审查，最多 5 轮。
-6. 为目标论文图/子图生成 crop 或红框 locator，并记录到 `paper_target_figure.json`。
-7. 输出 `task_agent_result.json` 和 `task_agent_result.md`；只有上游分析/契约错误才输出 `task_revision_request.json`。
+5. 不匹配时继续提出新假设、修改、重跑和再审查；没有轮数上限，禁止在代码/配置未变化时机械重复 full。
+6. 输出 `task_agent_result.json` 和审计用 `task_agent_result.md`；只声明本地结果图片，不生成论文 crop。
 
-主持人不会重复跑全项目 full，也不会另起独立 reviewer；主持人只验收结构、合并产物、生成报告。
+主持人不会重复跑全项目 full，也不会另起独立 reviewer或执行格式 repair。最终单独启动一个 reporter Codex，负责论文图定位、裁切和三份人工报告；Word 层只做确定性渲染，不改写报告内容。
 
 ## 安全边界
 
