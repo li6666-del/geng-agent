@@ -20,11 +20,12 @@ class PromptTests(unittest.TestCase):
         book = PromptBook()
         rendered = {
             "facts": book.render("extract_engineering_facts.md", paper_chunks_json="[]"),
-            "fact_gaps": book.render(
-                "extract_engineering_facts_gaps.md",
+            "backfill": book.render(
+                "targeted_fact_backfill.md",
                 existing_facts_json="{}",
-                coverage_report_json="{}",
-                paper_chunks_json="[]",
+                targeted_requests_json="[]",
+                preliminary_tasks_json="{}",
+                paper_context_json="[]",
             ),
             "thesis": book.render(
                 "extract_paper_thesis.md",
@@ -34,14 +35,14 @@ class PromptTests(unittest.TestCase):
             "tasks": book.render(
                 "build_repro_tasks.md",
                 engineering_facts_json="{}",
+                fact_coverage_json="{}",
                 paper_context_json="[]",
             ),
-            "task_gaps": book.render(
-                "build_repro_tasks_gaps.md",
-                engineering_facts_json="{}",
-                existing_tasks_json="{}",
-                coverage_report_json="{}",
-                paper_context_json="[]",
+            "finalize_tasks": book.render(
+                "finalize_repro_tasks.md",
+                preliminary_tasks_json="{}",
+                final_engineering_facts_json="{}",
+                backfill_resolution_json="{}",
             ),
         }
 
@@ -52,6 +53,8 @@ class PromptTests(unittest.TestCase):
         self.assertIn("JSON", rendered["facts"])
         self.assertIn("机制", rendered["thesis"])
         self.assertIn("required_facts", rendered["tasks"])
+        self.assertIn("missing_fact_requests", rendered["tasks"])
+        self.assertIn("定向", rendered["backfill"])
 
 
 if __name__ == "__main__":

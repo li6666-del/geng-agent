@@ -101,6 +101,70 @@
       "title": "ExpectedTrend",
       "type": "object"
     },
+    "MissingFactRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "request_id": {
+          "minLength": 1,
+          "title": "Request Id",
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "channel_model",
+            "modulation",
+            "coding",
+            "metric",
+            "simulation_parameter",
+            "baseline",
+            "figure_claim",
+            "algorithm",
+            "dataset",
+            "topology",
+            "hardware",
+            "other"
+          ],
+          "title": "Type",
+          "type": "string"
+        },
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "why_needed": {
+          "minLength": 1,
+          "title": "Why Needed",
+          "type": "string"
+        },
+        "impact": {
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "title": "Impact",
+          "type": "string"
+        },
+        "search_targets": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Search Targets",
+          "type": "array"
+        }
+      },
+      "required": [
+        "request_id",
+        "type",
+        "name",
+        "why_needed",
+        "impact",
+        "search_targets"
+      ],
+      "title": "MissingFactRequest",
+      "type": "object"
+    },
     "ReproTask": {
       "additionalProperties": false,
       "properties": {
@@ -167,6 +231,13 @@
             "$ref": "#/$defs/RequiredFactRef"
           },
           "title": "Required Facts",
+          "type": "array"
+        },
+        "missing_fact_requests": {
+          "items": {
+            "$ref": "#/$defs/MissingFactRequest"
+          },
+          "title": "Missing Fact Requests",
           "type": "array"
         },
         "assumptions": {

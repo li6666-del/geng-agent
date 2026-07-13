@@ -234,7 +234,7 @@ def _runtime_task_passed(item: Mapping[str, Any]) -> int:
     if isinstance(item.get("passed"), bool):
         return int(item["passed"])
     status = str(item.get("task_writer_status") or item.get("status") or "")
-    return int(status in {"matched", "explained_gap"})
+    return int(status == "matched")
 
 
 def _outcome_counts(case_dir: Path, runtime: dict[str, Any] | None) -> dict[str, int]:

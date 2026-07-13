@@ -29,7 +29,7 @@ def validate_stage(
     issues: list[ValidationIssue] = []
     try:
         # Loose JSON recovery annotates manifests with _meta. That metadata is useful
-        # for risk reporting, but it is not part of the public schema contract.
+        # for risk reporting, but it is not part of the public schema interface.
         model.model_validate({key: value for key, value in data.items() if key != "_meta"})
     except ValidationError as exc:
         issues.extend(_issues_from_pydantic(exc))

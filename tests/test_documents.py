@@ -233,5 +233,32 @@ class DocumentTests(unittest.TestCase):
         )
         self.assertIn("通过，有 1 条依赖告警", markdown)
 
+    def test_unresolved_task_evidence_is_reported_without_pre_rating(self) -> None:
+        facts = {"engineering_facts": [], "missing_information": []}
+        tasks = {
+            "repro_tasks": [
+                {
+                    "task_id": "fig_4",
+                    "assumptions": [],
+                    "missing_fact_requests": [
+                        {
+                            "request_id": "power_norm",
+                            "type": "simulation_parameter",
+                            "name": "power normalization",
+                            "why_needed": "sets the x axis",
+                            "impact": "high",
+                            "search_targets": ["Fig. 4"],
+                        }
+                    ],
+                }
+            ]
+        }
+        validation = {"required_files_present": True, "python_compiles": True}
+
+        risk = build_risk_report(facts, tasks, validation)
+
+        self.assertEqual(risk["task_evidence_gap_count"], 1)
+        self.assertTrue(any(item["type"] == "task_evidence_gaps" for item in risk["findings"]))
+
 if __name__ == "__main__":
     unittest.main()

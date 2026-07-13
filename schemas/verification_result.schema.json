@@ -1,0 +1,97 @@
+{
+  "$defs": {
+    "TaskVerificationResult": {
+      "additionalProperties": false,
+      "properties": {
+        "task_id": {
+          "minLength": 1,
+          "title": "Task Id",
+          "type": "string"
+        },
+        "verdict": {
+          "enum": [
+            "accepted",
+            "revise"
+          ],
+          "title": "Verdict",
+          "type": "string"
+        },
+        "comparison_summary": {
+          "minLength": 1,
+          "title": "Comparison Summary",
+          "type": "string"
+        },
+        "differences": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Differences",
+          "type": "array"
+        },
+        "evidence_files": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Evidence Files",
+          "type": "array"
+        },
+        "feedback": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Feedback",
+          "type": "array"
+        },
+        "confidence": {
+          "enum": [
+            "high",
+            "medium",
+            "low"
+          ],
+          "title": "Confidence",
+          "type": "string"
+        }
+      },
+      "required": [
+        "task_id",
+        "verdict",
+        "comparison_summary",
+        "differences",
+        "evidence_files",
+        "feedback",
+        "confidence"
+      ],
+      "title": "TaskVerificationResult",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "all_accepted": {
+      "title": "All Accepted",
+      "type": "boolean"
+    },
+    "tasks": {
+      "items": {
+        "$ref": "#/$defs/TaskVerificationResult"
+      },
+      "minItems": 1,
+      "title": "Tasks",
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "all_accepted",
+    "tasks"
+  ],
+  "title": "VerificationResultDocument",
+  "type": "object"
+}

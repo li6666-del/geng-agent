@@ -30,11 +30,13 @@ from pydantic import ValidationError
 
 from .facts_normalize import _map_enum, _norm_token, _salvage_array_objects
 from .json_utils import prepare_json_candidate
-from .schema_models import AssumptionRisk, MetricName, ReproTask, TrendDirection
+from .schema_models import AssumptionRisk, FactType, MetricName, MissingImpact, ReproTask, TrendDirection
 
 _ALLOWED_METRICS = set(get_args(MetricName))
 _ALLOWED_DIRECTIONS = set(get_args(TrendDirection))
 _ALLOWED_RISK = set(get_args(AssumptionRisk))
+_ALLOWED_FACT_TYPES = set(get_args(FactType))
+_ALLOWED_IMPACTS = set(get_args(MissingImpact))
 
 _TASK_KEYS = {
     "task_id",
@@ -47,6 +49,7 @@ _TASK_KEYS = {
     "expected_trend",
     "comparison",
     "required_facts",
+    "missing_fact_requests",
     "assumptions",
     "risk_if_unreproducible",
 }
@@ -279,6 +282,9 @@ def _normalize_task(task: dict[str, Any], index: int, coercions: list[str], fact
             coercions.append(f"tasks[{index}].{key} -> []")
 
     task["required_facts"] = _normalize_required_facts(task.get("required_facts"), index, coercions, fact_keys, name_to_types, alias_to_key)
+    task["missing_fact_requests"] = _normalize_missing_fact_requests(
+        task.get("missing_fact_requests"), index, coercions
+    )
     task["assumptions"] = _normalize_assumptions(task.get("assumptions"), index, coercions)
 
 
@@ -390,6 +396,50 @@ def _normalize_assumptions(items: Any, index: int, coercions: list[str]) -> list
             continue
         risk, _ = _map_enum(item.get("risk"), _ALLOWED_RISK, _RISK_SYNONYMS, "medium")
         cleaned.append({"name": name, "default_value": item.get("default_value"), "reason": reason, "risk": risk})
+    return cleaned
+
+
+def _normalize_missing_fact_requests(
+    items: Any, index: int, coercions: list[str]
+) -> list[dict[str, Any]]:
+    if not isinstance(items, list):
+        return []
+    cleaned: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for request_index, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        why_needed = str(item.get("why_needed") or "").strip()
+        fact_type = str(item.get("type") or "other").strip()
+        if fact_type not in _ALLOWED_FACT_TYPES:
+            fact_type = "other"
+        if not name or not why_needed:
+            continue
+        key = (fact_type, name.casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        impact = str(item.get("impact") or "medium").strip().lower()
+        if impact not in _ALLOWED_IMPACTS:
+            impact = "medium"
+        request_id = str(item.get("request_id") or f"task_{index + 1}_request_{request_index + 1}").strip()
+        search_targets = item.get("search_targets")
+        cleaned.append(
+            {
+                "request_id": request_id,
+                "type": fact_type,
+                "name": name,
+                "why_needed": why_needed,
+                "impact": impact,
+                "search_targets": [
+                    str(target).strip()
+                    for target in search_targets if str(target).strip()
+                ] if isinstance(search_targets, list) else [],
+            }
+        )
+    if len(cleaned) != len(items):
+        coercions.append(f"tasks[{index}] normalized missing_fact_requests")
     return cleaned
 
 

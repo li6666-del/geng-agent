@@ -101,8 +101,8 @@ def build_fallback_engineering_facts(*, paper: dict[str, Any], reason: str) -> d
             },
             {
                 "name": "Original numeric curve points",
-                "why_needed": "The fallback can check qualitative trends but cannot claim point-level reproduction.",
-                "impact": "medium",
+                "why_needed": "Exact reproduction requires the task writer to inspect the original figure and recover or responsibly infer point-level targets.",
+                "impact": "high",
             },
         ],
         "_meta": {
@@ -153,7 +153,7 @@ def build_fallback_repro_tasks(*, facts: dict[str, Any], paper: dict[str, Any], 
                 "comparison": {
                     "baselines": ["local deterministic fallback baseline"],
                     "curve_groups": ["fallback_simulated"],
-                    "tolerance": "qualitative trend only; point-level agreement requires manual extraction of paper curve values",
+                    "tolerance": "complete figure-detail comparison; inspect the original paper figure and use explicit assumptions when numeric targets cannot be recovered",
                 },
                 "required_facts": fact_refs,
                 "assumptions": [

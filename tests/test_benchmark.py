@@ -48,7 +48,7 @@ class BenchmarkTests(unittest.TestCase):
             self.assertEqual(report["case_count"], 2)
             self.assertEqual(report["totals"]["facts_count"], 3)
             self.assertEqual(report["totals"]["tasks_count"], 3)
-            self.assertEqual(report["totals"]["runtime_coverage"], "2/3")
+            self.assertEqual(report["totals"]["runtime_coverage"], "1/3")
             self.assertEqual(report["totals"]["matched"], 1)
             self.assertEqual(report["totals"]["explained_gap"], 1)
             self.assertEqual(report["totals"]["failed"], 1)
@@ -58,14 +58,14 @@ class BenchmarkTests(unittest.TestCase):
             self.assertEqual(report["totals"]["cost_usd"], 1.5)
 
             runtime_stage = next(item for item in report["stage_totals"] if item["stage"] == "runtime")
-            self.assertEqual(runtime_stage, {"stage": "runtime", "ok": 1, "not_ok": 1, "total": 2})
+            self.assertEqual(runtime_stage, {"stage": "runtime", "ok": 0, "not_ok": 2, "total": 2})
 
             rendered_json = render_benchmark_json(report)
             self.assertEqual(json.loads(rendered_json), report)
             rendered_markdown = render_benchmark_markdown(report)
             self.assertIn("| case-a |", rendered_markdown)
             self.assertIn("| **Total** |", rendered_markdown)
-            self.assertIn("| runtime | 1 | 1 | 2 |", rendered_markdown)
+            self.assertIn("| runtime | 0 | 2 | 2 |", rendered_markdown)
 
             json_path, markdown_path = write_benchmark_reports(
                 report,
@@ -114,7 +114,7 @@ class BenchmarkTests(unittest.TestCase):
     ) -> None:
         write_json(case / "engineering_facts.json", {"engineering_facts": [{} for _ in range(facts)]})
         write_json(case / "repro_tasks.json", {"repro_tasks": [{} for _ in range(tasks)]})
-        passed = sum(status in {"matched", "explained_gap"} for status in statuses)
+        passed = sum(status == "matched" for status in statuses)
         write_json(
             case / "runtime_result.json",
             {
@@ -126,7 +126,7 @@ class BenchmarkTests(unittest.TestCase):
                 "per_task": [
                     {
                         "task_id": f"task-{index}",
-                        "passed": status in {"matched", "explained_gap"},
+                        "passed": status == "matched",
                         "task_writer_status": status,
                     }
                     for index, status in enumerate(statuses, start=1)

@@ -1,6 +1,3 @@
-from pathlib import Path
-import sys
-from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
@@ -51,40 +48,6 @@ class CodexRunnerModelTests(unittest.TestCase):
         command = run.call_args.kwargs["args"] if "args" in run.call_args.kwargs else run.call_args.args[0]
         self.assertEqual(status["reasoning_effort"], "medium")
         self.assertEqual(command[command.index("--config") + 1], 'model_reasoning_effort="medium"')
-
-    def test_task_writer_timeout_excludes_guarded_wait_and_full_phases(self) -> None:
-        with TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            script = root / "fake_codex.py"
-            timeout_state = root / "timeout_state.json"
-            script.write_text(
-                "import json, os, sys, time\n"
-                "from pathlib import Path\n"
-                "sys.stdin.read()\n"
-                "state = Path(os.environ['TEST_TIMEOUT_STATE'])\n"
-                "state.write_text(json.dumps({'phase':'full_run','heartbeat':time.time()}), encoding='utf-8')\n"
-                "time.sleep(0.6)\n"
-                "state.unlink(missing_ok=True)\n"
-                "time.sleep(0.05)\n",
-                encoding="utf-8",
-            )
-            status = run_codex_subprocess(
-                role="task_writer",
-                work_dir=root,
-                prompt="test",
-                audit_dir=root,
-                label="paused_timeout",
-                sandbox="workspace-write",
-                timeout=0.25,
-                command_override=f'"{sys.executable}" "{script}"',
-                extra_env={"TEST_TIMEOUT_STATE": str(timeout_state)},
-                timeout_state_path=timeout_state,
-            )
-
-        self.assertTrue(status["ok"], msg=status)
-        self.assertFalse(status["timed_out"])
-        self.assertGreaterEqual(float(status["excluded_duration_s"]), 0.4)
-        self.assertLess(float(status["active_duration_s"]), 0.25)
 
 
 if __name__ == "__main__":

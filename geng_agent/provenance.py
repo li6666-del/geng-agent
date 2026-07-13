@@ -22,12 +22,16 @@ def build_automation_provenance(
     for name in (
         "paper_chunks.json",
         "paper_memory.json",
+        "engineering_facts_initial.json",
+        "repro_tasks_preliminary.json",
+        "engineering_facts_backfill.json",
         "engineering_facts.json",
         "paper_thesis.json",
         "repro_tasks.json",
         "experiment_index.json",
         "repro_project_manifest.json",
         "runtime_result.json",
+        "verification_result.json",
         "result_review.md",
         "risk_report.json",
     ):
@@ -48,16 +52,14 @@ def build_automation_provenance(
             "facts_count": len(facts.get("engineering_facts", [])),
             "tasks_count": len(tasks.get("repro_tasks", [])),
             "experiments_count": len(experiment_index.get("experiments", [])),
-            "facts_gap": facts_meta.get("gap_finder", {}),
-            "tasks_gap": tasks_meta.get("gap_finder", {}),
+            "task_driven_backfill": facts_meta.get("task_driven_backfill", {}),
+            "task_finalization": tasks_meta.get("task_driven_finalization", {}),
             "fact_conflicts": len(fact_semantic.get("fact_conflicts", [])),
             "task_conflicts": len(task_semantic.get("task_conflicts", [])),
         },
         "task_writers": {
             "mode": agentic_status.get("mode"),
             "agent_concurrency": agentic_status.get("agent_concurrency"),
-            "agent_concurrency_max": agentic_status.get("agent_concurrency_max"),
-            "resource_plan": agentic_status.get("resource_plan"),
             "stop_rule": agentic_status.get("stop_rule"),
             "analysis_revision_history": agentic_status.get("analysis_revision_history", []),
             "tasks": [
@@ -65,9 +67,9 @@ def build_automation_provenance(
                     "task_id": item.get("task_id"),
                     "status": item.get("task_writer_status"),
                     "passed": item.get("passed"),
-                    "reproducibility_mode": item.get("reproducibility_mode"),
-                    "task_contract_hash": item.get("task_contract_hash"),
-                    "full_run": item.get("full_run"),
+                    "task_reporter_verdict": item.get("task_reporter_verdict"),
+                    "task_reporter_revision_target": item.get("task_reporter_revision_target"),
+                    "execution_summary": item.get("execution_summary"),
                     "revision_request": item.get("revision_request"),
                 }
                 for item in runtime_result.get("per_task", [])

@@ -232,6 +232,48 @@ class FigureSourceTests(unittest.TestCase):
         self.assertEqual(len(doc["engineering_facts"]), 1)
         self.assertEqual(doc["engineering_facts"][0]["source"]["source_kind"], "figure")
 
+    def test_finalize_keeps_approximate_visual_formula_and_conflicting_observations(self) -> None:
+        visual = figure_fact(
+            name="Fig.7 approximate points",
+            value={"observation": "P=64 dBm 时约为 57 bit/s/Hz", "uncertainty": "±2 bit/s/Hz"},
+        )
+        bound = good_fact(
+            type="algorithm",
+            name="ULA cluster eigenvalue bound Cn",
+            value={"formula": "Cn = M/(M+1) * ((n-1)!)^4"},
+            source={
+                "source_kind": "text",
+                "chunk_id": "text_c1",
+                "page": 3,
+                "section": "APPENDIX C PROOF OF LEMMA 3",
+                "quote": "Cn bound",
+                "figure_ref": "",
+            },
+        )
+        conflicting = figure_fact(
+            name="Fig.5 visual observation",
+            source={
+                "source_kind": "figure",
+                "chunk_id": None,
+                "page": 7,
+                "section": "Results",
+                "quote": "visual observation requiring downstream review",
+                "figure_ref": "Fig.4",
+            },
+        )
+        doc = finalize_engineering_facts(
+            {"paper_repro_type": "mimo_ofdm", "engineering_facts": [visual, bound, conflicting]},
+            CHUNK_IDS,
+            {3, 7},
+        )
+
+        self.assertEqual(
+            {fact["name"] for fact in doc["engineering_facts"]},
+            {visual["name"], bound["name"], conflicting["name"]},
+        )
+        self.assertNotIn("dropped_fact_count", doc.get("_meta", {}))
+        self.assertNotIn("dropped_facts", doc.get("_meta", {}))
+
     def test_validate_fact_sources_branches_on_kind(self) -> None:
         from geng_agent.schemas import validate_fact_sources
 

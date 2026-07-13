@@ -18,6 +18,7 @@ STAGES = [
     ("repro_project_manifest", "repro_project_manifest.json", "repro_project_manifest"),
     ("repro_project", "repro_project", None),
     ("runtime", "runtime_result.json", None),
+    ("verification_result", "verification_result.json", "verification_result"),
     ("reproduction_report", "reproduction_report.md", None),
     ("result_review", "result_review.md", None),
     ("review", "review.md", None),
@@ -30,15 +31,16 @@ RESUME_LABELS = {
     "paper": "01_extract_engineering_facts",
     "paper_memory": "01_build_paper_memory",
     "engineering_facts": "01_extract_engineering_facts",
-    "paper_thesis": "01c_extract_paper_thesis",
-    "repro_tasks": "02_build_repro_tasks",
-    "experiment_index": "02b_build_experiment_index",
+    "paper_thesis": "02d_extract_paper_thesis",
+    "repro_tasks": "02c_finalize_repro_tasks",
+    "experiment_index": "02e_build_experiment_index",
     "repro_project_manifest": "03c_task_writer_workflow",
     "repro_project": "03c_task_writer_workflow",
     "runtime": "03c_task_writer_workflow",
-    "reproduction_report": "04_codex_reporter",
-    "result_review": "04_codex_reporter",
-    "review": "04_codex_reporter",
+    "verification_result": "04a_task_reporters",
+    "reproduction_report": "04b_report_editor",
+    "result_review": "04b_report_editor",
+    "review": "04b_report_editor",
     "review_docx": "render_reports",
     "reproduction_report_docx": "render_reports",
     "result_review_docx": "render_reports",
@@ -71,7 +73,7 @@ def inspect_stage(output_dir: Path, name: str, rel_path: str, schema_stage: str 
     path = output_dir / rel_path
     if not path.exists():
         if name in {"review", "reproduction_report", "result_review"}:
-            error_path = output_dir / "reporter_error.json"
+            error_path = output_dir / "report_editor_error.json"
             if error_path.exists():
                 try:
                     error_data = read_json(error_path)
@@ -109,7 +111,7 @@ def inspect_stage(output_dir: Path, name: str, rel_path: str, schema_stage: str 
             return {"stage": name, "ok": False, "path": str(path), "reason": f"invalid json: {exc}"}
 
     if name in {"review", "reproduction_report", "result_review"}:
-        error_path = output_dir / "reporter_error.json"
+        error_path = output_dir / "report_editor_error.json"
         if error_path.exists() and error_path.stat().st_mtime >= path.stat().st_mtime:
             try:
                 error_data = read_json(error_path)
@@ -158,10 +160,18 @@ def _required_files_for_stage(name: str, data: dict[str, Any]) -> set[str] | Non
 def latest_audit_items(audit_dir: Path, limit: int = 8) -> list[dict[str, Any]]:
     if not audit_dir.exists():
         return []
-    items = sorted((path for path in audit_dir.iterdir() if path.is_file()), key=lambda path: path.stat().st_mtime, reverse=True)
+    items = sorted(
+        (
+            path
+            for path in audit_dir.rglob("*")
+            if path.is_file() and (path.suffix.lower() == ".json" or path.name.endswith("_brief.md"))
+        ),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
     return [
         {
-            "name": path.name,
+            "name": path.relative_to(audit_dir).as_posix(),
             "size": path.stat().st_size,
             "mtime": path.stat().st_mtime,
             "summary": audit_summary(path),

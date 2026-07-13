@@ -58,10 +58,6 @@ MetricName = Literal[
 
 TrendDirection = Literal["decreasing", "increasing", "flat", "unknown"]
 AssumptionRisk = Literal["low", "medium", "high"]
-ExperimentIndexStatus = Literal["ready", "ready_with_limitations", "blocked"]
-ReproducibilityMode = Literal[
-    "native_full", "scaled_full", "proxy_only", "environment_blocked", "upstream_patch_required"
-]
 PaperEntityKind = Literal["section", "figure", "table", "equation", "algorithm"]
 ReproducibilityVerdict = Literal[
     "fully_reproduced",
@@ -136,6 +132,15 @@ class Comparison(StrictModel):
     tolerance: NonEmptyStr
 
 
+class MissingFactRequest(StrictModel):
+    request_id: NonEmptyStr
+    type: FactType
+    name: NonEmptyStr
+    why_needed: NonEmptyStr
+    impact: MissingImpact
+    search_targets: list[str]
+
+
 class ReproTask(StrictModel):
     task_id: NonEmptyStr
     target: NonEmptyStr
@@ -147,6 +152,7 @@ class ReproTask(StrictModel):
     expected_trend: ExpectedTrend
     comparison: Comparison
     required_facts: list[RequiredFactRef]
+    missing_fact_requests: list[MissingFactRequest] = Field(default_factory=list)
     assumptions: list[Assumption]
     risk_if_unreproducible: NonEmptyStr
 
@@ -231,7 +237,6 @@ class ExperimentIndexItem(StrictModel):
     source_pages: list[int]
     source_chunk_ids: list[NonEmptyStr]
     required_facts: list[RequiredFactRef]
-    status: ExperimentIndexStatus
     limitations: list[str]
     target_entity_ids: list[str] = Field(default_factory=list)
     subfigure: str | None = None
@@ -240,9 +245,6 @@ class ExperimentIndexItem(StrictModel):
     baselines: list[str] = Field(default_factory=list)
     regimes: list[str] = Field(default_factory=list)
     parameters: dict[str, Any] = Field(default_factory=dict)
-    acceptance_criteria: list[str] = Field(default_factory=list)
-    reproducibility_mode: ReproducibilityMode = "native_full"
-    feasibility: dict[str, Any] = Field(default_factory=dict)
 
 
 class ExperimentIndexDocument(StrictModel):
@@ -250,49 +252,36 @@ class ExperimentIndexDocument(StrictModel):
     experiments: list[ExperimentIndexItem]
 
 
-class TaskContractInput(StrictModel):
-    name: NonEmptyStr
-    source: NonEmptyStr
-    value: Any = None
-    required: bool
+class TaskVerificationResult(StrictModel):
+    task_id: NonEmptyStr
+    verdict: Literal["accepted", "revise"]
+    comparison_summary: NonEmptyStr
+    differences: list[str]
+    evidence_files: list[NonEmptyStr] = Field(min_length=1)
+    feedback: list[str]
+    confidence: Confidence
 
 
-class TaskContractOutput(StrictModel):
-    path_pattern: NonEmptyStr
-    kind: Literal["csv", "png", "json", "text", "other"]
-    required: bool
-
-
-class TaskContractBackend(StrictModel):
-    requested: Literal["auto", "cpu", "gpu"]
-    allow_cpu_fallback: bool
-
-
-class TaskContractResources(StrictModel):
-    execution_class: Literal["cpu_light", "cpu_heavy", "gpu", "unknown"]
-    cpu_cores: int = Field(ge=1)
-    ram_gb: float = Field(gt=0)
-    gpu_count: int = Field(ge=0)
-    vram_gb: float = Field(ge=0)
-    confidence: Literal["low", "medium", "high"]
-
-
-class TaskContractDocument(StrictModel):
+class IsolatedTaskVerificationDocument(StrictModel):
     schema_version: Literal["1.0"]
     task_id: NonEmptyStr
-    experiment_id: NonEmptyStr
-    memory_snapshot_hash: NonEmptyStr
-    reproducibility_mode: ReproducibilityMode
-    inputs: list[TaskContractInput]
-    outputs: list[TaskContractOutput] = Field(min_length=1)
-    equations: list[str]
-    algorithm_steps: list[NonEmptyStr] = Field(min_length=1)
-    invariants: list[NonEmptyStr]
-    backend: TaskContractBackend
-    resources: TaskContractResources
-    seed: int
-    acceptance_criteria: list[NonEmptyStr] = Field(min_length=1)
-    assumptions: list[str]
+    verdict: Literal["accepted", "revise"]
+    revision_target: Literal["none", "writer", "reporter"]
+    comparison_summary: NonEmptyStr
+    differences: list[str]
+    non_material_differences: list[str] = Field(default_factory=list)
+    evidence_files: list[NonEmptyStr] = Field(min_length=1)
+    feedback: list[str]
+    confidence: Confidence
+    local_assets: list[str] = Field(default_factory=list)
+    paper_assets: list[str] = Field(default_factory=list)
+    remaining_uncertainties: list[str] = Field(default_factory=list)
+
+
+class VerificationResultDocument(StrictModel):
+    schema_version: Literal["1.0"]
+    all_accepted: bool
+    tasks: list[TaskVerificationResult] = Field(min_length=1)
 
 
 class ManifestTextFile(StrictModel):
@@ -354,7 +343,8 @@ SCHEMA_MODELS: dict[str, type[BaseModel]] = {
     "paper_thesis": PaperThesisDocument,
     "paper_memory": PaperMemoryDocument,
     "experiment_index": ExperimentIndexDocument,
-    "task_contract": TaskContractDocument,
+    "task_verification_result": IsolatedTaskVerificationDocument,
+    "verification_result": VerificationResultDocument,
     "repro_project_manifest": ReproProjectManifest,
     "reproducibility_verdict": ReproducibilityVerdictDocument,
 }
@@ -366,7 +356,8 @@ SCHEMA_FILENAMES: dict[str, str] = {
     "paper_thesis": "paper_thesis.schema.json",
     "paper_memory": "paper_memory.schema.json",
     "experiment_index": "experiment_index.schema.json",
-    "task_contract": "task_contract.schema.json",
+    "task_verification_result": "task_verification_result.schema.json",
+    "verification_result": "verification_result.schema.json",
     "repro_project_manifest": "repro_project_manifest.schema.json",
     "reproducibility_verdict": "reproducibility_verdict.schema.json",
 }

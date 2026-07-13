@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import io
-import json
 import re
 from pathlib import Path
 from typing import Any
@@ -13,7 +12,6 @@ from .pipeline_helpers import wrap_untrusted
 
 
 MAX_IMAGE_DIMENSION = 1600
-MAX_PAPER_PAGES = 6
 MAX_TASK_PAPER_CONTEXT_CHARS = 14000
 RESULT_KEYWORDS = (
     "figure",
@@ -54,8 +52,7 @@ def facts_for_task(facts: dict[str, Any], task: dict[str, Any], max_facts: int =
     }
 
 
-def paper_context_for_task(*, paper: dict[str, Any], facts: dict[str, Any], task: dict[str, Any]) -> str:
-    task_pages = set(select_paper_pages_for_task(paper=paper, facts=facts, task=task, max_pages=MAX_PAPER_PAGES))
+def paper_context_for_task(*, paper: dict[str, Any], task: dict[str, Any]) -> str:
     figure_numbers = _extract_figure_numbers(str(task.get("figure_or_claim", "")))
     tokens = task_match_tokens(task)
     scored_chunks = []
@@ -64,8 +61,6 @@ def paper_context_for_task(*, paper: dict[str, Any], facts: dict[str, Any], task
             continue
         text = " ".join(str(chunk.get(key, "")) for key in ("section", "text")).lower()
         score = 0
-        if chunk.get("page") in task_pages:
-            score += 5
         if any(f"fig. {number}" in text or f"figure {number}" in text for number in figure_numbers):
             score += 6
         if any(keyword in text for keyword in RESULT_KEYWORDS):
@@ -100,78 +95,6 @@ def paper_context_for_task(*, paper: dict[str, Any], facts: dict[str, Any], task
         total += len(copied["text"])
 
     return wrap_untrusted("paper_context_json", pretty_json({"chunks": selected}))
-
-
-def select_paper_pages_for_task(
-    *,
-    paper: dict[str, Any],
-    facts: dict[str, Any],
-    task: dict[str, Any],
-    max_pages: int,
-) -> list[int]:
-    priority_candidates: list[tuple[int, int]] = []
-    candidates: list[int] = []
-    figure_numbers = _task_figure_numbers(task)
-    required = {
-        (str(ref.get("type")), str(ref.get("name")).lower())
-        for ref in task.get("required_facts", [])
-        if isinstance(ref, dict)
-    }
-    task_text = " ".join(
-        str(task.get(key, ""))
-        for key in ("task_id", "target", "metric", "figure_or_claim", "risk_if_unreproducible")
-    ).lower()
-    for fact in facts.get("engineering_facts", []):
-        if not isinstance(fact, dict):
-            continue
-        key = (str(fact.get("type")), str(fact.get("name")).lower())
-        if key not in required and fact.get("type") not in {"figure_claim", "metric", "baseline"}:
-            continue
-        source = fact.get("source")
-        if isinstance(source, dict) and isinstance(source.get("page"), int):
-            fact_type = str(fact.get("type"))
-            fact_name = str(fact.get("name", "")).lower()
-            quote = str(source.get("quote", "")).lower()
-            mentions_target_figure = _fact_mentions_any_target_figure(fact, figure_numbers)
-            if mentions_target_figure and source.get("source_kind") == "figure":
-                priority_candidates.append((0, source["page"]))
-            elif mentions_target_figure and fact_type == "figure_claim":
-                priority_candidates.append((1, source["page"]))
-            elif key in required and fact_type == "figure_claim" and source.get("source_kind") == "figure":
-                priority_candidates.append((2, source["page"]))
-            elif key in required and fact_type in {"figure_claim", "metric", "simulation_parameter"}:
-                priority_candidates.append((3, source["page"]))
-            elif key in required and (
-                fact_name in task_text or any(token and token in quote for token in task_match_tokens(task))
-            ):
-                priority_candidates.append((4, source["page"]))
-            else:
-                candidates.append(source["page"])
-
-    tokens = task_match_tokens(task)
-    for chunk in paper.get("chunks", []):
-        if not isinstance(chunk, dict):
-            continue
-        page = chunk.get("page")
-        if not isinstance(page, int):
-            continue
-        text = " ".join(str(chunk.get(key, "")) for key in ("section", "text")).lower()
-        if any(_text_has_figure_caption(text, number) for number in figure_numbers):
-            priority_candidates.append((5, page))
-        elif any(_text_mentions_figure_number(text, number) for number in figure_numbers):
-            candidates.insert(0, page)
-        elif any(keyword in text for keyword in RESULT_KEYWORDS) and any(token and token in text for token in tokens):
-            candidates.append(page)
-
-    selected: list[int] = []
-    ordered_priority_pages = [page for _, page in sorted(priority_candidates, key=lambda item: item[0])]
-    for page in ordered_priority_pages + candidates:
-        if page <= 0 or page in selected:
-            continue
-        selected.append(page)
-        if len(selected) >= max_pages:
-            break
-    return selected
 
 
 def task_match_tokens(task: dict[str, Any]) -> set[str]:
@@ -248,7 +171,7 @@ def safe_label(value: str) -> str:
 def render_pdf_pages_for_llm(
     paper_path: Path,
     pages: list[int] | None = None,
-    max_pages: int = MAX_PAPER_PAGES,
+    max_pages: int | None = None,
 ) -> list[LLMImage]:
     try:
         import fitz
@@ -260,7 +183,8 @@ def render_pdf_pages_for_llm(
     try:
         if pages is None:
             pages = list(range(1, document.page_count + 1))
-        for page_number in pages[:max_pages]:
+        page_numbers = pages if max_pages is None else pages[:max_pages]
+        for page_number in page_numbers:
             if page_number < 1 or page_number > document.page_count:
                 continue
             page = document.load_page(page_number - 1)
@@ -286,47 +210,6 @@ def encode_png_bytes_for_llm(data: bytes, label: str) -> LLMImage:
         label=label,
         mime_type="image/png",
         data_b64=base64.b64encode(buffer.getvalue()).decode("ascii"),
-    )
-
-
-def _task_figure_numbers(task: dict[str, Any]) -> set[str]:
-    parts = [
-        str(task.get("task_id", "")),
-        str(task.get("target", "")),
-        str(task.get("figure_or_claim", "")),
-        str(task.get("figure_or_table", "")),
-        str(task.get("description", "")),
-    ]
-    return _extract_figure_numbers(" ".join(parts))
-
-
-def _fact_mentions_any_target_figure(fact: dict[str, Any], figure_numbers: set[str]) -> bool:
-    if not figure_numbers:
-        return False
-    source = fact.get("source") if isinstance(fact.get("source"), dict) else {}
-    value = fact.get("value")
-    haystack = " ".join(
-        [
-            str(fact.get("name") or ""),
-            json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value or ""),
-            str(source.get("figure_ref") or ""),
-            str(source.get("quote") or ""),
-        ]
-    )
-    return bool(_extract_figure_numbers(haystack) & figure_numbers)
-
-
-def _text_mentions_figure_number(text: str, number: str) -> bool:
-    return bool(
-        re.search(rf"\bfig(?:\.|ure)?[._\s:-]*{re.escape(number)}\b", text, re.I)
-        or re.search(rf"图\s*{re.escape(number)}\b", text)
-    )
-
-
-def _text_has_figure_caption(text: str, number: str) -> bool:
-    return bool(
-        re.search(rf"(?:^|\n)\s*(?:fig\.|figure)\s*{re.escape(number)}\b\s*[:.]", text, re.I)
-        or re.search(rf"(?:^|\n)\s*图\s*{re.escape(number)}\b\s*[:：.]", text)
     )
 
 

@@ -106,13 +106,14 @@ class NormalizeReproTasksTests(unittest.TestCase):
         self.assertTrue(doc["_meta"]["partial_acceptance_used"])
         self.assertEqual(doc["_meta"]["dropped_task_count"], 1)
 
-    def test_clean_input_is_left_untouched_without_meta(self) -> None:
+    def test_clean_input_remains_schema_valid(self) -> None:
         clean = {"repro_tasks": [good_task()]}
 
         doc = finalize_repro_tasks(clean, FACTS)
 
         self.assertEqual(validate_stage("repro_tasks", doc), [])
-        self.assertNotIn("_meta", doc)
+        self.assertEqual(doc["repro_tasks"][0]["task_id"], "reproduce_fig_11")
+        self.assertEqual(len(doc["repro_tasks"]), 1)
 
     def test_truncation_recovery_salvages_complete_task_prefix(self) -> None:
         first = json.dumps(good_task(required_facts=["F-CH-AWGN"]))

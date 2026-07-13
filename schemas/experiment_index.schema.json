@@ -64,15 +64,6 @@
           "title": "Required Facts",
           "type": "array"
         },
-        "status": {
-          "enum": [
-            "ready",
-            "ready_with_limitations",
-            "blocked"
-          ],
-          "title": "Status",
-          "type": "string"
-        },
         "limitations": {
           "items": {
             "type": "string"
@@ -129,30 +120,6 @@
           "additionalProperties": true,
           "title": "Parameters",
           "type": "object"
-        },
-        "acceptance_criteria": {
-          "items": {
-            "type": "string"
-          },
-          "title": "Acceptance Criteria",
-          "type": "array"
-        },
-        "reproducibility_mode": {
-          "default": "native_full",
-          "enum": [
-            "native_full",
-            "scaled_full",
-            "proxy_only",
-            "environment_blocked",
-            "upstream_patch_required"
-          ],
-          "title": "Reproducibility Mode",
-          "type": "string"
-        },
-        "feasibility": {
-          "additionalProperties": true,
-          "title": "Feasibility",
-          "type": "object"
         }
       },
       "required": [
@@ -162,7 +129,6 @@
         "source_pages",
         "source_chunk_ids",
         "required_facts",
-        "status",
         "limitations"
       ],
       "title": "ExperimentIndexItem",

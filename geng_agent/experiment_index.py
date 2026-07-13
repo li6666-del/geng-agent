@@ -3,7 +3,6 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from .repro_feasibility import classify_repro_feasibility
 from .semantic_merge import canonical_figure_ref
 
 
@@ -12,9 +11,8 @@ def build_local_experiment_index(
     tasks: Any,
     paper: Any,
     paper_memory: Any = None,
-    environment: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build a versioned experiment map and conservative execution profile."""
+    """Build a versioned evidence map without predicting reproduction success."""
     fact_items = _list_from_document(facts, "engineering_facts")
     task_items = _list_from_document(tasks, "repro_tasks")
     chunks = _paper_chunks(paper)
@@ -43,17 +41,8 @@ def build_local_experiment_index(
             source_pages=source_pages,
             source_chunk_ids=source_chunk_ids,
         )
-        feasibility = classify_repro_feasibility(
-            task_data,
-            _as_dict(facts),
-            environment if isinstance(environment, dict) else {"ready": True},
-        )
-        mode = str(feasibility.get("mode") or "proxy_only")
-        if mode in {"environment_blocked", "upstream_patch_required"}:
-            limitations.extend(str(reason) for reason in feasibility.get("reasons", []) if str(reason) not in limitations)
         target_entity_ids = _target_entities(figure_or_table, paper_memory)
         comparison = _as_dict(task_data.get("comparison"))
-
         experiments.append(
             {
                 "experiment_id": _experiment_id(task_id, index),
@@ -64,7 +53,6 @@ def build_local_experiment_index(
                 "source_pages": source_pages,
                 "source_chunk_ids": source_chunk_ids,
                 "required_facts": required_facts,
-                "status": "ready_with_limitations" if limitations else "ready",
                 "limitations": limitations,
                 "target_entity_ids": target_entity_ids,
                 "subfigure": _subfigure(figure_or_table),
@@ -73,9 +61,6 @@ def build_local_experiment_index(
                 "baselines": _string_items(comparison.get("baselines")),
                 "regimes": _regimes(task_data),
                 "parameters": _parameters(task_data),
-                "acceptance_criteria": _acceptance_criteria(task_data),
-                "reproducibility_mode": mode,
-                "feasibility": feasibility,
             }
         )
 
@@ -134,22 +119,6 @@ def _parameters(task: dict[str, Any]) -> dict[str, Any]:
         for item in task.get("assumptions", []) if isinstance(task.get("assumptions"), list)
         if isinstance(item, dict) and _string(item.get("name"))
     }
-
-
-def _acceptance_criteria(task: dict[str, Any]) -> list[str]:
-    explicit = _string_items(task.get("acceptance_criteria"))
-    if explicit:
-        return explicit
-    trend = _as_dict(task.get("expected_trend"))
-    comparison = _as_dict(task.get("comparison"))
-    criteria: list[str] = []
-    if trend:
-        criteria.append(
-            f"{_string(trend.get('y_axis')) or 'metric'}:{_string(trend.get('direction')) or 'unknown'}"
-        )
-    if _string(comparison.get("tolerance")):
-        criteria.append(f"tolerance:{_string(comparison.get('tolerance'))}")
-    return criteria
 
 
 def _as_dict(value: Any) -> dict[str, Any]:

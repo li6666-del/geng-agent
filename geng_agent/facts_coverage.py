@@ -1,15 +1,13 @@
-"""Deterministic coverage check + merge helpers for round-1 fact extraction.
+"""Deterministic evidence coverage and fact-merge helpers.
 
-The single-pass extractor tends to skim long papers and silently drop facts -- and a
-missed fact at this, the highest-leverage stage, diverges everything downstream (the
-Fig.7 threshold case). This module adds two pure, deterministic pieces that let a
-targeted LLM gap-finder re-query only the omissions:
+The global extractor establishes a high-recall experiment map. Preliminary tasks then
+request only execution-critical missing evidence. This module provides two pure pieces
+used to audit that task-driven flow:
 
 1. anchor coverage -- enumerate the figures/tables the paper *references* (from chunk
-   text) and compare against the anchors the extracted facts actually *cover*, so the
-   gap-finder gets concrete targets instead of "look again".
+   text) and compare them with extracted facts and finalized reproduction tasks.
 2. semantic merge/dedup -- preserve subfigures, enrich incomplete records, retain
-   conflicts for later adjudication, and converge under repeated resume merges.
+   conflicts, and merge the one targeted fact-backfill result into the global facts.
 
 No I/O, no LLM, no randomness here -- everything is unit-testable in isolation.
 """
@@ -20,7 +18,7 @@ import json
 import re
 from typing import Any
 
-from .semantic_merge import semantic_merge_engineering_facts, semantic_merge_repro_tasks
+from .semantic_merge import semantic_merge_engineering_facts
 
 
 # Keep subfigure identity: Fig. 9(a) and Fig. 9(b) are different experiments.  The
@@ -193,8 +191,8 @@ def merge_engineering_facts(
     return semantic_merge_engineering_facts(base, addition)
 
 
-# --- round-2 task coverage: every reproducible experiment (a figure_claim fact) needs a
-# repro task, else that figure/result is silently never reproduced ----------------------
+# Every reproducible experiment (a figure_claim fact) needs a finalized task, otherwise
+# that figure/result is silently never reproduced.
 
 # A figure counts as a reproducible EXPERIMENT only on positive evidence that it plots a
 # measurable result (a metric on its axes). Ambiguous figures default to NOT-experiment so we
@@ -223,20 +221,6 @@ def _is_experiment_blob(blob: str) -> bool:
     if _DIAGRAM_KW.search(blob):
         return False
     return bool(_RESULT_KW.search(blob))
-
-
-def is_concrete_experiment_task(task: dict[str, Any]) -> bool:
-    """A real reproduction experiment computes a SPECIFIC measurable metric with concrete
-    numeric output columns. metric='other' (or empty) with no real columns is the tell of a
-    non-reproducible figure (e.g. a concept/system diagram). Used as a deterministic gate on
-    gap-finder tasks -- it catches a misjudged figure regardless of how the figure was worded."""
-    if not isinstance(task, dict):
-        return False
-    metric = str(task.get("metric", "")).strip().lower()
-    if metric in ("", "other"):
-        return False
-    cols = task.get("output_columns")
-    return isinstance(cols, list) and any(str(c).strip() for c in cols)
 
 
 def experiment_anchors_from_facts(facts: list[dict[str, Any]] | None) -> dict[str, set[str]]:
@@ -283,8 +267,3 @@ def compute_task_coverage(facts: dict[str, Any] | None, tasks: dict[str, Any] | 
         "uncovered_tables": uncovered_tables,
         "fully_covered": not uncovered_figures and not uncovered_tables,
     }
-
-
-def merge_repro_tasks(base: dict[str, Any], addition: dict[str, Any]) -> tuple[dict[str, Any], int]:
-    """Semantic experiment merge preserving subfigures, regimes, and baseline sets."""
-    return semantic_merge_repro_tasks(base, addition)

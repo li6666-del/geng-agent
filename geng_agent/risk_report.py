@@ -125,9 +125,14 @@ def build_risk_report(
     missing = facts.get("missing_information", [])
     repro_tasks = tasks.get("repro_tasks", [])
     assumptions = []
+    task_evidence_gaps: list[dict[str, Any]] = []
     for task in repro_tasks if isinstance(repro_tasks, list) else []:
         if isinstance(task, dict) and isinstance(task.get("assumptions"), list):
             assumptions.extend(task["assumptions"])
+        if isinstance(task, dict) and isinstance(task.get("missing_fact_requests"), list):
+            for request in task["missing_fact_requests"]:
+                if isinstance(request, dict):
+                    task_evidence_gaps.append({**request, "task_id": task.get("task_id")})
 
     findings: list[dict[str, Any]] = []
 
@@ -146,6 +151,15 @@ def build_risk_report(
         findings.append({"type": "missing_information", "message": "论文存在复现需要但未明确说明的信息。", "count": len(missing)})
     if assumptions:
         findings.append({"type": "assumptions_required", "message": "复现任务需要使用假设参数。", "count": len(assumptions)})
+    if task_evidence_gaps:
+        findings.append(
+            {
+                "type": "task_evidence_gaps",
+                "message": "任务定稿后仍有论文未明确的执行证据；这些缺口不是运行前复现评级。",
+                "count": len(task_evidence_gaps),
+                "items": task_evidence_gaps,
+            }
+        )
     if not validation.get("required_files_present"):
         findings.append({"type": "generated_project_incomplete", "message": "Codex task writer 交付的复现项目缺少必要文件。", "missing_files": validation.get("missing_files", [])})
     if not validation.get("python_compiles"):
@@ -220,8 +234,19 @@ def build_risk_report(
     if result_review_result and result_review_result.get("enabled") and not result_review_result.get("passed"):
         findings.append({"type": "writer_results_incomplete", "message": "至少一个任务 writer 未完成最终科学结论。", "error": result_review_result.get("error")})
 
+    combined_missing = list(missing) if isinstance(missing, list) else []
+    known_missing_names = {
+        str(item.get("name") or "").strip().casefold()
+        for item in combined_missing if isinstance(item, dict)
+    }
+    for item in task_evidence_gaps:
+        name_key = str(item.get("name") or "").strip().casefold()
+        if name_key in known_missing_names:
+            continue
+        known_missing_names.add(name_key)
+        combined_missing.append(item)
     dimensions = build_risk_dimensions(
-        missing=missing if isinstance(missing, list) else [],
+        missing=combined_missing,
         assumptions=assumptions,
         validation=validation,
         runtime_result=runtime_result or {},
@@ -235,6 +260,7 @@ def build_risk_report(
         "judgement_style": "reproducibility_risk_only",
         "risk_dimensions": dimensions,
         "missing_information_count": len(missing) if isinstance(missing, list) else 0,
+        "task_evidence_gap_count": len(task_evidence_gaps),
         "assumptions_count": len(assumptions),
         "findings": findings,
         "scientific_check": scientific_check or {},

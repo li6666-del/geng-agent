@@ -43,11 +43,11 @@ def _add_common_review_args(parser: argparse.ArgumentParser, *, include_resume: 
     parser.add_argument("--temperature", type=float, default=0.1, help="LLM 采样温度，默认 0.1。")
     parser.add_argument("--timeout", type=float, default=120.0, help="单次 LLM 请求超时时间，单位秒。")
     parser.add_argument("--tasks-timeout", type=float, default=300.0, help="第二轮生成复现任务的单次 LLM 请求超时时间，单位秒。")
-    parser.add_argument("--project-timeout", type=float, default=1200.0, help="第三轮单个 task writer 子进程的默认超时，单位秒；没有总墙钟预算。")
+    parser.add_argument("--project-timeout", type=float, default=1200.0, help="兼容参数；Reporter 未单独设置超时时作为其默认值。Writer 自治迭代不设内部时间上限。")
     parser.add_argument("--thinking", choices=("enabled", "disabled"), default=None, help="DeepSeek V4 Pro thinking 开关。")
     parser.add_argument("--reasoning-effort", choices=("low", "medium", "high"), default=None, help="推理模型 reasoning_effort 参数。")
     run_group = parser.add_mutually_exclusive_group()
-    run_group.add_argument("--run-repro", dest="run_repro", action="store_true", help="允许每个 task writer 运行自己的 full，并持续迭代到匹配或形成有证据的差异解释。")
+    run_group.add_argument("--run-repro", dest="run_repro", action="store_true", help="允许每个 task writer 运行自己的 full，并直接对照论文持续迭代后提交 ready_for_review。")
     run_group.add_argument("--no-run-repro", dest="run_repro", action="store_false", help="不自动运行生成代码；这是默认行为。")
     parser.set_defaults(run_repro=False)
     if include_resume:
@@ -70,8 +70,13 @@ def _add_common_review_args(parser: argparse.ArgumentParser, *, include_resume: 
         default=None,
         help="前两阶段单个 Codex analysis 子进程超时，单位秒；默认 600。",
     )
-    parser.add_argument("--codex-agent-timeout", type=float, default=None, help="单个自治 task writer 子进程超时，单位秒；默认复用 --project-timeout，未设置时 1800。")
+    parser.add_argument("--codex-agent-timeout", type=float, default=None, help="兼容参数；当前自治 Writer 不设置内部时间上限，避免在逼近论文过程中被固定墙钟截断。")
     parser.add_argument("--codex-reporter-timeout", type=float, default=None, help="最终 Codex 报告子进程超时，单位秒；默认复用 writer 超时。")
+    parser.add_argument(
+        "--analysis-only",
+        action="store_true",
+        help="只完成任务驱动的前两阶段分析并生成最终事实、任务和实验索引；不启动 writer 或 reporter。",
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -108,7 +113,14 @@ def main(argv: list[str] | None = None) -> int:
             codex_analysis_timeout=args.codex_analysis_timeout,
             codex_agent_timeout=args.codex_agent_timeout,
             codex_reporter_timeout=args.codex_reporter_timeout,
+            analysis_only=args.analysis_only,
         )
+        if args.analysis_only:
+            print(f"前两阶段完成：{result.output_dir}")
+            print(f"最终事实：{result.output_dir / 'engineering_facts.json'}")
+            print(f"最终任务：{result.output_dir / 'repro_tasks.json'}")
+            print(f"实验索引：{result.experiment_index_path}")
+            return 0
         print(f"审查完成：{result.output_dir}")
         print(f"报告：{result.review_path if result.review_path.exists() else '未生成'}")
         print(f"Word 主报告：{result.review_docx_path}")

@@ -82,6 +82,7 @@ def render_review_markdown(
             f"- 总风险等级：`{risk_report.get('risk_level')}`",
             f"- 假设数量：{risk_report.get('assumptions_count')}",
             f"- 缺失信息数量：{risk_report.get('missing_information_count')}",
+            f"- 未解决任务证据缺口：{risk_report.get('task_evidence_gap_count', 0)}",
             "- 说明：风险等级只表示工程复现风险，不等同于造假结论；smoke 通过也不等于论文完全复现成功。",
             "",
             "### 多维风险",
@@ -95,8 +96,7 @@ def render_review_markdown(
                 lines.append(
                     f"- `{experiment.get('experiment_id', 'experiment')}`: task `{experiment.get('task_id')}`, "
                     f"metric `{experiment.get('metric')}`, figure/table `{experiment.get('figure_or_table')}`, "
-                    f"status `{experiment.get('status')}`, mode `{experiment.get('reproducibility_mode', 'unknown')}`, "
-                    f"pages {experiment.get('source_pages', [])}"
+                    f"pages {experiment.get('source_pages', [])}, limitations {experiment.get('limitations', [])}"
                 )
     else:
         lines.append("- experiment_index.json was not generated.")

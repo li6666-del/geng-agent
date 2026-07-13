@@ -1,0 +1,110 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "task_id": {
+      "minLength": 1,
+      "title": "Task Id",
+      "type": "string"
+    },
+    "verdict": {
+      "enum": [
+        "accepted",
+        "revise"
+      ],
+      "title": "Verdict",
+      "type": "string"
+    },
+    "revision_target": {
+      "enum": [
+        "none",
+        "writer",
+        "reporter"
+      ],
+      "title": "Revision Target",
+      "type": "string"
+    },
+    "comparison_summary": {
+      "minLength": 1,
+      "title": "Comparison Summary",
+      "type": "string"
+    },
+    "differences": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Differences",
+      "type": "array"
+    },
+    "non_material_differences": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Non Material Differences",
+      "type": "array"
+    },
+    "evidence_files": {
+      "items": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "minItems": 1,
+      "title": "Evidence Files",
+      "type": "array"
+    },
+    "feedback": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Feedback",
+      "type": "array"
+    },
+    "confidence": {
+      "enum": [
+        "high",
+        "medium",
+        "low"
+      ],
+      "title": "Confidence",
+      "type": "string"
+    },
+    "local_assets": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Local Assets",
+      "type": "array"
+    },
+    "paper_assets": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Paper Assets",
+      "type": "array"
+    },
+    "remaining_uncertainties": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Remaining Uncertainties",
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "task_id",
+    "verdict",
+    "revision_target",
+    "comparison_summary",
+    "differences",
+    "evidence_files",
+    "feedback",
+    "confidence"
+  ],
+  "title": "IsolatedTaskVerificationDocument",
+  "type": "object"
+}

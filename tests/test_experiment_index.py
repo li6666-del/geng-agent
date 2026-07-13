@@ -56,7 +56,8 @@ class ExperimentIndexTests(unittest.TestCase):
         self.assertEqual(experiment["task_id"], "reproduce_fig_2")
         self.assertEqual(experiment["metric"], "bit_error_rate")
         self.assertEqual(experiment["required_facts"][0], {"type": "channel_model", "name": "AWGN"})
-        self.assertEqual(experiment["status"], "ready")
+        self.assertNotIn("status", experiment)
+        self.assertNotIn("reproducibility_mode", experiment)
         self.assertEqual(experiment["limitations"], [])
 
     def test_source_pages_and_chunk_ids_link_back_to_facts_and_paper_chunks(self) -> None:
@@ -106,7 +107,7 @@ class ExperimentIndexTests(unittest.TestCase):
         )
 
         experiment = index["experiments"][0]
-        self.assertEqual(experiment["status"], "ready_with_limitations")
+        self.assertNotIn("status", experiment)
         self.assertTrue(any("Missing figure_or_claim" in item for item in experiment["limitations"]))
         self.assertTrue(any("Missing metric" in item for item in experiment["limitations"]))
         self.assertTrue(any("Required fact not found" in item for item in experiment["limitations"]))

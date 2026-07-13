@@ -163,6 +163,7 @@ def write_review_docx(
             ("总风险等级", _label_with_raw(risk_report.get("risk_level"), RISK_LABELS)),
             ("缺失信息数量", risk_report.get("missing_information_count")),
             ("假设数量", risk_report.get("assumptions_count")),
+            ("未解决任务证据缺口", risk_report.get("task_evidence_gap_count", 0)),
             ("判断边界", "复现风险评估，不等同于论文真伪判定"),
         ],
     )
@@ -179,12 +180,11 @@ def write_review_docx(
                         experiment.get("task_id"),
                         experiment.get("metric"),
                         experiment.get("figure_or_table"),
-                        experiment.get("status"),
-                        experiment.get("reproducibility_mode"),
+                        _join_items(experiment.get("limitations")),
                         _join_items(experiment.get("source_pages")),
                     ]
                 )
-        _add_table(document, ["Experiment", "Task", "Metric", "Figure/Table", "Status", "Mode", "Pages"], rows)
+        _add_table(document, ["Experiment", "Task", "Metric", "Figure/Table", "Evidence gaps", "Pages"], rows)
     else:
         _add_note(document, "experiment_index.json was not generated.")
 

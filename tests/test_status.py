@@ -106,7 +106,6 @@ class StatusTests(unittest.TestCase):
                             "source_pages": [],
                             "source_chunk_ids": ["text_c1"],
                             "required_facts": [{"type": "channel_model", "name": "AWGN"}],
-                            "status": "ready",
                             "limitations": [],
                         }
                     ]
@@ -180,7 +179,7 @@ class StatusTests(unittest.TestCase):
                 },
             )
             write_json(
-                case / "reporter_error.json",
+                case / "report_editor_error.json",
                 {"enabled": True, "passed": False, "reason": "task writer report assembly failed", "error": "empty report"},
             )
 
