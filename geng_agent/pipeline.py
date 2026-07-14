@@ -22,6 +22,8 @@ from .facts_normalize import (
 from .heuristic_fallbacks import build_fallback_engineering_facts, build_fallback_repro_tasks
 from .json_utils import parse_json_object, pretty_json
 from .llm import LLMClient
+from .mineru_adapter import figure_index_prompt_summary
+from .mineru_runner import run_mineru_layout_stage
 from .outputs import write_json, write_text
 from .paper_memory import load_or_build_paper_memory, paper_memory_summary, write_memory_manifest
 from .prompts import PromptBook
@@ -156,6 +158,7 @@ class ReviewPipeline:
         max_pages: int | None = None,
         run_repro: bool = False,
         run_timeout: float = 120.0,
+        mineru_timeout: float = 1800.0,
         json_repair_attempts: int = 3,
         tasks_timeout: float = 300.0,
         project_timeout: float = 1200.0,
@@ -190,6 +193,7 @@ class ReviewPipeline:
             max_pages=max_pages,
             run_repro=run_repro,
             run_timeout=run_timeout,
+            mineru_timeout=mineru_timeout,
             json_repair_attempts=json_repair_attempts,
             tasks_timeout=tasks_timeout,
             project_timeout=project_timeout,
@@ -209,6 +213,7 @@ class ReviewPipeline:
         max_pages: int | None = None,
         run_repro: bool = False,
         run_timeout: float = 120.0,
+        mineru_timeout: float = 1800.0,
         json_repair_attempts: int = 3,
         tasks_timeout: float = 300.0,
         project_timeout: float = 1200.0,
@@ -267,18 +272,32 @@ class ReviewPipeline:
             if isinstance(chunk, dict) and chunk.get("chunk_id")
         }
 
-        paper_context_raw = pretty_json(
-            {
-                "paper_chunks": json.loads(_paper_context_for_prompt(paper["chunks"])),
-                "paper_memory": paper_memory_summary(paper_memory),
-            }
-        )
-        paper_context = wrap_untrusted("paper_chunks_json", paper_context_raw)
-
         # Render paper pages once so fact-extraction (round 1) and code-generation (round 3)
         # can SEE the figures/diagrams/in-figure values that plain text chunking drops.
         # Empty for non-PDF papers or non-multimodal clients -> those stages stay text-only.
         paper_images = self._render_paper_images(paper_path=paper_path, paper=paper)
+        mineru_result = run_mineru_layout_stage(
+            paper_path=paper_path,
+            output_dir=output_dir,
+            audit_dir=audit_dir,
+            resume=resume,
+            timeout=mineru_timeout,
+            max_pages=max_pages,
+        )
+        figure_index = (
+            mineru_result.get("figure_index")
+            if isinstance(mineru_result.get("figure_index"), dict)
+            else {"figures": [], "unmatched_visuals": []}
+        )
+        _mark("mineru_layout")
+        paper_context_raw = pretty_json(
+            {
+                "paper_chunks": json.loads(_paper_context_for_prompt(paper["chunks"])),
+                "paper_memory": paper_memory_summary(paper_memory),
+                "paper_figure_index": figure_index_prompt_summary(figure_index),
+            }
+        )
+        paper_context = wrap_untrusted("paper_chunks_json", paper_context_raw)
         # Pages the model actually saw as images -> the set a "figure"-sourced fact may cite.
         valid_pages: set[int] = set()
         for image in paper_images:
@@ -537,6 +556,7 @@ class ReviewPipeline:
             tasks=tasks,
             paper=paper,
             paper_memory=paper_memory,
+            figure_index=figure_index,
             resume=resume,
         )
         _mark("experiment_index")
@@ -554,6 +574,7 @@ class ReviewPipeline:
                 "paper_thesis": output_dir / "paper_thesis.json",
                 "repro_tasks": output_dir / "repro_tasks.json",
                 "experiment_index": output_dir / "experiment_index.json",
+                "paper_figure_index": output_dir / "paper_figure_index.json",
             },
         )
         analysis_stage_invocations = 3 + (2 if targeted_requests else 0)
@@ -571,6 +592,13 @@ class ReviewPipeline:
                     "analysis_stage_invocations": analysis_stage_invocations,
                     "facts_stop_rule": "single_task_driven_targeted_backfill",
                     "tasks_stop_rule": "draft_then_finalize_once",
+                    "mineru_layout": {
+                        "ok": mineru_result.get("ok"),
+                        "cached": mineru_result.get("cached"),
+                        "fallback_used": mineru_result.get("fallback_used"),
+                        "duration_s": mineru_result.get("duration_s"),
+                        "figure_count": mineru_result.get("figure_count", 0),
+                    },
                 }
             )
             write_json(output_dir / "run_cost.json", run_cost)
@@ -586,6 +614,11 @@ class ReviewPipeline:
                     "task_driven_backfill": facts.get("_meta", {}).get("task_driven_backfill", {}),
                     "task_finalization": tasks.get("_meta", {}).get("task_driven_finalization", {}),
                     "memory_snapshot_hash": memory_manifest.get("snapshot_hash"),
+                    "mineru_layout": {
+                        "ok": mineru_result.get("ok"),
+                        "fallback_used": mineru_result.get("fallback_used"),
+                        "figure_count": mineru_result.get("figure_count", 0),
+                    },
                 },
             )
             return PipelineResult(
@@ -630,6 +663,7 @@ class ReviewPipeline:
                 paper_thesis=paper_thesis,
                 paper_memory=paper_memory,
                 paper_images=paper_images,
+                figure_index=figure_index,
                 output_dir=output_dir,
                 audit_dir=audit_dir,
                 timeout=codex_reporter_timeout or codex_agent_timeout or project_timeout or 1800.0,
@@ -659,6 +693,7 @@ class ReviewPipeline:
                     paper_thesis=paper_thesis,
                     paper_memory=paper_memory,
                     paper_images=paper_images,
+                    figure_index=figure_index,
                     output_dir=output_dir,
                     audit_dir=audit_dir,
                     timeout=codex_reporter_timeout or codex_agent_timeout or project_timeout or 1800.0,
@@ -799,6 +834,12 @@ class ReviewPipeline:
         )
         risk_report["experiment_index"] = experiment_index
         risk_report["verification_result"] = verification_result
+        risk_report["mineru_layout"] = {
+            "ok": mineru_result.get("ok"),
+            "fallback_used": mineru_result.get("fallback_used"),
+            "error_kind": mineru_result.get("error_kind"),
+            "figure_count": mineru_result.get("figure_count", 0),
+        }
         verification_round = max(
             [int(record.get("writer_session_count") or 1) for record in task_records] or [1]
         )
@@ -821,11 +862,13 @@ class ReviewPipeline:
             timeout=codex_reporter_timeout or codex_agent_timeout or project_timeout or 1800.0,
             resume=resume,
         )
-        if (
-            not report_editor_result.get("ok")
-            and isinstance(report_editor_result.get("codex_status"), dict)
-            and report_editor_result["codex_status"].get("ok")
-        ):
+        first_editor_status = report_editor_result.get("codex_status")
+        report_editor_invocations = int(
+            not report_editor_result.get("cached")
+            and isinstance(first_editor_status, dict)
+            and first_editor_status.get("role") == "report_editor"
+        )
+        if not report_editor_result.get("ok") and report_editor_result.get("retryable"):
             report_editor_result = run_codex_report_editor_workflow(
                 paper=paper,
                 facts=facts,
@@ -844,6 +887,13 @@ class ReviewPipeline:
                 timeout=codex_reporter_timeout or codex_agent_timeout or project_timeout or 1800.0,
                 resume=False,
                 attempt_no=2,
+                repair_context=report_editor_result,
+                allow_fallback=True,
+            )
+            second_editor_status = report_editor_result.get("codex_status")
+            report_editor_invocations += int(
+                isinstance(second_editor_status, dict)
+                and second_editor_status.get("role") == "report_editor"
             )
         result_review_result = report_editor_result["result_review_result"]
         if not report_editor_result.get("ok"):
@@ -877,6 +927,9 @@ class ReviewPipeline:
             "ok": report_editor_result.get("ok"),
             "mode": report_editor_result.get("mode"),
             "cached": report_editor_result.get("cached"),
+            "completion_mode": report_editor_result.get("completion_mode"),
+            "degraded_report_generation": report_editor_result.get("degraded_report_generation", False),
+            "invocations": report_editor_invocations,
         }
         _mark("task_reporters")
         _mark("report_editor")
@@ -919,7 +972,14 @@ class ReviewPipeline:
         run_cost["report_backend"] = "codex_task_reporters_plus_editor"
         run_cost["task_reporter_count"] = len(task_records)
         run_cost["task_reporter_verification_rounds"] = verification_round
-        run_cost["report_editor_invocations"] = 1
+        run_cost["report_editor_invocations"] = report_editor_invocations
+        run_cost["mineru_layout"] = {
+            "ok": mineru_result.get("ok"),
+            "cached": mineru_result.get("cached"),
+            "fallback_used": mineru_result.get("fallback_used"),
+            "duration_s": mineru_result.get("duration_s"),
+            "figure_count": mineru_result.get("figure_count", 0),
+        }
         if analysis_backend == CODEX_ANALYSIS_BACKEND:
             run_cost["codex_analysis_timeout_s"] = codex_analysis_timeout or 600.0
             run_cost["analysis_agent_count"] = 1
@@ -940,6 +1000,7 @@ class ReviewPipeline:
                 "paper_thesis": output_dir / "paper_thesis.json",
                 "repro_tasks": output_dir / "repro_tasks.json",
                 "experiment_index": output_dir / "experiment_index.json",
+                "paper_figure_index": output_dir / "paper_figure_index.json",
                 "repro_project_manifest": output_dir / "repro_project_manifest.json",
                 "runtime_result": output_dir / "runtime_result.json",
                 "verification_result": output_dir / "verification_result.json",
@@ -1199,6 +1260,7 @@ class ReviewPipeline:
         tasks: dict[str, Any],
         paper: dict[str, Any],
         paper_memory: dict[str, Any] | None = None,
+        figure_index: dict[str, Any] | None = None,
         resume: bool,
     ) -> dict[str, Any]:
         output_path = output_dir / "experiment_index.json"
@@ -1213,7 +1275,13 @@ class ReviewPipeline:
             if cached is not None:
                 return cached
 
-        experiment_index = build_local_experiment_index(facts, tasks, paper, paper_memory)
+        experiment_index = build_local_experiment_index(
+            facts,
+            tasks,
+            paper,
+            paper_memory,
+            figure_index,
+        )
         issues = validate_stage("experiment_index", experiment_index)
         if issues:
             raise RuntimeError(f"{stage_label} failed local validation: {format_issues(issues)}")

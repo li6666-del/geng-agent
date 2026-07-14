@@ -8,6 +8,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from geng_agent.agentic_task_reporters import (
+    _accepted_asset_issues,
     run_codex_task_reporter_workflow,
     task_verifications_document,
 )
@@ -22,6 +23,7 @@ def _fake_task_reporter(
     verdict: str = "accepted",
     target: str = "none",
     misplaced_assets: bool = False,
+    omit_paper_asset: bool = False,
 ) -> str:
     script = root / f"task_reporter_{verdict}_{target}.py"
     script.write_text(textwrap.dedent(f"""
@@ -50,10 +52,12 @@ def _fake_task_reporter(
         }}
         if {verdict!r} == "accepted":
             asset_dir.mkdir(parents=True)
-            for name in ("local_result.png", "paper_target.png"):
+            names = ("local_result.png",) if {omit_paper_asset!r} else ("local_result.png", "paper_target.png")
+            for name in names:
                 (asset_dir / name).write_bytes(base64.b64decode({PNG_B64!r}))
             result["local_assets"] = [str((asset_dir / "local_result.png").relative_to(root)).replace("\\\\", "/")]
-            result["paper_assets"] = [str((asset_dir / "paper_target.png").relative_to(root)).replace("\\\\", "/")]
+            if not {omit_paper_asset!r}:
+                result["paper_assets"] = [str((asset_dir / "paper_target.png").relative_to(root)).replace("\\\\", "/")]
         (root / "task_verification_result.json").write_text(json.dumps(result), encoding="utf-8")
     """), encoding="utf-8")
     return f'"{sys.executable}" "{script}"'
@@ -83,6 +87,32 @@ def _record(root: Path, task_id: str) -> dict:
 
 
 class IsolatedTaskReporterTests(unittest.TestCase):
+    def test_pdf_fallback_crop_requires_exact_bbox_provenance(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace = Path(temp)
+            asset_dir = workspace / "report_assets" / "task_a"
+            asset_dir.mkdir(parents=True)
+            for name in ("local_result.png", "paper_target.png"):
+                (asset_dir / name).write_bytes(base64.b64decode(PNG_B64))
+            verification = {
+                "local_assets": ["report_assets/task_a/local_result.png"],
+                "paper_assets": ["report_assets/task_a/paper_target.png"],
+            }
+            issues = _accepted_asset_issues(
+                verification,
+                workspace,
+                "task_a",
+                crop_result={
+                    "status": "reporter_provided_crop",
+                    "source_mode": "reporter_provided_crop",
+                    "output_path": str(asset_dir / "paper_target.png"),
+                    "output_sha256": "abc",
+                    "selection_reason": "no_unique_verified_candidate",
+                },
+                require_verified_pdf_crop=True,
+            )
+            self.assertTrue(any("verified exact crop" in issue for issue in issues), issues)
+
     def _kwargs(self, root: Path, records: list[dict]) -> dict:
         paper = root / "paper.md"
         paper.write_text("Fig. 1 and Fig. 2.", encoding="utf-8")
@@ -171,6 +201,25 @@ class IsolatedTaskReporterTests(unittest.TestCase):
             self.assertFalse(item["ok"])
             self.assertTrue(any("assigned task asset directory" in issue for issue in item["asset_issues"]))
             self.assertFalse((root / "case" / "report_assets" / "task_a").exists())
+
+    def test_scientifically_accepted_missing_crop_routes_back_to_reporter_only(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            records = [_record(root, "task_a")]
+            kwargs = self._one_kwargs(root, records, "task_a")
+            old = os.environ.get("GENG_CODEX_TASK_REPORTER_CMD")
+            os.environ["GENG_CODEX_TASK_REPORTER_CMD"] = _fake_task_reporter(root, omit_paper_asset=True)
+            try:
+                item = run_codex_task_reporter_workflow(**kwargs)
+            finally:
+                if old is None: os.environ.pop("GENG_CODEX_TASK_REPORTER_CMD", None)
+                else: os.environ["GENG_CODEX_TASK_REPORTER_CMD"] = old
+            self.assertFalse(item["ok"])
+            self.assertTrue(item["scientific_accepted"])
+            self.assertFalse(item["accepted"])
+            self.assertEqual(item["revision_target"], "reporter")
+            self.assertEqual(item["crop_status"], "unresolved")
+            self.assertTrue(any("finalized paper target" in issue for issue in item["asset_issues"]))
 
 
 if __name__ == "__main__":

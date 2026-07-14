@@ -202,6 +202,10 @@ class PipelineTests(unittest.TestCase):
         self.assertIn('not verification_result.get("all_accepted")', source)
         self.assertIn("run_codex_report_editor_workflow(", source)
         self.assertIn("writer_session_count", source)
+        self.assertIn('report_editor_result.get("retryable")', source)
+        self.assertIn("repair_context=report_editor_result", source)
+        self.assertIn("allow_fallback=True", source)
+        self.assertIn("report_editor_invocations += int(", source)
 
     def test_analysis_agent_width_is_not_a_pipeline_option(self) -> None:
         self.assertNotIn("analysis_agent_width", inspect.signature(ReviewPipeline.run).parameters)

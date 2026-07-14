@@ -8,8 +8,10 @@ from typing import Any
 
 from .codex_runner import run_codex_subprocess
 from .config import get_config_value
+from .mineru_adapter import resolve_candidate_asset, task_figure_candidates
 from .outputs import write_json, write_text
 from .paper_evidence import safe_label, thesis_ordering_anchor_for_task
+from .paper_crop import PAPER_TARGET_METADATA_FILE, finalize_paper_target
 from .schemas import validate_stage
 from .security import redact_text
 from .task_writer_support import PAPER_EVIDENCE_DIR, _write_paper_evidence_bundle
@@ -41,6 +43,7 @@ def run_codex_task_reporter_workflow(
     audit_dir: Path,
     timeout: float,
     resume: bool,
+    figure_index: dict[str, Any] | None = None,
     memory_snapshot_hash: str = "",
     round_no: int = 1,
     include_all_paper_pages: bool = False,
@@ -50,7 +53,13 @@ def run_codex_task_reporter_workflow(
     label = f"{index:02d}_{safe_label(task_id)}"
     task_audit_dir = audit_dir / "04a_task_reporters" / label
     task_audit_dir.mkdir(parents=True, exist_ok=True)
-    input_hash = _task_reporter_input_hash(task=task, task_record=task_record, paper_path=paper_path)
+    figure_candidates = task_figure_candidates(figure_index, task)
+    input_hash = _task_reporter_input_hash(
+        task=task,
+        task_record=task_record,
+        paper_path=paper_path,
+        figure_candidates=figure_candidates,
+    )
     status_path = task_audit_dir / "status.json"
     if resume:
         cached = _load_task_reporter_cache(
@@ -82,6 +91,11 @@ def run_codex_task_reporter_workflow(
             memory_snapshot_hash=memory_snapshot_hash,
             full_paper_images=paper_images,
         )
+        copied_figure_candidates = _copy_task_figure_candidates(
+            workspace=workspace,
+            output_dir=output_dir,
+            candidates=figure_candidates,
+        )
         report_input = _prepare_task_reporter_input(
             inputs_dir=inputs_dir,
             task=task,
@@ -89,6 +103,7 @@ def run_codex_task_reporter_workflow(
             facts=isolated_facts,
             experiment_index=experiment_index,
             paper_thesis=paper_thesis,
+            figure_candidates=copied_figure_candidates,
         )
         write_json(inputs_dir / "task_report_input.json", report_input)
         prompt = _build_task_reporter_brief(
@@ -113,6 +128,7 @@ def run_codex_task_reporter_workflow(
         task=task,
         experiment_index=experiment_index,
         local_images=report_input.get("local_image_paths", []),
+        figure_candidates=report_input.get("figure_candidates", []),
         include_all_paper_pages=include_all_paper_pages,
     )
     codex_status = run_codex_subprocess(
@@ -133,15 +149,31 @@ def run_codex_task_reporter_workflow(
         for issue in validate_stage("task_verification_result", verification)
     ] + task_verification_issues(verification, task_id)
     validation_issues.extend(_evidence_path_issues(verification, workspace))
-    accepted = (
+    scientific_accepted = (
         bool(codex_status.get("ok"))
         and not validation_issues
         and str(verification.get("verdict") or "") == TASK_REPORTER_ACCEPTED
     )
+    crop_result: dict[str, Any] = {"status": "not_applicable", "issues": []}
     asset_issues: list[str] = []
     copied_assets: list[str] = []
-    if accepted:
-        asset_issues = _accepted_asset_issues(verification, workspace, task_id)
+    if scientific_accepted:
+        crop_result = finalize_paper_target(
+            paper_path=paper_path,
+            workspace=workspace,
+            task=task,
+            task_id=task_id,
+            candidates=report_input.get("figure_candidates", []),
+            verification=verification,
+        )
+        write_json(task_audit_dir / f"round_{max(1, int(round_no)):03d}_crop.json", crop_result)
+        asset_issues = _accepted_asset_issues(
+            verification,
+            workspace,
+            task_id,
+            crop_result=crop_result,
+            require_verified_pdf_crop=paper_path.suffix.lower() == ".pdf",
+        )
         if not asset_issues:
             try:
                 copied_assets = _copy_task_assets(
@@ -173,8 +205,16 @@ def run_codex_task_reporter_workflow(
         "validation_issues": validation_issues,
         "asset_issues": asset_issues,
         "asset_paths": copied_assets,
-        "accepted": accepted and not asset_issues,
-        "revision_target": verification.get("revision_target") if isinstance(verification, dict) else None,
+        "scientific_accepted": scientific_accepted,
+        "crop_status": crop_result.get("status"),
+        "crop_result": crop_result,
+        "accepted": scientific_accepted and not asset_issues,
+        "paper_asset_verified": scientific_accepted and not asset_issues,
+        "revision_target": (
+            TASK_REPORTER_ROUTE_REPORTER
+            if scientific_accepted and asset_issues
+            else verification.get("revision_target") if isinstance(verification, dict) else None
+        ),
         "error": None if ok else _task_reporter_reason(codex_status, validation_issues, asset_issues),
     }
     write_json(status_path, status)
@@ -200,6 +240,7 @@ def _prepare_task_reporter_input(
     facts: dict[str, Any],
     experiment_index: dict[str, Any],
     paper_thesis: dict[str, Any] | None,
+    figure_candidates: list[dict[str, Any]],
 ) -> dict[str, Any]:
     task_id = str(task.get("task_id") or task_record.get("task_id") or "task")
     writer_dir = inputs_dir / "writer_output"
@@ -234,6 +275,7 @@ def _prepare_task_reporter_input(
         "writer_output_dir": "inputs/writer_output",
         "writer_output_available": output_available,
         "input_warnings": [] if output_available else ["assigned writer output directory is missing"],
+        "figure_candidates": figure_candidates,
         "report_asset_dir": f"report_assets/{safe_label(task_id)}",
     }
 
@@ -264,6 +306,7 @@ You verify exactly one reproduction task: `{task_id}`. There are no other experi
 - `inputs/writer_output/`: only this writer's CSV, summary, PNG, and result files.
 - `paper_evidence/source/`: copied original paper.
 - `paper_evidence/full_paper_pages/`: rendered original-paper pages.
+- `paper_evidence/mineru_figure_candidates/`: MinerU parent-figure candidates. They narrow the search but are not authoritative.
 - `paper_evidence/01_{safe_label(task_id)}/`: task-scoped navigation evidence. It is a hint, never an information boundary.
 
 ## Direct scientific verification
@@ -295,10 +338,71 @@ Before any crop is considered complete, write `{TASK_VERIFICATION_FILE}` exactly
 - Cite only files that exist within this workspace.
 
 ## Figure localization and crop
-Locate the exact target figure, subfigure, table, formula, or text claim. For a target such as Fig. 9(a), crop the complete `(a)` panel without cutting axes, legend, curves, labels, panel marker, or essential annotations. Keep a small amount of caption or label evidence when needed to establish identity; do not substitute an unrelated full paper page.
+First verify every MinerU candidate against its caption and the original page. A candidate is only a parent-figure proposal; reject it if its figure identity is wrong. Locate the exact target figure, subfigure, table, formula, or text claim. For a target such as Fig. 9(a), identify the complete `(a)` panel without cutting axes, legend, curves, labels, panel marker, or essential annotations.
 
-When and only when your scientific verdict is `accepted`, save the representative unmodified local image as `{report_asset_dir}/local_result.png` and the tightest readable paper target crop as `{report_asset_dir}/paper_target.png`. Use numbered files only when several panels are essential.
+Write `{PAPER_TARGET_METADATA_FILE}` as JSON when a MinerU candidate is available:
+```json
+{{
+  "target": "Fig. 9(a)",
+  "candidate_status": "accepted|rejected_wrong_identity|rejected_incomplete_boundary|unverified",
+  "candidate_id": null,
+  "rejected_candidate_id": "page_0013_visual_001",
+  "source_page": 13,
+  "child_bbox_relative": [0.0, 0.0, 0.33, 0.48],
+  "manual_crop": {{
+    "source_page": 13,
+    "source_image": "paper_evidence/full_paper_pages/paper_page_013.png",
+    "bbox_pixels": [40, 80, 430, 390],
+    "output": "report_assets/{safe_label(task_id)}/paper_target.png"
+  }},
+  "confidence": "high",
+  "included_elements": ["panel label", "x axis", "y axis", "legend"],
+  "remaining_risks": [],
+  "visual_check": {{
+    "target_identity_confirmed": true,
+    "figure_content_complete": true,
+    "panel_boundary_complete": true,
+    "axes_and_labels_complete": true,
+    "legend_and_annotations_complete": true,
+    "caption_complete": true,
+    "no_adjacent_content": true,
+    "compared_against_parent": true
+  }}
+}}
+```
+- `candidate_status: accepted` means you directly confirmed that the candidate is the requested figure. Only then may `candidate_id` be populated for deterministic replacement.
+- If the candidate is the wrong figure, set `candidate_status: rejected_wrong_identity`, set `candidate_id` to null, put its id in `rejected_candidate_id`, and provide `manual_crop`. Python must preserve or regenerate that manual page crop.
+- If the candidate has the right figure identity but omits required content or includes neighboring material, use `candidate_status: rejected_incomplete_boundary` and provide a tighter `manual_crop`.
+- If identity remains uncertain, use `candidate_status: unverified`; never guess a candidate id merely because its caption mentions the requested number.
+- `child_bbox_relative` uses `[x0,y0,x1,y1]` in `[0,1]`, relative to the complete MinerU parent figure.
+- For a whole-figure task, the final crop must contain the complete plot/panel, every axis and label, legend and essential annotation, plus the figure number and complete caption. Keep the crop tight and exclude neighboring figures, body paragraphs, headers, and footers.
+- Select a whole-figure `candidate_id` only when that candidate already satisfies the complete-and-clean rule. If it omits the caption or includes adjacent content, do not accept it: provide a `manual_crop` from the full paper page instead.
+- Re-open your provisional crop and compare it with the parent figure before finishing. Set every `visual_check` field to true only after direct visual confirmation. If identity, panel boundary, axes, legend, labels, curves, or essential annotations are uncertain, omit the child bbox or mark the corresponding check false so Python deliberately falls back to the complete parent figure.
+- A crop packaging problem belongs to the reporter. Never send a scientifically accepted Writer back merely because the crop needs repair.
+
+When and only when your scientific verdict is `accepted`, save the representative unmodified local image as `{report_asset_dir}/local_result.png`. You may save a provisional `{report_asset_dir}/paper_target.png`, but Python will replace it from the original PDF whenever a valid MinerU candidate and bbox are available. Use numbered files only when several panels are essential.
 """
+
+
+def _copy_task_figure_candidates(
+    *,
+    workspace: Path,
+    output_dir: Path,
+    candidates: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    target_dir = workspace / PAPER_EVIDENCE_DIR / "mineru_figure_candidates"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    copied: list[dict[str, Any]] = []
+    for candidate in candidates[:8]:
+        item = json.loads(json.dumps(candidate, ensure_ascii=False))
+        source = resolve_candidate_asset(candidate, output_dir)
+        if source is not None:
+            name = f"{safe_label(str(candidate.get('candidate_id') or 'candidate'))}{source.suffix.lower()}"
+            target = target_dir / name
+            shutil.copy2(source, target)
+            item["workspace_asset_path"] = target.relative_to(workspace).as_posix()
+        copied.append(item)
+    return copied
 
 
 def _task_reporter_image_paths(
@@ -307,11 +411,20 @@ def _task_reporter_image_paths(
     task: dict[str, Any],
     experiment_index: dict[str, Any],
     local_images: list[Any],
+    figure_candidates: list[dict[str, Any]],
     include_all_paper_pages: bool,
 ) -> list[Path]:
     full_pages = sorted((workspace / PAPER_EVIDENCE_DIR / "full_paper_pages").glob("paper_page_*.png"))
     source_pages = _source_pages_for_task(experiment_index, str(task.get("task_id") or ""))
     selected: list[Path] = []
+    for candidate in figure_candidates:
+        path = workspace / str(candidate.get("workspace_asset_path") or "")
+        if path.is_file():
+            selected.append(path)
+    for raw_path in local_images:
+        path = workspace / str(raw_path)
+        if path.is_file():
+            selected.append(path)
     if include_all_paper_pages or not source_pages:
         selected.extend(full_pages)
     else:
@@ -320,10 +433,6 @@ def _task_reporter_image_paths(
             number = _page_number(page)
             if number in wanted:
                 selected.append(page)
-    for raw_path in local_images:
-        path = workspace / str(raw_path)
-        if path.is_file():
-            selected.append(path)
     seen: set[Path] = set()
     return [path.resolve() for path in selected if path.is_file() and not (path.resolve() in seen or seen.add(path.resolve()))]
 
@@ -375,17 +484,24 @@ def _task_only_facts(facts: dict[str, Any], task: dict[str, Any]) -> dict[str, A
     }
 
 
-def _task_reporter_input_hash(*, task: dict[str, Any], task_record: dict[str, Any], paper_path: Path) -> str:
+def _task_reporter_input_hash(
+    *,
+    task: dict[str, Any],
+    task_record: dict[str, Any],
+    paper_path: Path,
+    figure_candidates: list[dict[str, Any]],
+) -> str:
     stat = paper_path.stat() if paper_path.exists() else None
     raw_sandbox = str(task_record.get("sandbox") or "").strip()
     sandbox = Path(raw_sandbox) if raw_sandbox else paper_path.parent / "__missing_writer_sandbox__"
     output_subdir = str(task_record.get("output_subdir") or task.get("task_id") or "")
     payload = {
-        "prompt_version": "isolated_task_reporter_v1",
+        "prompt_version": "isolated_task_reporter_v2_mineru_crop_spec",
         "task": task,
         "result": task_record.get("result_json"),
         "execution": task_record.get("execution_summary"),
         "output_inventory": _file_inventory(sandbox / "outputs" / output_subdir),
+        "figure_candidates": figure_candidates,
         "paper": {"size": stat.st_size if stat else None, "mtime_ns": stat.st_mtime_ns if stat else None},
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
@@ -447,8 +563,28 @@ def _accepted_asset_issues(
     verification: dict[str, Any],
     workspace: Path,
     task_id: str,
+    *,
+    crop_result: dict[str, Any],
+    require_verified_pdf_crop: bool = False,
 ) -> list[str]:
     issues: list[str] = []
+    crop_status = str(crop_result.get("status") or "")
+    if crop_status in {"", "unresolved", "not_applicable"}:
+        issues.append("accepted result does not have a finalized paper target image")
+    if require_verified_pdf_crop and crop_status in {
+        "fallback_parent_figure",
+        "legacy_reporter_crop",
+        "reporter_provided_crop",
+    }:
+        issues.append(
+            "PDF paper target lacks a verified exact crop; provide an accepted complete candidate "
+            "or a manual page crop with source page and bbox provenance"
+        )
+    selection_reason = str(crop_result.get("selection_reason") or "")
+    if selection_reason.startswith("reporter_rejected") and crop_result.get("source_mode") == "verified_mineru_candidate":
+        issues.append("a reporter-rejected MinerU candidate replaced the paper target")
+    if crop_result.get("output_path") and not crop_result.get("output_sha256"):
+        issues.append("finalized paper target is missing provenance hash")
     asset_root = (workspace / REPORT_ASSETS_DIR / safe_label(task_id)).resolve()
     for key in ("local_assets", "paper_assets"):
         values = verification.get(key)
@@ -559,6 +695,9 @@ def _task_reporter_failure(
         "validation_issues": [message],
         "asset_issues": [],
         "asset_paths": [],
+        "scientific_accepted": False,
+        "crop_status": "unresolved",
+        "crop_result": {"status": "unresolved", "issues": [message]},
         "accepted": False,
         "revision_target": TASK_REPORTER_ROUTE_REPORTER,
         "error": message,

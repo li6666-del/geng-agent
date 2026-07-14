@@ -13,6 +13,7 @@ def _clear_stage_outputs(output_dir: Path, stage: str, *, preserve_audit: bool =
     stage_outputs = {
         "paper": [
             "paper_chunks.json",
+            "paper_figure_index.json",
             "paper_memory.json",
             "memory_manifest.json",
             "engineering_facts_initial.json",
@@ -206,7 +207,7 @@ def _clear_stage_audit(output_dir: Path, stage: str) -> None:
     if not audit_dir.exists():
         return
     stage_numbers = {
-        "paper": ["01", "02", "03", "04"],
+        "paper": ["00", "01", "02", "03", "04"],
         "facts": ["01", "02", "03", "04"],
         "paper_thesis": ["02d", "03"],
         "tasks": ["02", "03", "04"],

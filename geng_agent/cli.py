@@ -57,6 +57,12 @@ def _add_common_review_args(parser: argparse.ArgumentParser, *, include_resume: 
         parser.set_defaults(resume=True)
     parser.add_argument("--no-analysis-fallback", action="store_true", help="禁用前两阶段本地确定性兜底；默认启用以提高端到端稳定性。")
     parser.add_argument("--run-timeout", type=float, default=120.0, help="单次复现运行超时时间，单位秒。")
+    parser.add_argument(
+        "--mineru-timeout",
+        type=float,
+        default=1800.0,
+        help="MinerU 每篇论文预解析超时，单位秒；默认 1800，超时后自动回退页面图定位。",
+    )
     parser.add_argument("--json-repair-attempts", type=int, default=5, help="前两阶段 Codex/兼容 LLM 输出未通过 JSON schema 时的重试次数；只在结构校验失败时追加调用。")
     parser.add_argument(
         "--analysis-backend",
@@ -104,6 +110,7 @@ def main(argv: list[str] | None = None) -> int:
             max_pages=args.max_pages,
             run_repro=args.run_repro,
             run_timeout=args.run_timeout,
+            mineru_timeout=args.mineru_timeout,
             json_repair_attempts=args.json_repair_attempts,
             tasks_timeout=args.tasks_timeout,
             project_timeout=args.project_timeout,

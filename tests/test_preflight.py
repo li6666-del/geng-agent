@@ -10,6 +10,7 @@ from geng_agent.preflight import (
     CRITICAL_REPRO_PACKAGES,
     REQUIRED_PYTHON,
     EnvironmentReport,
+    ExternalToolStatus,
     PackageStatus,
     check_environment,
     environment_warning,
@@ -131,6 +132,28 @@ class ReportFormattingTests(unittest.TestCase):
         )
         self.assertTrue(report.fatal)
         self.assertIn("低于要求", environment_warning(report))
+
+    def test_mineru_is_reported_as_optional_and_does_not_change_readiness(self) -> None:
+        report = _ready_report()
+        report = EnvironmentReport(
+            interpreter=report.interpreter,
+            python_version=report.python_version,
+            python_required=report.python_required,
+            python_ok=report.python_ok,
+            orchestrator=report.orchestrator,
+            repro=report.repro,
+            mineru=ExternalToolStatus(
+                name="MinerU",
+                command="missing-mineru",
+                available=False,
+                resolved_executable=None,
+                purpose="candidate figures",
+            ),
+        )
+        self.assertTrue(report.ok)
+        rendered = format_report(report)
+        self.assertIn("可选论文版面工具", rendered)
+        self.assertIn("missing-mineru", rendered)
 
 
 class PyprojectSyncTests(unittest.TestCase):

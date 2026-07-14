@@ -21,7 +21,7 @@
 
 ```text
 论文 PDF
-  -> 文本、页面图像、图表位置解析
+  -> 文本与页面图像解析；MinerU 可选预解析一次，生成带 caption/page/bbox 的整图候选索引
   -> 构建 paper_memory.json 与 memory_manifest.json
   -> 单个 Codex 事实专家生成 engineering_facts_initial.json，建立高召回实验地图
   -> 图中近似读数、视觉结构、附录公式和冲突观察均带来源/置信度保留，不做语义删除
@@ -34,7 +34,8 @@
   -> 为每个复现任务创建独立 sandbox
   -> 所有任务 writer 同时启动，在独立 sandbox 内自主写代码、选择硬件并直接运行 full
   -> 每个 writer 自行对比论文、修改代码并反复运行，完成可靠 full 后提交 ready_for_review
-  -> 每个任务完成后立刻启动独立 task reporter，直接对照论文并定位裁图；差异只反馈给对应 writer
+  -> 每个任务完成后立刻启动独立 task reporter，核对论文并在 MinerU 父图内定位目标子图；差异只反馈给对应 writer
+  -> Python 按 Reporter 提交且完成视觉复检的坐标从原 PDF 高分辨率裁切；边界不可靠时自动回退完整父图
   -> 全部任务通过后系统授予 matched，Final Report Editor 统一组织三份报告
   -> 输出 review、reproduction_report、result_review 的 Markdown/Word 版本
 ```
@@ -64,11 +65,31 @@ python -m geng_agent doctor
 
 `doctor` 会检查 Python 版本、运行本体依赖和复现白名单库。缺关键库时请先修复，再喂论文。
 
+### 可选 MinerU 图定位增强
+
+MinerU 不安装进主项目或 torch 复现环境，建议使用独立 Conda 环境。它在 PDF 载入后、事实抽取前只运行一次，负责生成整图候选，不负责科学审查，也不直接决定最终子图边界。项目调用时关闭 MinerU 的公式和表格识别，只保留图定位所需的版面解析，避免为无关能力付出大段 CPU 时间。
+
+```powershell
+conda create -n mineru python=3.11 -y
+conda run -n mineru python -m pip install -U "mineru[all]"
+
+# 按实际安装位置设置；命令也可以是带参数的完整命令行
+setx GENG_MINERU_CMD "C:\Users\<you>\miniconda3\envs\mineru\Scripts\mineru.exe"
+# 可选：指定 MinerU backend；未设置时使用 MinerU 默认值
+setx GENG_MINERU_BACKEND "pipeline"
+# 可选：把模型缓存放到空间更充足的磁盘；只传给 MinerU 子进程
+setx GENG_MINERU_CACHE_ROOT "D:\geng-tools\mineru-cache"
+```
+
+MinerU 缺失、超时、非零退出或未识别到目标图时，流程不会失败：Task Reporter 继续使用完整论文与页面图定位，状态和回退原因记录在 `audit/00_mineru/mineru_status.json`。
+
 ## 论文目标图定位
 
 系统会把原始论文文件、全论文页面图以及前两轮最终定稿的 `engineering_facts.json`、`repro_tasks.json`、`experiment_index.json` 和可选 `paper_thesis.json` 复制到每个 writer sandbox。所有论文页面图直接随 Codex writer 会话发送，不再执行任务页筛选；任务相关事实摘要只用于文本导航，不构成信息边界。
 
 每个 writer 交付后，专属 task reporter 在独立上下文中读取该任务的 `task_agent_result.json`、执行摘要、本地 PNG/CSV/summary 和完整论文证据，直接判断 `accepted/revise` 并定位论文原图。科学差异只退回对应 writer；裁图或证据定位问题只重跑对应 task reporter。所有任务通过后，Final Report Editor 只读取已验收的紧凑任务包和图片，汇总生成三份最终报告。
+
+对 PDF，系统优先把 MinerU 的整图候选连同 caption、页码和归一化 bbox 交给 task reporter。Reporter 只在候选父图内部标注目标子图，并显式复检目标身份、面板边界、坐标轴、图例和关键注释；Python 再从原 PDF 确定性裁切。任一复检项不确定时使用完整父图，避免“为了紧凑而斩断图”。
 
 每个 task reporter 都拥有独立工作区，绝不接收其他实验的本地产物或结论；最终编辑器没有科学裁决权。任务级或编辑器级进程失败会分别记录在对应 audit 状态中。
 
@@ -149,6 +170,7 @@ python -m geng_agent review paper.pdf --out case_analysis --analysis-only
 ```text
 --analysis-backend codex     前两阶段 backend，默认 codex；llm 为旧兼容路径
 --analysis-only              只生成最终事实、最终任务、论文主张和实验索引
+--mineru-timeout 1800        MinerU 单篇预解析超时；超时后自动回退页面图定位
 --codex-analysis-timeout 600 前两阶段单个 Codex 子进程超时
 --codex-agent-timeout 1800   单个任务 writer 子进程超时
 --codex-reporter-timeout 1800 最终报告 Codex 子进程超时
@@ -192,6 +214,7 @@ Web UI 支持上传 PDF 或填写 PDF 链接，后台启动全流程，并通过
 case_001/
   paper_chunks.json
   paper_memory.json
+  paper_figure_index.json
   memory_manifest.json
   engineering_facts_initial.json
   repro_tasks_preliminary.json
@@ -214,6 +237,7 @@ case_001/
   result_review.md
   result_review.docx
   audit/
+    00_mineru/
     01_*.md/json/txt
     02_*.md/json/txt
     03c_task_writer_sandboxes/

@@ -114,6 +114,37 @@ class ExperimentIndexTests(unittest.TestCase):
         self.assertTrue(any("No source_pages" in item for item in experiment["limitations"]))
         self.assertTrue(any("No source_chunk_ids" in item for item in experiment["limitations"]))
 
+    def test_mineru_candidate_page_is_merged_into_task_navigation_pages(self) -> None:
+        index = build_local_experiment_index(
+            {"engineering_facts": []},
+            {
+                "repro_tasks": [
+                    {
+                        "task_id": "fig9a",
+                        "target": "BER curve",
+                        "metric": "BER",
+                        "figure_or_claim": "Fig. 9(a)",
+                        "required_facts": [],
+                    }
+                ]
+            },
+            {"chunks": []},
+            figure_index={
+                "figures": [
+                    {
+                        "candidate_id": "page_0013_visual_001",
+                        "figure_number": "9",
+                        "page": 13,
+                        "bbox_norm": [0.1, 0.2, 0.9, 0.8],
+                        "caption": "Fig. 9. BER comparison.",
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(index["experiments"][0]["source_pages"], [13])
+        self.assertTrue(index["_meta"]["mineru_enriched"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from .mineru_adapter import task_figure_candidates
 from .semantic_merge import canonical_figure_ref
 
 
@@ -11,6 +12,7 @@ def build_local_experiment_index(
     tasks: Any,
     paper: Any,
     paper_memory: Any = None,
+    figure_index: Any = None,
 ) -> dict[str, Any]:
     """Build a versioned evidence map without predicting reproduction success."""
     fact_items = _list_from_document(facts, "engineering_facts")
@@ -32,6 +34,14 @@ def build_local_experiment_index(
             matched_facts=matched_facts,
             chunks=chunks,
         )
+        mineru_pages = [
+            int(candidate.get("page"))
+            for candidate in task_figure_candidates(_as_dict(figure_index), task_data)
+            if isinstance(candidate.get("page"), int)
+        ]
+        for page in mineru_pages:
+            if page not in source_pages:
+                source_pages.append(page)
         limitations = _limitations_for(
             task_data=task_data,
             figure_or_table=figure_or_table,
@@ -69,8 +79,9 @@ def build_local_experiment_index(
         "experiments": experiments,
         "_meta": {
             "local_fallback_used": True,
-            "builder": "local_experiment_index_v2",
+            "builder": "local_experiment_index_v3_mineru_enriched",
             "experiment_count": len(experiments),
+            "mineru_enriched": bool(_as_dict(figure_index).get("figures")),
         },
     }
 

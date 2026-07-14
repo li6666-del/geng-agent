@@ -23,9 +23,12 @@ from __future__ import annotations
 
 import importlib.metadata as importlib_metadata
 import importlib.util
+import shutil
 import sys
 from dataclasses import dataclass
 
+from .codex_runner import split_command
+from .config import get_config_value
 from .security import ALLOWED_REQUIREMENTS, import_names_for_requirement
 
 # Minimum interpreter. Keep in sync with pyproject `requires-python`.
@@ -59,6 +62,15 @@ class PackageStatus:
 
 
 @dataclass(frozen=True)
+class ExternalToolStatus:
+    name: str
+    command: str
+    available: bool
+    resolved_executable: str | None
+    purpose: str
+
+
+@dataclass(frozen=True)
 class EnvironmentReport:
     interpreter: str
     python_version: str
@@ -66,6 +78,7 @@ class EnvironmentReport:
     python_ok: bool
     orchestrator: list[PackageStatus]
     repro: list[PackageStatus]
+    mineru: ExternalToolStatus | None = None
 
     @property
     def missing_orchestrator(self) -> list[PackageStatus]:
@@ -151,6 +164,20 @@ def check_environment() -> EnvironmentReport:
         python_ok=sys.version_info[:2] >= REQUIRED_PYTHON,
         orchestrator=orchestrator,
         repro=repro,
+        mineru=_check_mineru_command(),
+    )
+
+
+def _check_mineru_command() -> ExternalToolStatus:
+    command = get_config_value("GENG_MINERU_CMD") or "mineru"
+    argv = split_command(command)
+    resolved = shutil.which(argv[0]) if argv else None
+    return ExternalToolStatus(
+        name="MinerU",
+        command=command,
+        available=resolved is not None,
+        resolved_executable=resolved,
+        purpose="为 Task Reporter 提供论文整图候选；缺失时自动回退到页面图定位",
     )
 
 
@@ -183,6 +210,14 @@ def format_report(report: EnvironmentReport) -> str:
         version = f" {item.version}" if item.version else ""
         tag = "关键" if item.critical else "可选"
         lines.append(f"  [{_mark(item.installed)}] {item.package}{version}  ({tag})")
+    if report.mineru is not None:
+        lines.append("")
+        lines.append("三、可选论文版面工具:")
+        location = f" -> {report.mineru.resolved_executable}" if report.mineru.resolved_executable else ""
+        lines.append(
+            f"  [{_mark(report.mineru.available)}] {report.mineru.name}: "
+            f"{report.mineru.command}{location}  - {report.mineru.purpose}"
+        )
     lines.append("")
     if report.ok:
         lines.append("结论: 环境就绪，可以输入 PDF 开始审查。")
