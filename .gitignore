@@ -9,6 +9,10 @@ htmlcov/
 venv/
 build/
 dist/
+node_modules/
+*.tsbuildinfo
+!geng_agent/web/frontend/dist/
+!geng_agent/web/frontend/dist/**
 *.egg-info/
 case_*/
 review_case_*/
