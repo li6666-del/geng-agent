@@ -1,53 +1,60 @@
 from __future__ import annotations
 
-# 面向用户的流水线步骤（合并 Word 导出为「报告」一步）
+from geng_agent.progress import PHASES, phase_for_step
+
+
 DISPLAY_STAGES: list[tuple[str, str]] = [
-    ("paper", "论文解析"),
-    ("paper_memory", "论文记忆"),
-    ("engineering_facts", "工程事实"),
-    ("paper_thesis", "论文主张"),
-    ("repro_tasks", "复现任务"),
-    ("experiment_index", "实验索引"),
-    ("repro_project_manifest", "复现清单"),
-    ("repro_project", "复现代码"),
-    ("runtime", "运行复现"),
-    ("reproduction_report", "本地复现报告"),
-    ("result_review", "论文对比报告"),
-    ("review", "主审查报告"),
+    (phase_id, label) for phase_id, label, _steps in PHASES
 ]
 
 
 def stage_label(stage_id: str) -> str:
-    for sid, label in DISPLAY_STAGES:
-        if sid == stage_id:
+    for phase_id, label, steps in PHASES:
+        if stage_id == phase_id or stage_id in steps:
             return label
     return stage_id
 
 
 def build_stage_progress(inspect: dict) -> list[dict]:
-    by_name = {item["stage"]: item for item in inspect.get("stages", []) if isinstance(item, dict)}
+    """Fold filesystem checkpoints into the five user-facing Web phases."""
+    by_name = {
+        item["stage"]: item
+        for item in inspect.get("stages", [])
+        if isinstance(item, dict) and item.get("stage")
+    }
     next_stage = inspect.get("next_stage")
-    complete = next_stage is None
+    try:
+        active_phase = phase_for_step(next_stage) if next_stage else None
+    except KeyError:
+        active_phase = None
 
     rows: list[dict] = []
-    for stage_id, label in DISPLAY_STAGES:
-        info = by_name.get(stage_id, {})
-        ok = bool(info.get("ok"))
-        if complete:
-            state = "done" if ok else "skipped"
-        elif stage_id == next_stage:
+    for index, (phase_id, label, steps) in enumerate(PHASES, start=1):
+        statuses = []
+        for step, status in by_name.items():
+            try:
+                if phase_for_step(step) == phase_id:
+                    statuses.append(status)
+            except KeyError:
+                continue
+        completed = sum(bool(item.get("ok")) for item in statuses)
+        if phase_id == active_phase:
             state = "running"
-        elif ok:
-            state = "done"
+        elif statuses and completed == len(statuses):
+            state = "success"
+        elif completed:
+            state = "partial"
         else:
-            state = "pending"
+            state = "waiting"
         rows.append(
             {
-                "id": stage_id,
+                "id": phase_id,
+                "index": index,
                 "label": label,
                 "state": state,
-                "ok": ok,
-                "reason": info.get("reason"),
+                "ok": state == "success",
+                "steps": list(steps),
+                "completed_steps": completed,
             }
         )
     return rows

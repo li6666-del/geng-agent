@@ -192,7 +192,7 @@ python -m geng_agent benchmark case_001 case_002 --out benchmark_report
 
 ## Web UI
 
-安装 web extra 后启动：
+安装 web extra 后启动，前端静态文件已经随 Python 包提供：
 
 ```bash
 geng-agent-web
@@ -204,7 +204,21 @@ geng-agent-web
 http://127.0.0.1:8765
 ```
 
-Web UI 支持上传 PDF 或填写 PDF 链接，后台启动全流程，并通过接口实时展示阶段进度。默认 case 根目录由配置决定，可用 `GENG_CASES_ROOT` 覆盖。
+Web UI 支持上传 PDF、管理案例、查看五个当前主流程阶段、接收 SSE 实时事件、预览阶段产物并导出 ZIP。五个阶段对应“论文解构、复现设计、任务级复现、报告编排、交付物生成”，不再依赖旧流水线的私有方法名。
+
+本地默认使用 SQLite 和进程内 Celery eager worker；数据库位于 case 根目录下的 `geng_web.db`。生产部署可通过以下环境变量切换 PostgreSQL、Redis 和外部 Celery worker：
+
+```text
+GENG_CASES_ROOT         case 根目录
+GENG_DATABASE_URL       SQLAlchemy 数据库地址
+GENG_REDIS_URL          Redis/Celery 地址
+GENG_CELERY_EAGER       1 表示本地进程内执行
+GENG_ENABLE_URL_IMPORT  1 表示允许受 SSRF 防护的 PDF URL 导入 API
+```
+
+当前 Web 尚未实现登录和租户隔离，默认只应通过 `127.0.0.1` 本机访问；不要把服务直接绑定到公网地址。
+
+取消操作采用安全边界协作停止：已经启动的单次外部调用不会被粗暴截断，但进入下一阶段前会停止。Web worker 不额外设置固定科学迭代墙钟上限。为避免案例页一次加载近千个页面图和 transcript，`audit/` 完整保留在磁盘但不进入默认 Web 产物索引；报告、复现代码、结果图、CSV 和顶层证据文件仍可浏览和导出。
 
 ## 输出目录
 

@@ -27,6 +27,7 @@ from .mineru_runner import run_mineru_layout_stage
 from .outputs import write_json, write_text
 from .paper_memory import load_or_build_paper_memory, paper_memory_summary, write_memory_manifest
 from .prompts import PromptBook
+from .progress import NullProgressReporter, PhaseProgressTracker, ProgressReporter
 from .schema_models import response_format_for_stage
 from .semantic_merge import semantic_conflicts, semantic_merge_repro_tasks
 from .schemas import (
@@ -168,6 +169,7 @@ class ReviewPipeline:
         codex_agent_timeout: float | None = None,
         codex_reporter_timeout: float | None = None,
         analysis_only: bool = False,
+        progress: ProgressReporter | None = None,
     ) -> PipelineResult:
         stage_cleanup = {
             "facts": "facts",
@@ -204,6 +206,7 @@ class ReviewPipeline:
             codex_agent_timeout=codex_agent_timeout,
             codex_reporter_timeout=codex_reporter_timeout,
             analysis_only=analysis_only,
+            progress=progress,
         )
 
     def run(
@@ -224,6 +227,7 @@ class ReviewPipeline:
         codex_agent_timeout: float | None = None,
         codex_reporter_timeout: float | None = None,
         analysis_only: bool = False,
+        progress: ProgressReporter | None = None,
     ) -> PipelineResult:
         output_dir = output_dir.expanduser().resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -238,8 +242,13 @@ class ReviewPipeline:
 
         run_start = time.perf_counter()
         cost_marks: list[dict[str, Any]] = []
+        progress_tracker = PhaseProgressTracker(progress or NullProgressReporter())
+
+        def _begin(stage: str) -> None:
+            progress_tracker.begin(stage)
 
         def _mark(stage: str) -> None:
+            progress_tracker.complete(stage)
             cost_marks.append(
                 {
                     "stage": stage,
@@ -347,6 +356,7 @@ class ReviewPipeline:
         )
         write_json(audit_dir / "01_fact_coverage_after_global_extraction.json", fact_coverage)
 
+        _begin("tasks_preliminary")
         prompt_2 = self.prompt_book.render(
             "build_repro_tasks.md",
             engineering_facts_json=wrap_untrusted("engineering_facts_json", pretty_json(initial_facts)),
@@ -621,6 +631,7 @@ class ReviewPipeline:
                     },
                 },
             )
+            progress_tracker.finish()
             return PipelineResult(
                 output_dir=output_dir,
                 review_path=output_dir / "review.md",
@@ -704,6 +715,7 @@ class ReviewPipeline:
                 )
             return result
 
+        _begin("generation")
         agentic_result = run_codex_task_writer_workflow(
             facts=facts,
             tasks=tasks,
@@ -844,6 +856,8 @@ class ReviewPipeline:
             [int(record.get("writer_session_count") or 1) for record in task_records] or [1]
         )
 
+        _mark("task_reporters")
+        _begin("report_editor")
         report_editor_result = run_codex_report_editor_workflow(
             paper=paper,
             facts=facts,
@@ -931,8 +945,8 @@ class ReviewPipeline:
             "degraded_report_generation": report_editor_result.get("degraded_report_generation", False),
             "invocations": report_editor_invocations,
         }
-        _mark("task_reporters")
         _mark("report_editor")
+        _begin("reports")
         docx_generation = self._generate_docx_reports(
             output_dir=output_dir,
             result_review_result=result_review_result,
@@ -1037,6 +1051,7 @@ class ReviewPipeline:
         review_docx_path = output_dir / "review.docx"
         reproduction_report_docx_path = output_dir / "reproduction_report.docx"
         result_review_docx_path = output_dir / "result_review.docx"
+        progress_tracker.finish()
         return PipelineResult(
             output_dir=output_dir,
             review_path=review_path,

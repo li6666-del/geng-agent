@@ -18,6 +18,11 @@ web = [
   "fastapi>=0.115",
   "uvicorn[standard]>=0.32",
   "python-multipart>=0.0.9",
+  "sqlalchemy>=2.0.36",
+  "alembic>=1.14",
+  "celery[redis]>=5.4",
+  "redis>=5.2",
+  "psycopg[binary]>=3.2",
 ]
 # Libraries the generated reproduction code is allowed to import. Single source of
 # truth for the allow-list is geng_agent/security.ALLOWED_REQUIREMENTS; this extra
@@ -53,4 +58,11 @@ build-backend = "setuptools.build_meta"
 include = ["geng_agent*"]
 
 [tool.setuptools.package-data]
-geng_agent = ["prompts/*.md", "web/static/*"]
+geng_agent = [
+  "prompts/*.md",
+  "web/frontend/dist/*",
+  "web/frontend/dist/assets/*",
+  "web/migrations/*.py",
+  "web/migrations/*.mako",
+  "web/migrations/versions/*.py",
+]
