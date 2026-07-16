@@ -17,7 +17,13 @@ def _command_for(script: Path) -> str:
 
 def _write_analysis_script(temp: Path, body: str) -> str:
     script = temp / "fake_codex_analysis.py"
-    script.write_text(textwrap.dedent(body), encoding="utf-8")
+    capability_preamble = (
+        "import sys\n"
+        "if sys.argv[1:] == ['exec', '--help']:\n"
+        "    print('--ephemeral')\n"
+        "    raise SystemExit(0)\n"
+    )
+    script.write_text(capability_preamble + textwrap.dedent(body), encoding="utf-8")
     return _command_for(script)
 
 

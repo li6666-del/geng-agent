@@ -16,7 +16,11 @@ def _fake_editor(root: Path) -> str:
     script = root / "report_editor.py"
     script.write_text(textwrap.dedent("""
         import json
+        import sys
         from pathlib import Path
+        if sys.argv[1:] == ["exec", "--help"]:
+            print("--ephemeral")
+            raise SystemExit(0)
         root = Path.cwd()
         report_input = json.loads((root / "inputs" / "report_editor_input.json").read_text(encoding="utf-8"))
         ids = [packet["task_id"] for packet in report_input["task_packets"]]
@@ -30,7 +34,12 @@ def _fake_editor(root: Path) -> str:
 def _editor_command(root: Path, name: str, body: str) -> str:
     script = root / name
     script.write_text(
-        "from pathlib import Path\nroot = Path.cwd()\n" + textwrap.dedent(body),
+        "import sys\n"
+        "if sys.argv[1:] == ['exec', '--help']:\n"
+        "    print('--ephemeral')\n"
+        "    raise SystemExit(0)\n"
+        "from pathlib import Path\nroot = Path.cwd()\n"
+        + textwrap.dedent(body),
         encoding="utf-8",
     )
     return f'"{sys.executable}" "{script}"'

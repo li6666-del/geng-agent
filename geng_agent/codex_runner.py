@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import json
 import os
 import shlex
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -15,6 +15,7 @@ from .security import codex_safe_env, redact_text
 
 
 MAX_TRANSCRIPT_CHARS = 200_000
+CODEX_CAPABILITY_TIMEOUT_SECONDS = 5.0
 DEFAULT_GENG_CODEX_MODEL = "gpt-5.5"
 DEFAULT_GENG_CODEX_REASONING_EFFORT = {
     "analysis": "high",
@@ -22,6 +23,9 @@ DEFAULT_GENG_CODEX_REASONING_EFFORT = {
     "task_reporter": "high",
     "report_editor": "medium",
 }
+
+_EPHEMERAL_CAPABILITY_CACHE: dict[tuple[str, ...], dict[str, Any]] = {}
+_EPHEMERAL_CAPABILITY_LOCK = threading.Lock()
 
 
 def run_codex_subprocess(
@@ -49,6 +53,8 @@ def run_codex_subprocess(
         "ok": False,
         "role": role,
         "backend": "codex",
+        "session_persistence": "ephemeral",
+        "ephemeral_capability": None,
         "model": model,
         "reasoning_effort": resolved_reasoning_effort,
         "command": None,
@@ -69,11 +75,37 @@ def run_codex_subprocess(
         write_json(audit_dir / f"{label}.json", status)
         return status
 
+    # Every current project Worker is one-shot: project-owned transcript,
+    # last-message, JSON and case artifacts are its durable state. A future
+    # feature that genuinely needs resume must use a case-local subprocess-only
+    # state design, an explicit session UUID, and never --last. CODEX_SQLITE_HOME
+    # alone does not isolate sessions/logs/config/auth; zero writes to personal
+    # Codex data also requires a separately designed CODEX_HOME and auth flow.
+    command_prefix = [resolved, *(arg for arg in argv[1:] if arg != "--ephemeral")]
+    env = codex_safe_env()
+    if extra_env:
+        env.update({str(key): str(value) for key, value in extra_env.items()})
+    if path_prepend:
+        _prepend_path(env, path_prepend)
+
+    capability = _ephemeral_capability(command_prefix, env, work_dir)
+    status["ephemeral_capability"] = capability
+    if not capability["supported"]:
+        detail = str(capability.get("error") or "--ephemeral is absent from codex exec --help")
+        status["error_kind"] = "unsupported_cli_feature"
+        status["blocked_reason"] = "Codex CLI does not support required ephemeral Worker sessions"
+        status["error"] = (
+            "Codex CLI must support codex exec --ephemeral; run codex update "
+            f"or upgrade the CLI, restart the project process, and retry. Detail: {detail}"
+        )
+        write_json(audit_dir / f"{label}.json", status)
+        return status
+
     last_message_path = audit_dir / f"{label}_last_message.txt"
     command = [
-        resolved,
-        *argv[1:],
+        *command_prefix,
         "exec",
+        "--ephemeral",
         "--skip-git-repo-check",
         "--sandbox",
         sandbox,
@@ -96,11 +128,6 @@ def run_codex_subprocess(
 
     started = time.monotonic()
     try:
-        env = codex_safe_env()
-        if extra_env:
-            env.update({str(key): str(value) for key, value in extra_env.items()})
-        if path_prepend:
-            _prepend_path(env, path_prepend)
         completed = subprocess.run(
             command,
             cwd=work_dir,
@@ -144,6 +171,77 @@ def run_codex_subprocess(
     status["transcript"] = str(transcript_path)
     write_json(audit_dir / f"{label}.json", status)
     return status
+
+
+def _ephemeral_capability(
+    command_prefix: list[str],
+    env: dict[str, str],
+    work_dir: Path,
+) -> dict[str, Any]:
+    """Fail closed unless this exact Codex command supports one-shot sessions.
+
+    The lock makes the first probe single-flight. Other Worker threads wait for
+    that short probe only, then launch concurrently using the cached result.
+    """
+    key = tuple(command_prefix)
+    with _EPHEMERAL_CAPABILITY_LOCK:
+        cached = _EPHEMERAL_CAPABILITY_CACHE.get(key)
+        if cached is not None:
+            return {**cached, "cached": True}
+        result = _probe_ephemeral_capability(command_prefix, env, work_dir)
+        _EPHEMERAL_CAPABILITY_CACHE[key] = result
+        return {**result, "cached": False}
+
+
+def _probe_ephemeral_capability(
+    command_prefix: list[str],
+    env: dict[str, str],
+    work_dir: Path,
+) -> dict[str, Any]:
+    command = [*command_prefix, "exec", "--help"]
+    result: dict[str, Any] = {
+        "supported": False,
+        "cached": False,
+        "command": command,
+        "returncode": None,
+        "timeout_s": CODEX_CAPABILITY_TIMEOUT_SECONDS,
+        "error": None,
+    }
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=work_dir,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=CODEX_CAPABILITY_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        result["error"] = "codex exec --help timed out"
+        return result
+    except Exception as exc:
+        result["error"] = f"capability check failed: {type(exc).__name__}: {exc}"
+        return result
+
+    help_text = (completed.stdout or "") + "\n" + (completed.stderr or "")
+    result["returncode"] = completed.returncode
+    result["supported"] = completed.returncode == 0 and "--ephemeral" in help_text
+    if not result["supported"]:
+        result["error"] = (
+            "codex exec --help did not advertise --ephemeral"
+            if completed.returncode == 0
+            else f"codex exec --help exited with status {completed.returncode}"
+        )
+    return result
+
+
+def _clear_ephemeral_capability_cache() -> None:
+    """Reset process-local capability state for deterministic tests."""
+    with _EPHEMERAL_CAPABILITY_LOCK:
+        _EPHEMERAL_CAPABILITY_CACHE.clear()
 
 
 def _annotate_codex_failure(status: dict[str, Any], transcript: str) -> None:

@@ -29,7 +29,12 @@ def _fake_task_reporter(
     script.write_text(textwrap.dedent(f"""
         import base64
         import json
+        import sys
         from pathlib import Path
+
+        if sys.argv[1:] == ["exec", "--help"]:
+            print("--ephemeral")
+            raise SystemExit(0)
 
         root = Path.cwd()
         report_input = json.loads((root / "inputs" / "task_report_input.json").read_text(encoding="utf-8"))
