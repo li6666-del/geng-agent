@@ -97,6 +97,38 @@ class CoverageTests(unittest.TestCase):
         self.assertEqual(coverage["experiment_figures"], ["4", "7"])
         self.assertEqual(coverage["uncovered_figures"], ["7"])
 
+    def test_task_presence_does_not_imply_specification_completeness(self) -> None:
+        facts = {"engineering_facts": [_fact_claim("Figure 4: BER vs SNR")]}
+        tasks = {
+            "repro_tasks": [
+                {"task_id": "fig4", "figure_or_claim": "Fig. 4", "target": "BER"}
+            ]
+        }
+
+        coverage = compute_task_coverage(facts, tasks)
+
+        self.assertTrue(coverage["anchor_fully_covered"])
+        self.assertFalse(coverage["specification_complete"])
+        self.assertFalse(coverage["fully_covered"])
+
+    def test_explicit_specification_states_make_task_complete(self) -> None:
+        facts = {"engineering_facts": [_fact_claim("Figure 4: BER vs SNR")]}
+        item = {"name": "declared", "status": "not_applicable"}
+        task = {"task_id": "fig4", "figure_or_claim": "Fig. 4", "target": "BER"}
+        for key in (
+            "formula_chain",
+            "parameter_matrix",
+            "baseline_definitions",
+            "statistical_protocol",
+            "validation_anchors",
+        ):
+            task[key] = [item]
+
+        coverage = compute_task_coverage(facts, {"repro_tasks": [task]})
+
+        self.assertTrue(coverage["specification_complete"])
+        self.assertTrue(coverage["fully_covered"])
+
 
 class MergeTests(unittest.TestCase):
     def _facts(self, items: list[dict]) -> dict:

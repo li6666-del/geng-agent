@@ -1,5 +1,76 @@
 {
   "$defs": {
+    "BackfillFieldResolution": {
+      "additionalProperties": false,
+      "properties": {
+        "field_id": {
+          "minLength": 1,
+          "title": "Field Id",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "resolved_explicit",
+            "resolved_derived",
+            "resolved_visual_estimate",
+            "not_found_in_paper",
+            "ambiguous_or_conflicting"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "fact_refs": {
+          "items": {
+            "$ref": "#/$defs/RequiredFactRef"
+          },
+          "title": "Fact Refs",
+          "type": "array"
+        },
+        "searched_locations": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Searched Locations",
+          "type": "array"
+        },
+        "note": {
+          "minLength": 1,
+          "title": "Note",
+          "type": "string"
+        }
+      },
+      "required": [
+        "field_id",
+        "status",
+        "note"
+      ],
+      "title": "BackfillFieldResolution",
+      "type": "object"
+    },
+    "BackfillRequestResolution": {
+      "additionalProperties": false,
+      "properties": {
+        "request_id": {
+          "minLength": 1,
+          "title": "Request Id",
+          "type": "string"
+        },
+        "field_results": {
+          "items": {
+            "$ref": "#/$defs/BackfillFieldResolution"
+          },
+          "minItems": 1,
+          "title": "Field Results",
+          "type": "array"
+        }
+      },
+      "required": [
+        "request_id",
+        "field_results"
+      ],
+      "title": "BackfillRequestResolution",
+      "type": "object"
+    },
     "EngineeringFact": {
       "additionalProperties": false,
       "properties": {
@@ -169,6 +240,40 @@
       ],
       "title": "MissingInformation",
       "type": "object"
+    },
+    "RequiredFactRef": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "enum": [
+            "channel_model",
+            "modulation",
+            "coding",
+            "metric",
+            "simulation_parameter",
+            "baseline",
+            "figure_claim",
+            "algorithm",
+            "dataset",
+            "topology",
+            "hardware",
+            "other"
+          ],
+          "title": "Type",
+          "type": "string"
+        },
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "name"
+      ],
+      "title": "RequiredFactRef",
+      "type": "object"
     }
   },
   "additionalProperties": false,
@@ -206,14 +311,22 @@
       },
       "title": "Missing Information",
       "type": "array"
+    },
+    "request_resolutions": {
+      "items": {
+        "$ref": "#/$defs/BackfillRequestResolution"
+      },
+      "title": "Request Resolutions",
+      "type": "array"
     }
   },
   "required": [
     "paper_domain",
     "paper_repro_type",
     "engineering_facts",
-    "missing_information"
+    "missing_information",
+    "request_resolutions"
   ],
-  "title": "EngineeringFactsDocument",
+  "title": "TargetedFactBackfillDocument",
   "type": "object"
 }

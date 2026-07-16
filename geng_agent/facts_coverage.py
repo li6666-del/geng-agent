@@ -7,7 +7,7 @@ used to audit that task-driven flow:
 1. anchor coverage -- enumerate the figures/tables the paper *references* (from chunk
    text) and compare them with extracted facts and finalized reproduction tasks.
 2. semantic merge/dedup -- preserve subfigures, enrich incomplete records, retain
-   conflicts, and merge the one targeted fact-backfill result into the global facts.
+   conflicts, and merge targeted fact-backfill rounds into the global facts.
 
 No I/O, no LLM, no randomness here -- everything is unit-testable in isolation.
 """
@@ -259,11 +259,64 @@ def compute_task_coverage(facts: dict[str, Any] | None, tasks: dict[str, Any] | 
     cov = _task_anchors(task_list if isinstance(task_list, list) else [])
     uncovered_figures = _sorted_anchors(exp["figures"] - cov["figures"])
     uncovered_tables = _sorted_anchors(exp["tables"] - cov["tables"])
+    specification = _task_specification_coverage(
+        task_list if isinstance(task_list, list) else []
+    )
+    anchor_fully_covered = not uncovered_figures and not uncovered_tables
+    no_silent_specification_gaps = all(
+        not item["silent_missing_dimensions"] for item in specification
+    )
+    specification_complete = no_silent_specification_gaps and all(
+        not item["explicitly_unresolved_dimensions"] for item in specification
+    )
     return {
         "experiment_figures": _sorted_anchors(exp["figures"]),
         "experiment_tables": _sorted_anchors(exp["tables"]),
         "task_figures": _sorted_anchors(cov["figures"]),
         "uncovered_figures": uncovered_figures,
         "uncovered_tables": uncovered_tables,
-        "fully_covered": not uncovered_figures and not uncovered_tables,
+        "anchor_fully_covered": anchor_fully_covered,
+        "task_specification_coverage": specification,
+        "no_silent_specification_gaps": no_silent_specification_gaps,
+        "specification_complete": specification_complete,
+        "fully_covered": anchor_fully_covered and specification_complete,
     }
+
+
+_TASK_SPEC_DIMENSIONS = (
+    "formula_chain",
+    "parameter_matrix",
+    "baseline_definitions",
+    "statistical_protocol",
+    "validation_anchors",
+)
+
+
+def _task_specification_coverage(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        declared: list[str] = []
+        unresolved: list[str] = []
+        missing: list[str] = []
+        for dimension in _TASK_SPEC_DIMENSIONS:
+            items = task.get(dimension)
+            if not isinstance(items, list) or not items:
+                missing.append(dimension)
+                continue
+            declared.append(dimension)
+            if any(
+                isinstance(item, dict) and item.get("status") == "unresolved"
+                for item in items
+            ):
+                unresolved.append(dimension)
+        rows.append(
+            {
+                "task_id": str(task.get("task_id") or ""),
+                "declared_dimensions": declared,
+                "explicitly_unresolved_dimensions": unresolved,
+                "silent_missing_dimensions": missing,
+            }
+        )
+    return rows

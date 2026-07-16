@@ -42,6 +42,15 @@ FactType = Literal[
 
 Confidence = Literal["high", "medium", "low"]
 MissingImpact = Literal["low", "medium", "high"]
+EvidenceKind = Literal["paper_explicit", "paper_derived", "visual_estimate"]
+TaskSpecificationStatus = Literal["evidenced", "assumed", "not_applicable", "unresolved"]
+BackfillFieldStatus = Literal[
+    "resolved_explicit",
+    "resolved_derived",
+    "resolved_visual_estimate",
+    "not_found_in_paper",
+    "ambiguous_or_conflicting",
+]
 
 MetricName = Literal[
     "bit_error_rate",
@@ -92,6 +101,8 @@ class EngineeringFact(StrictModel):
     source: FactSource
     confidence: Confidence
     used_for_reproduction: bool
+    evidence_kind: EvidenceKind = "paper_explicit"
+    derivation: str | None = None
 
 
 class MissingInformation(StrictModel):
@@ -117,6 +128,9 @@ class Assumption(StrictModel):
     default_value: Any
     reason: NonEmptyStr
     risk: AssumptionRisk
+    request_id: str | None = None
+    field_ids: list[str] = Field(default_factory=list)
+    sensitivity_check: str = ""
 
 
 class ExpectedTrend(StrictModel):
@@ -132,6 +146,12 @@ class Comparison(StrictModel):
     tolerance: NonEmptyStr
 
 
+class RequestedFactField(StrictModel):
+    field_id: NonEmptyStr
+    description: NonEmptyStr
+    affects: list[NonEmptyStr] = Field(default_factory=list)
+
+
 class MissingFactRequest(StrictModel):
     request_id: NonEmptyStr
     type: FactType
@@ -139,6 +159,15 @@ class MissingFactRequest(StrictModel):
     why_needed: NonEmptyStr
     impact: MissingImpact
     search_targets: list[str]
+    required_fields: list[RequestedFactField] = Field(default_factory=list)
+
+
+class TaskSpecificationItem(StrictModel):
+    name: NonEmptyStr
+    value: Any = None
+    status: TaskSpecificationStatus
+    evidence_facts: list[RequiredFactRef] = Field(default_factory=list)
+    note: str = ""
 
 
 class ReproTask(StrictModel):
@@ -155,6 +184,28 @@ class ReproTask(StrictModel):
     missing_fact_requests: list[MissingFactRequest] = Field(default_factory=list)
     assumptions: list[Assumption]
     risk_if_unreproducible: NonEmptyStr
+    formula_chain: list[TaskSpecificationItem] = Field(default_factory=list)
+    parameter_matrix: list[TaskSpecificationItem] = Field(default_factory=list)
+    baseline_definitions: list[TaskSpecificationItem] = Field(default_factory=list)
+    statistical_protocol: list[TaskSpecificationItem] = Field(default_factory=list)
+    validation_anchors: list[TaskSpecificationItem] = Field(default_factory=list)
+
+
+class BackfillFieldResolution(StrictModel):
+    field_id: NonEmptyStr
+    status: BackfillFieldStatus
+    fact_refs: list[RequiredFactRef] = Field(default_factory=list)
+    searched_locations: list[str] = Field(default_factory=list)
+    note: NonEmptyStr
+
+
+class BackfillRequestResolution(StrictModel):
+    request_id: NonEmptyStr
+    field_results: list[BackfillFieldResolution] = Field(min_length=1)
+
+
+class TargetedFactBackfillDocument(EngineeringFactsDocument):
+    request_resolutions: list[BackfillRequestResolution]
 
 
 class ReproTasksDocument(StrictModel):
@@ -339,6 +390,7 @@ class ReproducibilityVerdictDocument(StrictModel):
 
 SCHEMA_MODELS: dict[str, type[BaseModel]] = {
     "engineering_facts": EngineeringFactsDocument,
+    "targeted_fact_backfill": TargetedFactBackfillDocument,
     "repro_tasks": ReproTasksDocument,
     "paper_thesis": PaperThesisDocument,
     "paper_memory": PaperMemoryDocument,
@@ -352,6 +404,7 @@ SCHEMA_MODELS: dict[str, type[BaseModel]] = {
 
 SCHEMA_FILENAMES: dict[str, str] = {
     "engineering_facts": "engineering_facts.schema.json",
+    "targeted_fact_backfill": "targeted_fact_backfill.schema.json",
     "repro_tasks": "repro_tasks.schema.json",
     "paper_thesis": "paper_thesis.schema.json",
     "paper_memory": "paper_memory.schema.json",

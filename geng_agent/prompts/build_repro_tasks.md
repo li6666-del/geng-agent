@@ -20,6 +20,13 @@
 2. 背景知识、措辞完善和不会改变实验的边缘细节不要请求。
 3. `type + name` 必须描述期望回补成 engineering_fact 的稳定键；多个任务需要同一事实时使用相同 type 和 name，便于程序去重。
 4. search_targets 写最可能的 Fig./Table/Equation/Section/page 线索；不知道时可为空列表。
+5. 每个请求必须把所需答案拆成 required_fields。一个字段只表达一个可验证信息，并用 affects 说明它会改变公式、参数、baseline、统计协议还是验收锚点。
+
+任务规格原则：
+1. 每个任务必须分别给出 formula_chain、parameter_matrix、baseline_definitions、statistical_protocol 和 validation_anchors。
+2. 每个规格项标记 `evidenced|assumed|not_applicable|unresolved`，并通过 evidence_facts 引用事实。
+3. 一个维度确实不适用时仍输出一项 not_applicable，不能用空数组表示。
+4. 图中可读的近似数值、方法排序、交点、端点、阈值和坐标范围写入 validation_anchors，明确其为视觉估读时不得伪装成精确数据。
 
 输出 schema：
 {
@@ -63,7 +70,14 @@
           "name": "Fig. 4 transmit-power normalization",
           "why_needed": "determines the x-axis values and per-antenna power used by the simulation",
           "impact": "high",
-          "search_targets": ["Fig. 4 caption", "Simulation Setup"]
+          "search_targets": ["Fig. 4 caption", "Simulation Setup"],
+          "required_fields": [
+            {
+              "field_id": "power_definition",
+              "description": "exact total/per-antenna power normalization",
+              "affects": ["formula_chain", "parameter_matrix"]
+            }
+          ]
         }
       ],
       "assumptions": [
@@ -71,10 +85,26 @@
           "name": "",
           "default_value": "",
           "reason": "",
-          "risk": "low|medium|high"
+          "risk": "low|medium|high",
+          "request_id": null,
+          "field_ids": [],
+          "sensitivity_check": ""
         }
       ],
-      "risk_if_unreproducible": ""
+      "risk_if_unreproducible": "",
+      "formula_chain": [
+        {
+          "name": "metric computation",
+          "value": "",
+          "status": "evidenced|assumed|not_applicable|unresolved",
+          "evidence_facts": [],
+          "note": ""
+        }
+      ],
+      "parameter_matrix": [],
+      "baseline_definitions": [],
+      "statistical_protocol": [],
+      "validation_anchors": []
     }
   ]
 }

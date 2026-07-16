@@ -24,6 +24,30 @@
           ],
           "title": "Risk",
           "type": "string"
+        },
+        "request_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Request Id"
+        },
+        "field_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Field Ids",
+          "type": "array"
+        },
+        "sensitivity_check": {
+          "default": "",
+          "title": "Sensitivity Check",
+          "type": "string"
         }
       },
       "required": [
@@ -152,6 +176,13 @@
           },
           "title": "Search Targets",
           "type": "array"
+        },
+        "required_fields": {
+          "items": {
+            "$ref": "#/$defs/RequestedFactField"
+          },
+          "title": "Required Fields",
+          "type": "array"
         }
       },
       "required": [
@@ -251,6 +282,41 @@
           "minLength": 1,
           "title": "Risk If Unreproducible",
           "type": "string"
+        },
+        "formula_chain": {
+          "items": {
+            "$ref": "#/$defs/TaskSpecificationItem"
+          },
+          "title": "Formula Chain",
+          "type": "array"
+        },
+        "parameter_matrix": {
+          "items": {
+            "$ref": "#/$defs/TaskSpecificationItem"
+          },
+          "title": "Parameter Matrix",
+          "type": "array"
+        },
+        "baseline_definitions": {
+          "items": {
+            "$ref": "#/$defs/TaskSpecificationItem"
+          },
+          "title": "Baseline Definitions",
+          "type": "array"
+        },
+        "statistical_protocol": {
+          "items": {
+            "$ref": "#/$defs/TaskSpecificationItem"
+          },
+          "title": "Statistical Protocol",
+          "type": "array"
+        },
+        "validation_anchors": {
+          "items": {
+            "$ref": "#/$defs/TaskSpecificationItem"
+          },
+          "title": "Validation Anchors",
+          "type": "array"
         }
       },
       "required": [
@@ -268,6 +334,35 @@
         "risk_if_unreproducible"
       ],
       "title": "ReproTask",
+      "type": "object"
+    },
+    "RequestedFactField": {
+      "additionalProperties": false,
+      "properties": {
+        "field_id": {
+          "minLength": 1,
+          "title": "Field Id",
+          "type": "string"
+        },
+        "description": {
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "affects": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Affects",
+          "type": "array"
+        }
+      },
+      "required": [
+        "field_id",
+        "description"
+      ],
+      "title": "RequestedFactField",
       "type": "object"
     },
     "RequiredFactRef": {
@@ -302,6 +397,48 @@
         "name"
       ],
       "title": "RequiredFactRef",
+      "type": "object"
+    },
+    "TaskSpecificationItem": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "value": {
+          "default": null,
+          "title": "Value"
+        },
+        "status": {
+          "enum": [
+            "evidenced",
+            "assumed",
+            "not_applicable",
+            "unresolved"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "evidence_facts": {
+          "items": {
+            "$ref": "#/$defs/RequiredFactRef"
+          },
+          "title": "Evidence Facts",
+          "type": "array"
+        },
+        "note": {
+          "default": "",
+          "title": "Note",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "status"
+      ],
+      "title": "TaskSpecificationItem",
       "type": "object"
     }
   },

@@ -52,9 +52,19 @@ _ALLOWED_REPRO_TYPES = set(get_args(PaperReproType))
 _ALLOWED_CONFIDENCE = set(get_args(Confidence))
 _ALLOWED_IMPACT = set(get_args(MissingImpact))
 
-_FACT_KEYS = {"type", "name", "value", "source", "confidence", "used_for_reproduction"}
+_FACT_KEYS = {
+    "type",
+    "name",
+    "value",
+    "source",
+    "confidence",
+    "used_for_reproduction",
+    "evidence_kind",
+    "derivation",
+}
 _SOURCE_KEYS = {"source_kind", "chunk_id", "page", "section", "quote", "figure_ref"}
 _FIGURE_SOURCE_TOKENS = {"figure", "image", "diagram", "plot", "fig", "chart", "graph", "subfigure"}
+_EVIDENCE_KINDS = {"paper_explicit", "paper_derived", "visual_estimate"}
 
 FACT_TYPE_SYNONYMS = {
     "parameter": "simulation_parameter",
@@ -257,6 +267,25 @@ def _normalize_fact(fact: dict[str, Any], index: int, coercions: list[str]) -> N
     source = fact.get("source")
     if isinstance(source, dict):
         _normalize_source(source, index, coercions)
+
+    raw_evidence_kind = fact.get("evidence_kind")
+    inferred_kind = (
+        "visual_estimate"
+        if isinstance(fact.get("source"), dict)
+        and fact["source"].get("source_kind") == "figure"
+        else "paper_explicit"
+    )
+    if raw_evidence_kind not in _EVIDENCE_KINDS:
+        fact["evidence_kind"] = inferred_kind
+        if raw_evidence_kind is not None:
+            coercions.append(
+                f"facts[{index}].evidence_kind {raw_evidence_kind!r} -> {inferred_kind!r}"
+            )
+
+    derivation = fact.get("derivation")
+    if derivation is not None and not isinstance(derivation, str):
+        fact["derivation"] = str(derivation)
+        coercions.append(f"facts[{index}].derivation coerced to string")
 
 
 def _normalize_source(source: dict[str, Any], index: int, coercions: list[str]) -> None:

@@ -115,6 +115,62 @@ class NormalizeReproTasksTests(unittest.TestCase):
         self.assertEqual(doc["repro_tasks"][0]["task_id"], "reproduce_fig_11")
         self.assertEqual(len(doc["repro_tasks"]), 1)
 
+    def test_preserves_field_requests_specs_and_linked_sensitivity(self) -> None:
+        request = {
+            "request_id": "fig11_trials",
+            "type": "simulation_parameter",
+            "name": "Fig. 11 trial count",
+            "why_needed": "controls statistical reliability",
+            "impact": "high",
+            "search_targets": ["Fig. 11 caption"],
+            "required_fields": [
+                {
+                    "field_id": "trial_count",
+                    "description": "number of Monte Carlo trials",
+                    "affects": ["statistical_protocol"],
+                }
+            ],
+        }
+        spec = {
+            "name": "BER formula",
+            "value": "errors / bits",
+            "status": "evidenced",
+            "evidence_facts": [{"type": "metric", "name": "Bit Error Rate (BER)"}],
+            "note": "paper metric",
+        }
+        task = good_task(
+            missing_fact_requests=[request],
+            formula_chain=[spec],
+            parameter_matrix=[{**spec, "name": "SNR grid"}],
+            baseline_definitions=[{**spec, "name": "AWGN baseline"}],
+            statistical_protocol=[{**spec, "name": "trial protocol", "status": "unresolved"}],
+            validation_anchors=[{**spec, "name": "BER ordering"}],
+            assumptions=[
+                {
+                    "name": "trial count",
+                    "default_value": 1000,
+                    "reason": "not disclosed",
+                    "risk": "medium",
+                    "request_id": "backfill_x",
+                    "field_ids": ["trial_count"],
+                    "sensitivity_check": "repeat with 500 and 2000 trials",
+                }
+            ],
+        )
+
+        doc = finalize_repro_tasks({"repro_tasks": [task]}, FACTS)
+        normalized = doc["repro_tasks"][0]
+
+        self.assertEqual(
+            normalized["missing_fact_requests"][0]["required_fields"][0]["field_id"],
+            "trial_count",
+        )
+        self.assertEqual(normalized["formula_chain"][0]["status"], "evidenced")
+        self.assertEqual(
+            normalized["assumptions"][0]["sensitivity_check"],
+            "repeat with 500 and 2000 trials",
+        )
+
     def test_truncation_recovery_salvages_complete_task_prefix(self) -> None:
         first = json.dumps(good_task(required_facts=["F-CH-AWGN"]))
         raw = '{"repro_tasks":[' + first + ',{"task_id":"cut"'

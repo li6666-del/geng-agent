@@ -192,13 +192,29 @@ def _merge_fact_fields(current: dict[str, Any], candidate: dict[str, Any], key: 
     if _confidence_rank(candidate.get("confidence")) > _confidence_rank(current.get("confidence")):
         current["confidence"] = candidate.get("confidence")
         changed = True
+    if _evidence_rank(candidate.get("evidence_kind")) > _evidence_rank(current.get("evidence_kind")):
+        current["evidence_kind"] = candidate.get("evidence_kind")
+        changed = True
+    if not current.get("derivation") and candidate.get("derivation"):
+        current["derivation"] = candidate.get("derivation")
+        changed = True
     return changed, conflicts
 
 
 def _merge_task_fields(current: dict[str, Any], candidate: dict[str, Any], key: tuple[str, ...]) -> tuple[bool, list[dict[str, Any]]]:
     changed = False
     conflicts: list[dict[str, Any]] = []
-    for field in ("expected_artifacts", "output_columns", "required_facts", "assumptions"):
+    for field in (
+        "expected_artifacts",
+        "output_columns",
+        "required_facts",
+        "assumptions",
+        "formula_chain",
+        "parameter_matrix",
+        "baseline_definitions",
+        "statistical_protocol",
+        "validation_anchors",
+    ):
         candidate_items = candidate.get(field)
         if not isinstance(candidate_items, list) or not candidate_items:
             continue
@@ -278,3 +294,11 @@ def _equivalent(left: Any, right: Any) -> bool:
 
 def _confidence_rank(value: Any) -> int:
     return {"low": 0, "medium": 1, "high": 2}.get(str(value).lower(), 0)
+
+
+def _evidence_rank(value: Any) -> int:
+    return {
+        "visual_estimate": 0,
+        "paper_derived": 1,
+        "paper_explicit": 2,
+    }.get(str(value).lower(), 0)

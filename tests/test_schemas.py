@@ -93,6 +93,18 @@ class SchemaTests(unittest.TestCase):
         self.assertTrue(response_format["json_schema"]["strict"])
         self.assertEqual(response_format["json_schema"]["schema"], SCHEMA_MODELS["repro_tasks"].model_json_schema())
 
+    def test_targeted_backfill_schema_requires_field_resolutions(self) -> None:
+        document = {
+            "paper_domain": "communication",
+            "paper_repro_type": "signal_chain",
+            "engineering_facts": [],
+            "missing_information": [],
+        }
+
+        issues = validate_stage("targeted_fact_backfill", document)
+
+        self.assertTrue(any("request_resolutions" in issue.path for issue in issues))
+
 
 if __name__ == "__main__":
     unittest.main()

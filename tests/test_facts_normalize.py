@@ -47,6 +47,17 @@ def figure_fact(**overrides):
 
 
 class NormalizeTests(unittest.TestCase):
+    def test_infers_evidence_kind_from_source(self) -> None:
+        out, _ = normalize_engineering_facts_candidate(
+            {
+                "paper_repro_type": "signal_chain",
+                "engineering_facts": [good_fact(), figure_fact()],
+                "missing_information": [],
+            }
+        )
+        self.assertEqual(out["engineering_facts"][0]["evidence_kind"], "paper_explicit")
+        self.assertEqual(out["engineering_facts"][1]["evidence_kind"], "visual_estimate")
+
     def test_maps_fact_type_synonym_and_unknown(self) -> None:
         data = {
             "paper_domain": "communication",

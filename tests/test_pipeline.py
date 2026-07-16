@@ -10,6 +10,7 @@ from unittest.mock import patch
 from geng_agent.agentic_analysis import CODEX_ANALYSIS_BACKEND
 from geng_agent.outputs import write_json
 from geng_agent.pipeline import ReviewPipeline
+from geng_agent.task_evidence_backfill import collect_missing_fact_requests
 
 
 def fact_doc(*facts: dict) -> dict:
@@ -227,7 +228,7 @@ class PipelineTests(unittest.TestCase):
             for name in ("review.docx", "reproduction_report.docx", "result_review.docx"):
                 self.assertTrue((root / name).exists())
 
-    def test_pipeline_runs_one_task_driven_backfill_and_finalizes_once(self) -> None:
+    def test_pipeline_runs_one_converged_backfill_round_and_refreshes_tasks(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             paper_path = root / "paper.md"
@@ -251,7 +252,31 @@ class PipelineTests(unittest.TestCase):
                 }
             ]
             preliminary = task_doc(draft_task)
-            backfill = fact_doc(fact("simulation_parameter", "Fig. 4 power normalization"))
+            aggregate_request = collect_missing_fact_requests(preliminary)[0]
+            backfill_fact = fact("simulation_parameter", "Fig. 4 power normalization")
+            backfill_fact["evidence_kind"] = "paper_explicit"
+            backfill = {
+                **fact_doc(backfill_fact),
+                "request_resolutions": [
+                    {
+                        "request_id": aggregate_request["request_id"],
+                        "field_results": [
+                            {
+                                "field_id": "answer",
+                                "status": "resolved_explicit",
+                                "fact_refs": [
+                                    {
+                                        "type": "simulation_parameter",
+                                        "name": "Fig. 4 power normalization",
+                                    }
+                                ],
+                                "searched_locations": ["Fig. 4 caption"],
+                                "note": "explicitly stated",
+                            }
+                        ],
+                    }
+                ],
+            }
             finalized = task_doc({**draft_task, "missing_fact_requests": []})
 
             def fake_analysis_stage(**kwargs):
@@ -260,8 +285,8 @@ class PipelineTests(unittest.TestCase):
                 documents = {
                     "01_extract_engineering_facts": initial,
                     "02a_build_preliminary_repro_tasks": preliminary,
-                    "02b_targeted_fact_backfill": backfill,
-                    "02c_finalize_repro_tasks": finalized,
+                    "02b_round_01_targeted_fact_backfill": backfill,
+                    "02c_round_01_refresh_repro_tasks": finalized,
                 }
                 document = documents[label]
                 write_json(kwargs["output_path"], document)
@@ -291,8 +316,8 @@ class PipelineTests(unittest.TestCase):
                 [
                     "01_extract_engineering_facts",
                     "02a_build_preliminary_repro_tasks",
-                    "02b_targeted_fact_backfill",
-                    "02c_finalize_repro_tasks",
+                    "02b_round_01_targeted_fact_backfill",
+                    "02c_round_01_refresh_repro_tasks",
                 ],
             )
             final_facts = json.loads((output_dir / "engineering_facts.json").read_text(encoding="utf-8"))
@@ -311,6 +336,148 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(analysis_result["analysis_stage_invocations"], 5)
             self.assertFalse((output_dir / "repro_project").exists())
             self.assertFalse((output_dir / "runtime_result.json").exists())
+
+    def test_pipeline_runs_second_round_for_new_task_field(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paper_path = root / "paper.md"
+            paper_path.write_text("# Results\nFig. 4 reports throughput versus SNR.", encoding="utf-8")
+            output_dir = root / "case"
+            calls: list[str] = []
+
+            initial = fact_doc(
+                fact("figure_claim", "Fig. 4 throughput versus SNR"),
+                fact("metric", "throughput"),
+            )
+            draft = task("reproduce_fig_4", "Fig. 4")
+            draft["missing_fact_requests"] = [
+                {
+                    "request_id": "fig4_setup",
+                    "type": "simulation_parameter",
+                    "name": "Fig. 4 simulation setup",
+                    "why_needed": "controls the implementation",
+                    "impact": "high",
+                    "search_targets": ["Fig. 4"],
+                    "required_fields": [
+                        {
+                            "field_id": "normalization",
+                            "description": "power normalization",
+                            "affects": ["formula_chain"],
+                        }
+                    ],
+                }
+            ]
+            preliminary = task_doc(draft)
+            aggregate_id = collect_missing_fact_requests(preliminary)[0]["request_id"]
+
+            setup_fact = fact("simulation_parameter", "Fig. 4 simulation setup")
+            setup_fact["evidence_kind"] = "paper_explicit"
+            round_1_backfill = {
+                **fact_doc(setup_fact),
+                "request_resolutions": [
+                    {
+                        "request_id": aggregate_id,
+                        "field_results": [
+                            {
+                                "field_id": "normalization",
+                                "status": "resolved_explicit",
+                                "fact_refs": [
+                                    {
+                                        "type": "simulation_parameter",
+                                        "name": "Fig. 4 simulation setup",
+                                    }
+                                ],
+                                "searched_locations": ["Fig. 4"],
+                                "note": "found normalization",
+                            }
+                        ],
+                    }
+                ],
+            }
+            round_1_task = json.loads(json.dumps(preliminary))
+            round_1_task["repro_tasks"][0]["missing_fact_requests"][0]["required_fields"].append(
+                {
+                    "field_id": "trial_count",
+                    "description": "Monte Carlo trial count",
+                    "affects": ["statistical_protocol"],
+                }
+            )
+            round_2_backfill = {
+                **fact_doc(),
+                "request_resolutions": [
+                    {
+                        "request_id": aggregate_id,
+                        "field_results": [
+                            {
+                                "field_id": "trial_count",
+                                "status": "not_found_in_paper",
+                                "fact_refs": [],
+                                "searched_locations": ["Fig. 4", "Simulation Setup"],
+                                "note": "paper does not disclose a trial count",
+                            }
+                        ],
+                    }
+                ],
+            }
+            round_2_task = json.loads(json.dumps(round_1_task))
+            round_2_task["repro_tasks"][0]["assumptions"] = [
+                {
+                    "name": "Monte Carlo trial count",
+                    "default_value": 1000,
+                    "reason": "not disclosed in the paper",
+                    "risk": "medium",
+                    "request_id": aggregate_id,
+                    "field_ids": ["trial_count"],
+                    "sensitivity_check": "repeat with 500 and 2000 trials",
+                }
+            ]
+
+            documents = {
+                "01_extract_engineering_facts": initial,
+                "02a_build_preliminary_repro_tasks": preliminary,
+                "02b_round_01_targeted_fact_backfill": round_1_backfill,
+                "02c_round_01_refresh_repro_tasks": round_1_task,
+                "02b_round_02_targeted_fact_backfill": round_2_backfill,
+                "02c_round_02_refresh_repro_tasks": round_2_task,
+            }
+
+            def fake_analysis_stage(**kwargs):
+                label = kwargs["stage_label"]
+                calls.append(label)
+                document = documents[label]
+                write_json(kwargs["output_path"], document)
+                return document
+
+            def fake_thesis(**kwargs):
+                document = {
+                    "central_claim": "throughput increases with SNR",
+                    "proposed_method": "method",
+                    "mechanism": "higher SNR improves decoding",
+                    "comparisons": [],
+                    "headline_shape": "increasing",
+                    "caveats": [],
+                }
+                write_json(kwargs["output_dir"] / "paper_thesis.json", document)
+                return document
+
+            pipeline = ReviewPipeline()
+            with (
+                patch.object(pipeline, "_load_or_create_analysis_stage_json", side_effect=fake_analysis_stage),
+                patch.object(pipeline, "_load_or_create_paper_thesis", side_effect=fake_thesis),
+            ):
+                pipeline.run(paper_path, output_dir, resume=False, analysis_only=True)
+
+            self.assertEqual(len(calls), 6)
+            summary = json.loads(
+                (output_dir / "audit" / "02b_targeted_fact_backfill_summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(summary["round_count"], 2)
+            self.assertEqual(summary["terminal_unresolved_count"], 1)
+            self.assertEqual(summary["stop_reason"], "all_requests_terminal")
+            analysis_result = json.loads(
+                (output_dir / "analysis_result.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(analysis_result["analysis_stage_invocations"], 7)
 
 
 if __name__ == "__main__":

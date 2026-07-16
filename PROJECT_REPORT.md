@@ -1,6 +1,6 @@
 # 耿同学agent 项目架构报告（当前源码版）
 
-> 更新日期：2026-07-12。本文档以当前源码、CLI 和测试为准。
+> 更新日期：2026-07-16。本文档以当前源码、CLI 和测试为准。
 
 ## 1. 项目定位
 
@@ -8,7 +8,7 @@
 
 当前核心原则：
 
-- 前两阶段采用任务驱动证据闭环：全局事实抽取、初步任务设计、一次定向事实回补、任务定稿；不再以“直到零新增”为停止规则。
+- 前两阶段采用字段级任务驱动证据闭环：全局事实抽取、初步任务设计、定向事实回补与任务刷新交替执行；按有效字段增量收敛，最多 6 轮。
 - 论文解析后先建立带实体 ID、子图、公式、表格与交叉引用的 Paper Memory，并用快照哈希锁定第三轮输入。
 - `paper_thesis.json` 无条件抽取，向后续 writer 提供中心主张、机制、方法排序和适用区间。
 - 第三阶段使用任务级 Codex Writer 与对应的隔离 Task Reporter，不再保留全局 writer、harness runner、全局审查线程或模板项目路径。
@@ -52,12 +52,13 @@ OpenAI-compatible LLM 只保留为前两阶段显式兼容路径；第三阶段�
 3. **初步任务与定向回补**
    - Codex 任务设计专家生成 `repro_tasks_preliminary.json`。
    - 同一 figure/subfigure、同一指标、可共享仿真的曲线、baseline 和参数点优先合并成一个任务。
-   - 每个任务用 `missing_fact_requests` 精确声明会改变代码、配置或验收的缺失证据；低影响请求不触发回补。
-   - 程序按事实 type/name 合并去重所有中高影响请求，事实专家只执行一次定向检索，生成 `engineering_facts_backfill.json`。
+   - 每个任务用 `missing_fact_requests.required_fields` 精确声明会改变代码、配置或验收的缺失证据。
+   - 程序按稳定请求键和字段 ID 合并去重；每轮事实专家只处理尚无终态的字段，并把搜索位置、证据和冲突写入累计台账。
+   - 每轮结束后任务专家刷新公式链、参数矩阵、baseline、统计协议和图像锚点；只有新暴露的代码关键字段才触发下一轮，最多 6 轮。
 
 4. **任务定稿与论文主张**
    - 初始事实与回补事实语义合并为最终 `engineering_facts.json`，未解析请求保留为显式缺失信息。
-   - 任务专家根据最终事实定稿 `repro_tasks.json`，不再启动开放式查漏循环。
+   - 任务专家根据最终事实定稿 `repro_tasks.json`；论文未公开或证据冲突的字段保留显式假设和敏感性检查，不伪装成已解决事实。
    - 无条件生成 `paper_thesis.json`，记录中心结论、作用机制、方法排序、适用区间和 caveat。
    - `experiment_index.py` 生成 v2 实验索引，只记录实体、参数、baseline、验收标准和证据缺口，不预测运行结果。
 
@@ -103,7 +104,8 @@ OpenAI-compatible LLM 只保留为前两阶段显式兼容路径；第三阶段�
 | `paper_evidence.py` | 任务相关事实/页面选择、论文图像编码、排序锚点 |
 | `paper_memory.py` | 论文实体图、稳定 ID、交叉引用与快照 manifest |
 | `semantic_merge.py` / `facts_coverage.py` | 语义合并、冲突保留和子图级确定性覆盖 |
-| `task_evidence_backfill.py` | 跨任务事实请求去重、影响过滤和回补解析统计 |
+| `task_evidence_backfill.py` | 字段级请求去重、证据引用验收、搜索台账和有效增量统计 |
+| `targeted_backfill_loop.py` | 定向事实回补与任务刷新的最多六轮收敛编排 |
 | `experiment_index.py` | 无预评级的实验实体、参数、baseline 与证据缺口索引 |
 | `provenance.py` / `benchmark.py` | 自动化来源链与跨 case 离线评测 |
 | `task_scripts.py` | task manifest、dispatcher 和 trusted scaffolding |

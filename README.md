@@ -7,7 +7,7 @@
 ## 当前能力
 
 - 解析 PDF/TXT/Markdown 论文，构建带稳定实体 ID、子图、公式、表格、章节和交叉引用的 `paper_memory.json`。
-- 由一个 Codex 事实专家先建立高召回实验地图；初步任务再提出中高影响 `missing_fact_requests`，程序跨任务合并去重后只进行一次定向事实回补。
+- 由一个 Codex 事实专家先建立高召回实验地图；初步任务再提出字段级 `missing_fact_requests`，事实专家与任务专家围绕新暴露的代码关键字段迭代回补，收敛停止且最多 6 轮。
 - 无条件抽取论文核心主张、作用机制、方法排序和限制，生成 `paper_thesis.json` 作为后续复现锚点。
 - 将论文图表拆成可运行的复现实验任务；任务描述用于导航，最终科学目标始终以论文原文和原图为准。
 - 第三阶段采用任务级自治 writer：一个任务一个 Codex writer，任务数就是启动并发数；writer 自主写代码、直接运行 full、对比并迭代。
@@ -26,9 +26,10 @@
   -> 单个 Codex 事实专家生成 engineering_facts_initial.json，建立高召回实验地图
   -> 图中近似读数、视觉结构、附录公式和冲突观察均带来源/置信度保留，不做语义删除
   -> 单个 Codex 任务专家生成 repro_tasks_preliminary.json，并提出结构化事实缺口
-  -> 程序按 type + name 跨任务合并去重，仅对中高影响缺口执行一次定向事实回补
-  -> 合并生成 engineering_facts.json；未找到的证据显式保留为 missing_information
-  -> 任务专家根据回补结果定稿 repro_tasks.json
+  -> 程序按稳定请求键和 required_fields 跨任务合并去重，启动定向事实回补
+  -> 每轮按字段记录论文证据、未找到位置或冲突，并把搜索结果写入累计台账
+  -> 任务专家依据新事实刷新任务；只有新暴露的代码关键字段才进入下一轮，收敛停止且最多 6 轮
+  -> 合并生成 engineering_facts.json；未找到的证据转成显式假设和敏感性检查，最终定稿 repro_tasks.json
   -> Codex analysis 基于最终事实抽取 paper_thesis.json
   -> experiment_index v2 记录任务、图表、参数、baseline 和证据定位，不做运行前复现评级
   -> 为每个复现任务创建独立 sandbox

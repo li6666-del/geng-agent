@@ -7,8 +7,13 @@ from tempfile import TemporaryDirectory
 from geng_agent.stage_cleanup import _clear_stage_outputs
 from geng_agent.task_evidence_backfill import (
     collect_missing_fact_requests,
+    cumulative_resolution_from_ledger,
+    filter_actionable_requests,
     reconcile_final_tasks,
     summarize_backfill_resolution,
+    update_search_ledger,
+    validate_terminal_gap_assumptions,
+    validate_targeted_backfill,
 )
 from geng_agent.tasks_normalize import finalize_repro_tasks
 
@@ -59,7 +64,11 @@ class TaskEvidenceBackfillTests(unittest.TestCase):
 
     def test_low_impact_request_does_not_trigger_backfill(self) -> None:
         tasks = {"repro_tasks": [_task("task_a", [_request("a", impact="low")])]}
-        self.assertEqual(collect_missing_fact_requests(tasks), [])
+        self.assertEqual(collect_missing_fact_requests(tasks, minimum_impact="medium"), [])
+
+    def test_default_worklist_keeps_every_material_request(self) -> None:
+        tasks = {"repro_tasks": [_task("task_a", [_request("a", impact="low")])]}
+        self.assertEqual(len(collect_missing_fact_requests(tasks)), 1)
 
     def test_shared_request_uses_highest_impact_and_keeps_all_tasks(self) -> None:
         tasks = {
@@ -72,7 +81,19 @@ class TaskEvidenceBackfillTests(unittest.TestCase):
         self.assertEqual(worklist[0]["impact"], "high")
         self.assertEqual(worklist[0]["task_ids"], ["task_a", "task_b"])
 
-    def test_resolution_uses_stable_fact_type_and_name(self) -> None:
+    def test_unicode_request_names_remain_distinct(self) -> None:
+        first = _request("a")
+        first["name"] = "图四发射功率归一化"
+        second = _request("b")
+        second["name"] = "图四蒙特卡洛次数"
+        tasks = {"repro_tasks": [_task("task_a", [first, second])]}
+
+        worklist = collect_missing_fact_requests(tasks)
+
+        self.assertEqual(len(worklist), 2)
+        self.assertEqual(len({item["request_id"] for item in worklist}), 2)
+
+    def test_fact_name_alone_does_not_resolve_a_request(self) -> None:
         requests = collect_missing_fact_requests(
             {"repro_tasks": [_task("task_a", [_request("a")])]}
         )
@@ -87,8 +108,80 @@ class TaskEvidenceBackfillTests(unittest.TestCase):
 
         summary = summarize_backfill_resolution(requests, facts)
 
+        self.assertEqual(summary["resolved_count"], 0)
+        self.assertEqual(summary["open_count"], 1)
+
+    def test_field_level_evidence_resolves_a_request(self) -> None:
+        requests = collect_missing_fact_requests(
+            {"repro_tasks": [_task("task_a", [_request("a")])]}
+        )
+        facts = {
+            "engineering_facts": [
+                {
+                    "type": "simulation_parameter",
+                    "name": "Fig. 4 transmit-power normalization",
+                    "evidence_kind": "paper_explicit",
+                }
+            ]
+        }
+        backfill = {
+            "request_resolutions": [
+                {
+                    "request_id": requests[0]["request_id"],
+                    "field_results": [
+                        {
+                            "field_id": "answer",
+                            "status": "resolved_explicit",
+                            "fact_refs": [
+                                {
+                                    "type": "simulation_parameter",
+                                    "name": "Fig. 4 transmit-power normalization",
+                                }
+                            ],
+                            "searched_locations": ["Fig. 4 caption"],
+                            "note": "explicitly stated",
+                        }
+                    ],
+                }
+            ]
+        }
+
+        summary = summarize_backfill_resolution(requests, facts, backfill)
+
         self.assertEqual(summary["resolved_count"], 1)
         self.assertEqual(summary["unresolved_count"], 0)
+
+    def test_not_found_is_terminal_but_not_resolved(self) -> None:
+        requests = collect_missing_fact_requests(
+            {"repro_tasks": [_task("task_a", [_request("a")])]}
+        )
+        backfill = {
+            "request_resolutions": [
+                {
+                    "request_id": requests[0]["request_id"],
+                    "field_results": [
+                        {
+                            "field_id": "answer",
+                            "status": "not_found_in_paper",
+                            "fact_refs": [],
+                            "searched_locations": ["Fig. 4 caption"],
+                            "note": "not disclosed",
+                        }
+                    ],
+                }
+            ]
+        }
+        summary = summarize_backfill_resolution(requests, {"engineering_facts": []}, backfill)
+        ledger = update_search_ledger(
+            None, round_index=1, requests=requests, resolution=summary
+        )
+
+        self.assertEqual(summary["terminal_unresolved_count"], 1)
+        self.assertEqual(filter_actionable_requests(requests, ledger), [])
+        cumulative = cumulative_resolution_from_ledger(
+            requests, {"engineering_facts": []}, ledger
+        )
+        self.assertEqual(cumulative["terminal_unresolved_count"], 1)
 
     def test_task_normalization_preserves_structured_requests(self) -> None:
         document = {"repro_tasks": [_task("task_a", [_request("a")])]}
@@ -131,7 +224,28 @@ class TaskEvidenceBackfillTests(unittest.TestCase):
                 }
             ]
         }
-        resolution = summarize_backfill_resolution(requests, facts)
+        backfill = {
+            "request_resolutions": [
+                {
+                    "request_id": requests[0]["request_id"],
+                    "field_results": [
+                        {
+                            "field_id": "answer",
+                            "status": "resolved_explicit",
+                            "fact_refs": [
+                                {
+                                    "type": "simulation_parameter",
+                                    "name": "Fig. 4 transmit-power normalization",
+                                }
+                            ],
+                            "searched_locations": ["Fig. 4 caption"],
+                            "note": "explicitly stated",
+                        }
+                    ],
+                }
+            ]
+        }
+        resolution = summarize_backfill_resolution(requests, facts, backfill)
 
         reconciled = reconcile_final_tasks(draft, draft, resolution)
 
@@ -146,6 +260,97 @@ class TaskEvidenceBackfillTests(unittest.TestCase):
                 }
             ],
         )
+
+    def test_validator_rejects_resolved_field_without_fact_ref(self) -> None:
+        requests = collect_missing_fact_requests(
+            {"repro_tasks": [_task("task_a", [_request("a")])]}
+        )
+        document = {
+            "engineering_facts": [],
+            "request_resolutions": [
+                {
+                    "request_id": requests[0]["request_id"],
+                    "field_results": [
+                        {
+                            "field_id": "answer",
+                            "status": "resolved_explicit",
+                            "fact_refs": [],
+                            "searched_locations": ["Fig. 4"],
+                            "note": "claimed resolved",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        issues = validate_targeted_backfill(
+            document, requests, {"engineering_facts": []}
+        )
+
+        self.assertTrue(any("requires evidence" in issue.message for issue in issues))
+
+    def test_validator_rejects_derived_fact_without_derivation_chain(self) -> None:
+        requests = collect_missing_fact_requests(
+            {"repro_tasks": [_task("task_a", [_request("a")])]}
+        )
+        fact = {
+            "type": "simulation_parameter",
+            "name": "Fig. 4 transmit-power normalization",
+            "evidence_kind": "paper_derived",
+        }
+        document = {
+            "engineering_facts": [fact],
+            "request_resolutions": [
+                {
+                    "request_id": requests[0]["request_id"],
+                    "field_results": [
+                        {
+                            "field_id": "answer",
+                            "status": "resolved_derived",
+                            "fact_refs": [
+                                {"type": fact["type"], "name": fact["name"]}
+                            ],
+                            "searched_locations": ["Equation 12"],
+                            "note": "derived from the stated normalization",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        issues = validate_targeted_backfill(
+            document, requests, {"engineering_facts": []}
+        )
+
+        self.assertTrue(any("derivation chain" in issue.message for issue in issues))
+
+    def test_terminal_gap_requires_linked_sensitivity_assumption(self) -> None:
+        request = collect_missing_fact_requests(
+            {"repro_tasks": [_task("task_a", [_request("a")])]}
+        )[0]
+        resolution = {
+            "terminal_unresolved": [
+                {
+                    **request,
+                    "field_results": [
+                        {"field_id": "answer", "status": "not_found_in_paper"}
+                    ],
+                }
+            ]
+        }
+        tasks = {"repro_tasks": [_task("task_a", [_request("a")])]}
+
+        issues = validate_terminal_gap_assumptions(tasks, resolution)
+        self.assertTrue(issues)
+
+        tasks["repro_tasks"][0]["assumptions"] = [
+            {
+                "request_id": request["request_id"],
+                "field_ids": ["answer"],
+                "sensitivity_check": "run 500 and 2000 trials",
+            }
+        ]
+        self.assertEqual(validate_terminal_gap_assumptions(tasks, resolution), [])
 
     def test_task_restart_preserves_global_facts_and_clears_derived_evidence(self) -> None:
         with TemporaryDirectory() as temp_dir:

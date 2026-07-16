@@ -30,13 +30,22 @@ from pydantic import ValidationError
 
 from .facts_normalize import _map_enum, _norm_token, _salvage_array_objects
 from .json_utils import prepare_json_candidate
-from .schema_models import AssumptionRisk, FactType, MetricName, MissingImpact, ReproTask, TrendDirection
+from .schema_models import (
+    AssumptionRisk,
+    FactType,
+    MetricName,
+    MissingImpact,
+    ReproTask,
+    TaskSpecificationStatus,
+    TrendDirection,
+)
 
 _ALLOWED_METRICS = set(get_args(MetricName))
 _ALLOWED_DIRECTIONS = set(get_args(TrendDirection))
 _ALLOWED_RISK = set(get_args(AssumptionRisk))
 _ALLOWED_FACT_TYPES = set(get_args(FactType))
 _ALLOWED_IMPACTS = set(get_args(MissingImpact))
+_ALLOWED_SPEC_STATUSES = set(get_args(TaskSpecificationStatus))
 
 _TASK_KEYS = {
     "task_id",
@@ -52,10 +61,23 @@ _TASK_KEYS = {
     "missing_fact_requests",
     "assumptions",
     "risk_if_unreproducible",
+    "formula_chain",
+    "parameter_matrix",
+    "baseline_definitions",
+    "statistical_protocol",
+    "validation_anchors",
 }
 _TREND_KEYS = {"x_axis", "y_axis", "direction", "reason"}
 _COMPARISON_KEYS = {"baselines", "curve_groups", "tolerance"}
-_ASSUMPTION_KEYS = {"name", "default_value", "reason", "risk"}
+_ASSUMPTION_KEYS = {
+    "name",
+    "default_value",
+    "reason",
+    "risk",
+    "request_id",
+    "field_ids",
+    "sensitivity_check",
+}
 _DOC_KEYS = {"repro_tasks", "_meta"}
 
 METRIC_SYNONYMS = {
@@ -286,6 +308,16 @@ def _normalize_task(task: dict[str, Any], index: int, coercions: list[str], fact
         task.get("missing_fact_requests"), index, coercions
     )
     task["assumptions"] = _normalize_assumptions(task.get("assumptions"), index, coercions)
+    for key in (
+        "formula_chain",
+        "parameter_matrix",
+        "baseline_definitions",
+        "statistical_protocol",
+        "validation_anchors",
+    ):
+        task[key] = _normalize_spec_items(
+            task.get(key), key, index, coercions, fact_keys, name_to_types, alias_to_key
+        )
 
 
 def _normalize_trend(trend: dict[str, Any], index: int, coercions: list[str]) -> None:
@@ -395,7 +427,65 @@ def _normalize_assumptions(items: Any, index: int, coercions: list[str]) -> list
         if not (isinstance(name, str) and name.strip()) or not (isinstance(reason, str) and reason.strip()):
             continue
         risk, _ = _map_enum(item.get("risk"), _ALLOWED_RISK, _RISK_SYNONYMS, "medium")
-        cleaned.append({"name": name, "default_value": item.get("default_value"), "reason": reason, "risk": risk})
+        field_ids = item.get("field_ids")
+        cleaned.append(
+            {
+                "name": name,
+                "default_value": item.get("default_value"),
+                "reason": reason,
+                "risk": risk,
+                "request_id": (
+                    str(item.get("request_id")).strip()
+                    if item.get("request_id") is not None
+                    else None
+                ),
+                "field_ids": [
+                    str(field_id).strip()
+                    for field_id in field_ids
+                    if str(field_id).strip()
+                ] if isinstance(field_ids, list) else [],
+                "sensitivity_check": str(item.get("sensitivity_check") or "").strip(),
+            }
+        )
+    return cleaned
+
+
+def _normalize_spec_items(
+    items: Any,
+    key: str,
+    index: int,
+    coercions: list[str],
+    fact_keys: set[tuple[str, str]],
+    name_to_types: dict[str, set[str]],
+    alias_to_key: dict[str, tuple[str, str]],
+) -> list[dict[str, Any]]:
+    if not isinstance(items, list):
+        return []
+    cleaned: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        status = str(item.get("status") or "unresolved").strip().lower()
+        if status not in _ALLOWED_SPEC_STATUSES:
+            status = "unresolved"
+        evidence_facts = _normalize_required_facts(
+            item.get("evidence_facts"), index, coercions,
+            fact_keys, name_to_types, alias_to_key,
+        )
+        cleaned.append(
+            {
+                "name": name,
+                "value": item.get("value"),
+                "status": status,
+                "evidence_facts": evidence_facts,
+                "note": str(item.get("note") or ""),
+            }
+        )
+    if len(cleaned) != len(items):
+        coercions.append(f"tasks[{index}] normalized {key}")
     return cleaned
 
 
@@ -425,6 +515,40 @@ def _normalize_missing_fact_requests(
             impact = "medium"
         request_id = str(item.get("request_id") or f"task_{index + 1}_request_{request_index + 1}").strip()
         search_targets = item.get("search_targets")
+        raw_fields = item.get("required_fields")
+        required_fields: list[dict[str, Any]] = []
+        seen_fields: set[str] = set()
+        for field_index, field in enumerate(raw_fields if isinstance(raw_fields, list) else []):
+            if not isinstance(field, dict):
+                continue
+            field_id = str(field.get("field_id") or "").strip()
+            description = str(field.get("description") or "").strip()
+            if not field_id or not description or field_id.casefold() in seen_fields:
+                continue
+            seen_fields.add(field_id.casefold())
+            affects = field.get("affects")
+            required_fields.append(
+                {
+                    "field_id": field_id,
+                    "description": description,
+                    "affects": [
+                        str(value).strip()
+                        for value in affects
+                        if str(value).strip()
+                    ] if isinstance(affects, list) else [],
+                }
+            )
+        if not required_fields:
+            required_fields = [
+                {
+                    "field_id": "answer",
+                    "description": why_needed,
+                    "affects": ["implementation"],
+                }
+            ]
+            coercions.append(
+                f"tasks[{index}].missing_fact_requests[{request_index}] added legacy answer field"
+            )
         cleaned.append(
             {
                 "request_id": request_id,
@@ -436,6 +560,7 @@ def _normalize_missing_fact_requests(
                     str(target).strip()
                     for target in search_targets if str(target).strip()
                 ] if isinstance(search_targets, list) else [],
+                "required_fields": required_fields,
             }
         )
     if len(cleaned) != len(items):
