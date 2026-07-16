@@ -44,6 +44,7 @@ _CASE_NAME_RE = re.compile(r"[^\w\-. ]+", re.UNICODE)
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_database()
+    _recover_interrupted_eager_jobs()
     yield
 
 
@@ -158,7 +159,14 @@ def _latest_job(session: Session, case_id: str) -> JobRecord | None:
 
 def _dispatch_review(job_id: str) -> None:
     if settings.celery_eager:
-        threading.Thread(target=run_review.delay, args=(job_id,), name=f"geng-eager-{job_id[:8]}", daemon=True).start()
+        # Keep the local worker alive through a graceful Web-server shutdown. The
+        # production path already uses a separate Celery worker process.
+        threading.Thread(
+            target=run_review.delay,
+            args=(job_id,),
+            name=f"geng-eager-{job_id[:8]}",
+            daemon=False,
+        ).start()
         return
     try:
         run_review.delay(job_id)
@@ -171,6 +179,23 @@ def _dispatch_review(job_id: str) -> None:
                 job.error_message = str(exc)
                 session.commit()
         raise HTTPException(status_code=503, detail="任务队列暂不可用") from exc
+
+
+def _recover_interrupted_eager_jobs() -> list[str]:
+    """Resume local jobs whose in-process worker disappeared with the Web process."""
+    if not settings.celery_eager:
+        return []
+    with SessionLocal() as session:
+        job_ids = list(
+            session.scalars(
+                select(JobRecord.id).where(
+                    JobRecord.status.in_(("queued", "running", "cancel_requested"))
+                )
+            ).all()
+        )
+    for job_id in job_ids:
+        _dispatch_review(job_id)
+    return job_ids
 
 
 async def _save_upload(upload: UploadFile, destination: Path) -> str:

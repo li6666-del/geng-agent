@@ -10,7 +10,7 @@ import zipfile
 from pathlib import Path
 from typing import Any, Iterable
 
-from sqlalchemy import delete
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from geng_agent.progress import phase_for_step
@@ -26,9 +26,19 @@ STEP_FILES: dict[str, tuple[str, ...]] = {
         "engineering_facts.json",
     ),
     "repro_tasks": ("repro_tasks_preliminary.json", "repro_tasks.json"),
-    "experiment_index": ("experiment_index.json", "paper_thesis.json"),
+    "experiment_index": (
+        "experiment_index.json",
+        "paper_thesis.json",
+        "fact_conflicts.json",
+        "task_conflicts.json",
+        "memory_manifest.json",
+    ),
     "repro_project_manifest": ("repro_project_manifest.json",),
-    "repro_project": ("repro_project/",),
+    "repro_project": (
+        "repro_project/",
+        "audit/03c_task_writer_sandboxes/",
+        "audit/04a_task_reporters/",
+    ),
     "runtime": ("runtime_result.json",),
     "verification_result": ("verification_result.json",),
     "result_review": ("report_assets/", "reproduction_report.md", "result_review.md", "review.md"),
@@ -42,6 +52,14 @@ STEP_FILES: dict[str, tuple[str, ...]] = {
         "automation_provenance.json",
     ),
 }
+
+LIVE_AUDIT_GLOBS: tuple[str, ...] = (
+    "audit/03c_task_writer_sandboxes/*/outputs/**/*",
+    "audit/03c_task_writer_sandboxes/*/task_agent_result.json",
+    "audit/03c_task_writer_sandboxes/*/task_agent_result.md",
+    "audit/04a_task_reporters/*/round_*/report_assets/**/*",
+    "audit/04a_task_reporters/*/round_*/task_verification_result.json",
+)
 
 
 class UnsafeArtifactPath(ValueError):
@@ -72,13 +90,21 @@ class LocalArtifactStore:
     def iter_files(self) -> Iterable[Path]:
         if not self.case_dir.exists():
             return
+        yielded: set[Path] = set()
         for path in self.case_dir.rglob("*"):
             if not path.is_file() or path.is_symlink():
                 continue
             rel = path.relative_to(self.case_dir)
             if any(part.startswith(".") for part in rel.parts) or rel.parts[0] in {"audit", "exports"}:
                 continue
+            yielded.add(path)
             yield path
+        for pattern in LIVE_AUDIT_GLOBS:
+            for path in self.case_dir.glob(pattern):
+                if path in yielded or not path.is_file() or path.is_symlink():
+                    continue
+                yielded.add(path)
+                yield path
 
 
 def _sha256(path: Path) -> str:
@@ -121,23 +147,45 @@ def phase_for_path(relative_path: str) -> str:
 
 def catalog_case_artifacts(session: Session, case: CaseRecord) -> list[ArtifactRecord]:
     store = LocalArtifactStore(Path(case.directory))
-    session.execute(delete(ArtifactRecord).where(ArtifactRecord.case_id == case.id))
+    existing = {
+        item.relative_path: item
+        for item in session.scalars(
+            select(ArtifactRecord).where(ArtifactRecord.case_id == case.id)
+        ).all()
+    }
+    seen: set[str] = set()
     records: list[ArtifactRecord] = []
     for path in store.iter_files():
         rel = path.relative_to(store.case_dir).as_posix()
+        seen.add(rel)
+        try:
+            before = path.stat()
+            sha256 = _sha256(path)
+            after = path.stat()
+        except OSError:
+            # A writer may atomically replace an output while a live catalog pass is
+            # walking the case. Keep any previous record and retry at the next boundary.
+            continue
+        if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
+            continue
         mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-        record = ArtifactRecord(
-            id=str(uuid.uuid4()),
-            case_id=case.id,
-            phase=phase_for_path(rel),
-            relative_path=rel,
-            kind=artifact_kind(path),
-            mime_type=mime,
-            size_bytes=path.stat().st_size,
-            sha256=_sha256(path),
-        )
-        session.add(record)
+        record = existing.get(rel)
+        if record is None:
+            record = ArtifactRecord(
+                id=str(uuid.uuid4()),
+                case_id=case.id,
+                relative_path=rel,
+            )
+            session.add(record)
+        record.phase = phase_for_path(rel)
+        record.kind = artifact_kind(path)
+        record.mime_type = mime
+        record.size_bytes = after.st_size
+        record.sha256 = sha256
         records.append(record)
+    for rel, record in existing.items():
+        if rel not in seen:
+            session.delete(record)
     session.commit()
     return records
 

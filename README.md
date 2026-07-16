@@ -193,11 +193,13 @@ python -m geng_agent benchmark case_001 case_002 --out benchmark_report
 
 ## Web UI
 
-安装 web extra 后启动，前端静态文件已经随 Python 包提供：
+安装 web extra 后启动，前端静态文件已经随 Python 包提供。Windows 日常运行建议使用持久启动脚本，它会把服务放到独立后台进程，不继承调用终端或自动化工具的执行时限：
 
-```bash
-geng-agent-web
+```powershell
+.\start-web.ps1
 ```
+
+`geng-agent-web` 仍可用于前台调试。Web 服务和本地 Celery 作业均不设置固定 hard/soft time limit；持久启动日志及 PID 写入 `GENG_CASES_ROOT\.web\`。
 
 浏览器打开：
 
@@ -205,7 +207,7 @@ geng-agent-web
 http://127.0.0.1:8765
 ```
 
-Web UI 支持上传 PDF、管理案例、查看五个当前主流程阶段、接收 SSE 实时事件、预览阶段产物并导出 ZIP。五个阶段对应“论文解构、复现设计、任务级复现、报告编排、交付物生成”，不再依赖旧流水线的私有方法名。
+Web UI 支持上传 PDF、管理案例、查看五个当前主流程阶段、接收 SSE 实时事件、预览阶段产物并导出 ZIP。运行期间每 10 秒增量更新一次产物索引，每个步骤或阶段完成时也会立即同步；任务失败、取消或重试前仍会保留并展示已经落盘的阶段产物。第三阶段只索引 writer 的结果图、CSV、summary、自审结果及 task reporter 的目标裁图和核验结果，不索引大体积 transcript 与重复论文页。五个阶段对应“论文解构、复现设计、任务级复现、报告编排、交付物生成”，不再依赖旧流水线的私有方法名。
 
 本地默认使用 SQLite 和进程内 Celery eager worker；数据库位于 case 根目录下的 `geng_web.db`。生产部署可通过以下环境变量切换 PostgreSQL、Redis 和外部 Celery worker：
 

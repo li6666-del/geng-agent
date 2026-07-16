@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import threading
 
 from celery import Celery
 from sqlalchemy import select
@@ -23,7 +24,60 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,
     task_track_started=True,
     task_always_eager=settings.celery_eager,
+    task_time_limit=None,
+    task_soft_time_limit=None,
 )
+
+
+_ARTIFACT_SYNC_EVENTS = {"step.completed", "phase.completed"}
+_LIVE_ARTIFACT_SYNC_SECONDS = 10.0
+
+
+def _sync_job_artifacts(job_id: str) -> None:
+    with SessionLocal() as session:
+        job = session.get(JobRecord, job_id)
+        case = session.get(CaseRecord, job.case_id) if job else None
+        if case is not None:
+            catalog_case_artifacts(session, case)
+
+
+def _best_effort_sync_job_artifacts(job_id: str) -> Exception | None:
+    try:
+        _sync_job_artifacts(job_id)
+    except Exception as exc:
+        return exc
+    return None
+
+
+def _record_sync_warning(job_id: str, error: Exception, payload: dict | None = None) -> None:
+    payload = payload or {}
+    try:
+        append_event(
+            job_id,
+            {
+                "type": "artifact.sync_failed",
+                "phase": payload.get("phase"),
+                "step": payload.get("step"),
+                "message": "阶段产物索引将在下一边界重试",
+                "data": {"error": str(error)[:1000]},
+            },
+        )
+    except Exception:
+        pass
+
+
+def _record_progress(job_id: str, payload: dict) -> None:
+    sync_error = None
+    if payload.get("type") in _ARTIFACT_SYNC_EVENTS:
+        sync_error = _best_effort_sync_job_artifacts(job_id)
+    append_event(job_id, payload)
+    if sync_error is not None:
+        _record_sync_warning(job_id, sync_error, payload)
+
+
+def _live_artifact_sync(job_id: str, stop: threading.Event) -> None:
+    while not stop.wait(_LIVE_ARTIFACT_SYNC_SECONDS):
+        _best_effort_sync_job_artifacts(job_id)
 
 
 def _cancel_requested(job_id: str) -> bool:
@@ -78,10 +132,21 @@ def run_review(self, job_id: str) -> None:
         {"type": "job.started", "message": "复现任务已由 worker 接管", "data": {"attempt": self.request.retries + 1}},
     )
     reporter = CallbackProgressReporter(
-        callback=lambda payload: append_event(job_id, payload),
+        callback=lambda payload: _record_progress(job_id, payload),
         cancelled=lambda: _cancel_requested(job_id),
     )
+    sync_stop = threading.Event()
+    sync_thread = threading.Thread(
+        target=_live_artifact_sync,
+        args=(job_id, sync_stop),
+        name=f"geng-artifacts-{job_id[:8]}",
+        daemon=True,
+    )
+    sync_thread.start()
     try:
+        initial_sync_error = _best_effort_sync_job_artifacts(job_id)
+        if initial_sync_error is not None:
+            _record_sync_warning(job_id, initial_sync_error)
         pipeline = ReviewPipeline()
         pipeline.run(
             paper_path=paper_path,
@@ -92,19 +157,24 @@ def run_review(self, job_id: str) -> None:
             progress=reporter,
         )
         reporter.check_cancelled()
+        final_sync_error = _best_effort_sync_job_artifacts(job_id)
         with SessionLocal() as session:
             job = session.get(JobRecord, job_id)
             case = session.get(CaseRecord, job.case_id) if job else None
             if job is None or case is None:
                 return
-            catalog_case_artifacts(session, case)
             job.status = "succeeded"
             job.error_code = None
             job.error_message = None
             job.finished_at = datetime.now(timezone.utc)
             session.commit()
+        if final_sync_error is not None:
+            _record_sync_warning(job_id, final_sync_error)
         append_event(job_id, {"type": "job.finished", "message": "复现航行已完成", "data": {"ok": True}})
     except PipelineCancelled:
+        sync_error = _best_effort_sync_job_artifacts(job_id)
+        if sync_error is not None:
+            _record_sync_warning(job_id, sync_error)
         with SessionLocal() as session:
             job = session.get(JobRecord, job_id)
             if job:
@@ -113,6 +183,9 @@ def run_review(self, job_id: str) -> None:
                 session.commit()
         append_event(job_id, {"type": "job.cancelled", "message": "任务已在安全边界停止"})
     except Exception as exc:
+        sync_error = _best_effort_sync_job_artifacts(job_id)
+        if sync_error is not None:
+            _record_sync_warning(job_id, sync_error)
         if _is_transient(exc) and self.request.retries < self.max_retries:
             next_retry = self.request.retries + 1
             with SessionLocal() as session:
@@ -140,6 +213,9 @@ def run_review(self, job_id: str) -> None:
             {"type": "job.failed", "message": "复现任务失败", "data": {"code": type(exc).__name__, "detail": str(exc)[:1000]}},
         )
         raise
+    finally:
+        sync_stop.set()
+        sync_thread.join(timeout=2.0)
 
 
 @celery_app.task(bind=True, max_retries=1, name="geng.build_export")

@@ -27,7 +27,13 @@ class ArtifactStoreTests(unittest.TestCase):
         self.assertEqual(artifact_kind(Path("results.csv")), "csv")
         self.assertEqual(phase_for_path("engineering_facts_initial.json"), "paper_analysis")
         self.assertEqual(phase_for_path("engineering_facts.json"), "repro_design")
+        self.assertEqual(phase_for_path("fact_conflicts.json"), "repro_design")
+        self.assertEqual(phase_for_path("memory_manifest.json"), "repro_design")
         self.assertEqual(phase_for_path("repro_project/outputs/figure.png"), "task_reproduction")
+        self.assertEqual(
+            phase_for_path("audit/03c_task_writer_sandboxes/01_task/outputs/task/figure.png"),
+            "task_reproduction",
+        )
         self.assertEqual(phase_for_path("review.md"), "report_composition")
         self.assertEqual(phase_for_path("review.docx"), "report_delivery")
 
@@ -37,6 +43,9 @@ class ArtifactStoreTests(unittest.TestCase):
             (root / "review.md").write_text("ok", encoding="utf-8")
             (root / "audit").mkdir()
             (root / "audit" / "transcript.txt").write_text("large trace", encoding="utf-8")
+            live_output = root / "audit" / "03c_task_writer_sandboxes" / "01_task" / "outputs" / "task"
+            live_output.mkdir(parents=True)
+            (live_output / "figure.png").write_bytes(b"png")
             (root / "exports").mkdir()
             (root / "exports" / "case.zip").write_bytes(b"zip")
 
@@ -44,7 +53,13 @@ class ArtifactStoreTests(unittest.TestCase):
                 path.relative_to(root).as_posix()
                 for path in LocalArtifactStore(root).iter_files()
             }
-            self.assertEqual(relative, {"review.md"})
+            self.assertEqual(
+                relative,
+                {
+                    "review.md",
+                    "audit/03c_task_writer_sandboxes/01_task/outputs/task/figure.png",
+                },
+            )
 
 
 if __name__ == "__main__":
