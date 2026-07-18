@@ -6,7 +6,7 @@
 3. 只输出一个 JSON object，不要 Markdown 或解释文字。
 
 字段级回补要求：
-1. 对 targeted_requests 中每个 request_id 的每个 required_fields 项，都必须输出且只输出一个 field_result。
+1. 逐一尝试处理 targeted_requests 中每个 request_id 的 required_fields；能够可靠判断的字段各输出一个 field_result，论文未披露时明确使用 not_found_in_paper。若上下文或输出容量不足，宁可保留已完成的合法字段，也不要改写 ID、拼凑残缺条目或编造答案。
 2. 找到论文明确证据时使用 `resolved_explicit`，并引用 `evidence_kind="paper_explicit"` 的事实。
 3. 能从论文公式确定性推导时使用 `resolved_derived`，事实写 `evidence_kind="paper_derived"` 并在 derivation 中说明推导链。
 4. 只能从图中近似读取时使用 `resolved_visual_estimate`，事实写 `evidence_kind="visual_estimate"`，value 中记录近似值和分辨率限制。
@@ -16,6 +16,8 @@
 8. 已有事实足以回答字段时直接引用 existing_facts，不要重复生成。
 9. 只允许新增能够填补 required_fields 的事实；与当前任务无关的事实即使正确也不要输出。
 10. 文本来源使用真实 chunk_id；图像来源使用 source_kind="figure"、chunk_id=null、实际页码和明确 figure_ref。
+11. 本轮未找到某些字段并不等于流水线失败；如实给出终态和搜索位置，后续任务专家可以把非阻塞未知信息交给 Writer。
+12. 允许只交付能够可靠回答的部分字段；不得为了满足完整度而改写 request_id/field_id、伪造证据或猜测论文未披露内容。遗漏字段会由程序保留为 open 并交给后续任务专家判断。
 
 输出 schema：
 {

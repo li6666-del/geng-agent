@@ -34,7 +34,6 @@ PHASES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
 
 STEP_PHASE_ALIASES: dict[str, str] = {
     "paper": "paper_analysis",
-    "paper_memory": "paper_analysis",
     "engineering_facts": "paper_analysis",
     "repro_tasks": "repro_design",
     "paper_thesis": "repro_design",

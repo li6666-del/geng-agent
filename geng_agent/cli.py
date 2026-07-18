@@ -21,21 +21,31 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument("--no-resume", action="store_true", help="不复用已有阶段产物，从头重新运行。")
 
     status = subparsers.add_parser("status", help="检查已有 case 目录的断点续跑状态。")
-    status.add_argument("out", type=Path, help="已有输出目录。")
+    status.add_argument("out", type=Path, help="已有输出目录；相对名称从统一 case 根目录解析。")
 
     subparsers.add_parser(
         "doctor",
         help="自检本机环境（Python 版本 + 运行依赖 + 复现白名单库）；建议在输入 PDF 前先运行。",
     )
     benchmark = subparsers.add_parser("benchmark", help="离线汇总多个 case 的复现覆盖、结论、耗时和成本。")
-    benchmark.add_argument("cases", nargs="+", type=Path, help="一个或多个 case 输出目录。")
+    benchmark.add_argument(
+        "cases",
+        nargs="+",
+        type=Path,
+        help="一个或多个 case 输出目录；相对名称从统一 case 根目录解析。",
+    )
     benchmark.add_argument("--out", type=Path, required=True, help="benchmark JSON/Markdown 输出目录。")
     return parser
 
 
 def _add_common_review_args(parser: argparse.ArgumentParser, *, include_resume: bool) -> None:
     parser.add_argument("paper", type=Path, help="论文文件，支持 PDF/TXT/Markdown。")
-    parser.add_argument("--out", type=Path, required=True, help="输出目录。")
+    parser.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        help="case 输出目录；相对名称自动放入桌面统一 case 根目录。",
+    )
     parser.add_argument("--api-key", default=None, help="OpenAI 兼容 API key。")
     parser.add_argument("--base-url", default=None, help="OpenAI 兼容 API base URL。")
     parser.add_argument("--model", default=None, help="模型名。")
@@ -63,7 +73,7 @@ def _add_common_review_args(parser: argparse.ArgumentParser, *, include_resume: 
         default=1800.0,
         help="MinerU 每篇论文预解析超时，单位秒；默认 1800，超时后自动回退页面图定位。",
     )
-    parser.add_argument("--json-repair-attempts", type=int, default=5, help="前两阶段 Codex/兼容 LLM 输出未通过 JSON schema 时的重试次数；只在结构校验失败时追加调用。")
+    parser.add_argument("--json-repair-attempts", type=int, default=1, help="前两阶段输出无法解析或基础结构仍不合法时的格式修复次数；默认最多修复一次，不用于科学内容重写。")
     parser.add_argument(
         "--analysis-backend",
         choices=("codex", "llm"),
@@ -97,6 +107,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if report.fatal else 0
 
     if args.command == "review":
+        output_dir = _resolve_case_path_or_error(args.out, parser)
         _warn_if_environment_incomplete()
         from .pipeline import ReviewPipeline
 
@@ -106,7 +117,7 @@ def main(argv: list[str] | None = None) -> int:
             client = None
         result = ReviewPipeline(client=client).run(
             paper_path=args.paper,
-            output_dir=args.out,
+            output_dir=output_dir,
             max_pages=args.max_pages,
             run_repro=args.run_repro,
             run_timeout=args.run_timeout,
@@ -142,7 +153,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "benchmark":
         from .benchmark import build_benchmark, write_benchmark_reports
 
-        report = build_benchmark(args.cases)
+        case_dirs = [_resolve_case_path_or_error(path, parser) for path in args.cases]
+        report = build_benchmark(case_dirs)
         json_path, markdown_path = write_benchmark_reports(
             report,
             json_path=args.out / "benchmark.json",
@@ -156,11 +168,20 @@ def main(argv: list[str] | None = None) -> int:
         from .json_utils import pretty_json
         from .status import inspect_case_status
 
-        print(pretty_json(inspect_case_status(args.out)))
+        print(pretty_json(inspect_case_status(_resolve_case_path_or_error(args.out, parser))))
         return 0
 
     parser.error(f"未知命令：{args.command}")
     return 2
+
+
+def _resolve_case_path_or_error(path: Path, parser: argparse.ArgumentParser) -> Path:
+    from .config import resolve_case_dir
+
+    try:
+        return resolve_case_dir(path)
+    except ValueError as exc:
+        parser.error(str(exc))
 
 
 def _warn_if_environment_incomplete() -> None:

@@ -9,9 +9,11 @@ from tempfile import TemporaryDirectory
 
 from geng_agent.agentic_task_reporters import (
     _accepted_asset_issues,
+    _build_task_reporter_brief,
     run_codex_task_reporter_workflow,
     task_verifications_document,
 )
+from geng_agent.verification_result import task_verification_issues
 
 
 PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
@@ -92,6 +94,36 @@ def _record(root: Path, task_id: str) -> dict:
 
 
 class IsolatedTaskReporterTests(unittest.TestCase):
+    def test_reporter_prompt_uses_core_claim_and_materiality_convergence_gate(self) -> None:
+        prompt = _build_task_reporter_brief(
+            task_id="task_a",
+            report_asset_dir="report_assets/task_a",
+            include_all_paper_pages=False,
+        )
+
+        self.assertIn("not to discover every conceivable imperfection", prompt)
+        self.assertIn("Acceptance may be conditional on disclosed paper-silent assumptions", prompt)
+        self.assertIn("Return `revise` to the Writer only when all of the following are true", prompt)
+        self.assertIn("Do not issue speculative revisions", prompt)
+        self.assertIn("the assigned core claim is supported", prompt)
+
+    def test_accepted_verdict_allows_disclosed_assumptions_and_non_material_differences(self) -> None:
+        result = {
+            "schema_version": "1.0",
+            "task_id": "task_a",
+            "verdict": "accepted",
+            "revision_target": "none",
+            "comparison_summary": "Core ordering and trend match under a disclosed paper-silent seed assumption.",
+            "differences": [],
+            "non_material_differences": ["Exact marker positions differ slightly."],
+            "evidence_files": ["inputs/writer_output/outputs/curve.png"],
+            "feedback": [],
+            "confidence": "medium",
+            "remaining_uncertainties": ["The paper does not disclose its random seed."],
+        }
+
+        self.assertEqual(task_verification_issues(result, "task_a"), [])
+
     def test_pdf_fallback_crop_requires_exact_bbox_provenance(self) -> None:
         with TemporaryDirectory() as temp:
             workspace = Path(temp)
@@ -133,7 +165,7 @@ class IsolatedTaskReporterTests(unittest.TestCase):
                 {"task_id": "task_b", "figure_or_claim": "Fig. 2", "required_facts": [{"type": "parameter", "name": "alpha_b"}]},
             ]},
             "experiment_index": {"experiments": [{"task_id": "task_a", "source_pages": [1]}, {"task_id": "task_b", "source_pages": [2]}]},
-            "paper_thesis": {}, "paper_memory": None, "paper_images": [],
+            "paper_thesis": {}, "paper_images": [],
             "task_records": records, "output_dir": root / "case", "audit_dir": root / "case" / "audit",
             "timeout": 30, "resume": False,
         }
@@ -147,7 +179,7 @@ class IsolatedTaskReporterTests(unittest.TestCase):
             "task_record": next(item for item in records if item["task_id"] == task_id),
             "paper": batch["paper"], "paper_path": batch["paper_path"], "facts": batch["facts"],
             "experiment_index": batch["experiment_index"], "paper_thesis": batch["paper_thesis"],
-            "paper_memory": batch["paper_memory"], "paper_images": batch["paper_images"],
+            "paper_images": batch["paper_images"],
             "output_dir": batch["output_dir"], "audit_dir": batch["audit_dir"],
             "timeout": batch["timeout"], "resume": batch["resume"], "round_no": 1,
         }

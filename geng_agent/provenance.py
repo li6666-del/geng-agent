@@ -10,7 +10,6 @@ def build_automation_provenance(
     *,
     output_dir: Path,
     paper_path: Path,
-    memory_manifest: dict[str, Any],
     facts: dict[str, Any],
     tasks: dict[str, Any],
     experiment_index: dict[str, Any],
@@ -21,8 +20,9 @@ def build_automation_provenance(
     artifacts: dict[str, dict[str, Any]] = {}
     for name in (
         "paper_chunks.json",
-        "paper_memory.json",
+        "paper_figure_index.json",
         "engineering_facts_initial.json",
+        "analysis_warnings.json",
         "repro_tasks_preliminary.json",
         "engineering_facts_backfill.json",
         "engineering_facts.json",
@@ -46,7 +46,6 @@ def build_automation_provenance(
     return {
         "schema_version": "1.0",
         "source": {"paper_path": str(paper_path), "paper_sha256": _sha256(paper_path) if paper_path.exists() else None},
-        "memory_snapshot_hash": memory_manifest.get("snapshot_hash"),
         "settings": settings,
         "analysis": {
             "facts_count": len(facts.get("engineering_facts", [])),

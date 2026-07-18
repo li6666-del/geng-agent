@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import re
@@ -18,6 +19,7 @@ def semantic_merge_engineering_facts(base: dict[str, Any], addition: dict[str, A
     facts = [dict(item) for item in merged.get("engineering_facts", []) if isinstance(item, dict)]
     index = {canonical_fact_key(item): position for position, item in enumerate(facts)}
     meta = dict(merged.get("_meta", {})) if isinstance(merged.get("_meta"), dict) else {}
+
     semantic_meta = dict(meta.get("semantic_merge", {})) if isinstance(meta.get("semantic_merge"), dict) else {}
     conflict_records = [item for item in semantic_meta.get("fact_conflicts", []) if isinstance(item, dict)]
     conflict_fingerprints = {str(item.get("fingerprint")) for item in conflict_records}
@@ -73,6 +75,14 @@ def semantic_merge_repro_tasks(base: dict[str, Any], addition: dict[str, Any]) -
         if _normalize(item.get("task_id"))
     }
     meta = dict(merged.get("_meta", {})) if isinstance(merged.get("_meta"), dict) else {}
+    addition_meta = (
+        addition.get("_meta", {})
+        if isinstance(addition, dict) and isinstance(addition.get("_meta"), dict)
+        else {}
+    )
+    handoff = addition_meta.get("backfill_handoff")
+    if isinstance(handoff, dict):
+        meta["backfill_handoff"] = copy.deepcopy(handoff)
     semantic_meta = dict(meta.get("semantic_merge", {})) if isinstance(meta.get("semantic_merge"), dict) else {}
     conflicts = [item for item in semantic_meta.get("task_conflicts", []) if isinstance(item, dict)]
     fingerprints = {str(item.get("fingerprint")) for item in conflicts}

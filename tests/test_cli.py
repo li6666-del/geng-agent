@@ -14,6 +14,7 @@ class CliDefaultsTests(unittest.TestCase):
         self.assertIsNone(args.codex_agent_timeout)
         self.assertIsNone(args.codex_reporter_timeout)
         self.assertEqual(args.mineru_timeout, 1800.0)
+        self.assertEqual(args.json_repair_attempts, 1)
         self.assertFalse(args.analysis_only)
         self.assertFalse(hasattr(args, "no_result_review"))
         self.assertFalse(hasattr(args, "analysis_agent_width"))

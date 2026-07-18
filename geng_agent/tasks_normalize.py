@@ -247,6 +247,40 @@ def _build_fact_index(facts: Any) -> tuple[set[tuple[str, str]], dict[str, set[s
     return keys, name_to_types, alias_to_key
 
 
+def _normalize_backfill_handoff(
+    value: Any, coercions: list[str]
+) -> dict[str, Any] | None:
+    """Normalize optional task-expert advice without making it a schema gate."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        coercions.append("ignored malformed backfill_handoff")
+        return None
+
+    raw_ready = value.get("ready_for_writer", True)
+    if isinstance(raw_ready, bool):
+        ready = raw_ready
+    elif isinstance(raw_ready, str) and raw_ready.strip().lower() in {"false", "no", "0"}:
+        ready = False
+        coercions.append("backfill_handoff.ready_for_writer string -> false")
+    else:
+        ready = True
+        if raw_ready is not True:
+            coercions.append("backfill_handoff.ready_for_writer -> true")
+
+    request_ids: list[str] = []
+    raw_ids = value.get("blocking_request_ids")
+    for item in raw_ids if isinstance(raw_ids, list) else []:
+        request_id = item.strip() if isinstance(item, str) else ""
+        if request_id and request_id not in request_ids:
+            request_ids.append(request_id)
+    return {
+        "ready_for_writer": ready,
+        "blocking_request_ids": request_ids,
+        "reason": str(value.get("reason") or "").strip(),
+    }
+
+
 def normalize_repro_tasks_candidate(data: Any, facts: Any) -> tuple[dict[str, Any], list[str]]:
     """Return a coerced copy of the candidate plus a log of every change made."""
     coercions: list[str] = []
@@ -254,6 +288,8 @@ def normalize_repro_tasks_candidate(data: Any, facts: Any) -> tuple[dict[str, An
         return {"repro_tasks": []}, ["top-level was not a JSON object"]
 
     out = copy.deepcopy(data)
+    existing_meta = out.get("_meta") if isinstance(out.get("_meta"), dict) else {}
+    raw_handoff = out.pop("backfill_handoff", existing_meta.get("backfill_handoff"))
 
     extra_top = [key for key in out if key not in _DOC_KEYS]
     for key in extra_top:
@@ -271,6 +307,11 @@ def normalize_repro_tasks_candidate(data: Any, facts: Any) -> tuple[dict[str, An
         out["repro_tasks"] = []
         if tasks is not None:
             coercions.append("repro_tasks was not a list -> []")
+    handoff = _normalize_backfill_handoff(raw_handoff, coercions)
+    if handoff is not None:
+        meta = dict(out.get("_meta", {})) if isinstance(out.get("_meta"), dict) else {}
+        meta["backfill_handoff"] = handoff
+        out["_meta"] = meta
     return out, coercions
 
 

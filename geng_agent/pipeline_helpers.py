@@ -142,6 +142,29 @@ END UNTRUSTED DATA: original_task
 """.strip()
 
 
+def build_json_file_retry_prompt(
+    *,
+    candidate_path: Path,
+    schema_path: Path,
+    errors: str,
+) -> str:
+    """Build a format-only repair brief backed by complete local files."""
+    error_summary = str(errors or "")[:12000]
+    return f"""
+The previous answer is scientifically frozen and must not be regenerated.
+
+Perform JSON FORMAT REPAIR ONLY:
+1. Read the complete candidate from: {candidate_path}
+2. Read the structural schema from: {schema_path}
+3. Preserve every usable fact, task, request_id, field_id, value, and note.
+4. Do not inspect the paper, infer missing science, rename identifiers, or add new content.
+5. Drop only structurally unusable fragments when necessary.
+6. Return exactly one corrected JSON object with no Markdown or explanation.
+
+Structural errors:
+{error_summary}
+""".strip()
+
 def _is_non_retryable_llm_error(error: str) -> bool:
     lowered = error.lower()
     return any(token in lowered for token in ("http 401", "http 403", "unauthorized", "forbidden", "invalid api key"))

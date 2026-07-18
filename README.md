@@ -6,14 +6,14 @@
 
 ## 当前能力
 
-- 解析 PDF/TXT/Markdown 论文，构建带稳定实体 ID、子图、公式、表格、章节和交叉引用的 `paper_memory.json`。
-- 由一个 Codex 事实专家先建立高召回实验地图；初步任务再提出字段级 `missing_fact_requests`，事实专家与任务专家围绕新暴露的代码关键字段迭代回补，收敛停止且最多 6 轮。
+- 解析 PDF/TXT/Markdown 论文，保留全文分块、页面图像和带 caption/page/bbox 的图候选索引，供 Codex 直接查证。
+- 一个 Codex 事实专家只做一轮全局事实扫描，一个任务专家只做一轮初步设计并立即输出 `backfill_handoff`；只有明确点名的实验定义 blocker 才进入定向回补，通常 0–2 轮，第三轮仅作异常熔断。
 - 无条件抽取论文核心主张、作用机制、方法排序和限制，生成 `paper_thesis.json` 作为后续复现锚点。
 - 将论文图表拆成可运行的复现实验任务；任务描述用于导航，最终科学目标始终以论文原文和原图为准。
 - 第三阶段采用任务级自治 writer：一个任务一个 Codex writer，任务数就是启动并发数；writer 自主写代码、直接运行 full、对比并迭代。
-- 每个 writer 直接对照完整论文持续修改、运行和检查，完成 full 后提交 `ready_for_review`，无权授予最终 `matched`。
+- 每个 writer 把论文明确事实作为最高约束，只在论文未披露或确有歧义处作显式工程假设；完成 full、支持核心观点且不存在材料性事实冲突后提交 `ready_for_review`，无权授予最终 `matched`。
 - 主持人只做任务覆盖、证据路径和基础代码健康检查，不参与科学结论。
-- 每个 writer 交付后立即启动对应的独立 Codex task reporter，直接核对论文与本地产物；不通过的任务单独回到原 sandbox，已通过任务不重跑。全部通过后才启动 Final Report Editor。
+- 每个 writer 交付后立即启动对应的独立 Codex task reporter，直接核对论文与本地产物；Reporter 只为违反明确事实或核心观点未得到支持的材料性问题打回任务，合理假设和非材料差异作为限制记录。已通过任务不重跑，全部通过后才启动 Final Report Editor。
 - 固定生成主审查报告 `review.md/docx`、本地复现报告 `reproduction_report.md/docx` 和论文对比报告 `result_review.md/docx`；对比报告不附带 writer 迭代流水账。
 - 提供极简 Web UI，可上传 PDF 或填写 PDF 链接并实时查看阶段进度。
 
@@ -22,20 +22,20 @@
 ```text
 论文 PDF
   -> 文本与页面图像解析；MinerU 可选预解析一次，生成带 caption/page/bbox 的整图候选索引
-  -> 构建 paper_memory.json 与 memory_manifest.json
+  -> 生成 paper_chunks.json 与 paper_figure_index.json，不增加 Python 语义实体中间层
   -> 单个 Codex 事实专家生成 engineering_facts_initial.json，建立高召回实验地图
   -> 图中近似读数、视觉结构、附录公式和冲突观察均带来源/置信度保留，不做语义删除
   -> 单个 Codex 任务专家生成 repro_tasks_preliminary.json，并提出结构化事实缺口
-  -> 程序按稳定请求键和 required_fields 跨任务合并去重，启动定向事实回补
+  -> 程序按稳定请求键和 required_fields 跨任务合并去重；任务专家先选择真正阻塞 Writer 的 request_id
   -> 每轮按字段记录论文证据、未找到位置或冲突，并把搜索结果写入累计台账
-  -> 任务专家依据新事实刷新任务；只有新暴露的代码关键字段才进入下一轮，收敛停止且最多 6 轮
-  -> 合并生成 engineering_facts.json；未找到的证据转成显式假设和敏感性检查，最终定稿 repro_tasks.json
+  -> 没有 blocker 时直接交给 Writer；有 blocker 时只回补选中项，任务刷新后再次软交接，同一未解字段最多搜索两次
+  -> Python 只硬验收 JSON/基本结构；来源、引用、证据类型和缺失字段写入 analysis_warnings.json，不触发科学内容重写
   -> Codex analysis 基于最终事实抽取 paper_thesis.json
   -> experiment_index v2 记录任务、图表、参数、baseline 和证据定位，不做运行前复现评级
   -> 为每个复现任务创建独立 sandbox
   -> 所有任务 writer 同时启动，在独立 sandbox 内自主写代码、选择硬件并直接运行 full
   -> 每个 writer 自行对比论文、修改代码并反复运行，完成可靠 full 后提交 ready_for_review
-  -> 每个任务完成后立刻启动独立 task reporter，核对论文并在 MinerU 父图内定位目标子图；差异只反馈给对应 writer
+  -> 每个任务完成后立刻启动独立 task reporter，按“明确事实忠实 + 核心观点支持”的材料性门槛裁决，并在 MinerU 父图内定位目标子图
   -> Python 按 Reporter 提交且完成视觉复检的坐标从原 PDF 高分辨率裁切；边界不可靠时自动回退完整父图
   -> 全部任务通过后系统授予 matched，Final Report Editor 统一组织三份报告
   -> 输出 review、reproduction_report、result_review 的 Markdown/Word 版本
@@ -86,7 +86,7 @@ MinerU 缺失、超时、非零退出或未识别到目标图时，流程不会�
 
 ## 论文目标图定位
 
-系统会把原始论文文件、全论文页面图以及前两轮最终定稿的 `engineering_facts.json`、`repro_tasks.json`、`experiment_index.json` 和可选 `paper_thesis.json` 复制到每个 writer sandbox。所有论文页面图直接随 Codex writer 会话发送，不再执行任务页筛选；任务相关事实摘要只用于文本导航，不构成信息边界。
+系统会把原始论文文件、全论文页面图以及前两轮最终定稿的 `engineering_facts.json`、`repro_tasks.json`、`experiment_index.json`、可选 `paper_thesis.json` 和 `analysis_warnings.json` 复制到每个 writer sandbox。所有论文页面图直接随 Codex writer 会话发送，不再执行任务页筛选；任务相关事实摘要只用于文本导航，不构成信息边界。
 
 每个 writer 交付后，专属 task reporter 在独立上下文中读取该任务的 `task_agent_result.json`、执行摘要、本地 PNG/CSV/summary 和完整论文证据，直接判断 `accepted/revise` 并定位论文原图。科学差异只退回对应 writer；裁图或证据定位问题只重跑对应 task reporter。所有任务通过后，Final Report Editor 只读取已验收的紧凑任务包和图片，汇总生成三份最终报告。
 
@@ -111,26 +111,27 @@ set GENG_CODEX_TASK_REPORTER_CMD=codex
 set GENG_CODEX_REPORT_EDITOR_CMD=codex
 ```
 
-项目启动的 Codex 子智能体默认使用 `gpt-5.5`，不跟随桌面 Codex 的全局默认模型。需要临时覆盖时可设置：
+项目启动的 Codex 子智能体默认使用 `gpt-5.6-sol`，推理强度统一为 `xhigh`，不跟随桌面 Codex 的全局默认配置。需要临时覆盖时可设置：
 
 ```bash
 set GENG_CODEX_MODEL=gpt-5.6-luna
+set GENG_CODEX_REASONING_EFFORT=high
 ```
 
-analysis 与 task reporter 默认使用 `high` 推理强度，task writer 与 Final Report Editor 默认使用 `medium`，避免继承桌面配置中的 `xhigh` 后出现不必要的超长推理。可分别覆盖：
+需要针对不同角色调整推理强度时，可分别覆盖：
 
 ```bash
-set GENG_CODEX_ANALYSIS_REASONING_EFFORT=high
-set GENG_CODEX_TASK_WRITER_REASONING_EFFORT=medium
-set GENG_CODEX_TASK_REPORTER_REASONING_EFFORT=high
-set GENG_CODEX_REPORT_EDITOR_REASONING_EFFORT=medium
+set GENG_CODEX_ANALYSIS_REASONING_EFFORT=xhigh
+set GENG_CODEX_TASK_WRITER_REASONING_EFFORT=xhigh
+set GENG_CODEX_TASK_REPORTER_REASONING_EFFORT=xhigh
+set GENG_CODEX_REPORT_EDITOR_REASONING_EFFORT=xhigh
 ```
 
 task writer 采用全任务并发：有多少复现任务就同时启动多少个 writer。每个 writer 在自己的 sandbox 内直接调用当前 Python，自行探测 CPU/GPU、选择 backend、声明依赖并运行 smoke/full；主持人不做资源排队、命令拦截、科学迭代超时或中途重试。
 
-Writer 必须先从抽取事实、原论文 PDF、caption、正文、公式、表格和附录中补找缺失参数；仍找不到时才做可追踪的科学假设，并把假设当作后续图像对比中的可调变量。对 Monte Carlo、批量矩阵运算和分钟级 CPU full，CUDA 可用时应优先实现真实 Torch CUDA 计算路径；仅调用 backend selector 或在报告中写 GPU 名称不算使用 GPU。
+Writer 必须先读取 `repro_tasks.json` 的 `_meta.fact_gap_handoff`，再从抽取事实、原论文 PDF、caption、正文、公式、表格和附录中补找缺失参数；前两阶段的未解决记录只是导航，不是停止依据。论文明确给出的数据、模型、公式、算法和实验协议不可为了贴图而改动；仍找不到的值或实现细节才允许成为可追踪、可调整的科学假设。对 Monte Carlo、批量矩阵运算和分钟级 CPU full，CUDA 可用时应优先实现真实 Torch CUDA 计算路径；仅调用 backend selector 或在报告中写 GPU 名称不算使用 GPU。
 
-Writer 使用直接的对比迭代：运行 full，逐项对照论文原文和原图，先写出具体修改方针，再修改代码、参数或配置并重新运行。修改后再次比较同一组差异，决定保留、回退或继续调整；不设置固定轮数，也不为凑次数运行无变化的 full。Writer 只能提交带完整运行与图像证据的 `ready_for_review`；最终 `matched` 由 Reporter 直接核验论文后授予。
+Writer 使用直接的对比迭代：运行 full，先核验明确事实和核心观点，再区分材料性问题、合理的论文空白假设与非材料差异。只有材料性问题且存在论文证据支撑的修改方向时才修改并重新 full；不得盲从与论文冲突的 Reporter 建议，也不得为非阻塞差异机械重跑。Writer 只能提交带完整运行与图像证据的 `ready_for_review`；最终 `matched` 由 Reporter 直接核验论文后授予。
 
 旧 LLM analysis 兼容路径必须显式开启：
 
@@ -147,6 +148,10 @@ set GENG_LLM_MODEL=...
 ```
 
 ## CLI 使用
+
+case 产物默认集中到 %USERPROFILE%\Desktop\耿同学agent_cases。因此 --out case_001、
+status case_001 和 benchmark case_001 ... 中的相对名称都会从该目录解析，不会再在源码仓库根目录
+创建运行产物。需要临时改位置时设置 GENG_CASES_ROOT；显式绝对路径仍会按原样使用。
 
 只生成审查包和复现项目，不运行复现实验：
 
@@ -212,7 +217,7 @@ Web UI 支持上传 PDF、管理案例、查看五个当前主流程阶段、接
 本地默认使用 SQLite 和进程内 Celery eager worker；数据库位于 case 根目录下的 `geng_web.db`。生产部署可通过以下环境变量切换 PostgreSQL、Redis 和外部 Celery worker：
 
 ```text
-GENG_CASES_ROOT         case 根目录
+GENG_CASES_ROOT         case 根目录；默认 %USERPROFILE%\Desktop\耿同学agent_cases
 GENG_DATABASE_URL       SQLAlchemy 数据库地址
 GENG_REDIS_URL          Redis/Celery 地址
 GENG_CELERY_EAGER       1 表示本地进程内执行
@@ -225,18 +230,19 @@ GENG_ENABLE_URL_IMPORT  1 表示允许受 SSRF 防护的 PDF URL 导入 API
 
 ## 输出目录
 
+以下结构默认位于 %USERPROFILE%\Desktop\耿同学agent_cases\case_001，而不是源码仓库内：
+
 一次运行会生成类似结构：
 
 ```text
 case_001/
   paper_chunks.json
-  paper_memory.json
   paper_figure_index.json
-  memory_manifest.json
   engineering_facts_initial.json
   repro_tasks_preliminary.json
   engineering_facts_backfill.json
   engineering_facts.json
+  analysis_warnings.json
   fact_conflicts.json
   repro_tasks.json
   task_conflicts.json
@@ -277,7 +283,7 @@ case_001/
 - `result_review.md/docx`：逐任务并排展示本地复现图和 reporter 裁切的论文原图，并给出最终差异、原因与不确定性；不包含 writer 自我迭代附录。
 - `verification_result.json`：Reporter 对论文证据与本地结果的逐任务直接裁决。
 - `runtime_result.json`：执行摘要、产物汇总和最终独立验收状态；候选阶段不计为最终 matched。
-- `automation_provenance.json`：记忆快照、初始事实、初步任务、定向回补、冲突和 writer 执行证据的哈希化来源链。
+- `analysis_warnings.json`：前两阶段来源、引用、证据契约和缺失字段的非阻断诊断，供 Writer 继续核对全文。
 - `risk_report.json`：可复现性风险、缺失信息、前两阶段兜底、运行异常和审计摘要。
 - `audit/`：Codex prompt、stdout/stderr、JSON 校验、运行日志、图片证据等完整审计链。
 
@@ -288,9 +294,9 @@ case_001/
 1. 阅读任务事实、论文证据和完整目标图，生成本任务复现代码与配置。
 2. 自行探测硬件并选择 CPU/GPU、并行度、批量大小和依赖。
 3. 在 `--run-repro` 开启时直接运行自己的 smoke/full。
-4. 逐项对照论文图的曲线、baseline、数值形状、坐标轴、单位、尺度、统计量、标注、图例和样式。
-5. 不匹配时先回查论文参数，再提出显式假设、修改、重跑和再审查；没有轮数上限，禁止在代码/配置未变化时机械重复 full。
-6. 完成成功 full 并直接对照完整论文后输出 `ready_for_review`，提供本地图、CSV/summary、参数来源和差异说明；Writer 不能输出最终 matched。
+4. 先核验论文明确的数据、模型、公式、核心算法和实验协议，再对照曲线、baseline、数值形状、坐标轴、统计量与呈现细节。
+5. 只在论文未披露或确有歧义处提出显式合理假设；材料性问题存在具体修正方向时修改并重跑，非材料差异只记录，禁止机械重复 full。
+6. 成功 full 已忠于明确事实、支持任务核心观点且只剩公开假设或非材料差异时输出 `ready_for_review`；Writer 不能输出最终 matched。
 
 主持人同时启动所有 writers。每个 Writer 交付后，只有其对应的 task reporter 会立刻在独立上下文中审查该任务；科学差异仅让该 Writer 在原 sandbox 继续修改和 full，其他任务不受影响。所有任务通过后，Final Report Editor 只读取已验收任务包与图片，负责三份人工报告的语言组织与排版。
 
@@ -301,8 +307,8 @@ case_001/
 - 静态扫描会检查高风险文件操作、系统命令、网络行为等。
 - 每个 writer 使用独立 sandbox 隔离任务文件；运行权限和资源决策由 writer 自己负责。
 - 主持人会确定性清理 Python BOM；静态扫描发现语法错误时 runtime 不得显示通过。
-- `matched` 要求 Reporter 直接检查论文目标与本地产物后确认无实质差异；仅定性趋势、排序或大致外观一致不能通过。
+- `matched` 要求 Reporter 确认明确论文事实未被违反、任务核心观点得到本地结果支持且 full 证据可信；论文未披露部分允许采用公开、合理的假设，剩余非材料差异不阻断通过。
 
 ## 项目定位
 
-耿同学 agent 的目标是提供尽可能逼近原论文的复现证据，不是替代人工科研判断。`matched` 只表示可观察目标经独立 task reporter 直接核验通过，不表示恢复了作者未公开代码；外部 Codex、网络、额度或运行环境错误会保留为未完成状态。
+耿同学 agent 的目标是提供忠于论文证据并能检验核心观点的复现结果，不是替代人工科研判断。`matched` 只表示明确事实与核心观点经独立 task reporter 核验通过；它允许对论文未披露细节作出透明、合理的工程假设，不表示恢复了作者未公开代码。

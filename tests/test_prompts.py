@@ -59,9 +59,17 @@ class PromptTests(unittest.TestCase):
         self.assertIn("机制", rendered["thesis"])
         self.assertIn("required_facts", rendered["tasks"])
         self.assertIn("missing_fact_requests", rendered["tasks"])
+        self.assertIn("backfill_handoff", rendered["tasks"])
+        self.assertIn("ready_for_writer", rendered["tasks"])
+        self.assertIn("只进行这一轮全局扫描", rendered["facts"])
+        self.assertIn("允许只交付", rendered["backfill"])
+        self.assertNotIn("都必须输出且只输出", rendered["backfill"])
         self.assertIn("定向", rendered["backfill"])
         self.assertIn("request_resolutions", rendered["backfill"])
         self.assertIn("required_fields", rendered["finalize_tasks"])
+        self.assertIn("backfill_handoff", rendered["finalize_tasks"])
+        self.assertIn("ready_for_writer", rendered["finalize_tasks"])
+        self.assertNotIn("不能用空数组掩盖未知", rendered["finalize_tasks"])
 
 
 if __name__ == "__main__":

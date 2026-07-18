@@ -10,7 +10,6 @@ from .schemas import validate_stage
 
 STAGES = [
     ("paper", "paper_chunks.json", None),
-    ("paper_memory", "paper_memory.json", "paper_memory"),
     ("engineering_facts", "engineering_facts.json", "engineering_facts"),
     ("paper_thesis", "paper_thesis.json", "paper_thesis"),
     ("repro_tasks", "repro_tasks.json", "repro_tasks"),
@@ -29,7 +28,6 @@ STAGES = [
 
 RESUME_LABELS = {
     "paper": "01_extract_engineering_facts",
-    "paper_memory": "01_build_paper_memory",
     "engineering_facts": "01_extract_engineering_facts",
     "paper_thesis": "02d_extract_paper_thesis",
     "repro_tasks": "02c_finalize_repro_tasks",

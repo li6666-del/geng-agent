@@ -9,6 +9,8 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from geng_agent.agentic_analysis import run_codex_json_stage
+from geng_agent.llm import LLMImage
+from geng_agent.tasks_normalize import finalize_repro_tasks
 
 
 def _command_for(script: Path) -> str:
@@ -95,6 +97,92 @@ class CodexAnalysisStageTests(unittest.TestCase):
             self.assertTrue((audit_dir / "raw_01_extract_engineering_facts.txt").exists())
             self.assertTrue((audit_dir / "validation_01_extract_engineering_facts_attempt_1.json").exists())
 
+    def test_candidate_normalizer_accepts_soft_handoff_before_schema_validation(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            cmd = _write_analysis_script(
+                temp,
+                r"""
+                import json
+                import sys
+                from pathlib import Path
+
+                args = sys.argv[1:]
+                out = Path(args[args.index("--output-last-message") + 1])
+                counter = Path(__file__).with_name("attempts.txt")
+                attempt = int(counter.read_text(encoding="utf-8")) + 1 if counter.exists() else 1
+                counter.write_text(str(attempt), encoding="utf-8")
+                doc = {
+                    "repro_tasks": [
+                        {
+                            "task_id": "reproduce_fig_1",
+                            "target": "BER vs SNR",
+                            "metric": "bit_error_rate",
+                            "metric_formula": "bit_error_rate = bit_errors / total_bits",
+                            "figure_or_claim": "Fig. 1",
+                            "expected_artifacts": [
+                                "outputs/results.csv",
+                                "outputs/fig1.png",
+                                "outputs/summary.json",
+                            ],
+                            "output_columns": ["snr_db", "bit_error_rate"],
+                            "expected_trend": {
+                                "x_axis": "snr_db",
+                                "y_axis": "bit_error_rate",
+                                "direction": "decreasing",
+                                "reason": "Higher SNR reduces BER.",
+                            },
+                            "comparison": {
+                                "baselines": [],
+                                "curve_groups": [],
+                                "tolerance": "qualitative trend",
+                            },
+                            "required_facts": [],
+                            "assumptions": [],
+                            "risk_if_unreproducible": "Core trend cannot be checked.",
+                        }
+                    ],
+                    "backfill_handoff": {
+                        "ready_for_writer": False,
+                        "blocking_request_ids": ["reproduce_fig_1:decoder"],
+                        "reason": "Decoder settings still define the experiment.",
+                    },
+                }
+                out.write_text(json.dumps(doc), encoding="utf-8")
+                """,
+            )
+            old_cmd = os.environ.get("GENG_CODEX_ANALYSIS_CMD")
+            os.environ["GENG_CODEX_ANALYSIS_CMD"] = cmd
+            try:
+                out_dir = temp / "case"
+                audit_dir = out_dir / "audit"
+                out_dir.mkdir()
+                audit_dir.mkdir()
+                parsed = run_codex_json_stage(
+                    prompt="Finalize tasks.",
+                    stage_label="02c_finalize_repro_tasks",
+                    schema_stage="repro_tasks",
+                    output_dir=out_dir,
+                    audit_dir=audit_dir,
+                    max_attempts=2,
+                    timeout=30,
+                    candidate_normalizer=lambda candidate: finalize_repro_tasks(
+                        candidate, {"engineering_facts": []}
+                    ),
+                )
+            finally:
+                if old_cmd is None:
+                    os.environ.pop("GENG_CODEX_ANALYSIS_CMD", None)
+                else:
+                    os.environ["GENG_CODEX_ANALYSIS_CMD"] = old_cmd
+
+            handoff = parsed["_meta"]["backfill_handoff"]
+            self.assertFalse(handoff["ready_for_writer"])
+            self.assertEqual(
+                handoff["blocking_request_ids"], ["reproduce_fig_1:decoder"]
+            )
+            self.assertEqual((temp / "attempts.txt").read_text(encoding="utf-8"), "1")
+
     def test_codex_analysis_stage_retries_bad_json(self) -> None:
         with TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
@@ -110,6 +198,12 @@ class CodexAnalysisStageTests(unittest.TestCase):
                 counter = Path(__file__).with_name("attempts.txt")
                 attempt = int(counter.read_text(encoding="utf-8")) + 1 if counter.exists() else 1
                 counter.write_text(str(attempt), encoding="utf-8")
+                Path(__file__).with_name(f"args_{attempt}.json").write_text(
+                    json.dumps(args), encoding="utf-8"
+                )
+                Path(__file__).with_name(f"prompt_{attempt}.txt").write_text(
+                    sys.stdin.read(), encoding="utf-8"
+                )
                 if attempt == 1:
                     out.write_text("not json", encoding="utf-8")
                 else:
@@ -154,6 +248,13 @@ class CodexAnalysisStageTests(unittest.TestCase):
                     audit_dir=audit_dir,
                     max_attempts=2,
                     timeout=30,
+                    images=[
+                        LLMImage(
+                            label="paper_page:1",
+                            mime_type="image/png",
+                            data_b64="AA==",
+                        )
+                    ],
                 )
             finally:
                 if old_cmd is None:
@@ -170,6 +271,20 @@ class CodexAnalysisStageTests(unittest.TestCase):
             )
             self.assertFalse(first_validation["ok"])
             self.assertTrue(second_validation["ok"])
+            first_args = json.loads(
+                (temp / "args_1.json").read_text(encoding="utf-8")
+            )
+            second_args = json.loads(
+                (temp / "args_2.json").read_text(encoding="utf-8")
+            )
+            second_prompt = (temp / "prompt_2.txt").read_text(encoding="utf-8")
+            self.assertEqual(first_args.count("--image"), 1)
+            self.assertNotIn("--image", second_args)
+            self.assertIn("FORMAT REPAIR ONLY", second_prompt)
+            self.assertIn(
+                "raw_02_build_repro_tasks_attempt_1.txt", second_prompt
+            )
+            self.assertIn("02_build_repro_tasks.schema.json", second_prompt)
 
 
 if __name__ == "__main__":

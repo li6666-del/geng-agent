@@ -54,6 +54,7 @@ WRITER_REQUIRED_ANALYSIS_ARTIFACTS = (
 )
 WRITER_OPTIONAL_ANALYSIS_ARTIFACTS = (
     "paper_thesis.json",
+    "analysis_warnings.json",
 )
 
 
@@ -79,8 +80,7 @@ def _write_paper_evidence_bundle(
     facts: dict[str, Any],
     tasks: dict[str, Any],
     paper_thesis: dict[str, Any] | None,
-    paper_memory: dict[str, Any] | None = None,
-    memory_snapshot_hash: str = "",
+    analysis_snapshot_hash: str = "",
     analysis_artifacts: dict[str, Path] | None = None,
     full_paper_images: list[Any] | None = None,
 ) -> dict[str, Any]:
@@ -129,10 +129,7 @@ def _write_paper_evidence_bundle(
             "task": task,
             "facts": facts_for_task(facts, task),
             "paper_thesis": paper_thesis if isinstance(paper_thesis, dict) else {},
-            "paper_memory_hash": (
-                str(paper_memory.get("memory_hash") or "") if isinstance(paper_memory, dict) else ""
-            ),
-            "memory_snapshot_hash": memory_snapshot_hash,
+            "analysis_snapshot_hash": analysis_snapshot_hash,
             "paper_ordering_anchor": thesis_ordering_anchor_for_task(paper_thesis, task),
             "paper_context": paper_context_for_task(paper=paper, task=task),
             "paper_source": source_record,
@@ -163,10 +160,7 @@ def _write_paper_evidence_bundle(
         "paper_source": source_record,
         "analysis_artifacts": analysis_record,
         "full_paper_pages": full_page_record,
-        "paper_memory_hash": (
-            str(paper_memory.get("memory_hash") or "") if isinstance(paper_memory, dict) else ""
-        ),
-        "memory_snapshot_hash": memory_snapshot_hash,
+        "analysis_snapshot_hash": analysis_snapshot_hash,
         "policy": [
             "Every task writer receives the copied original paper and the finalized first-two-stage artifacts.",
             "Task-scoped facts and text context are navigation aids only, never the information boundary.",
@@ -307,6 +301,20 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _analysis_snapshot_hash(*, paper_path: Path, artifacts: dict[str, Path]) -> str:
+    """Hash finalized handoff files without interpreting their scientific content."""
+    payload = {
+        "paper_sha256": _sha256_file(paper_path) if paper_path.is_file() else None,
+        "analysis_artifacts": {
+            name: _sha256_file(path)
+            for name, path in sorted(artifacts.items())
+            if path.is_file()
+        },
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _render_task_evidence_markdown(task_evidence: dict[str, Any]) -> str:
     lines = [
         f"# Paper Evidence: {task_evidence.get('task_id')}",
@@ -429,7 +437,7 @@ def _load_cached_task_writer_workflow(
     output_dir: Path,
     repro_project_dir: Path,
     run_repro: bool,
-    memory_snapshot_hash: str = "",
+    analysis_snapshot_hash: str = "",
 ) -> dict[str, Any] | None:
     manifest_path = output_dir / "repro_project_manifest.json"
     if not manifest_path.exists() or not repro_project_dir.exists():
@@ -441,7 +449,7 @@ def _load_cached_task_writer_workflow(
     meta = manifest.get("_meta") if isinstance(manifest, dict) else {}
     if not isinstance(meta, dict) or meta.get("backend") != CODEX_PROJECT_BACKEND or meta.get("mode") != "task_writers":
         return None
-    if memory_snapshot_hash and meta.get("memory_snapshot_hash") != memory_snapshot_hash:
+    if analysis_snapshot_hash and meta.get("analysis_snapshot_hash") != analysis_snapshot_hash:
         return None
     validation = validate_repro_project(repro_project_dir)
     if not validation.get("required_files_present") or not validation.get("python_compiles"):

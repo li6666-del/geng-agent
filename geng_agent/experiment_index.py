@@ -11,7 +11,6 @@ def build_local_experiment_index(
     facts: Any,
     tasks: Any,
     paper: Any,
-    paper_memory: Any = None,
     figure_index: Any = None,
 ) -> dict[str, Any]:
     """Build a versioned evidence map without predicting reproduction success."""
@@ -51,7 +50,6 @@ def build_local_experiment_index(
             source_pages=source_pages,
             source_chunk_ids=source_chunk_ids,
         )
-        target_entity_ids = _target_entities(figure_or_table, paper_memory)
         comparison = _as_dict(task_data.get("comparison"))
         experiments.append(
             {
@@ -64,7 +62,6 @@ def build_local_experiment_index(
                 "source_chunk_ids": source_chunk_ids,
                 "required_facts": required_facts,
                 "limitations": limitations,
-                "target_entity_ids": target_entity_ids,
                 "subfigure": _subfigure(figure_or_table),
                 "claim": _string(task_data.get("target")) or figure_or_table,
                 "methods": _curve_groups(comparison),
@@ -84,19 +81,6 @@ def build_local_experiment_index(
             "mineru_enriched": bool(_as_dict(figure_index).get("figures")),
         },
     }
-
-
-def _target_entities(figure_or_table: str, paper_memory: Any) -> list[str]:
-    memory = _as_dict(paper_memory)
-    available = {
-        str(entity.get("entity_id"))
-        for entity in memory.get("entities", [])
-        if isinstance(entity, dict) and str(entity.get("entity_id") or "")
-    }
-    figure_refs = [item for item in canonical_figure_ref(figure_or_table).split("|") if item]
-    table_refs = [f"table:{value.upper()}" for value in re.findall(r"(?i)\btable\s*([IVX]+|\d+)\b", figure_or_table)]
-    candidates = figure_refs + table_refs
-    return [item for item in candidates if not available or item in available]
 
 
 def _subfigure(text: str) -> str | None:

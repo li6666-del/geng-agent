@@ -6,6 +6,7 @@
 # the wrong environment. This launcher pins the project to the torch/CUDA env.
 #
 # Usage:  .\run.ps1 review paper.pdf --out case_001 --run-repro
+# Relative case names are stored under %USERPROFILE%\Desktop\耿同学agent_cases.
 # If blocked by execution policy:
 #   powershell -ExecutionPolicy Bypass -File run.ps1 review paper.pdf --out case_001 --run-repro
 

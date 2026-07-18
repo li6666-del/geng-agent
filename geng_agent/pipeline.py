@@ -6,7 +6,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from .config import validate_case_output_dir
 from .documents import load_paper
+from .analysis_diagnostics import write_analysis_warnings
 from .agentic_analysis import CODEX_ANALYSIS_BACKEND, run_codex_json_stage
 from .experiment_index import build_local_experiment_index
 from .facts_coverage import (
@@ -25,7 +27,6 @@ from .llm import LLMClient
 from .mineru_adapter import figure_index_prompt_summary
 from .mineru_runner import run_mineru_layout_stage
 from .outputs import write_json, write_text
-from .paper_memory import load_or_build_paper_memory, paper_memory_summary, write_memory_manifest
 from .prompts import PromptBook
 from .progress import NullProgressReporter, PhaseProgressTracker, ProgressReporter
 from .schema_models import response_format_for_stage
@@ -39,6 +40,7 @@ from .schemas import (
 )
 from .tasks_normalize import finalize_repro_tasks, recover_truncated_repro_tasks
 from .task_evidence_backfill import (
+    backfill_normalization_issues,
     finalize_targeted_backfill,
     validate_terminal_gap_assumptions,
     validate_targeted_backfill,
@@ -91,7 +93,7 @@ SYSTEM_MESSAGE = (
     "所有需要机器读取的回答必须是一个 JSON object，不要输出 Markdown。"
 )
 
-TARGETED_BACKFILL_MAX_ROUNDS = 6
+TARGETED_BACKFILL_MAX_ROUNDS = 3
 
 
 @dataclass(frozen=True)
@@ -163,7 +165,7 @@ class ReviewPipeline:
         run_repro: bool = False,
         run_timeout: float = 120.0,
         mineru_timeout: float = 1800.0,
-        json_repair_attempts: int = 3,
+        json_repair_attempts: int = 1,
         tasks_timeout: float = 300.0,
         project_timeout: float = 1200.0,
         analysis_fallback: bool = True,
@@ -189,7 +191,7 @@ class ReviewPipeline:
         except KeyError as exc:
             raise ValueError(f"unknown pipeline stage: {stage}") from exc
 
-        output_dir = output_dir.expanduser().resolve()
+        output_dir = validate_case_output_dir(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         _clear_stage_outputs(output_dir, cleanup_stage)
         return self.run(
@@ -220,7 +222,7 @@ class ReviewPipeline:
         run_repro: bool = False,
         run_timeout: float = 120.0,
         mineru_timeout: float = 1800.0,
-        json_repair_attempts: int = 3,
+        json_repair_attempts: int = 1,
         tasks_timeout: float = 300.0,
         project_timeout: float = 1200.0,
         resume: bool = True,
@@ -232,7 +234,7 @@ class ReviewPipeline:
         analysis_only: bool = False,
         progress: ProgressReporter | None = None,
     ) -> PipelineResult:
-        output_dir = output_dir.expanduser().resolve()
+        output_dir = validate_case_output_dir(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         audit_dir = output_dir / "audit"
         audit_dir.mkdir(parents=True, exist_ok=True)
@@ -269,15 +271,6 @@ class ReviewPipeline:
             max_pages=max_pages,
             resume=resume,
         )
-        paper_memory = load_or_build_paper_memory(
-            paper=paper,
-            source_path=paper_path,
-            output_dir=output_dir,
-            resume=resume,
-        )
-        paper_memory_issues = validate_stage("paper_memory", paper_memory)
-        if paper_memory_issues:
-            raise RuntimeError(f"paper_memory failed schema validation: {format_issues(paper_memory_issues)}")
         valid_chunk_ids = {
             str(chunk.get("chunk_id"))
             for chunk in paper.get("chunks", [])
@@ -305,7 +298,6 @@ class ReviewPipeline:
         paper_context_raw = pretty_json(
             {
                 "paper_chunks": json.loads(_paper_context_for_prompt(paper["chunks"])),
-                "paper_memory": paper_memory_summary(paper_memory),
                 "paper_figure_index": figure_index_prompt_summary(figure_index),
             }
         )
@@ -322,49 +314,61 @@ class ReviewPipeline:
             paper_chunks_json=paper_context,
         )
         initial_facts = self._load_or_create_analysis_stage_json(
-                output_path=output_dir / "engineering_facts_initial.json",
-                output_dir=output_dir,
-                audit_dir=audit_dir,
-                prompt=prompt_1,
-                stage_label="01_extract_engineering_facts",
-                cleanup_stage="facts",
-                schema_stage="engineering_facts",
-                max_attempts=json_repair_attempts + 1,
-                resume=resume,
-                images=paper_images,
-                candidate_extra_validation=lambda parsed: validate_fact_sources(parsed, valid_chunk_ids, valid_pages),
-                final_extra_validation=lambda parsed: (
-                    validate_fact_sources(parsed, valid_chunk_ids, valid_pages)
-                    + engineering_facts_floor_issues(parsed)
-                ),
-                candidate_normalizer=lambda parsed: finalize_engineering_facts(parsed, valid_chunk_ids, valid_pages),
-                truncation_recovery=recover_truncated_engineering_facts,
-                backend=analysis_backend,
-                codex_timeout=codex_analysis_timeout,
-                fallback_factory=(
-                    (lambda exc: build_fallback_engineering_facts(
+            output_path=output_dir / "engineering_facts_initial.json",
+            output_dir=output_dir,
+            audit_dir=audit_dir,
+            prompt=prompt_1,
+            stage_label="01_extract_engineering_facts",
+            cleanup_stage="facts",
+            schema_stage="engineering_facts",
+            max_attempts=json_repair_attempts + 1,
+            resume=resume,
+            images=paper_images,
+            candidate_normalizer=lambda parsed: finalize_engineering_facts(
+                parsed, valid_chunk_ids, valid_pages
+            ),
+            truncation_recovery=recover_truncated_engineering_facts,
+            backend=analysis_backend,
+            codex_timeout=codex_analysis_timeout,
+            fallback_factory=(
+                (
+                    lambda exc: build_fallback_engineering_facts(
                         paper=paper,
-                        reason=f"{analysis_backend} engineering fact extraction failed after retries: {exc}",
-                    ))
-                    if analysis_fallback
-                    else None
-                ),
-            )
+                        reason=(
+                            f"{analysis_backend} engineering fact extraction "
+                            f"failed after format repair: {exc}"
+                        ),
+                    )
+                )
+                if analysis_fallback
+                else None
+            ),
+        )
         initial_facts = finalize_engineering_facts(
             initial_facts, valid_chunk_ids, valid_pages
         )
-        initial_fact_issues = (
-            validate_stage("engineering_facts", initial_facts)
-            + validate_fact_sources(initial_facts, valid_chunk_ids, valid_pages)
-            + engineering_facts_floor_issues(initial_facts)
+        initial_structure_issues = validate_stage(
+            "engineering_facts", initial_facts
         )
-        if initial_fact_issues:
+        if initial_structure_issues:
             raise RuntimeError(
-                "Internal initial fact normalization failed validation: "
-                + format_issues(initial_fact_issues)
+                "Internal initial fact normalization produced an unreadable document: "
+                + format_issues(initial_structure_issues)
             )
+        write_analysis_warnings(
+            output_dir=output_dir,
+            audit_dir=audit_dir,
+            stage="01_extract_engineering_facts",
+            groups={
+                "fact_source": validate_fact_sources(
+                    initial_facts, valid_chunk_ids, valid_pages
+                ),
+                "fact_coverage_floor": engineering_facts_floor_issues(
+                    initial_facts
+                ),
+            },
+        )
         write_json(output_dir / "engineering_facts_initial.json", initial_facts)
-
         _mark("facts_initial")
 
         fact_coverage = compute_fact_coverage(
@@ -410,19 +414,24 @@ class ReviewPipeline:
             schema_stage="repro_tasks",
             max_attempts=json_repair_attempts + 1,
             resume=resume,
-            candidate_extra_validation=lambda parsed: validate_task_fact_refs(parsed, initial_facts),
-            final_extra_validation=lambda parsed: validate_task_fact_refs(parsed, initial_facts),
-            candidate_normalizer=lambda parsed: finalize_repro_tasks(parsed, initial_facts),
+            candidate_normalizer=lambda parsed: finalize_repro_tasks(
+                parsed, initial_facts
+            ),
             truncation_recovery=recover_truncated_repro_tasks,
             request_timeout=tasks_timeout,
             backend=analysis_backend,
             codex_timeout=codex_analysis_timeout,
             fallback_factory=(
-                (lambda exc: build_fallback_repro_tasks(
-                    facts=initial_facts,
-                    paper=paper,
-                    reason=f"{analysis_backend} reproduction task generation failed after retries: {exc}",
-                ))
+                (
+                    lambda exc: build_fallback_repro_tasks(
+                        facts=initial_facts,
+                        paper=paper,
+                        reason=(
+                            f"{analysis_backend} reproduction task generation "
+                            f"failed after format repair: {exc}"
+                        ),
+                    )
+                )
                 if analysis_fallback
                 else None
             ),
@@ -430,17 +439,30 @@ class ReviewPipeline:
         preliminary_tasks, _ = semantic_merge_repro_tasks(
             {"repro_tasks": []}, preliminary_tasks
         )
-        preliminary_tasks = finalize_repro_tasks(preliminary_tasks, initial_facts)
-        preliminary_issues = (
-            validate_stage("repro_tasks", preliminary_tasks)
-            + validate_task_fact_refs(preliminary_tasks, initial_facts)
+        preliminary_tasks = finalize_repro_tasks(
+            preliminary_tasks, initial_facts
         )
-        if preliminary_issues:
+        preliminary_structure_issues = validate_stage(
+            "repro_tasks", preliminary_tasks
+        )
+        if preliminary_structure_issues:
             raise RuntimeError(
-                f"Internal preliminary task merge failed validation: {format_issues(preliminary_issues)}"
+                "Internal preliminary task merge produced no readable task set: "
+                + format_issues(preliminary_structure_issues)
             )
-        write_json(output_dir / "repro_tasks_preliminary.json", preliminary_tasks)
-
+        write_analysis_warnings(
+            output_dir=output_dir,
+            audit_dir=audit_dir,
+            stage="02a_build_preliminary_repro_tasks",
+            groups={
+                "task_fact_reference": validate_task_fact_refs(
+                    preliminary_tasks, initial_facts
+                )
+            },
+        )
+        write_json(
+            output_dir / "repro_tasks_preliminary.json", preliminary_tasks
+        )
         _mark("tasks_preliminary")
 
         def _run_backfill_round(
@@ -478,14 +500,11 @@ class ReviewPipeline:
                     valid_pages,
                 )
 
-            def _validate_backfill(parsed: dict[str, Any]) -> list[ValidationIssue]:
-                return (
-                    validate_fact_sources(parsed, valid_chunk_ids, valid_pages)
-                    + validate_targeted_backfill(parsed, requests, current_facts)
-                )
-
-            return self._load_or_create_analysis_stage_json(
-                output_path=audit_dir / f"02b_backfill_round_{round_index:02d}_result.json",
+            backfill = self._load_or_create_analysis_stage_json(
+                output_path=(
+                    audit_dir
+                    / f"02b_backfill_round_{round_index:02d}_result.json"
+                ),
                 output_dir=output_dir,
                 audit_dir=audit_dir,
                 prompt=prompt,
@@ -495,12 +514,25 @@ class ReviewPipeline:
                 max_attempts=json_repair_attempts + 1,
                 resume=resume,
                 images=paper_images,
-                candidate_extra_validation=_validate_backfill,
-                final_extra_validation=_validate_backfill,
                 candidate_normalizer=_normalize_backfill,
                 backend=analysis_backend,
                 codex_timeout=codex_analysis_timeout,
             )
+            write_analysis_warnings(
+                output_dir=output_dir,
+                audit_dir=audit_dir,
+                stage=label,
+                groups={
+                    "normalization": backfill_normalization_issues(backfill),
+                    "fact_source": validate_fact_sources(
+                        backfill, valid_chunk_ids, valid_pages
+                    ),
+                    "evidence_contract": validate_targeted_backfill(
+                        backfill, requests, current_facts
+                    ),
+                },
+            )
+            return backfill
 
         def _refresh_tasks_after_round(
             round_index: int,
@@ -528,14 +560,11 @@ class ReviewPipeline:
                 paper_context_json=paper_context,
             )
 
-            def _validate_refreshed_tasks(parsed: dict[str, Any]) -> list[ValidationIssue]:
-                return (
-                    validate_task_fact_refs(parsed, current_facts)
-                    + validate_terminal_gap_assumptions(parsed, cumulative_resolution)
-                )
-
-            return self._load_or_create_analysis_stage_json(
-                output_path=audit_dir / f"02b_backfill_round_{round_index:02d}_task_refresh.json",
+            refreshed = self._load_or_create_analysis_stage_json(
+                output_path=(
+                    audit_dir
+                    / f"02b_backfill_round_{round_index:02d}_task_refresh.json"
+                ),
                 output_dir=output_dir,
                 audit_dir=audit_dir,
                 prompt=prompt,
@@ -545,8 +574,6 @@ class ReviewPipeline:
                 max_attempts=json_repair_attempts + 1,
                 resume=resume,
                 images=paper_images,
-                candidate_extra_validation=_validate_refreshed_tasks,
-                final_extra_validation=_validate_refreshed_tasks,
                 candidate_normalizer=lambda parsed: finalize_repro_tasks(
                     parsed, current_facts
                 ),
@@ -555,6 +582,17 @@ class ReviewPipeline:
                 backend=analysis_backend,
                 codex_timeout=codex_analysis_timeout,
             )
+            write_analysis_warnings(
+                output_dir=output_dir,
+                audit_dir=audit_dir,
+                stage=label,
+                groups={
+                    "task_fact_reference": validate_task_fact_refs(
+                        refreshed, current_facts
+                    )
+                },
+            )
+            return refreshed
 
         def _write_round_audit(round_index: int, summary: dict[str, Any]) -> None:
             write_json(
@@ -610,16 +648,34 @@ class ReviewPipeline:
         write_json(output_dir / "fact_conflicts.json", {"conflicts": semantic_conflicts(facts, "fact")})
         _mark("facts")
 
-        task_issues = (
-            validate_stage("repro_tasks", tasks)
-            + validate_task_fact_refs(tasks, facts)
-            + validate_terminal_gap_assumptions(tasks, resolution)
-        )
-        if task_issues:
+        task_structure_issues = validate_stage("repro_tasks", tasks)
+        if task_structure_issues:
             raise RuntimeError(
-                f"Internal task finalization failed validation: {format_issues(task_issues)}"
+                "Internal task finalization produced no readable task set: "
+                + format_issues(task_structure_issues)
             )
 
+        terminal_gap_issues = validate_terminal_gap_assumptions(
+            tasks, resolution
+        )
+        write_json(
+            audit_dir / "02c_terminal_gap_diagnostics.json",
+            {
+                "advisory": True,
+                "passed": not terminal_gap_issues,
+                "issue_count": len(terminal_gap_issues),
+                "issues": [issue.as_dict() for issue in terminal_gap_issues],
+            },
+        )
+        analysis_warnings = write_analysis_warnings(
+            output_dir=output_dir,
+            audit_dir=audit_dir,
+            stage="02c_final_repro_tasks",
+            groups={
+                "task_fact_reference": validate_task_fact_refs(tasks, facts),
+                "terminal_gap": terminal_gap_issues,
+            },
+        )
         final_task_coverage = compute_task_coverage(facts, tasks)
         final_task_coverage["stop_reason"] = backfill_loop["stop_reason"]
         tasks_meta = dict(tasks.get("_meta", {})) if isinstance(tasks.get("_meta"), dict) else {}
@@ -629,6 +685,19 @@ class ReviewPipeline:
             "unresolved_request_count": resolution["unresolved_count"],
             "round_count": backfill_round_count,
             "stop_reason": backfill_loop["stop_reason"],
+            "handoff_ready": bool(backfill_loop.get("final_handoff", {}).get("ready_for_writer", True)),
+        }
+        tasks_meta["fact_gap_handoff"] = {
+            "stop_reason": backfill_loop["stop_reason"],
+            "round_count": backfill_round_count,
+            "task_expert_handoff": backfill_loop.get("final_handoff", {}),
+            "terminal_unresolved": resolution.get("terminal_unresolved", []),
+            "open": resolution.get("open", []),
+            "assumption_diagnostics": [issue.as_dict() for issue in terminal_gap_issues],
+            "analysis_warning_count": int(
+                analysis_warnings.get("warning_count") or 0
+            ),
+            "analysis_warnings_artifact": "analysis_warnings.json",
         }
         tasks["_meta"] = tasks_meta
         write_json(output_dir / "repro_tasks.json", tasks)
@@ -656,28 +725,12 @@ class ReviewPipeline:
             facts=facts,
             tasks=tasks,
             paper=paper,
-            paper_memory=paper_memory,
             figure_index=figure_index,
             resume=resume,
         )
         _mark("experiment_index")
         repro_project_dir = output_dir / "repro_project"
 
-        memory_manifest = write_memory_manifest(
-            output_dir,
-            {
-                "paper_chunks": output_dir / "paper_chunks.json",
-                "paper_memory": output_dir / "paper_memory.json",
-                "engineering_facts_initial": output_dir / "engineering_facts_initial.json",
-                "repro_tasks_preliminary": output_dir / "repro_tasks_preliminary.json",
-                "engineering_facts_backfill": output_dir / "engineering_facts_backfill.json",
-                "engineering_facts": output_dir / "engineering_facts.json",
-                "paper_thesis": output_dir / "paper_thesis.json",
-                "repro_tasks": output_dir / "repro_tasks.json",
-                "experiment_index": output_dir / "experiment_index.json",
-                "paper_figure_index": output_dir / "paper_figure_index.json",
-            },
-        )
         analysis_stage_invocations = 3 + (2 * backfill_round_count)
         if analysis_only:
             run_cost = _build_run_cost(
@@ -691,8 +744,10 @@ class ReviewPipeline:
                     "analysis_only": True,
                     "analysis_agent_count": 1,
                     "analysis_stage_invocations": analysis_stage_invocations,
-                    "facts_stop_rule": "field_level_targeted_backfill_until_converged_max_6",
-                    "tasks_stop_rule": "refresh_after_each_backfill_round",
+                    "analysis_warning_count": int(analysis_warnings.get("warning_count") or 0),
+                    "json_format_repair_limit": int(json_repair_attempts),
+                    "facts_stop_rule": "single_global_then_selected_blockers_max_3",
+                    "tasks_stop_rule": "preliminary_or_refreshed_handoff_ready",
                     "mineru_layout": {
                         "ok": mineru_result.get("ok"),
                         "cached": mineru_result.get("cached"),
@@ -714,7 +769,6 @@ class ReviewPipeline:
                     "analysis_stage_invocations": analysis_stage_invocations,
                     "task_driven_backfill": facts.get("_meta", {}).get("task_driven_backfill", {}),
                     "task_finalization": tasks.get("_meta", {}).get("task_driven_finalization", {}),
-                    "memory_snapshot_hash": memory_manifest.get("snapshot_hash"),
                     "mineru_layout": {
                         "ok": mineru_result.get("ok"),
                         "fallback_used": mineru_result.get("fallback_used"),
@@ -763,14 +817,12 @@ class ReviewPipeline:
                 facts=facts,
                 experiment_index=experiment_index,
                 paper_thesis=paper_thesis,
-                paper_memory=paper_memory,
                 paper_images=paper_images,
                 figure_index=figure_index,
                 output_dir=output_dir,
                 audit_dir=audit_dir,
                 timeout=codex_reporter_timeout or codex_agent_timeout or project_timeout or 1800.0,
                 resume=resume,
-                memory_snapshot_hash=str(memory_manifest.get("snapshot_hash") or ""),
                 round_no=writer_round,
             )
             verification = result.get("task_verification") if isinstance(result, dict) else None
@@ -793,14 +845,12 @@ class ReviewPipeline:
                     facts=facts,
                     experiment_index=experiment_index,
                     paper_thesis=paper_thesis,
-                    paper_memory=paper_memory,
                     paper_images=paper_images,
                     figure_index=figure_index,
                     output_dir=output_dir,
                     audit_dir=audit_dir,
                     timeout=codex_reporter_timeout or codex_agent_timeout or project_timeout or 1800.0,
                     resume=False,
-                    memory_snapshot_hash=str(memory_manifest.get("snapshot_hash") or ""),
                     round_no=writer_round * 100 + 1,
                     include_all_paper_pages=True,
                 )
@@ -816,8 +866,6 @@ class ReviewPipeline:
             paper_context_json=paper_context,
             paper_images=paper_images,
             paper_thesis=paper_thesis,
-            paper_memory=paper_memory,
-            memory_snapshot_hash=str(memory_manifest.get("snapshot_hash") or ""),
             output_dir=output_dir,
             audit_dir=audit_dir,
             repro_project_dir=repro_project_dir,
@@ -1078,6 +1126,12 @@ class ReviewPipeline:
         run_cost["task_reporter_count"] = len(task_records)
         run_cost["task_reporter_verification_rounds"] = verification_round
         run_cost["report_editor_invocations"] = report_editor_invocations
+        run_cost["analysis_warning_count"] = int(
+            analysis_warnings.get("warning_count") or 0
+        )
+        run_cost["json_format_repair_limit"] = int(json_repair_attempts)
+        run_cost["facts_stop_rule"] = "single_global_then_selected_blockers_max_3"
+        run_cost["tasks_stop_rule"] = "preliminary_or_refreshed_handoff_ready"
         run_cost["mineru_layout"] = {
             "ok": mineru_result.get("ok"),
             "cached": mineru_result.get("cached"),
@@ -1093,33 +1147,11 @@ class ReviewPipeline:
             output_dir / "run_cost.json",
             run_cost,
         )
-        final_memory_manifest = write_memory_manifest(
-            output_dir,
-            {
-                "paper_chunks": output_dir / "paper_chunks.json",
-                "paper_memory": output_dir / "paper_memory.json",
-                "engineering_facts_initial": output_dir / "engineering_facts_initial.json",
-                "repro_tasks_preliminary": output_dir / "repro_tasks_preliminary.json",
-                "engineering_facts_backfill": output_dir / "engineering_facts_backfill.json",
-                "engineering_facts": output_dir / "engineering_facts.json",
-                "paper_thesis": output_dir / "paper_thesis.json",
-                "repro_tasks": output_dir / "repro_tasks.json",
-                "experiment_index": output_dir / "experiment_index.json",
-                "paper_figure_index": output_dir / "paper_figure_index.json",
-                "repro_project_manifest": output_dir / "repro_project_manifest.json",
-                "runtime_result": output_dir / "runtime_result.json",
-                "verification_result": output_dir / "verification_result.json",
-                "reproduction_report": output_dir / "reproduction_report.md",
-                "result_review": output_dir / "result_review.md",
-                "risk_report": output_dir / "risk_report.json",
-            },
-        )
         write_json(
             output_dir / "automation_provenance.json",
             build_automation_provenance(
                 output_dir=output_dir,
                 paper_path=paper_path,
-                memory_manifest=final_memory_manifest,
                 facts=facts,
                 tasks=tasks,
                 experiment_index=experiment_index,
@@ -1128,8 +1160,8 @@ class ReviewPipeline:
                 settings={
                     "analysis_backend": analysis_backend,
                     "analysis_agent_count": 1,
-                    "facts_stop_rule": "field_level_targeted_backfill_until_converged_max_6",
-                    "tasks_stop_rule": "refresh_after_each_backfill_round",
+                    "facts_stop_rule": "single_global_then_selected_blockers_max_3",
+                    "tasks_stop_rule": "preliminary_or_refreshed_handoff_ready",
                     "task_writer_stop_rule": "accepted_by_own_isolated_task_reporter_or_external_blocker",
                     "verification_stop_rule": "every_task_directly_verified_in_an_isolated_context",
                     "report_backend": "parallel_task_reporters_plus_final_editor",
@@ -1365,7 +1397,6 @@ class ReviewPipeline:
         facts: dict[str, Any],
         tasks: dict[str, Any],
         paper: dict[str, Any],
-        paper_memory: dict[str, Any] | None = None,
         figure_index: dict[str, Any] | None = None,
         resume: bool,
     ) -> dict[str, Any]:
@@ -1385,7 +1416,6 @@ class ReviewPipeline:
             facts,
             tasks,
             paper,
-            paper_memory,
             figure_index,
         )
         issues = validate_stage("experiment_index", experiment_index)

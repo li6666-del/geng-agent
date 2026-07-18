@@ -88,22 +88,42 @@ def collect_missing_fact_requests(
 
 
 def filter_actionable_requests(
-    requests: list[dict[str, Any]], ledger: dict[str, Any] | None
+    requests: list[dict[str, Any]],
+    ledger: dict[str, Any] | None,
+    *,
+    max_unresolved_attempts: int = 1,
 ) -> list[dict[str, Any]]:
-    """Only send fields that have not already received a terminal field result."""
-    terminal = {
-        (str(item.get("request_id") or ""), str(item.get("field_id") or ""))
+    """Keep open fields while bounding every non-evidenced search attempt."""
+    entries = [
+        item
+        for item in (ledger or {}).get("entries", [])
+        if isinstance(item, dict)
+    ]
+    latest = {
+        (str(item.get("request_id") or ""), str(item.get("field_id") or "")): item
         for item in _ledger_latest(ledger)
-        if str(item.get("status") or "") in _FIELD_STATUSES
     }
+    search_attempts: dict[tuple[str, str], int] = {}
+    for item in entries:
+        key = (
+            str(item.get("request_id") or ""),
+            str(item.get("field_id") or ""),
+        )
+        search_attempts[key] = search_attempts.get(key, 0) + 1
+
+    unresolved_limit = max(1, int(max_unresolved_attempts))
     actionable: list[dict[str, Any]] = []
     for request in requests:
         request_id = str(request.get("request_id") or "")
-        fields = [
-            field
-            for field in _request_fields(request)
-            if (request_id, str(field.get("field_id") or "")) not in terminal
-        ]
+        fields: list[dict[str, Any]] = []
+        for field in _request_fields(request):
+            key = (request_id, str(field.get("field_id") or ""))
+            status = str(latest.get(key, {}).get("status") or "open")
+            if status in _EVIDENCED_STATUSES:
+                continue
+            if search_attempts.get(key, 0) >= unresolved_limit:
+                continue
+            fields.append(field)
         if not fields:
             continue
         candidate = copy.deepcopy(request)
@@ -146,56 +166,150 @@ def finalize_targeted_backfill(
     valid_chunk_ids: set[str] | None,
     valid_pages: set[int] | None = None,
 ) -> dict[str, Any]:
-    """Normalize a backfill candidate without losing its request-resolution contract."""
+    """Normalize a partial backfill while preserving every structurally usable field."""
     raw = copy.deepcopy(data) if isinstance(data, dict) else {}
     facts = finalize_engineering_facts(raw, valid_chunk_ids, valid_pages)
-    request_ids = {str(request.get("request_id") or "") for request in requests}
-    normalized_resolutions: list[dict[str, Any]] = []
-    for resolution in raw.get("request_resolutions", []) if isinstance(raw, dict) else []:
+    expected = {
+        str(request.get("request_id") or ""): {
+            str(field.get("field_id") or "") for field in _request_fields(request)
+        }
+        for request in requests
+        if str(request.get("request_id") or "")
+    }
+    by_request: dict[str, dict[str, Any]] = {}
+    warnings: list[dict[str, str]] = []
+
+    def warn(path: str, message: str) -> None:
+        warnings.append({"path": path, "message": message})
+
+    raw_resolutions = raw.get("request_resolutions")
+    if raw_resolutions is not None and not isinstance(raw_resolutions, list):
+        warn("$.request_resolutions", "non-list request_resolutions was ignored")
+        raw_resolutions = []
+
+    for resolution_index, resolution in enumerate(
+        raw_resolutions if isinstance(raw_resolutions, list) else []
+    ):
+        base = f"$.request_resolutions[{resolution_index}]"
         if not isinstance(resolution, dict):
+            warn(base, "non-object request resolution was ignored")
             continue
         request_id = str(resolution.get("request_id") or "").strip()
-        field_results: list[dict[str, Any]] = []
-        for field in (
-            resolution.get("field_results", [])
-            if isinstance(resolution.get("field_results"), list)
-            else []
-        ):
+        if request_id not in expected:
+            warn(f"{base}.request_id", "unknown request id was ignored")
+            continue
+
+        normalized = by_request.setdefault(
+            request_id, {"request_id": request_id, "field_results": []}
+        )
+        seen_fields = {
+            str(item.get("field_id") or "")
+            for item in normalized["field_results"]
+            if isinstance(item, dict)
+        }
+        raw_fields = resolution.get("field_results")
+        if not isinstance(raw_fields, list):
+            warn(f"{base}.field_results", "non-list field_results was ignored")
+            continue
+
+        for field_index, field in enumerate(raw_fields):
+            field_base = f"{base}.field_results[{field_index}]"
             if not isinstance(field, dict):
+                warn(field_base, "non-object field result was ignored")
+                continue
+            field_id = str(field.get("field_id") or "").strip()
+            if field_id not in expected[request_id]:
+                warn(f"{field_base}.field_id", "unknown field id was ignored")
+                continue
+            if field_id in seen_fields:
+                warn(f"{field_base}.field_id", "duplicate field result was ignored")
                 continue
             status = str(field.get("status") or "").strip().lower()
+            if status not in _FIELD_STATUSES:
+                warn(f"{field_base}.status", "unknown status was ignored")
+                continue
+
             fact_refs: list[dict[str, str]] = []
-            for ref in field.get("fact_refs", []) if isinstance(field.get("fact_refs"), list) else []:
+            for ref in (
+                field.get("fact_refs", [])
+                if isinstance(field.get("fact_refs"), list)
+                else []
+            ):
                 if not isinstance(ref, dict):
                     continue
                 fact_type = str(ref.get("type") or "other").strip()
                 name = str(ref.get("name") or "").strip()
-                if fact_type in _FACT_TYPES and name:
-                    marker = (fact_type, name)
-                    if marker not in {(item["type"], item["name"]) for item in fact_refs}:
-                        fact_refs.append({"type": fact_type, "name": name})
+                marker = (fact_type, name)
+                if (
+                    fact_type in _FACT_TYPES
+                    and name
+                    and marker
+                    not in {(item["type"], item["name"]) for item in fact_refs}
+                ):
+                    fact_refs.append({"type": fact_type, "name": name})
+
             locations = field.get("searched_locations")
-            field_results.append(
+            note = str(field.get("note") or "").strip()
+            if not note:
+                note = "No note supplied by the fact specialist."
+                warn(f"{field_base}.note", "empty note was replaced with a format placeholder")
+            normalized["field_results"].append(
                 {
-                    "field_id": str(field.get("field_id") or "").strip(),
+                    "field_id": field_id,
                     "status": status,
                     "fact_refs": fact_refs,
                     "searched_locations": [
                         str(location).strip()
                         for location in locations
                         if str(location).strip()
-                    ] if isinstance(locations, list) else [],
-                    "note": str(field.get("note") or "").strip(),
+                    ]
+                    if isinstance(locations, list)
+                    else [],
+                    "note": note,
                 }
             )
-        normalized_resolutions.append(
-            {"request_id": request_id, "field_results": field_results}
-        )
+            seen_fields.add(field_id)
+
+    normalized_resolutions = [
+        by_request[request_id]
+        for request_id in expected
+        if request_id in by_request and by_request[request_id]["field_results"]
+    ]
     facts["request_resolutions"] = normalized_resolutions
     meta = dict(facts.get("_meta", {})) if isinstance(facts.get("_meta"), dict) else {}
-    meta["targeted_request_count"] = len(request_ids)
+    meta["targeted_request_count"] = len(expected)
+    meta["partial_backfill_normalization"] = {
+        "accepted_request_count": len(normalized_resolutions),
+        "accepted_field_count": sum(
+            len(item["field_results"]) for item in normalized_resolutions
+        ),
+        "warning_count": len(warnings),
+        "warnings": warnings[:200],
+    }
     facts["_meta"] = meta
     return facts
+
+
+def backfill_normalization_issues(data: dict[str, Any]) -> list[ValidationIssue]:
+    meta = data.get("_meta") if isinstance(data, dict) else None
+    normalization = (
+        meta.get("partial_backfill_normalization")
+        if isinstance(meta, dict)
+        else None
+    )
+    warnings = (
+        normalization.get("warnings")
+        if isinstance(normalization, dict)
+        else None
+    )
+    return [
+        ValidationIssue(
+            str(item.get("path") or "$"),
+            str(item.get("message") or "backfill item was normalized"),
+        )
+        for item in warnings
+        if isinstance(item, dict)
+    ] if isinstance(warnings, list) else []
 
 
 def validate_targeted_backfill(

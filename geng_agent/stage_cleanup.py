@@ -14,8 +14,6 @@ def _clear_stage_outputs(output_dir: Path, stage: str, *, preserve_audit: bool =
         "paper": [
             "paper_chunks.json",
             "paper_figure_index.json",
-            "paper_memory.json",
-            "memory_manifest.json",
             "engineering_facts_initial.json",
             "engineering_facts_backfill.json",
             "engineering_facts.json",
@@ -40,7 +38,6 @@ def _clear_stage_outputs(output_dir: Path, stage: str, *, preserve_audit: bool =
             "automation_provenance.json",
         ],
         "facts": [
-            "memory_manifest.json",
             "engineering_facts_initial.json",
             "engineering_facts_backfill.json",
             "engineering_facts.json",
@@ -65,7 +62,6 @@ def _clear_stage_outputs(output_dir: Path, stage: str, *, preserve_audit: bool =
             "automation_provenance.json",
         ],
         "paper_thesis": [
-            "memory_manifest.json",
             "paper_thesis.json",
             "repro_project_manifest.json",
             "repro_project",
@@ -82,7 +78,6 @@ def _clear_stage_outputs(output_dir: Path, stage: str, *, preserve_audit: bool =
             "automation_provenance.json",
         ],
         "tasks": [
-            "memory_manifest.json",
             "engineering_facts_backfill.json",
             "engineering_facts.json",
             "fact_conflicts.json",

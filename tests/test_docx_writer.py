@@ -269,6 +269,42 @@ class DocxWriterTests(unittest.TestCase):
             self.assertEqual(len(document.tables), 1)
             self.assertEqual(len(document.inline_shapes), 1)
 
+    def test_write_result_review_markdown_docx_renders_multiple_images_in_one_table_cell(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            path = root / "result_review.docx"
+            local_a = root / "local_a.png"
+            local_b = root / "local_b.png"
+            paper = root / "paper.png"
+            for image_path in (local_a, local_b, paper):
+                image_path.write_bytes(TINY_PNG)
+
+            write_result_review_markdown_docx(
+                path,
+                markdown_text=(
+                    "## 1. reproduce_fig_1\n\n"
+                    "| 本地复现图 | 论文原图 |\n"
+                    "|---|---|\n"
+                    f"| ![本地复现图 A]({local_a}) <br /> ![本地复现图 B]({local_b}) "
+                    f"| ![论文原图]({paper}) |\n"
+                ),
+                status={"passed": True},
+            )
+
+            document = Document(path)
+            table_text = "\n".join(
+                paragraph.text
+                for table in document.tables
+                for row in table.rows
+                for cell in row.cells
+                for paragraph in cell.paragraphs
+            )
+            self.assertEqual(len(document.tables), 1)
+            self.assertEqual(len(document.inline_shapes), 3)
+            self.assertIn("本地复现图 A", table_text)
+            self.assertIn("本地复现图 B", table_text)
+            self.assertNotIn("![", table_text)
+
 
 if __name__ == "__main__":
     unittest.main()

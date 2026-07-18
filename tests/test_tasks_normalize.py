@@ -90,6 +90,29 @@ class NormalizeReproTasksTests(unittest.TestCase):
         self.assertIn({"type": "figure_claim", "name": "Figure 11"}, task["required_facts"])
         self.assertTrue(doc["_meta"]["normalization_used"])
 
+    def test_moves_soft_backfill_handoff_into_meta(self) -> None:
+        document = {
+            "backfill_handoff": {
+                "ready_for_writer": False,
+                "blocking_request_ids": ["backfill_a", "backfill_a", ""],
+                "reason": "a newly exposed formula is still missing",
+            },
+            "repro_tasks": [good_task()],
+        }
+
+        normalized = finalize_repro_tasks(document, FACTS)
+
+        self.assertNotIn("backfill_handoff", normalized)
+        self.assertEqual(
+            normalized["_meta"]["backfill_handoff"],
+            {
+                "ready_for_writer": False,
+                "blocking_request_ids": ["backfill_a"],
+                "reason": "a newly exposed formula is still missing",
+            },
+        )
+        self.assertEqual(validate_stage("repro_tasks", normalized), [])
+
     def test_drops_only_irreparable_tasks(self) -> None:
         doc = finalize_repro_tasks(
             {

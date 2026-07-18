@@ -71,13 +71,6 @@
           "title": "Limitations",
           "type": "array"
         },
-        "target_entity_ids": {
-          "items": {
-            "type": "string"
-          },
-          "title": "Target Entity Ids",
-          "type": "array"
-        },
         "subfigure": {
           "anyOf": [
             {

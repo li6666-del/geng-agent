@@ -64,7 +64,7 @@ class CodexRunnerEphemeralTests(unittest.TestCase):
         return status, calls, writes
 
     def test_default_command_is_ephemeral_and_prompt_stays_on_stdin(self) -> None:
-        self.assertEqual(DEFAULT_GENG_CODEX_MODEL, "gpt-5.5")
+        self.assertEqual(DEFAULT_GENG_CODEX_MODEL, "gpt-5.6-sol")
 
         status, calls, writes = self._invoke()
 
@@ -100,10 +100,10 @@ class CodexRunnerEphemeralTests(unittest.TestCase):
         self.assertEqual(command.count("--image"), 2)
         self.assertIn(str(images[0]), command)
         self.assertIn(str(images[1]), command)
-        self.assertEqual(command[command.index("--config") + 1], 'model_reasoning_effort="high"')
+        self.assertEqual(command[command.index("--config") + 1], 'model_reasoning_effort="xhigh"')
         self.assertEqual(kwargs["input"], "test prompt")
         self.assertTrue(kwargs["capture_output"])
-        self.assertEqual(status["reasoning_effort"], "high")
+        self.assertEqual(status["reasoning_effort"], "xhigh")
 
     def test_unsupported_cli_feature_fails_closed_without_worker_launch(self) -> None:
         status, calls, writes = self._invoke(help_text="Usage: codex exec [OPTIONS]")
@@ -136,10 +136,10 @@ class CodexRunnerEphemeralTests(unittest.TestCase):
 
     def test_all_one_shot_roles_are_ephemeral(self) -> None:
         expected_reasoning = {
-            "analysis": "high",
-            "task_writer": "medium",
-            "task_reporter": "high",
-            "report_editor": "medium",
+            "analysis": "xhigh",
+            "task_writer": "xhigh",
+            "task_reporter": "xhigh",
+            "report_editor": "xhigh",
         }
 
         for role, reasoning in expected_reasoning.items():

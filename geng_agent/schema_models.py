@@ -67,7 +67,6 @@ MetricName = Literal[
 
 TrendDirection = Literal["decreasing", "increasing", "flat", "unknown"]
 AssumptionRisk = Literal["low", "medium", "high"]
-PaperEntityKind = Literal["section", "figure", "table", "equation", "algorithm"]
 ReproducibilityVerdict = Literal[
     "fully_reproduced",
     "mostly_reproduced",
@@ -239,46 +238,6 @@ class PaperThesisDocument(StrictModel):
     caveats: list[str]
 
 
-class PaperMemorySource(StrictModel):
-    path: str
-    format: str
-    sha256: str | None
-    page_count: int | None
-
-
-class PaperMemoryEntity(StrictModel):
-    entity_id: NonEmptyStr
-    kind: PaperEntityKind
-    label: NonEmptyStr
-    number: str | None
-    subfigure: str | None
-    page: int | None
-    chunk_ids: list[NonEmptyStr]
-    text: str
-    parent_id: str | None
-
-
-class PaperCrossReference(StrictModel):
-    from_id: NonEmptyStr
-    to_id: NonEmptyStr
-    relation: Literal["references", "contains"]
-
-
-class PaperMemoryMetadata(StrictModel):
-    builder: NonEmptyStr
-    chunk_count: int
-    entity_count: int
-
-
-class PaperMemoryDocument(StrictModel):
-    schema_version: Literal["2.0"]
-    source: PaperMemorySource
-    entities: list[PaperMemoryEntity]
-    cross_references: list[PaperCrossReference]
-    metadata: PaperMemoryMetadata
-    memory_hash: NonEmptyStr
-
-
 class ExperimentIndexItem(StrictModel):
     experiment_id: NonEmptyStr
     title: NonEmptyStr
@@ -289,7 +248,6 @@ class ExperimentIndexItem(StrictModel):
     source_chunk_ids: list[NonEmptyStr]
     required_facts: list[RequiredFactRef]
     limitations: list[str]
-    target_entity_ids: list[str] = Field(default_factory=list)
     subfigure: str | None = None
     claim: str = ""
     methods: list[str] = Field(default_factory=list)
@@ -393,7 +351,6 @@ SCHEMA_MODELS: dict[str, type[BaseModel]] = {
     "targeted_fact_backfill": TargetedFactBackfillDocument,
     "repro_tasks": ReproTasksDocument,
     "paper_thesis": PaperThesisDocument,
-    "paper_memory": PaperMemoryDocument,
     "experiment_index": ExperimentIndexDocument,
     "task_verification_result": IsolatedTaskVerificationDocument,
     "verification_result": VerificationResultDocument,
@@ -407,7 +364,6 @@ SCHEMA_FILENAMES: dict[str, str] = {
     "targeted_fact_backfill": "targeted_fact_backfill.schema.json",
     "repro_tasks": "repro_tasks.schema.json",
     "paper_thesis": "paper_thesis.schema.json",
-    "paper_memory": "paper_memory.schema.json",
     "experiment_index": "experiment_index.schema.json",
     "task_verification_result": "task_verification_result.schema.json",
     "verification_result": "verification_result.schema.json",

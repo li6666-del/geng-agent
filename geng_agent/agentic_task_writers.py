@@ -16,6 +16,7 @@ from .verification_result import (
 from .task_writer_support import (
     PAPER_EVIDENCE_DIR,
     CODEX_PROJECT_BACKEND,
+    _analysis_snapshot_hash,
     _collect_writer_analysis_artifacts,
     _load_cached_task_writer_workflow,
     _manifest_from_project,
@@ -44,6 +45,16 @@ from .task_scripts import build_tasks_manifest, write_task_scaffolding
 
 
 TASK_WRITER_TERMINAL_STATUS = WRITER_REVIEW_STATUS
+
+WRITER_PAPER_FIDELITY_POLICY = """## Highest law: fidelity to the paper's established facts
+Fidelity outranks visual closeness, convenience, prior code, and reporter advice in both an initial implementation and every repair session.
+
+- Treat paper-explicit data, system models, equations, algorithm steps, experiment protocols, baseline identities, metric definitions, axes, and stated scan ranges as immutable constraints. Do not alter, replace, or bypass them merely to make a curve look closer to the target.
+- Use this evidence priority: explicit paper statements and figures; deterministic derivations from them; figure-level visual estimates; standard domain assumptions; target-informed calibration; reporter suggestions. Lower-priority evidence may fill a genuine gap but may never overwrite higher-priority evidence.
+- When the paper is silent, incomplete, or genuinely ambiguous, make a bold but scientifically plausible implementation or value assumption. Label it `assumed`, explain why it is reasonable, keep it separate from paper facts, and revise it when comparison evidence warrants that.
+- An assumed algorithm is acceptable only as an implementation completion for an unspecified step. It may not replace a model, data-generating law, objective, or core algorithm that the paper already defines.
+- Reporter feedback is evidence to investigate, not authority over the paper. Reject or reclassify feedback that conflicts with explicit paper evidence. Preserve the faithful main result and keep any conflicting figure-fitting alternative clearly labeled as a diagnostic branch.
+"""
 
 
 def _task_with_experiment_profile(task: dict[str, Any], experiment_index: dict[str, Any]) -> dict[str, Any]:
@@ -75,8 +86,6 @@ def run_codex_task_writer_workflow(
     timeout: float = 1800.0,
     run_timeout: float = 120.0,
     resume: bool = True,
-    paper_memory: dict[str, Any] | None = None,
-    memory_snapshot_hash: str = "",
     review_feedback: dict[str, dict[str, Any]] | None = None,
     force_task_ids: set[str] | None = None,
     task_review_callback: Callable[[int, dict[str, Any], dict[str, Any], int], dict[str, Any]] | None = None,
@@ -98,6 +107,10 @@ def run_codex_task_writer_workflow(
             "task writers require finalized first-two-stage artifacts: "
             + ", ".join(missing_analysis_artifacts)
         )
+    analysis_snapshot_hash = _analysis_snapshot_hash(
+        paper_path=paper_path,
+        artifacts=analysis_artifacts,
+    )
 
     task_manifest = build_tasks_manifest(tasks)
     task_items = [task for task in tasks.get("repro_tasks", []) if isinstance(task, dict)]
@@ -111,7 +124,7 @@ def run_codex_task_writer_workflow(
         output_dir=output_dir,
         repro_project_dir=repro_project_dir,
         run_repro=run_repro,
-        memory_snapshot_hash=memory_snapshot_hash,
+        analysis_snapshot_hash=analysis_snapshot_hash,
     )
     cached_runtime_passed = bool((cached or {}).get("runtime_result", {}).get("passed"))
     cached_records = cached.get("task_records") if isinstance((cached or {}).get("task_records"), list) else []
@@ -150,7 +163,7 @@ def run_codex_task_writer_workflow(
         _load_task_writer_resume_records(
             audit_dir=audit_dir,
             task_pairs=task_pairs,
-            expected_memory_snapshot_hash=memory_snapshot_hash,
+            expected_analysis_snapshot_hash=analysis_snapshot_hash,
         )
         if resume
         else {}
@@ -185,8 +198,7 @@ def run_codex_task_writer_workflow(
         paper_context_json=paper_context_json,
         paper_images=paper_images,
         paper_thesis=paper_thesis,
-        paper_memory=paper_memory,
-        memory_snapshot_hash=memory_snapshot_hash,
+        analysis_snapshot_hash=analysis_snapshot_hash,
         analysis_artifacts=analysis_artifacts,
         task_root=task_root,
         audit_dir=audit_dir,
@@ -231,7 +243,7 @@ def run_codex_task_writer_workflow(
         round_no=1,
     )
     manifest["_meta"]["mode"] = "task_writers"
-    manifest["_meta"]["memory_snapshot_hash"] = memory_snapshot_hash
+    manifest["_meta"]["analysis_snapshot_hash"] = analysis_snapshot_hash
     write_json(output_dir / "repro_project_manifest.json", manifest)
 
     runtime_result = _task_writer_runtime_result(
@@ -293,7 +305,7 @@ def _load_task_writer_resume_records(
     *,
     audit_dir: Path,
     task_pairs: list[tuple[dict[str, Any], dict[str, Any]]],
-    expected_memory_snapshot_hash: str,
+    expected_analysis_snapshot_hash: str,
 ) -> dict[int, dict[str, Any]]:
     path = audit_dir / "03c_task_writers_records.json"
     if not path.exists():
@@ -321,7 +333,7 @@ def _load_task_writer_resume_records(
         sandbox = Path(str(record.get("sandbox") or ""))
         if not sandbox.exists() or sandbox.resolve() != expected_sandbox.resolve():
             continue
-        if str(record.get("memory_snapshot_hash") or expected_memory_snapshot_hash) != expected_memory_snapshot_hash:
+        if str(record.get("analysis_snapshot_hash") or "") != expected_analysis_snapshot_hash:
             continue
         records[index] = record
     return records
@@ -358,8 +370,7 @@ def _dispatch_task_writers(
     paper_context_json: str,
     paper_images: list[Any] | None,
     paper_thesis: dict[str, Any] | None,
-    paper_memory: dict[str, Any] | None,
-    memory_snapshot_hash: str,
+    analysis_snapshot_hash: str,
     analysis_artifacts: dict[str, Path],
     task_root: Path,
     audit_dir: Path,
@@ -418,8 +429,7 @@ def _dispatch_task_writers(
                     paper_context_json=paper_context_json,
                     paper_images=paper_images,
                     paper_thesis=paper_thesis,
-                    paper_memory=paper_memory,
-                    memory_snapshot_hash=memory_snapshot_hash,
+                    analysis_snapshot_hash=analysis_snapshot_hash,
                     analysis_artifacts=analysis_artifacts,
                     task_root=task_root,
                     audit_dir=audit_dir,
@@ -469,8 +479,7 @@ def _run_one_task_writer(
     paper_context_json: str,
     paper_images: list[Any] | None,
     paper_thesis: dict[str, Any] | None,
-    paper_memory: dict[str, Any] | None,
-    memory_snapshot_hash: str,
+    analysis_snapshot_hash: str,
     analysis_artifacts: dict[str, Path],
     task_root: Path,
     audit_dir: Path,
@@ -492,8 +501,7 @@ def _run_one_task_writer(
         paper_path=paper_path,
         facts=facts,
         paper_thesis=paper_thesis,
-        paper_memory=paper_memory,
-        memory_snapshot_hash=memory_snapshot_hash,
+        analysis_snapshot_hash=analysis_snapshot_hash,
         analysis_artifacts=analysis_artifacts,
         full_paper_images=paper_images,
         reuse_existing=reuse_existing,
@@ -521,6 +529,7 @@ def _run_one_task_writer(
                 sandbox=sandbox,
                 writer_status={"ok": True, "source": "resumed_existing_delivery"},
             )
+            existing_record["analysis_snapshot_hash"] = analysis_snapshot_hash
             existing_record["writer_session_count"] = max(1, archive_round)
             if existing_record.get("task_writer_status") == TASK_WRITER_TERMINAL_STATUS:
                 review_action, returned_feedback = _attach_task_reporter_review(
@@ -569,6 +578,7 @@ def _run_one_task_writer(
             sandbox=sandbox,
             writer_status=writer_status,
         )
+        record["analysis_snapshot_hash"] = analysis_snapshot_hash
         record["writer_session_count"] = session_round
         if not writer_status.get("ok") or not run_repro:
             return record
@@ -694,21 +704,25 @@ def _build_task_writer_continuation_brief(
     feedback_text = pretty_json(review_feedback) if review_feedback else "None"
     return f"""# Mandatory continuation: session {session_round}
 
-The previous Codex session for `{task_id}` ended without a valid `ready_for_review` delivery, or the independent reporter found a material paper mismatch. That was not completion. Continue in the existing sandbox; do not restart the implementation and do not merely rewrite the previous explanation.
+The previous Codex session for `{task_id}` ended without a valid `ready_for_review` delivery, or the independent reporter reported a possible material paper mismatch. Continue in the existing sandbox; do not restart the implementation and do not merely rewrite the previous explanation.
+
+{WRITER_PAPER_FIDELITY_POLICY}
 
 Before acting:
 1. Read the existing task code, configs, outputs, and `writer_progress/` archives.
 2. Inspect the latest local CSV/summary/PNG against the complete paper evidence.
-3. State a concrete modification plan, apply it, and run a fresh full with `python -m tasks.{module} config.json`.
-4. Keep iterating inside this session. Do not emit `explained_gap`, `failed`, or final `matched` as a scientific terminal state.
-5. Write `task_agent_result.json` with status `ready_for_review` only after a successful full and a serious direct comparison against the complete paper figure.
+3. Classify every reporter item before editing: (a) a paper-grounded violation of an explicit fact or failure of the core claim; (b) a reasonable choice inside paper-silent or ambiguous space; or (c) a non-material numerical, statistical, visual, or presentation difference.
+4. Create a concrete modification plan only for category (a). For category (b), keep or revise the explicit assumption according to evidence. For category (c), record the caveat without changing faithful code merely to satisfy the reporter.
+5. Run a fresh full with `python -m tasks.{module} config.json` after a meaningful code, model, parameter, or configuration change. Never rerun unchanged code solely to answer non-blocking feedback.
+6. Keep iterating while a paper-grounded material blocker remains and a concrete change is available. Do not emit `explained_gap`, `failed`, or final `matched` as a scientific terminal state.
+7. Write `task_agent_result.json` with status `ready_for_review` once the latest successful full respects explicit paper facts, supports the task's core claim, and leaves only disclosed assumptions or non-material differences.
 
 ## Isolated task reporter feedback
 ```json
 {feedback_text}
 ```
 
-Treat every reported difference above as mandatory evidence to investigate. Fix the underlying code, model, parameters, or presentation and run a fresh full.
+Investigate every reported difference, but do not obey it blindly. Fix and rerun only for a material, paper-grounded blocker. If a suggestion conflicts with explicit paper evidence, preserve the faithful implementation and document that conflict. If it concerns an acceptable paper-silent assumption or a non-material difference, retain it as a caveat and resubmit without manufacturing scientific activity.
 
 The original task brief follows.
 
@@ -840,8 +854,7 @@ def _prepare_task_writer_sandbox(
     paper_path: Path,
     facts: dict[str, Any],
     paper_thesis: dict[str, Any] | None,
-    paper_memory: dict[str, Any] | None,
-    memory_snapshot_hash: str,
+    analysis_snapshot_hash: str,
     analysis_artifacts: dict[str, Path] | None = None,
     full_paper_images: list[Any] | None = None,
     reuse_existing: bool = False,
@@ -855,8 +868,7 @@ def _prepare_task_writer_sandbox(
             facts=facts,
             tasks={"repro_tasks": [task]},
             paper_thesis=paper_thesis,
-            paper_memory=paper_memory,
-            memory_snapshot_hash=memory_snapshot_hash,
+            analysis_snapshot_hash=analysis_snapshot_hash,
             analysis_artifacts=analysis_artifacts,
             full_paper_images=full_paper_images,
         )
@@ -875,8 +887,7 @@ def _prepare_task_writer_sandbox(
         facts=facts,
         tasks={"repro_tasks": [task]},
         paper_thesis=paper_thesis,
-        paper_memory=paper_memory,
-        memory_snapshot_hash=memory_snapshot_hash,
+        analysis_snapshot_hash=analysis_snapshot_hash,
         analysis_artifacts=analysis_artifacts,
         full_paper_images=full_paper_images,
     )
@@ -946,7 +957,9 @@ def _build_task_writer_brief(
     )
     return f"""# Role: autonomous Codex task writer
 
-You own exactly one reproduction task. Write the code, run the assigned full experiment, compare the result directly with the complete paper, and keep revising and rerunning while a concrete scientific or visual mismatch remains. Your handoff is `ready_for_review`; only the independent reporter may grant final `matched`.
+You own exactly one reproduction task. Write the code, run the assigned full experiment, compare the result directly with the complete paper, and keep revising and rerunning while a paper-grounded material scientific blocker remains. Your handoff is `ready_for_review`; only the independent reporter may grant final `matched`.
+
+{WRITER_PAPER_FIDELITY_POLICY}
 
 ## Ownership
 - Assigned task_id: `{task_id}`
@@ -961,48 +974,49 @@ You own exactly one reproduction task. Write the code, run the assigned full exp
 - Calling `_backend.select_backend()` is not GPU acceleration by itself. If CUDA is selected, the expensive computation must actually run on CUDA tensors. If CPU is selected despite available CUDA, record a concrete task-specific reason.
 - There is no cycle limit. Keep iterating toward the paper until the result is honestly ready for independent review; external process failures are handled by the host.
 
-## Exact-figure objective
-Your target is the closest technically achievable reproduction of the complete assigned paper figure, not a qualitative proxy. Reproduce every observable detail that can be grounded or responsibly inferred:
+## Paper-faithful core-claim objective
+Your target is a faithful implementation that supports the assigned figure's core scientific claim. Pursue close numerical and visual agreement, but never trade away explicit paper facts to obtain it. Reproduce every observable detail that can be grounded or responsibly inferred:
 - scientific content: all curves, baselines, parameter settings, sample regimes, statistics, ordering, crossings, slopes, saturation points, extrema, and annotations;
 - axes: variables, units, transforms, linear/log scale, limits, tick locations, and normalization;
 - presentation: subplot structure, aspect ratio, legend entries/order/location, labels, markers, line styles, colors, error bars, reference lines, and captions visible in the target;
-- numerical agreement: compare key coordinates, relative gaps, thresholds, and curve shapes, using explicit tolerances appropriate to the paper evidence.
+- numerical agreement: compare key coordinates, relative gaps, thresholds, and curve shapes, using tolerances appropriate to the paper evidence and its visual resolution.
 
-A trend-only, ordering-only, or merely visually similar result is not enough. The paper itself is the authority. If the upstream task description conflicts with the paper, follow the paper and record the correction.
+The core claim normally consists of the claimed method identity, comparison direction, ordering, trend, crossing or threshold region, scaling behavior, gain/loss region, or other conclusion the figure is used to establish. Exact pixels, styling, undisclosed nuisance parameters, and small numerical offsets are secondary unless the paper's claim depends on them. The paper itself is the authority. If the upstream task description conflicts with the paper, follow the paper and record the correction.
 
 ## Mandatory self-iteration protocol
-You are not a one-shot report writer. You are the coder, runner, and first-pass reviewer for this task. Missing parameters, modeling uncertainty, non-identifiability, or an imperfect result are reasons to search, change, and rerun, not reasons to stop early.
+You are not a one-shot report writer. You are the coder, runner, and first-pass reviewer for this task. Missing parameters, modeling uncertainty, non-identifiability, or an imperfect result are reasons to investigate rather than stop reflexively; only a paper-grounded material blocker should trigger scientific changes and another full.
 
 For each cycle:
 1. Before writing code, open `paper_evidence/analysis_artifacts/manifest.json`, verify the finalized facts/tasks/index are present, and inspect the copied original paper plus the complete rendered-page index. Task-scoped facts and text previews are navigation hints only and may be incomplete.
 2. Inspect the assigned task, finalized upstream artifacts, and the full paper. Build your checklist from the actual target figure: identity, panels, curves, baselines, equations, parameters, axes, scales, statistics, annotations, and style.
 3. Resolve missing parameters in this order: finalized facts/tasks/thesis/index; copied original paper under `paper_evidence/source/`; captions and neighboring text; equations, tables, appendices, references, and all available page images. Record the source for every recovered value.
-4. Only after that search fails, make a bold but scientifically plausible explicit assumption. Put it in code/config and `parameter_resolution`; never silently invent a value. An assumption is a testable hypothesis, so revise it when the local-paper comparison contradicts it.
+   Read `repro_tasks.json` `_meta.fact_gap_handoff` as prior-search context. Its unresolved entries are navigation aids, not permission to stop: inspect the full paper yourself, then make an explicit testable assumption only when the evidence remains unavailable. Read optional `analysis_warnings.json` the same way: warnings identify uncertain upstream evidence but never override the paper or excuse an incomplete search.
+4. Only after that search fails, make a bold but scientifically plausible explicit value or implementation assumption. Put it in code/config and `parameter_resolution`; never silently invent it or relabel it as a paper fact. An assumption may complete an unspecified step but must not replace an explicit model, data-generating law, objective, or core algorithm.
 5. Implement or revise the task code and configuration. Do not digitize or hard-code the target curves as the simulated result.
 6. Run smoke only as a quick sanity check, then run full directly with `python -m tasks.{module} config.json` when enabled.
-7. Inspect the local CSV/summary/PNG side by side with the paper figure. Check the complete detail checklist, not only the central claim.
-8. For every discrepancy, form a concrete hypothesis about equations, parameters, assumptions, normalization, statistics, backend precision, axis scaling, baseline implementation, or plotting. Modify code/config/model and run full again.
-9. Record each cycle in `task_agent_result.md`: evidence searched, recovered parameters or assumptions, backend/device, command, duration, return code, detail-by-detail comparison, the concrete modification plan, changed files, and the result after modification.
+7. Inspect the local CSV/summary/PNG side by side with the paper figure. First verify fidelity to explicit facts and support for the core claim; then classify remaining differences as material blockers, acceptable paper-silent assumptions, or non-material numerical/presentation differences.
+8. For every material blocker, form a concrete hypothesis about equations, parameters, assumptions, normalization, statistics, backend precision, axis scaling, or baseline implementation. Modify code/config/model and run full again. Do not modify faithful scientific code solely for typography or pixel-level agreement.
+9. Record each cycle in `task_agent_result.md`: evidence searched, recovered parameters or assumptions, backend/device, command, duration, return code, the core-claim comparison, material blockers, non-material caveats, the concrete modification plan, changed files, and the result after modification.
 
-Do not stop after an imperfect output. Any material discrepancy in data, axes, baselines, statistics, annotations, or presentation must trigger another concrete modification and fresh full. Never rerun unchanged code merely to consume a cycle. Do not emit `explained_gap`, self-declare `failed`, or claim final `matched`; hand off only as `ready_for_review` after a successful full and direct paper comparison.
+Do not stop while a material scientific blocker remains and an evidence-based change is available. Conversely, do not keep changing a paper-faithful implementation after the core claim is supported merely because exact values, undisclosed choices, or presentation details could still be debated. Never rerun unchanged code merely to consume a cycle. Do not emit `explained_gap`, self-declare `failed`, or claim final `matched`; hand off only as `ready_for_review` after a successful full and direct paper comparison.
 
 ## Comparison-driven iteration loop
-Do not score, rank, or maintain a hypothesis queue. There is no fixed iteration count. Use the direct loop below until the local result matches the paper:
+Do not score, rank, or maintain a hypothesis queue. There is no fixed iteration count. Use the direct loop below until explicit paper facts are respected and the core claim is supported:
 
-1. Run full and compare the local CSV/summary/PNG with the paper figure across scientific model, curves/baselines, numerical shape, axes/scales, statistics, annotations, and style.
-2. If anything material differs, write a concrete modification plan before editing. State what appears wrong, which parameter/equation/baseline/config/plotting choice will change, which files will change, and what direction the result should move.
+1. Run full and compare the local CSV/summary/PNG with the paper figure across explicit model/data/algorithm fidelity, core-claim support, curves/baselines, numerical shape, axes/scales, statistics, annotations, and style.
+2. If a material scientific blocker remains, write a concrete modification plan before editing. State the paper evidence, what appears wrong, which parameter/equation/baseline/config choice will change, which files will change, and what direction the result should move.
 3. Apply that modification plan. Keep each iteration coherent enough that its effect can be understood; do not change unrelated parts merely to create activity.
 4. Run smoke if useful, then run a fresh full. Compare the same figure details again and record whether each targeted difference improved, worsened, or stayed unchanged.
 5. Keep, revert, or revise the change based on the comparison, then write the next modification plan and repeat.
 
-When a parameter is missing, search the complete paper first. If it is still absent, choose a scientifically plausible value or small range, label it as assumed, run it, and revise it from the comparison result. Never repeat an unchanged full and never count prose, metadata, locator, or report-only edits as progress.
+When a value or implementation detail is missing, search the complete paper first. If it is still absent, choose a scientifically plausible value, algorithm, or small range, label it as assumed, run it, and revise it from the comparison result. For a material assumption, prefer a small sensitivity check when practical so the core claim is not supported only at one finely tuned point. Never repeat an unchanged full and never count prose, metadata, locator, or report-only edits as progress.
 
-Your only normal handoff decision is `ready_for_review`: the latest full is successful, the complete target has been compared against the paper, and you cannot identify another evidence-based change that should improve a material mismatch. If you cannot state another modification, revisit the complete paper, assumptions, equations, parameter ranges, baseline definitions, numerical methods, statistics, backend, and plotting choices before handing off. External Codex/runtime failure is handled by the host and must not be converted into a scientific conclusion.
+Your only normal handoff decision is `ready_for_review`: the latest full is successful, explicit paper facts remain intact, the task's core claim is supported, assumptions are disclosed, and no paper-grounded material blocker remains. Before handing off, revisit the complete paper, assumptions, equations, parameter ranges, baseline definitions, numerical methods, and statistics. Do not delay handoff for non-material styling differences or merely because another undocumented implementation is conceivable. External Codex/runtime failure is handled by the host and must not be converted into a scientific conclusion.
 
 Stopping rule:
-- If a material paper mismatch remains and a concrete change is available, continue iterating and rerun full.
-- If the latest full is successful and no further evidence-based change remains, write the review delivery.
-- Never write a terminal result merely to explain a gap. Record the gap and use it to drive the next modification.
+- If an explicit paper fact is materially violated, or the core claim is unsupported, and a concrete paper-grounded change is available, continue iterating and rerun full.
+- If the latest full respects explicit facts, supports the core claim, and only disclosed paper-silent assumptions or non-material differences remain, write the review delivery.
+- Never hide or hand-wave a material gap. Record it and use it to drive the next evidence-based modification; disclose non-material gaps as caveats without manufacturing another run.
 - If this Codex session ends before `ready_for_review`, the host will reopen the same sandbox and require you to continue.
 - The reporter may return concrete differences. The host then reopens this same sandbox; accepted tasks are not rerun.
 
@@ -1058,7 +1072,7 @@ Stopping rule:
 ```json
 {feedback_text}
 ```
-If feedback is present, investigate every reported difference. Fix the underlying code/config/model and run a fresh full; do not merely rewrite the evidence text.
+If feedback is present, investigate every reported difference against the paper's evidence hierarchy. Fix and rerun for a material paper-grounded blocker. Do not alter explicit paper facts, do not blindly obey speculative feedback, and do not rerun unchanged code for an acceptable assumption or non-material caveat.
 
 ## Trusted runtime APIs
 {IO_RUNTIME_API_DOC}
@@ -1076,6 +1090,7 @@ If feedback is present, investigate every reported difference. Fix the underlyin
 - `paper_evidence/analysis_artifacts/repro_tasks.json`
 - `paper_evidence/analysis_artifacts/experiment_index.json`
 - `paper_evidence/analysis_artifacts/paper_thesis.json` when present
+- `paper_evidence/analysis_artifacts/analysis_warnings.json` when present
 - `paper_evidence/full_paper_pages/index.json` and every page image listed there
 
 ## Task-scoped navigation aids

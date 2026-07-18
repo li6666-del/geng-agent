@@ -16,29 +16,6 @@ class StatusTests(unittest.TestCase):
             case.mkdir()
             write_json(case / "paper_chunks.json", {"source_path": str(root / "paper.md"), "chunks": [{"chunk_id": "text_c1", "text": "AWGN"}]})
             write_json(
-                case / "paper_memory.json",
-                {
-                    "schema_version": "2.0",
-                    "source": {"path": str(root / "paper.md"), "format": "md", "sha256": None, "page_count": None},
-                    "entities": [
-                        {
-                            "entity_id": "section:text_c1",
-                            "kind": "section",
-                            "label": "text_c1",
-                            "number": None,
-                            "subfigure": None,
-                            "page": None,
-                            "chunk_ids": ["text_c1"],
-                            "text": "AWGN",
-                            "parent_id": None,
-                        }
-                    ],
-                    "cross_references": [],
-                    "metadata": {"builder": "test", "chunk_count": 1, "entity_count": 1},
-                    "memory_hash": "test-hash",
-                },
-            )
-            write_json(
                 case / "engineering_facts.json",
                 {
                     "paper_domain": "communication",

@@ -252,6 +252,13 @@ class PipelineTests(unittest.TestCase):
                 }
             ]
             preliminary = task_doc(draft_task)
+            preliminary["_meta"] = {
+                "backfill_handoff": {
+                    "ready_for_writer": False,
+                    "blocking_request_ids": ["fig4_normalization"],
+                    "reason": "power normalization changes the experiment",
+                }
+            }
             aggregate_request = collect_missing_fact_requests(preliminary)[0]
             backfill_fact = fact("simulation_parameter", "Fig. 4 power normalization")
             backfill_fact["evidence_kind"] = "paper_explicit"
@@ -278,6 +285,11 @@ class PipelineTests(unittest.TestCase):
                 ],
             }
             finalized = task_doc({**draft_task, "missing_fact_requests": []})
+            finalized["backfill_handoff"] = {
+                "ready_for_writer": True,
+                "blocking_request_ids": [],
+                "reason": "the task is ready for writer implementation",
+            }
 
             def fake_analysis_stage(**kwargs):
                 label = kwargs["stage_label"]
@@ -368,6 +380,13 @@ class PipelineTests(unittest.TestCase):
                 }
             ]
             preliminary = task_doc(draft)
+            preliminary["_meta"] = {
+                "backfill_handoff": {
+                    "ready_for_writer": False,
+                    "blocking_request_ids": ["fig4_setup"],
+                    "reason": "simulation setup changes the implementation",
+                }
+            }
             aggregate_id = collect_missing_fact_requests(preliminary)[0]["request_id"]
 
             setup_fact = fact("simulation_parameter", "Fig. 4 simulation setup")
@@ -402,6 +421,11 @@ class PipelineTests(unittest.TestCase):
                     "affects": ["statistical_protocol"],
                 }
             )
+            round_1_task["backfill_handoff"] = {
+                "ready_for_writer": False,
+                "blocking_request_ids": [aggregate_id],
+                "reason": "trial count changes the statistical protocol",
+            }
             round_2_backfill = {
                 **fact_doc(),
                 "request_resolutions": [
@@ -420,17 +444,12 @@ class PipelineTests(unittest.TestCase):
                 ],
             }
             round_2_task = json.loads(json.dumps(round_1_task))
-            round_2_task["repro_tasks"][0]["assumptions"] = [
-                {
-                    "name": "Monte Carlo trial count",
-                    "default_value": 1000,
-                    "reason": "not disclosed in the paper",
-                    "risk": "medium",
-                    "request_id": aggregate_id,
-                    "field_ids": ["trial_count"],
-                    "sensitivity_check": "repeat with 500 and 2000 trials",
-                }
-            ]
+            round_2_task["repro_tasks"][0]["assumptions"] = []
+            round_2_task["backfill_handoff"] = {
+                "ready_for_writer": True,
+                "blocking_request_ids": [],
+                "reason": "writer can choose and test an explicit trial-count assumption",
+            }
 
             documents = {
                 "01_extract_engineering_facts": initial,
@@ -473,11 +492,33 @@ class PipelineTests(unittest.TestCase):
             )
             self.assertEqual(summary["round_count"], 2)
             self.assertEqual(summary["terminal_unresolved_count"], 1)
-            self.assertEqual(summary["stop_reason"], "all_requests_terminal")
+            self.assertEqual(summary["stop_reason"], "task_expert_handoff_ready")
             analysis_result = json.loads(
                 (output_dir / "analysis_result.json").read_text(encoding="utf-8")
             )
             self.assertEqual(analysis_result["analysis_stage_invocations"], 7)
+            diagnostics = json.loads(
+                (output_dir / "audit" / "02c_terminal_gap_diagnostics.json").read_text(encoding="utf-8")
+            )
+            self.assertTrue(diagnostics["advisory"])
+            self.assertFalse(diagnostics["passed"])
+            self.assertGreaterEqual(diagnostics["issue_count"], 1)
+            warnings = json.loads(
+                (output_dir / "analysis_warnings.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertTrue(warnings["advisory_only"])
+            self.assertGreaterEqual(warnings["warning_count"], 1)
+            self.assertIn(
+                "terminal_gap",
+                {item["category"] for item in warnings["warnings"]},
+            )
+            final_tasks = json.loads((output_dir / "repro_tasks.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                final_tasks["_meta"]["fact_gap_handoff"]["stop_reason"],
+                "task_expert_handoff_ready",
+            )
 
 
 if __name__ == "__main__":

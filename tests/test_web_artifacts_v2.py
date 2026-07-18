@@ -28,7 +28,6 @@ class ArtifactStoreTests(unittest.TestCase):
         self.assertEqual(phase_for_path("engineering_facts_initial.json"), "paper_analysis")
         self.assertEqual(phase_for_path("engineering_facts.json"), "repro_design")
         self.assertEqual(phase_for_path("fact_conflicts.json"), "repro_design")
-        self.assertEqual(phase_for_path("memory_manifest.json"), "repro_design")
         self.assertEqual(phase_for_path("repro_project/outputs/figure.png"), "task_reproduction")
         self.assertEqual(
             phase_for_path("audit/03c_task_writer_sandboxes/01_task/outputs/task/figure.png"),

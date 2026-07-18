@@ -26,6 +26,28 @@ from .verification_result import (
 TASK_VERIFICATION_FILE = "task_verification_result.json"
 REPORT_ASSETS_DIR = "report_assets"
 
+REPORTER_CONVERGENCE_POLICY = """## Convergence and materiality policy
+Your job is to decide whether another Writer iteration is scientifically necessary, not to discover every conceivable imperfection.
+
+### Evidence boundary
+- Strictly enforce paper-explicit data, system models, equations, core algorithm steps, experiment protocols, baseline identities, metric definitions, axes, and stated scan ranges. A Writer may not change these merely to fit the target figure.
+- Accept explicit, scientifically plausible value or implementation assumptions where the paper is silent, incomplete, or genuinely ambiguous. An assumed algorithm may complete an unspecified step, but it may not replace a model, data-generating law, objective, or core algorithm that the paper defines.
+- Treat the Writer's assumptions as disclosed hypotheses, not paper facts. Assess whether they are reasonable and whether the core conclusion remains supported; do not reject merely because another undocumented implementation is possible.
+
+### Acceptance gate
+Return `accepted` when the implementation respects explicit paper facts, the full run is credible, and the assigned core claim is supported. The core claim may be expressed by method identity, comparison direction, ordering, trend, crossing or threshold region, scaling behavior, gain/loss region, or another conclusion the target figure is used to establish.
+
+Acceptance may be conditional on disclosed paper-silent assumptions. Record those assumptions and residual uncertainty in `comparison_summary`, `non_material_differences`, and `remaining_uncertainties`; keep `differences` empty. Exact pixel alignment, plotting style, unavailable author code, unspecified seeds/sample counts/solvers, plausible baseline completion, and small numerical offsets are non-blocking unless the paper's core claim depends on them.
+
+### Revision gate
+Return `revise` to the Writer only when all of the following are true:
+1. There is a material blocker: either a substantive violation of explicit paper data/model/core algorithm/protocol, or failure to support the assigned core claim.
+2. The blocker can affect the scientific interpretation rather than only presentation or unknowable implementation identity.
+3. You can cite paper evidence and give a concrete change likely to resolve it.
+
+Do not issue speculative revisions. Do not demand proof of equivalence to private author code. Do not send the Writer back for reasonable assumptions inside paper-silent space, non-material residuals, crop problems, or report wording. Put such matters in non-blocking fields and converge.
+"""
+
 
 def run_codex_task_reporter_workflow(
     *,
@@ -37,14 +59,12 @@ def run_codex_task_reporter_workflow(
     facts: dict[str, Any],
     experiment_index: dict[str, Any],
     paper_thesis: dict[str, Any] | None,
-    paper_memory: dict[str, Any] | None,
     paper_images: list[Any] | None,
     output_dir: Path,
     audit_dir: Path,
     timeout: float,
     resume: bool,
     figure_index: dict[str, Any] | None = None,
-    memory_snapshot_hash: str = "",
     round_no: int = 1,
     include_all_paper_pages: bool = False,
 ) -> dict[str, Any]:
@@ -87,8 +107,6 @@ def run_codex_task_reporter_workflow(
             facts=isolated_facts,
             tasks={"repro_tasks": [task]},
             paper_thesis=None,
-            paper_memory=paper_memory,
-            memory_snapshot_hash=memory_snapshot_hash,
             full_paper_images=paper_images,
         )
         copied_figure_candidates = _copy_task_figure_candidates(
@@ -310,9 +328,11 @@ You verify exactly one reproduction task: `{task_id}`. There are no other experi
 - `paper_evidence/01_{safe_label(task_id)}/`: task-scoped navigation evidence. It is a hint, never an information boundary.
 
 ## Direct scientific verification
-Independently inspect the complete assigned target. Check target identity and subfigure, all panels, curves and baselines, model/equation logic, parameter settings, axes/scales, numerical anchors and curve shape, statistical reliability, annotations, and presentation. Trend-only similarity or method ordering is insufficient.
+Independently inspect the complete assigned target. Check target identity and subfigure, all panels, curves and baselines, model/equation logic, parameter settings, axes/scales, numerical anchors and curve shape, statistical reliability, annotations, and presentation. Classify each residual by materiality: explicit-fact violation, core-claim failure, acceptable paper-silent assumption, or non-material difference.
 
-If the task description conflicts with the paper, follow the paper. If the writer result has a material scientific, numerical, visual, or evidence defect that the writer can fix, return it to the writer. If the problem is only paper-location ambiguity, insufficient page visibility, or a crop/evidence packaging defect that you can resolve yourself, target the reporter instead.
+If the task description conflicts with the paper, follow the paper. Return work to the Writer only for a material blocker that passes the revision gate below. If the problem is only paper-location ambiguity, insufficient page visibility, or a crop/evidence packaging defect that you can resolve yourself, target the reporter instead.
+
+{REPORTER_CONVERGENCE_POLICY}
 
 ## Required result
 Before any crop is considered complete, write `{TASK_VERIFICATION_FILE}` exactly as JSON:
@@ -333,8 +353,8 @@ Before any crop is considered complete, write `{TASK_VERIFICATION_FILE}` exactly
   "remaining_uncertainties": ["explicit uncertainty"]
 }}
 ```
-- `accepted` requires no material difference, `revision_target: "none"`, and medium or high confidence.
-- `revise` requires concrete differences, actionable feedback, and `revision_target: "writer"` or `"reporter"`.
+- `accepted` requires no material blocker, `revision_target: "none"`, and medium or high confidence. It explicitly includes conditional acceptance based on reasonable, disclosed choices in paper-silent or ambiguous space.
+- `revise` requires a paper-grounded material blocker, concrete differences, actionable feedback, and `revision_target: "writer"` or `"reporter"`. A possible alternative implementation or a cosmetic/numerical residual is not enough.
 - Cite only files that exist within this workspace.
 
 ## Figure localization and crop

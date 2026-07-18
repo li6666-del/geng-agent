@@ -16,12 +16,12 @@ from .security import codex_safe_env, redact_text
 
 MAX_TRANSCRIPT_CHARS = 200_000
 CODEX_CAPABILITY_TIMEOUT_SECONDS = 5.0
-DEFAULT_GENG_CODEX_MODEL = "gpt-5.5"
+DEFAULT_GENG_CODEX_MODEL = "gpt-5.6-sol"
 DEFAULT_GENG_CODEX_REASONING_EFFORT = {
-    "analysis": "high",
-    "task_writer": "medium",
-    "task_reporter": "high",
-    "report_editor": "medium",
+    "analysis": "xhigh",
+    "task_writer": "xhigh",
+    "task_reporter": "xhigh",
+    "report_editor": "xhigh",
 }
 
 _EPHEMERAL_CAPABILITY_CACHE: dict[tuple[str, ...], dict[str, Any]] = {}

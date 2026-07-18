@@ -519,26 +519,46 @@ def _add_image_comparison_table(
 
 
 def _add_markdown_image_to_cell(cell: _Cell, value: str, *, base_dir: Path | None = None) -> None:
-    image_match = re.fullmatch(r"!\[([^\]]*)\]\((.*)\)", value.strip())
-    if not image_match:
+    image_items = _parse_markdown_image_cell(value)
+    if image_items is None:
         _add_cell_paragraph(cell, _clean_markdown_inline(value) or "无可用图片", align=WD_ALIGN_PARAGRAPH.CENTER)
         return
-    caption = image_match.group(1).strip()
-    raw_path = image_match.group(2).strip()
-    image_path = _resolve_markdown_image_path(raw_path, base_dir)
-    if not image_path.exists():
-        _add_cell_paragraph(cell, f"图片缺失：{raw_path}", align=WD_ALIGN_PARAGRAPH.CENTER, italic=True)
-        return
-    try:
-        paragraph = cell.paragraphs[0]
-        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        paragraph.paragraph_format.space_after = Pt(4)
-        run = paragraph.add_run()
-        run.add_picture(str(image_path), width=Inches(RESULT_REVIEW_COMPARISON_IMAGE_WIDTH_IN))
-        if caption:
-            _add_cell_paragraph(cell, _safe_text(caption), align=WD_ALIGN_PARAGRAPH.CENTER, italic=True, muted=True)
-    except Exception as exc:
-        _add_cell_paragraph(cell, f"图片插入失败：{raw_path}（{type(exc).__name__}: {exc}）", align=WD_ALIGN_PARAGRAPH.CENTER, italic=True)
+
+    for index, (caption, raw_path) in enumerate(image_items):
+        image_path = _resolve_markdown_image_path(raw_path, base_dir)
+        if not image_path.exists():
+            _add_cell_paragraph(cell, f"图片缺失：{raw_path}", align=WD_ALIGN_PARAGRAPH.CENTER, italic=True)
+            continue
+        try:
+            paragraph = cell.paragraphs[0] if index == 0 else cell.add_paragraph()
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            paragraph.paragraph_format.space_after = Pt(4)
+            run = paragraph.add_run()
+            run.add_picture(str(image_path), width=Inches(RESULT_REVIEW_COMPARISON_IMAGE_WIDTH_IN))
+            if caption:
+                caption_paragraph = cell.add_paragraph()
+                caption_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                caption_paragraph.paragraph_format.space_after = Pt(4)
+                caption_run = caption_paragraph.add_run(_safe_text(caption))
+                caption_run.italic = True
+                caption_run.font.color.rgb = RGBColor(95, 95, 95)
+                _set_run_font(caption_run, BODY_FONT, Pt(9))
+        except Exception as exc:
+            _add_cell_paragraph(cell, f"图片插入失败：{raw_path}（{type(exc).__name__}: {exc}）", align=WD_ALIGN_PARAGRAPH.CENTER, italic=True)
+
+
+def _parse_markdown_image_cell(value: str) -> list[tuple[str, str]] | None:
+    parts = [part.strip() for part in re.split(r"<br\s*/?>", value.strip(), flags=re.IGNORECASE)]
+    if not parts or any(not part for part in parts):
+        return None
+
+    images: list[tuple[str, str]] = []
+    for part in parts:
+        image_match = re.fullmatch(r"!\[([^\]]*)\]\((.*)\)", part)
+        if not image_match:
+            return None
+        images.append((image_match.group(1).strip(), image_match.group(2).strip()))
+    return images
 
 
 def _add_cell_paragraph(

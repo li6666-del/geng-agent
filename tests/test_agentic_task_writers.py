@@ -5,11 +5,18 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from geng_agent.agentic_task_writers import (
+    _build_task_writer_brief,
+    _build_task_writer_continuation_brief,
     _dispatch_task_writers,
     _record_is_valid_current_delivery,
     _run_one_task_writer,
     _task_writer_concurrency,
     apply_verified_result,
+)
+
+from geng_agent.task_writer_support import (
+    _analysis_snapshot_hash,
+    _collect_writer_analysis_artifacts,
 )
 
 
@@ -30,6 +37,72 @@ def _delivery(task_id: str, sandbox: Path) -> dict:
 
 
 class AutonomousTaskWriterTests(unittest.TestCase):
+    def test_initial_writer_prompt_makes_paper_fidelity_the_highest_law(self) -> None:
+        prompt = _build_task_writer_brief(
+            index=1,
+            task={"task_id": "task_1", "figure_or_claim": "Fig. 1"},
+            manifest_entry={"task_id": "task_1", "module": "task_1", "output_subdir": "task_1"},
+            facts={"engineering_facts": []},
+            experiment_index={"experiments": []},
+            paper={"chunks": []},
+            paper_context_json="",
+            paper_thesis=None,
+            run_repro=True,
+        )
+
+        self.assertIn("Highest law: fidelity to the paper's established facts", prompt)
+        self.assertIn("may never overwrite higher-priority evidence", prompt)
+        self.assertIn("An assumed algorithm is acceptable only", prompt)
+        self.assertIn("the core claim is supported", prompt)
+        self.assertNotIn("A trend-only, ordering-only, or merely visually similar result is not enough", prompt)
+
+    def test_repair_prompt_rechecks_reporter_feedback_against_paper_evidence(self) -> None:
+        prompt = _build_task_writer_continuation_brief(
+            base_prompt="base",
+            task_id="task_1",
+            module="task_1",
+            session_round=2,
+            review_feedback={"differences": ["change an explicit paper parameter"]},
+        )
+
+        self.assertIn("Highest law: fidelity to the paper's established facts", prompt)
+        self.assertIn("Reporter feedback is evidence to investigate, not authority", prompt)
+        self.assertIn("Classify every reporter item before editing", prompt)
+        self.assertIn("Never rerun unchanged code solely to answer non-blocking feedback", prompt)
+        self.assertIn("If a suggestion conflicts with explicit paper evidence", prompt)
+
+    def test_analysis_warnings_are_collected_as_optional_writer_evidence(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "analysis_warnings.json").write_text(
+                "{}", encoding="utf-8"
+            )
+
+            artifacts = _collect_writer_analysis_artifacts(output_dir=root)
+
+            self.assertEqual(
+                artifacts["analysis_warnings.json"],
+                (root / "analysis_warnings.json").resolve(),
+            )
+
+    def test_analysis_snapshot_hash_changes_with_final_artifact(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            paper = root / "paper.pdf"
+            facts = root / "engineering_facts.json"
+            paper.write_bytes(b"paper")
+            facts.write_text("{}", encoding="utf-8")
+            first = _analysis_snapshot_hash(
+                paper_path=paper,
+                artifacts={"engineering_facts.json": facts},
+            )
+            facts.write_text('{"changed": true}', encoding="utf-8")
+            second = _analysis_snapshot_hash(
+                paper_path=paper,
+                artifacts={"engineering_facts.json": facts},
+            )
+            self.assertNotEqual(first, second)
+
     def test_concurrency_equals_task_count(self) -> None:
         self.assertEqual(_task_writer_concurrency(7, 1, run_repro=True), 7)
 
@@ -45,8 +118,8 @@ class AutonomousTaskWriterTests(unittest.TestCase):
             with patch("geng_agent.agentic_task_writers._run_one_task_writer", side_effect=fake_writer):
                 records, audit = _dispatch_task_writers(
                     task_pairs=pairs, facts={}, experiment_index={}, paper={}, paper_path=root / "paper.pdf",
-                    paper_context_json="", paper_images=[], paper_thesis=None, paper_memory=None,
-                    memory_snapshot_hash="", analysis_artifacts={}, task_root=root / "sandboxes", audit_dir=root,
+                    paper_context_json="", paper_images=[], paper_thesis=None,
+                    analysis_snapshot_hash="snapshot", analysis_artifacts={}, task_root=root / "sandboxes", audit_dir=root,
                     run_repro=True, initial_records_by_index=existing,
                     review_feedback={"revise": {"differences": ["curve differs"]}}, force_task_ids={"revise"})
             self.assertEqual([item["task_id"] for item in records], ["accepted", "revise"])
@@ -113,7 +186,7 @@ class AutonomousTaskWriterTests(unittest.TestCase):
                     index=1, reuse_existing=False, task={"task_id": "task_1"},
                     manifest_entry={"task_id": "task_1", "module": "task_1", "output_subdir": "task_1"},
                     facts={}, experiment_index={}, paper={}, paper_path=root / "paper.pdf", paper_context_json="",
-                    paper_images=[], paper_thesis=None, paper_memory=None, memory_snapshot_hash="",
+                    paper_images=[], paper_thesis=None, analysis_snapshot_hash="snapshot",
                     analysis_artifacts={}, task_root=root / "task_root", audit_dir=root, run_repro=True,
                     task_review_callback=callback,
                 )
@@ -157,7 +230,7 @@ class AutonomousTaskWriterTests(unittest.TestCase):
                     index=1, reuse_existing=True, task={"task_id": "task_1"},
                     manifest_entry={"task_id": "task_1", "module": "task_1", "output_subdir": "task_1"},
                     facts={}, experiment_index={}, paper={}, paper_path=root / "paper.pdf", paper_context_json="",
-                    paper_images=[], paper_thesis=None, paper_memory=None, memory_snapshot_hash="",
+                    paper_images=[], paper_thesis=None, analysis_snapshot_hash="snapshot",
                     analysis_artifacts={}, task_root=root / "task_root", audit_dir=root, run_repro=True,
                     task_review_callback=callback,
                 )

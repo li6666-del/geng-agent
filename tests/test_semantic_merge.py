@@ -36,6 +36,42 @@ class SemanticMergeTests(unittest.TestCase):
         self.assertEqual(delta, 1)
         self.assertEqual(len(merged["_meta"]["semantic_merge"]["task_conflicts"]), 1)
 
+    def test_task_merge_preserves_soft_handoff_metadata(self) -> None:
+        addition = {
+            "repro_tasks": [
+                {"task_id": "fig4", "figure_or_claim": "Fig. 4"}
+            ],
+            "_meta": {
+                "backfill_handoff": {
+                    "ready_for_writer": False,
+                    "blocking_request_ids": ["fig4_setup"],
+                    "reason": "setup changes the experiment",
+                }
+            },
+        }
+
+        merged, _ = semantic_merge_repro_tasks(
+            {"repro_tasks": []}, addition
+        )
+
+        self.assertEqual(
+            merged["_meta"]["backfill_handoff"],
+            addition["_meta"]["backfill_handoff"],
+        )
+
+    def test_merge_does_not_copy_untrusted_unrelated_metadata(self) -> None:
+        facts, _ = semantic_merge_engineering_facts(
+            {"engineering_facts": []},
+            {"engineering_facts": [], "_meta": {"untrusted": True}},
+        )
+        tasks, _ = semantic_merge_repro_tasks(
+            {"repro_tasks": []},
+            {"repro_tasks": [], "_meta": {"untrusted": True}},
+        )
+
+        self.assertNotIn("untrusted", facts.get("_meta", {}))
+        self.assertNotIn("untrusted", tasks.get("_meta", {}))
+
     def test_task_coverage_does_not_use_fig9a_to_cover_fig9b(self) -> None:
         facts = {"engineering_facts": [
             {"type": "figure_claim", "name": "Fig. 9(a) BER vs SNR", "value": {}},

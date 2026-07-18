@@ -8,10 +8,10 @@ from typing import Any, Callable
 
 from .config import get_config_value
 from .codex_runner import run_codex_subprocess
-from .json_utils import parse_json_object, pretty_json
+from .json_utils import parse_json_object
 from .llm import LLMImage
 from .outputs import write_json, write_text
-from .pipeline_helpers import build_json_retry_prompt, summarize_bad_output
+from .pipeline_helpers import build_json_file_retry_prompt
 from .schema_models import model_for_stage
 from .schemas import ValidationIssue, format_issues, validate_stage
 
@@ -36,18 +36,18 @@ def run_codex_json_stage(
 ) -> dict[str, Any]:
     """Run one structured analysis stage through Codex CLI.
 
-    Codex is the reasoning worker; the harness remains the authority for JSON
-    parsing, schema validation, source checks, and normalization. This mirrors
-    the old LLM JSON loop closely enough that facts/tasks gap rounds can keep
-    using the same deterministic guards.
+    Codex is the reasoning worker; the harness only enforces JSON parsing,
+    structural schema validation, and deterministic normalization. Scientific
+    diagnostics are recorded by the pipeline without forcing regeneration.
     """
 
     attempts = max(1, int(max_attempts or 1))
     effective_timeout = float(timeout or DEFAULT_CODEX_ANALYSIS_TIMEOUT)
-    _write_stage_schema(audit_dir, stage_label, schema_stage)
+    schema_path = _write_stage_schema(audit_dir, stage_label, schema_stage)
     image_paths = _write_analysis_images(audit_dir, stage_label, images or [])
     current_prompt = prompt
     last_errors = ""
+    repair_mode = False
 
     for attempt in range(1, attempts + 1):
         label = f"{stage_label}_codex_attempt_{attempt}"
@@ -68,7 +68,7 @@ def run_codex_json_stage(
             sandbox="read-only",
             timeout=effective_timeout,
             command_override=get_config_value("GENG_CODEX_ANALYSIS_CMD"),
-            image_paths=image_paths,
+            image_paths=[] if repair_mode else image_paths,
         )
         if not status.get("ok"):
             last_errors = status.get("error") or "Codex analysis subprocess failed"
@@ -81,6 +81,7 @@ def run_codex_json_stage(
                 {"stage": stage_label, "attempt": attempt, "error": last_errors, "status": status},
             )
             current_prompt = prompt
+            repair_mode = False
             continue
 
         try:
@@ -93,7 +94,8 @@ def run_codex_json_stage(
             )
             continue
 
-        write_text(audit_dir / f"raw_{stage_label}_attempt_{attempt}.txt", raw)
+        raw_path = audit_dir / f"raw_{stage_label}_attempt_{attempt}.txt"
+        write_text(raw_path, raw)
         write_text(audit_dir / f"raw_{stage_label}.txt", raw)
 
         try:
@@ -106,7 +108,12 @@ def run_codex_json_stage(
                     audit_dir / f"validation_{stage_label}_attempt_{attempt}.json",
                     {"ok": False, "errors": [{"path": "$", "message": last_errors}]},
                 )
-                current_prompt = build_json_retry_prompt(prompt, summarize_bad_output(raw), last_errors)
+                current_prompt = build_json_file_retry_prompt(
+                    candidate_path=raw_path.resolve(),
+                    schema_path=schema_path.resolve(),
+                    errors=last_errors,
+                )
+                repair_mode = True
                 continue
             parsed = recovered
 
@@ -137,7 +144,16 @@ def run_codex_json_stage(
             audit_dir / f"validation_{stage_label}_attempt_{attempt}.json",
             {"ok": False, "errors": [issue.as_dict() for issue in issues]},
         )
-        current_prompt = build_json_retry_prompt(prompt, summarize_bad_output(pretty_json(parsed)), last_errors)
+        normalized_path = (
+            audit_dir / f"normalized_{stage_label}_attempt_{attempt}.json"
+        )
+        write_json(normalized_path, parsed)
+        current_prompt = build_json_file_retry_prompt(
+            candidate_path=normalized_path.resolve(),
+            schema_path=schema_path.resolve(),
+            errors=last_errors,
+        )
+        repair_mode = True
 
     error_doc = {
         "ok": False,

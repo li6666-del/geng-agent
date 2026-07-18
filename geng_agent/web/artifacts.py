@@ -19,11 +19,12 @@ from .models import ArtifactRecord, CaseRecord
 
 
 STEP_FILES: dict[str, tuple[str, ...]] = {
-    "paper": ("paper_chunks.json", "paper/", "paper_memory.json", "paper_figure_index.json"),
+    "paper": ("paper_chunks.json", "paper/", "paper_figure_index.json"),
     "facts_initial": ("engineering_facts_initial.json",),
     "facts": (
         "engineering_facts_backfill.json",
         "engineering_facts.json",
+        "analysis_warnings.json",
     ),
     "repro_tasks": ("repro_tasks_preliminary.json", "repro_tasks.json"),
     "experiment_index": (
@@ -31,7 +32,6 @@ STEP_FILES: dict[str, tuple[str, ...]] = {
         "paper_thesis.json",
         "fact_conflicts.json",
         "task_conflicts.json",
-        "memory_manifest.json",
     ),
     "repro_project_manifest": ("repro_project_manifest.json",),
     "repro_project": (

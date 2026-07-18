@@ -4,11 +4,14 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from geng_agent.schemas import validate_stage
 from geng_agent.stage_cleanup import _clear_stage_outputs
 from geng_agent.task_evidence_backfill import (
+    backfill_normalization_issues,
     collect_missing_fact_requests,
     cumulative_resolution_from_ledger,
     filter_actionable_requests,
+    finalize_targeted_backfill,
     reconcile_final_tasks,
     summarize_backfill_resolution,
     update_search_ledger,
@@ -183,6 +186,171 @@ class TaskEvidenceBackfillTests(unittest.TestCase):
         )
         self.assertEqual(cumulative["terminal_unresolved_count"], 1)
 
+    def test_selected_unresolved_field_can_be_searched_twice(self) -> None:
+        requests = collect_missing_fact_requests(
+            {"repro_tasks": [_task("task_a", [_request("a")])]}
+        )
+        backfill = {
+            "request_resolutions": [
+                {
+                    "request_id": requests[0]["request_id"],
+                    "field_results": [
+                        {
+                            "field_id": "answer",
+                            "status": "not_found_in_paper",
+                            "fact_refs": [],
+                            "searched_locations": ["Fig. 4"],
+                            "note": "not disclosed",
+                        }
+                    ],
+                }
+            ]
+        }
+        first = summarize_backfill_resolution(
+            requests, {"engineering_facts": []}, backfill
+        )
+        ledger = update_search_ledger(
+            None, round_index=1, requests=requests, resolution=first
+        )
+
+        self.assertEqual(filter_actionable_requests(requests, ledger), [])
+        self.assertEqual(
+            len(
+                filter_actionable_requests(
+                    requests, ledger, max_unresolved_attempts=2
+                )
+            ),
+            1,
+        )
+
+        second = summarize_backfill_resolution(
+            requests, {"engineering_facts": []}, backfill
+        )
+        ledger = update_search_ledger(
+            ledger, round_index=2, requests=requests, resolution=second
+        )
+        self.assertEqual(
+            filter_actionable_requests(
+                requests, ledger, max_unresolved_attempts=2
+            ),
+            [],
+        )
+
+    def test_open_field_is_also_limited_to_two_searches(self) -> None:
+        requests = collect_missing_fact_requests(
+            {"repro_tasks": [_task("task_a", [_request("a")])]}
+        )
+        open_resolution = summarize_backfill_resolution(
+            requests,
+            {"engineering_facts": []},
+            {"request_resolutions": []},
+        )
+        ledger = update_search_ledger(
+            None, round_index=1, requests=requests, resolution=open_resolution
+        )
+        self.assertEqual(
+            len(
+                filter_actionable_requests(
+                    requests, ledger, max_unresolved_attempts=2
+                )
+            ),
+            1,
+        )
+        ledger = update_search_ledger(
+            ledger, round_index=2, requests=requests, resolution=open_resolution
+        )
+        self.assertEqual(
+            filter_actionable_requests(
+                requests, ledger, max_unresolved_attempts=2
+            ),
+            [],
+        )
+
+    def test_partial_backfill_keeps_valid_fields_and_softens_science_issue(self) -> None:
+        requests = collect_missing_fact_requests(
+            {"repro_tasks": [_task("task_a", [_request("a")])]}
+        )
+        fact = {
+            "type": "other",
+            "name": "Fig. 4 visible layout",
+            "value": {"mapping": "caption and axes"},
+            "source": {
+                "source_kind": "figure",
+                "chunk_id": None,
+                "page": 1,
+                "section": "",
+                "quote": "visible layout",
+                "figure_ref": "Fig. 4",
+            },
+            "confidence": "medium",
+            "used_for_reproduction": True,
+            "evidence_kind": "visual_estimate",
+            "derivation": None,
+        }
+        raw = {
+            "paper_domain": "communication",
+            "paper_repro_type": "signal_chain",
+            "engineering_facts": [fact],
+            "missing_information": [],
+            "request_resolutions": [
+                {
+                    "request_id": requests[0]["request_id"],
+                    "field_results": [
+                        {
+                            "field_id": "answer",
+                            "status": "resolved_explicit",
+                            "fact_refs": [
+                                {"type": fact["type"], "name": fact["name"]}
+                            ],
+                            "searched_locations": ["Fig. 4"],
+                            "note": "caption mapping is explicit",
+                        },
+                        {
+                            "field_id": "invented_field",
+                            "status": "resolved_explicit",
+                            "fact_refs": [],
+                            "searched_locations": [],
+                            "note": "invalid field",
+                        },
+                    ],
+                },
+                {
+                    "request_id": "invented_request",
+                    "field_results": [
+                        {
+                            "field_id": "answer",
+                            "status": "resolved_explicit",
+                            "fact_refs": [],
+                            "searched_locations": [],
+                            "note": "invalid request",
+                        }
+                    ],
+                },
+            ],
+        }
+
+        normalized = finalize_targeted_backfill(
+            raw,
+            requests,
+            {"engineering_facts": []},
+            valid_chunk_ids=set(),
+            valid_pages={1},
+        )
+
+        self.assertEqual(
+            len(normalized["request_resolutions"][0]["field_results"]), 1
+        )
+        self.assertEqual(
+            len(backfill_normalization_issues(normalized)), 2
+        )
+        self.assertEqual(
+            validate_stage("targeted_fact_backfill", normalized), []
+        )
+        science_warnings = validate_targeted_backfill(
+            normalized, requests, {"engineering_facts": []}
+        )
+        self.assertEqual(len(science_warnings), 1)
+        self.assertIn("evidence kind", science_warnings[0].message)
     def test_task_normalization_preserves_structured_requests(self) -> None:
         document = {"repro_tasks": [_task("task_a", [_request("a")])]}
         finalized = finalize_repro_tasks(document, {"engineering_facts": []})
