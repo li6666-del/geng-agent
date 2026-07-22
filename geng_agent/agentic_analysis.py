@@ -1,23 +1,24 @@
 from __future__ import annotations
 
 import base64
+from copy import deepcopy
 import json
 import re
 from pathlib import Path
 from typing import Any, Callable
 
 from .config import get_config_value
-from .codex_runner import run_codex_subprocess
+from .codex_runner import DEFAULT_CODEX_TIMEOUT_SECONDS, resolve_codex_timeout, run_codex_subprocess
 from .json_utils import parse_json_object
 from .llm import LLMImage
 from .outputs import write_json, write_text
-from .pipeline_helpers import build_json_file_retry_prompt
+from .pipeline_helpers import build_json_inline_retry_prompt
 from .schema_models import model_for_stage
 from .schemas import ValidationIssue, format_issues, validate_stage
 
 
 CODEX_ANALYSIS_BACKEND = "codex"
-DEFAULT_CODEX_ANALYSIS_TIMEOUT = 600.0
+DEFAULT_CODEX_ANALYSIS_TIMEOUT = DEFAULT_CODEX_TIMEOUT_SECONDS
 
 
 def run_codex_json_stage(
@@ -29,8 +30,10 @@ def run_codex_json_stage(
     audit_dir: Path,
     max_attempts: int,
     timeout: float | None = None,
+    pre_validation: Callable[[dict[str, Any]], list[ValidationIssue]] | None = None,
     extra_validation: Callable[[dict[str, Any]], list[ValidationIssue]] | None = None,
     candidate_normalizer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    repair_preservation_validator: Callable[[dict[str, Any], dict[str, Any]], list[ValidationIssue]] | None = None,
     truncation_recovery: Callable[[str], dict[str, Any] | None] | None = None,
     images: list[LLMImage] | None = None,
 ) -> dict[str, Any]:
@@ -42,12 +45,14 @@ def run_codex_json_stage(
     """
 
     attempts = max(1, int(max_attempts or 1))
-    effective_timeout = float(timeout or DEFAULT_CODEX_ANALYSIS_TIMEOUT)
+    effective_timeout = resolve_codex_timeout(timeout)
     schema_path = _write_stage_schema(audit_dir, stage_label, schema_stage)
+    schema_text = schema_path.read_text(encoding="utf-8")
     image_paths = _write_analysis_images(audit_dir, stage_label, images or [])
     current_prompt = prompt
     last_errors = ""
     repair_mode = False
+    repair_baseline: dict[str, Any] | None = None
 
     for attempt in range(1, attempts + 1):
         label = f"{stage_label}_codex_attempt_{attempt}"
@@ -57,6 +62,7 @@ def run_codex_json_stage(
             schema_stage=schema_stage,
             attempt=attempt,
             max_attempts=attempts,
+            schema_text="" if repair_mode else schema_text,
         )
         write_text(audit_dir / f"{label}_brief.md", brief)
         status = run_codex_subprocess(
@@ -108,10 +114,10 @@ def run_codex_json_stage(
                     audit_dir / f"validation_{stage_label}_attempt_{attempt}.json",
                     {"ok": False, "errors": [{"path": "$", "message": last_errors}]},
                 )
-                current_prompt = build_json_file_retry_prompt(
-                    candidate_path=raw_path.resolve(),
-                    schema_path=schema_path.resolve(),
-                    errors=last_errors,
+                current_prompt = build_json_inline_retry_prompt(
+                    candidate_text=raw,
+                    schema_text=schema_text,
+                    issues=[ValidationIssue("$", last_errors)],
                 )
                 repair_mode = True
                 continue
@@ -119,10 +125,18 @@ def run_codex_json_stage(
 
         if candidate_normalizer is not None:
             parsed = candidate_normalizer(parsed)
+        if repair_baseline is None:
+            repair_baseline = deepcopy(parsed)
 
-        issues = validate_stage(schema_stage, parsed)
-        if extra_validation is not None:
-            issues.extend(extra_validation(parsed))
+        normalization_issues = pre_validation(parsed) if pre_validation is not None else []
+        schema_issues = validate_stage(schema_stage, parsed)
+        preservation_issues: list[ValidationIssue] = []
+        scientific_issues: list[ValidationIssue] = []
+        if not normalization_issues and not schema_issues and repair_mode and repair_preservation_validator is not None:
+            preservation_issues = repair_preservation_validator(repair_baseline, parsed)
+        if not normalization_issues and not schema_issues and not preservation_issues and extra_validation is not None:
+            scientific_issues = extra_validation(parsed)
+        issues = normalization_issues or schema_issues or preservation_issues or scientific_issues
         if not issues:
             meta = dict(parsed.get("_meta", {})) if isinstance(parsed.get("_meta"), dict) else {}
             meta.update(
@@ -148,10 +162,16 @@ def run_codex_json_stage(
             audit_dir / f"normalized_{stage_label}_attempt_{attempt}.json"
         )
         write_json(normalized_path, parsed)
-        current_prompt = build_json_file_retry_prompt(
-            candidate_path=normalized_path.resolve(),
-            schema_path=schema_path.resolve(),
-            errors=last_errors,
+        if normalization_issues or preservation_issues or scientific_issues:
+            write_json(
+                audit_dir / f"scientific_validation_{stage_label}_attempt_{attempt}.json",
+                {"ok": False, "errors": [issue.as_dict() for issue in issues]},
+            )
+            break
+        current_prompt = build_json_inline_retry_prompt(
+            candidate_text=json.dumps(parsed, ensure_ascii=False, indent=2),
+            schema_text=schema_text,
+            issues=issues,
         )
         repair_mode = True
 
@@ -160,12 +180,12 @@ def run_codex_json_stage(
         "backend": CODEX_ANALYSIS_BACKEND,
         "stage": stage_label,
         "schema_stage": schema_stage,
-        "attempts": attempts,
+        "attempts": attempt,
         "error": last_errors,
     }
     write_json(audit_dir / f"agentic_analysis_error_{stage_label}.json", error_doc)
     write_json(audit_dir / "agentic_analysis_error.json", error_doc)
-    raise RuntimeError(f"{stage_label} Codex analysis did not pass JSON validation after {attempts} attempts: {last_errors}")
+    raise RuntimeError(f"{stage_label} Codex analysis did not pass JSON validation after {attempt} attempt(s): {last_errors}")
 
 
 def _build_analysis_brief(
@@ -175,7 +195,14 @@ def _build_analysis_brief(
     schema_stage: str,
     attempt: int,
     max_attempts: int,
+    schema_text: str,
 ) -> str:
+    schema_section = (
+        "Trusted structural schema (follow field names, nesting, and types exactly):\n"
+        f"BEGIN TRUSTED SCHEMA\n{schema_text}\nEND TRUSTED SCHEMA\n\n"
+        if schema_text
+        else ""
+    )
     return f"""
 You are the Codex analysis subagent for geng-agent.
 
@@ -190,7 +217,7 @@ Rules:
 - Do not wrap the JSON in Markdown fences.
 - Do not add prose before or after the JSON.
 
-Stage prompt:
+{schema_section}Stage prompt:
 {prompt}
 """.strip()
 

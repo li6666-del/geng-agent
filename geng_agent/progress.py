@@ -13,12 +13,12 @@ PHASES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     (
         "repro_design",
         "复现设计",
-        ("tasks_preliminary", "facts", "tasks", "thesis", "experiment_index"),
+        ("tasks_preliminary", "facts", "tasks", "thesis", "experiment_index", "scientific_architecture"),
     ),
     (
         "task_reproduction",
         "任务级复现",
-        ("generation", "runtime", "task_reporters"),
+        ("foundation", "generation", "runtime", "task_reporters"),
     ),
     (
         "report_composition",
@@ -37,7 +37,9 @@ STEP_PHASE_ALIASES: dict[str, str] = {
     "engineering_facts": "paper_analysis",
     "repro_tasks": "repro_design",
     "paper_thesis": "repro_design",
+    "scientific_architecture": "repro_design",
     "repro_project_manifest": "task_reproduction",
+    "foundation_manifest": "task_reproduction",
     "repro_project": "task_reproduction",
     "verification_result": "task_reproduction",
     "reproduction_report": "report_composition",

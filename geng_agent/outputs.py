@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import py_compile
 import base64
 import csv
@@ -130,12 +131,119 @@ def validate_repro_project(root: Path) -> dict[str, Any]:
                 }
             )
 
+    missing_local_imports = _missing_local_imports(root)
+
     return {
         "required_files_present": not missing,
         "missing_files": missing,
         "python_compiles": not compile_errors,
         "compile_errors": compile_errors,
+        "local_imports_resolve": not missing_local_imports,
+        "missing_local_imports": missing_local_imports,
     }
+
+
+def _missing_local_imports(root: Path) -> list[dict[str, str]]:
+    """Find imports that target this project but have no local module.
+
+    ``py_compile`` accepts ``from tasks import missing_helper`` because it
+    never resolves imports. Generated projects are assembled from isolated
+    sandboxes, so this static gate catches omitted dependency files without
+    importing or executing untrusted scientific code.
+    """
+
+    local_roots = {
+        path.name
+        for path in root.iterdir()
+        if path.is_dir() and ((path / "__init__.py").is_file() or any(path.glob("*.py")))
+    }
+    local_roots.update(path.stem for path in root.glob("*.py"))
+    issues: list[dict[str, str]] = []
+    seen: set[tuple[str, str, int]] = set()
+    for path in root.rglob("*.py"):
+        if _is_auxiliary_generated_path(path, root):
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8-sig"), filename=str(path))
+        except (OSError, SyntaxError, UnicodeError):
+            continue
+        package = list(path.relative_to(root).with_suffix("").parts[:-1])
+        for node in ast.walk(tree):
+            candidates: list[str] = []
+            if isinstance(node, ast.Import):
+                candidates.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                if node.level and node.level > len(package):
+                    key = (
+                        path.relative_to(root).as_posix(),
+                        "<relative-import-beyond-top-level>",
+                        int(getattr(node, "lineno", 0)),
+                    )
+                    if key not in seen:
+                        seen.add(key)
+                        issues.append({"file": key[0], "module": key[1], "line": str(key[2])})
+                    continue
+                base_parts = _resolved_import_parts(package, node.module, node.level)
+                if not base_parts:
+                    continue
+                base = ".".join(base_parts)
+                candidates.append(base)
+                if _module_is_package(root, base):
+                    for alias in node.names:
+                        if alias.name == "*" or _package_defines_name(root, base, alias.name):
+                            continue
+                        candidates.append(f"{base}.{alias.name}")
+            for module in candidates:
+                top = module.split(".", 1)[0]
+                if top not in local_roots or _local_module_exists(root, module):
+                    continue
+                key = (path.relative_to(root).as_posix(), module, int(getattr(node, "lineno", 0)))
+                if key in seen:
+                    continue
+                seen.add(key)
+                issues.append({"file": key[0], "module": module, "line": str(key[2])})
+    return sorted(issues, key=lambda item: (item["file"], int(item["line"]), item["module"]))
+
+
+def _resolved_import_parts(package: list[str], module: str | None, level: int) -> list[str]:
+    if level:
+        keep = max(0, len(package) - level + 1)
+        parts = package[:keep]
+        if module:
+            parts.extend(part for part in module.split(".") if part)
+        return parts
+    return [part for part in str(module or "").split(".") if part]
+
+
+def _local_module_exists(root: Path, module: str) -> bool:
+    path = root.joinpath(*module.split("."))
+    return path.with_suffix(".py").is_file() or (path / "__init__.py").is_file()
+
+
+def _module_is_package(root: Path, module: str) -> bool:
+    return (root.joinpath(*module.split(".")) / "__init__.py").is_file()
+
+
+def _package_defines_name(root: Path, module: str, name: str) -> bool:
+    init_path = root.joinpath(*module.split(".")) / "__init__.py"
+    try:
+        tree = ast.parse(init_path.read_text(encoding="utf-8-sig"), filename=str(init_path))
+    except (OSError, SyntaxError, UnicodeError):
+        return False
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == name:
+            return True
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(isinstance(target, ast.Name) and target.id == name for target in targets):
+                return True
+        if isinstance(node, ast.Import):
+            if any((alias.asname or alias.name.split(".", 1)[0]) == name for alias in node.names):
+                return True
+        if isinstance(node, ast.ImportFrom):
+            if any((alias.asname or alias.name) == name for alias in node.names):
+                return True
+    return False
 
 
 def _is_auxiliary_generated_path(path: Path, root: Path) -> bool:

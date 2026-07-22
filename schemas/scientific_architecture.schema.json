@@ -1,0 +1,571 @@
+{
+  "$defs": {
+    "ArchitectureBasis": {
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "enum": [
+            "paper_explicit",
+            "paper_derived",
+            "assumed",
+            "unresolved"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "evidence_facts": {
+          "items": {
+            "$ref": "#/$defs/RequiredFactRef"
+          },
+          "title": "Evidence Facts",
+          "type": "array"
+        },
+        "assumption_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Assumption Refs",
+          "type": "array"
+        },
+        "note": {
+          "default": "",
+          "title": "Note",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "title": "ArchitectureBasis",
+      "type": "object"
+    },
+    "ArchitectureBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "task_id": {
+          "minLength": 1,
+          "title": "Task Id",
+          "type": "string"
+        },
+        "experiment_id": {
+          "minLength": 1,
+          "title": "Experiment Id",
+          "type": "string"
+        },
+        "consistency_group": {
+          "minLength": 1,
+          "title": "Consistency Group",
+          "type": "string"
+        },
+        "components": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Components",
+          "type": "array"
+        },
+        "overrides": {
+          "additionalProperties": true,
+          "title": "Overrides",
+          "type": "object"
+        },
+        "outputs": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Outputs",
+          "type": "array"
+        },
+        "allowed_overrides": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Allowed Overrides",
+          "type": "array"
+        }
+      },
+      "required": [
+        "task_id",
+        "experiment_id",
+        "consistency_group",
+        "components"
+      ],
+      "title": "ArchitectureBinding",
+      "type": "object"
+    },
+    "ArchitectureComponent": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "kind": {
+          "title": "Kind",
+          "type": "string",
+          "minLength": 1
+        },
+        "module": {
+          "minLength": 1,
+          "title": "Module",
+          "type": "string"
+        },
+        "callable": {
+          "title": "Callable",
+          "type": "string",
+          "default": ""
+        },
+        "execution": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArchitectureExecutionContract"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "inputs": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Inputs",
+          "type": "array"
+        },
+        "outputs": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Outputs",
+          "type": "array"
+        },
+        "parameters": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Parameters",
+          "type": "array"
+        },
+        "depends_on": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Depends On",
+          "type": "array"
+        },
+        "basis": {
+          "$ref": "#/$defs/ArchitectureBasis"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "module",
+        "basis"
+      ],
+      "title": "ArchitectureComponent",
+      "type": "object"
+    },
+    "ArchitectureExecutionContract": {
+      "additionalProperties": false,
+      "properties": {
+        "execution_kind": {
+          "minLength": 1,
+          "title": "Execution Kind",
+          "type": "string"
+        },
+        "primary_framework": {
+          "minLength": 1,
+          "title": "Primary Framework",
+          "type": "string"
+        },
+        "supporting_libraries": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Supporting Libraries",
+          "type": "array"
+        },
+        "device_policy": {
+          "enum": [
+            "cpu",
+            "framework_default",
+            "accelerator_preferred",
+            "accelerator_required",
+            "external_runtime"
+          ],
+          "title": "Device Policy",
+          "type": "string"
+        },
+        "precision": {
+          "title": "Precision",
+          "type": "string"
+        },
+        "trainable": {
+          "title": "Trainable",
+          "type": "boolean"
+        },
+        "gradient_mode": {
+          "enum": [
+            "required",
+            "not_required",
+            "not_applicable"
+          ],
+          "title": "Gradient Mode",
+          "type": "string"
+        },
+        "checkpoint_policy": {
+          "enum": [
+            "required",
+            "optional",
+            "not_applicable"
+          ],
+          "title": "Checkpoint Policy",
+          "type": "string"
+        },
+        "shared_implementation": {
+          "title": "Shared Implementation",
+          "type": "boolean"
+        },
+        "required_capabilities": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Required Capabilities",
+          "type": "array"
+        },
+        "rationale": {
+          "minLength": 1,
+          "title": "Rationale",
+          "type": "string"
+        }
+      },
+      "required": [
+        "execution_kind",
+        "primary_framework",
+        "supporting_libraries",
+        "device_policy",
+        "precision",
+        "trainable",
+        "gradient_mode",
+        "checkpoint_policy",
+        "shared_implementation",
+        "required_capabilities",
+        "rationale"
+      ],
+      "title": "ArchitectureExecutionContract",
+      "type": "object"
+    },
+    "ArchitectureInvariant": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "reference",
+            "shape",
+            "unit",
+            "normalization",
+            "global_override",
+            "consistency",
+            "foundation_ownership",
+            "other"
+          ],
+          "title": "Kind",
+          "type": "string",
+          "default": "other"
+        },
+        "subjects": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Subjects",
+          "type": "array"
+        },
+        "task_ids": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Task Ids",
+          "type": "array"
+        },
+        "severity": {
+          "enum": [
+            "error",
+            "warning"
+          ],
+          "title": "Severity",
+          "type": "string"
+        },
+        "basis": {
+          "$ref": "#/$defs/ArchitectureBasis"
+        },
+        "description": {
+          "default": "",
+          "title": "Description",
+          "type": "string"
+        },
+        "expression": {
+          "default": "",
+          "title": "Expression",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "severity",
+        "basis"
+      ],
+      "title": "ArchitectureInvariant",
+      "type": "object"
+    },
+    "ArchitectureQuantity": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "role": {
+          "minLength": 1,
+          "title": "Role",
+          "type": "string"
+        },
+        "dtype": {
+          "default": "",
+          "title": "Dtype",
+          "type": "string"
+        },
+        "shape": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Shape",
+          "type": "array"
+        },
+        "unit": {
+          "default": "",
+          "title": "Unit",
+          "type": "string"
+        },
+        "scale": {
+          "default": "",
+          "title": "Scale",
+          "type": "string"
+        },
+        "normalization": {
+          "default": "",
+          "title": "Normalization",
+          "type": "string"
+        },
+        "scope": {
+          "enum": [
+            "global",
+            "consistency_group",
+            "experiment",
+            "runtime"
+          ],
+          "title": "Scope",
+          "type": "string"
+        },
+        "default": {
+          "default": null,
+          "title": "Default"
+        },
+        "basis": {
+          "$ref": "#/$defs/ArchitectureBasis"
+        }
+      },
+      "required": [
+        "id",
+        "role",
+        "scope",
+        "basis"
+      ],
+      "title": "ArchitectureQuantity",
+      "type": "object"
+    },
+    "RequiredFactRef": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "enum": [
+            "channel_model",
+            "modulation",
+            "coding",
+            "metric",
+            "simulation_parameter",
+            "baseline",
+            "figure_claim",
+            "algorithm",
+            "dataset",
+            "topology",
+            "hardware",
+            "other"
+          ],
+          "title": "Type",
+          "type": "string"
+        },
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "name"
+      ],
+      "title": "RequiredFactRef",
+      "type": "object"
+    },
+    "ArchitectureConsistencyGroup": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "task_ids": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Task Ids",
+          "type": "array"
+        },
+        "shared_quantity_ids": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Shared Quantity Ids",
+          "type": "array"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "ArchitectureConsistencyGroup",
+      "type": "object"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "schema_version": {
+            "const": "1.1"
+          }
+        },
+        "required": [
+          "schema_version"
+        ]
+      },
+      "then": {
+        "properties": {
+          "components": {
+            "items": {
+              "required": [
+                "callable",
+                "execution"
+              ],
+              "properties": {
+                "callable": {
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": "\\S"
+                },
+                "execution": {
+                  "$ref": "#/$defs/ArchitectureExecutionContract"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "enum": [
+        "1.0",
+        "1.1"
+      ],
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "workflow_version": {
+      "const": "2",
+      "default": "2",
+      "title": "Workflow Version",
+      "type": "string"
+    },
+    "quantities": {
+      "items": {
+        "$ref": "#/$defs/ArchitectureQuantity"
+      },
+      "title": "Quantities",
+      "type": "array"
+    },
+    "components": {
+      "items": {
+        "$ref": "#/$defs/ArchitectureComponent"
+      },
+      "minItems": 1,
+      "title": "Components",
+      "type": "array"
+    },
+    "bindings": {
+      "items": {
+        "$ref": "#/$defs/ArchitectureBinding"
+      },
+      "minItems": 1,
+      "title": "Bindings",
+      "type": "array"
+    },
+    "invariants": {
+      "items": {
+        "$ref": "#/$defs/ArchitectureInvariant"
+      },
+      "title": "Invariants",
+      "type": "array"
+    },
+    "consistency_groups": {
+      "items": {
+        "$ref": "#/$defs/ArchitectureConsistencyGroup"
+      },
+      "title": "Consistency Groups",
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "quantities",
+    "components",
+    "bindings"
+  ],
+  "title": "ScientificArchitectureDocument",
+  "type": "object"
+}

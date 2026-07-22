@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .foundation_snapshot import path_is_foundation_link, validate_foundation_snapshot
 from .outputs import validate_repro_project
 from .schemas import validate_stage
 
@@ -14,6 +15,8 @@ STAGES = [
     ("paper_thesis", "paper_thesis.json", "paper_thesis"),
     ("repro_tasks", "repro_tasks.json", "repro_tasks"),
     ("experiment_index", "experiment_index.json", "experiment_index"),
+    ("scientific_architecture", "scientific_architecture.json", "scientific_architecture"),
+    ("foundation_manifest", "foundation_manifest.json", None),
     ("repro_project_manifest", "repro_project_manifest.json", "repro_project_manifest"),
     ("repro_project", "repro_project", None),
     ("runtime", "runtime_result.json", None),
@@ -32,6 +35,8 @@ RESUME_LABELS = {
     "paper_thesis": "02d_extract_paper_thesis",
     "repro_tasks": "02c_finalize_repro_tasks",
     "experiment_index": "02e_build_experiment_index",
+    "scientific_architecture": "02f_design_scientific_architecture",
+    "foundation_manifest": "03b_foundation_writer",
     "repro_project_manifest": "03c_task_writer_workflow",
     "repro_project": "03c_task_writer_workflow",
     "runtime": "03c_task_writer_workflow",
@@ -49,22 +54,48 @@ def inspect_case_status(output_dir: Path) -> dict[str, Any]:
     output_dir = output_dir.expanduser().resolve()
     stage_status = []
     next_stage = None
+    workflow_version = _case_workflow_version(output_dir)
     for name, rel_path, schema_stage in STAGES:
+        if workflow_version == "1" and name in {"scientific_architecture", "foundation_manifest"}:
+            continue
         status = inspect_stage(output_dir, name, rel_path, schema_stage)
         stage_status.append(status)
         if next_stage is None and not status["ok"]:
             next_stage = name
 
-    latest_audit = latest_audit_items(output_dir / "audit")
+    try:
+        latest_audit = latest_audit_items(output_dir / "audit")
+    except OSError:
+        latest_audit = []
+    try:
+        output_exists = output_dir.exists()
+    except OSError:
+        output_exists = False
     return {
         "output_dir": str(output_dir),
-        "exists": output_dir.exists(),
+        "exists": output_exists,
         "next_stage": next_stage,
         "resume_from": RESUME_LABELS.get(next_stage, "complete" if next_stage is None else next_stage),
         "suggested_command": suggested_review_command(output_dir, next_stage),
         "stages": stage_status,
         "latest_audit": latest_audit,
     }
+
+
+def _case_workflow_version(output_dir: Path) -> str:
+    marker = output_dir / "workflow.json"
+    if marker.is_file():
+        try:
+            value = str(read_json(marker).get("workflow_version") or "")
+        except Exception:
+            value = ""
+        if value in {"1", "2"}:
+            return value
+    return (
+        "2"
+        if any((output_dir / name).is_file() for name in ("scientific_architecture.json", "foundation_manifest.json"))
+        else "1"
+    )
 
 
 def inspect_stage(output_dir: Path, name: str, rel_path: str, schema_stage: str | None) -> dict[str, Any]:
@@ -95,9 +126,35 @@ def inspect_stage(output_dir: Path, name: str, rel_path: str, schema_stage: str 
         except Exception as exc:
             return {"stage": name, "ok": False, "path": str(path), "reason": f"invalid json: {exc}"}
 
+    if name == "foundation_manifest":
+        try:
+            if path_is_foundation_link(path):
+                raise ValueError("Foundation manifest must not be a link or reparse point")
+            manifest = read_json(path)
+        except Exception as exc:
+            return {"stage": name, "ok": False, "path": str(path), "reason": f"invalid json: {exc}"}
+        snapshot_dir = output_dir / "audit" / "03b_foundation_snapshot"
+        try:
+            issues = validate_foundation_snapshot(manifest, snapshot_dir)
+        except OSError as exc:
+            issues = [{"path": str(snapshot_dir), "message": f"cannot inspect Foundation snapshot: {exc}"}]
+        ok = not issues
+        return {
+            "stage": name,
+            "ok": ok,
+            "path": str(path),
+            "snapshot_dir": str(snapshot_dir),
+            "reason": "valid" if ok else "invalid foundation snapshot",
+            "issues": issues[:5],
+        }
+
     if name == "repro_project":
         validation = validate_repro_project(path)
-        ok = bool(validation.get("required_files_present") and validation.get("python_compiles"))
+        ok = bool(
+            validation.get("required_files_present")
+            and validation.get("python_compiles")
+            and validation.get("local_imports_resolve")
+        )
         return {"stage": name, "ok": ok, "path": str(path), "validation": validation, "reason": "valid" if ok else "invalid project"}
 
     if name == "runtime":

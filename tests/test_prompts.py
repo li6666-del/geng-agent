@@ -15,6 +15,7 @@ class PromptTests(unittest.TestCase):
         self.assertIn("torch", policy)
         self.assertIn("commpy", policy)
         self.assertIn("优先调", policy)
+        self.assertIn("Never silently replace", policy)
 
     def test_active_analysis_prompts_render(self) -> None:
         book = PromptBook()
@@ -49,6 +50,15 @@ class PromptTests(unittest.TestCase):
                 search_ledger_json="{}",
                 paper_context_json="[]",
             ),
+            "architecture": book.render(
+                "design_scientific_architecture.md",
+                engineering_facts_json="{}",
+                repro_tasks_json="{}",
+                paper_thesis_json="{}",
+                experiment_index_json="{}",
+                host_capabilities_json="{}",
+                paper_chunks_json="[]",
+            ),
         }
 
         for name, prompt in rendered.items():
@@ -70,6 +80,9 @@ class PromptTests(unittest.TestCase):
         self.assertIn("backfill_handoff", rendered["finalize_tasks"])
         self.assertIn("ready_for_writer", rendered["finalize_tasks"])
         self.assertNotIn("不能用空数组掩盖未知", rendered["finalize_tasks"])
+        self.assertIn("schema_version: \"1.1\"", rendered["architecture"])
+        self.assertIn("Host capability inventory", rendered["architecture"])
+        self.assertIn("must not replace that learned scientific component", rendered["architecture"])
 
 
 if __name__ == "__main__":

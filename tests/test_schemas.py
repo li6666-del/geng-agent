@@ -85,6 +85,66 @@ class SchemaTests(unittest.TestCase):
                 exported = json.loads((schema_dir / SCHEMA_FILENAMES[stage]).read_text(encoding="utf-8"))
                 self.assertEqual(exported, model.model_json_schema())
 
+    def test_scientific_architecture_schema_exposes_v11_execution_contract(self) -> None:
+        schema = SCHEMA_MODELS["scientific_architecture"].model_json_schema()
+
+        self.assertEqual(
+            schema["properties"]["schema_version"]["enum"],
+            ["1.0", "1.1"],
+        )
+        self.assertIn("schema_version", schema["required"])
+        self.assertNotIn("default", schema["properties"]["schema_version"])
+        component = schema["$defs"]["ArchitectureComponent"]
+        self.assertNotIn("enum", component["properties"]["kind"])
+        self.assertEqual(component["properties"]["kind"]["minLength"], 1)
+        execution = schema["$defs"]["ArchitectureExecutionContract"]
+        self.assertNotIn("enum", execution["properties"]["execution_kind"])
+        self.assertNotIn("enum", execution["properties"]["primary_framework"])
+        self.assertEqual(
+            execution["properties"]["device_policy"]["enum"],
+            [
+                "cpu",
+                "framework_default",
+                "accelerator_preferred",
+                "accelerator_required",
+                "external_runtime",
+            ],
+        )
+        self.assertEqual(
+            set(execution["required"]),
+            {
+                "execution_kind",
+                "primary_framework",
+                "supporting_libraries",
+                "device_policy",
+                "precision",
+                "trainable",
+                "gradient_mode",
+                "checkpoint_policy",
+                "shared_implementation",
+                "required_capabilities",
+                "rationale",
+            },
+        )
+        self.assertIn(
+            "execution",
+            schema["$defs"]["ArchitectureComponent"]["properties"],
+        )
+
+        v11_rule = schema["allOf"][0]
+        self.assertEqual(
+            v11_rule["if"]["properties"]["schema_version"]["const"],
+            "1.1",
+        )
+        component_rule = v11_rule["then"]["properties"]["components"]["items"]
+        self.assertEqual(set(component_rule["required"]), {"callable", "execution"})
+        self.assertEqual(component_rule["properties"]["callable"]["minLength"], 1)
+        self.assertEqual(component_rule["properties"]["callable"]["pattern"], r"\S")
+        self.assertEqual(
+            component_rule["properties"]["execution"]["$ref"],
+            "#/$defs/ArchitectureExecutionContract",
+        )
+
     def test_response_format_uses_json_schema(self) -> None:
         response_format = response_format_for_stage("repro_tasks")
 

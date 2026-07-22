@@ -8,8 +8,13 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from geng_agent.agentic_analysis import run_codex_json_stage
+from geng_agent.agentic_analysis import (
+    DEFAULT_CODEX_ANALYSIS_TIMEOUT,
+    run_codex_json_stage,
+)
 from geng_agent.llm import LLMImage
+from geng_agent.pipeline_helpers import _aggregate_validation_issues
+from geng_agent.schemas import ValidationIssue
 from geng_agent.tasks_normalize import finalize_repro_tasks
 
 
@@ -30,6 +35,20 @@ def _write_analysis_script(temp: Path, body: str) -> str:
 
 
 class CodexAnalysisStageTests(unittest.TestCase):
+    def test_default_codex_analysis_timeout_is_1800_seconds(self) -> None:
+        self.assertEqual(DEFAULT_CODEX_ANALYSIS_TIMEOUT, 1800.0)
+
+    def test_validation_errors_are_grouped_without_dropping_late_categories(self) -> None:
+        issues = [
+            ValidationIssue(f"$.quantities[{index}].shape", "must be an array")
+            for index in range(74)
+        ] + [ValidationIssue("$.bindings[6].components", "field required")]
+        grouped = json.loads(_aggregate_validation_issues(issues))
+        self.assertEqual(len(grouped), 2)
+        self.assertEqual(grouped[0]["path"], "$.quantities[*].shape")
+        self.assertEqual(grouped[0]["count"], 74)
+        self.assertEqual(grouped[1]["path"], "$.bindings[*].components")
+
     def test_codex_analysis_stage_returns_validated_json_and_audit(self) -> None:
         with TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
@@ -94,6 +113,9 @@ class CodexAnalysisStageTests(unittest.TestCase):
             self.assertEqual(parsed["engineering_facts"][0]["name"], "AWGN")
             self.assertEqual(parsed["_meta"]["analysis_backend"], "codex")
             self.assertTrue((audit_dir / "01_extract_engineering_facts.schema.json").exists())
+            first_brief = (audit_dir / "01_extract_engineering_facts_codex_attempt_1_brief.md").read_text(encoding="utf-8")
+            self.assertIn("BEGIN TRUSTED SCHEMA", first_brief)
+            self.assertIn('"engineering_facts"', first_brief)
             self.assertTrue((audit_dir / "raw_01_extract_engineering_facts.txt").exists())
             self.assertTrue((audit_dir / "validation_01_extract_engineering_facts_attempt_1.json").exists())
 
@@ -182,6 +204,56 @@ class CodexAnalysisStageTests(unittest.TestCase):
                 handoff["blocking_request_ids"], ["reproduce_fig_1:decoder"]
             )
             self.assertEqual((temp / "attempts.txt").read_text(encoding="utf-8"), "1")
+
+    def test_scientific_validation_failure_does_not_trigger_format_repair(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            cmd = _write_analysis_script(
+                temp,
+                r'''
+                import json
+                import sys
+                from pathlib import Path
+
+                args = sys.argv[1:]
+                out = Path(args[args.index("--output-last-message") + 1])
+                counter = Path(__file__).with_name("attempts.txt")
+                attempt = int(counter.read_text(encoding="utf-8")) + 1 if counter.exists() else 1
+                counter.write_text(str(attempt), encoding="utf-8")
+                out.write_text(json.dumps({
+                    "paper_domain": "communication",
+                    "paper_repro_type": "signal_chain",
+                    "engineering_facts": [],
+                    "missing_information": [],
+                }), encoding="utf-8")
+                ''',
+            )
+            old_cmd = os.environ.get("GENG_CODEX_ANALYSIS_CMD")
+            os.environ["GENG_CODEX_ANALYSIS_CMD"] = cmd
+            try:
+                out_dir = temp / "case"
+                audit_dir = out_dir / "audit"
+                out_dir.mkdir()
+                audit_dir.mkdir()
+                with self.assertRaises(RuntimeError):
+                    run_codex_json_stage(
+                        prompt="Extract facts.",
+                        stage_label="01_science_gate",
+                        schema_stage="engineering_facts",
+                        output_dir=out_dir,
+                        audit_dir=audit_dir,
+                        max_attempts=2,
+                        timeout=30,
+                        extra_validation=lambda _: [ValidationIssue("$.engineering_facts", "scientific conflict")],
+                    )
+            finally:
+                if old_cmd is None:
+                    os.environ.pop("GENG_CODEX_ANALYSIS_CMD", None)
+                else:
+                    os.environ["GENG_CODEX_ANALYSIS_CMD"] = old_cmd
+
+            self.assertEqual((temp / "attempts.txt").read_text(encoding="utf-8"), "1")
+            self.assertTrue((audit_dir / "scientific_validation_01_science_gate_attempt_1.json").is_file())
 
     def test_codex_analysis_stage_retries_bad_json(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -281,10 +353,13 @@ class CodexAnalysisStageTests(unittest.TestCase):
             self.assertEqual(first_args.count("--image"), 1)
             self.assertNotIn("--image", second_args)
             self.assertIn("FORMAT REPAIR ONLY", second_prompt)
-            self.assertIn(
-                "raw_02_build_repro_tasks_attempt_1.txt", second_prompt
-            )
-            self.assertIn("02_build_repro_tasks.schema.json", second_prompt)
+            self.assertIn("BEGIN UNTRUSTED CANDIDATE", second_prompt)
+            self.assertIn("not json", second_prompt)
+            self.assertIn("BEGIN TRUSTED SCHEMA", second_prompt)
+            self.assertIn('"repro_tasks"', second_prompt)
+            self.assertNotIn("Read the complete candidate from", second_prompt)
+            self.assertNotIn("raw_02_build_repro_tasks_attempt_1.txt", second_prompt)
+            self.assertNotIn("02_build_repro_tasks.schema.json", second_prompt)
 
 
 if __name__ == "__main__":

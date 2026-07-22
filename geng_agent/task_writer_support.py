@@ -53,6 +53,7 @@ WRITER_REQUIRED_ANALYSIS_ARTIFACTS = (
     "experiment_index.json",
 )
 WRITER_OPTIONAL_ANALYSIS_ARTIFACTS = (
+    "scientific_architecture.json",
     "paper_thesis.json",
     "analysis_warnings.json",
 )
@@ -452,7 +453,11 @@ def _load_cached_task_writer_workflow(
     if analysis_snapshot_hash and meta.get("analysis_snapshot_hash") != analysis_snapshot_hash:
         return None
     validation = validate_repro_project(repro_project_dir)
-    if not validation.get("required_files_present") or not validation.get("python_compiles"):
+    if (
+        not validation.get("required_files_present")
+        or not validation.get("python_compiles")
+        or not validation.get("local_imports_resolve")
+    ):
         return None
 
     runtime_result: dict[str, Any] = {

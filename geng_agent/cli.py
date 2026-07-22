@@ -53,7 +53,7 @@ def _add_common_review_args(parser: argparse.ArgumentParser, *, include_resume: 
     parser.add_argument("--temperature", type=float, default=0.1, help="LLM 采样温度，默认 0.1。")
     parser.add_argument("--timeout", type=float, default=120.0, help="单次 LLM 请求超时时间，单位秒。")
     parser.add_argument("--tasks-timeout", type=float, default=300.0, help="第二轮生成复现任务的单次 LLM 请求超时时间，单位秒。")
-    parser.add_argument("--project-timeout", type=float, default=1200.0, help="兼容参数；Reporter 未单独设置超时时作为其默认值。Writer 自治迭代不设内部时间上限。")
+    parser.add_argument("--project-timeout", type=float, default=1800.0, help="所有 Codex 推理会话的公共默认超时，单位秒；默认 1800（30 分钟）。")
     parser.add_argument("--thinking", choices=("enabled", "disabled"), default=None, help="DeepSeek V4 Pro thinking 开关。")
     parser.add_argument("--reasoning-effort", choices=("low", "medium", "high"), default=None, help="推理模型 reasoning_effort 参数。")
     run_group = parser.add_mutually_exclusive_group()
@@ -84,10 +84,10 @@ def _add_common_review_args(parser: argparse.ArgumentParser, *, include_resume: 
         "--codex-analysis-timeout",
         type=float,
         default=None,
-        help="前两阶段单个 Codex analysis 子进程超时，单位秒；默认 600。",
+        help="Analysis/架构专家单次 Codex 会话超时，单位秒；默认继承 1800。",
     )
-    parser.add_argument("--codex-agent-timeout", type=float, default=None, help="兼容参数；当前自治 Writer 不设置内部时间上限，避免在逼近论文过程中被固定墙钟截断。")
-    parser.add_argument("--codex-reporter-timeout", type=float, default=None, help="最终 Codex 报告子进程超时，单位秒；默认复用 writer 超时。")
+    parser.add_argument("--codex-agent-timeout", type=float, default=None, help="Foundation Writer 和 Task Writer 单次 Codex 会话超时；默认继承 1800 秒。")
+    parser.add_argument("--codex-reporter-timeout", type=float, default=None, help="Task Reporter 和 Report Editor 单次 Codex 会话超时；默认继承 agent/公共 1800 秒。")
     parser.add_argument(
         "--analysis-only",
         action="store_true",
@@ -138,6 +138,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"最终事实：{result.output_dir / 'engineering_facts.json'}")
             print(f"最终任务：{result.output_dir / 'repro_tasks.json'}")
             print(f"实验索引：{result.experiment_index_path}")
+            print(f"科学架构：{result.scientific_architecture_path}")
             return 0
         print(f"审查完成：{result.output_dir}")
         print(f"报告：{result.review_path if result.review_path.exists() else '未生成'}")

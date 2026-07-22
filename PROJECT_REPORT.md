@@ -61,9 +61,13 @@ OpenAI-compatible LLM 只保留为前两阶段显式兼容路径；第三阶段�
    - Python 仅硬验收 JSON 和基本结构；来源、事实引用、证据类型、缺失 resolution、assumption 与 sensitivity_check 均写入 `analysis_warnings.json`，不阻断 Writer。
    - 无条件生成 `paper_thesis.json`，记录中心结论、作用机制、方法排序、适用区间和 caveat。
    - `experiment_index.py` 生成 v2 实验索引，只记录实体、参数、baseline、验收标准和证据缺口，不预测运行结果。
+   - 新案例由 Architecture Agent 生成 `scientific_architecture.json`，跨文档校验 task/experiment/component/quantity 引用以及共享作用域。
+   - Foundation Writer 顺序生成共享 `src/` 和契约测试，验证通过后保存内容寻址快照；并行 task writer 不得修改共享层。
 
 5. **任务级自治复现**
    - `agentic_task_writers.py` 为每个任务创建独立 sandbox。
+   - v2 sandbox 先安装完全相同的 Foundation snapshot；其哈希参与 writer cache key，Foundation 改变时旧任务结果自动失效。
+   - 最终项目从 canonical Foundation 与任务依赖闭包组装，并重新执行必需文件、编译和本地导入门禁。
    - 每个 sandbox 都包含原始论文、全论文页面图和前两轮最终定稿产物；全论文页面图直接发送给 writer，不再筛选任务页，任务相关事实摘要只作为文本导航。
    - 有几个复现任务就同时启动几个 writer，不按本机资源缩减并发。
    - writer 在独立 sandbox 内自主修改代码、配置、README 和 requirements，自行探测并选择 CPU/GPU。
@@ -132,6 +136,8 @@ case_xxx/
   paper_thesis.json
   repro_tasks.json
   experiment_index.json
+  scientific_architecture.json
+  foundation_manifest.json
   repro_project_manifest.json
   runtime_result.json
   report_assets/

@@ -14,18 +14,23 @@ Two distinct dependency classes, both required on a new machine:
      security.ALLOWED_REQUIREMENTS; if these are absent the generator is told
      "don't use numpy" and the task writer cannot deliver a valid full run.
 
-This module only inspects (importlib.util.find_spec / importlib.metadata); it
-never imports the heavy packages, so `geng-agent doctor` still runs on a machine
-that is missing them.
+This module never imports heavy packages, so `geng-agent doctor` still runs on
+a machine that is missing them. The normal environment report uses
+``find_spec`` / package metadata only; the architecture-planning inventory may
+also issue one bounded, read-only ``nvidia-smi`` query to distinguish package
+availability from accelerator hardware presence.
 """
 
 from __future__ import annotations
 
 import importlib.metadata as importlib_metadata
 import importlib.util
+import re
 import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
+from typing import Any
 
 from .codex_runner import split_command
 from .config import get_config_value
@@ -49,6 +54,21 @@ CRITICAL_REPRO_PACKAGES: frozenset[str] = frozenset({"numpy", "scipy", "matplotl
 # pillow is already covered by the orchestrator list; "sklearn" is just the import
 # alias of "scikit-learn" (install the latter). Skip both to avoid double-listing.
 _REPRO_SKIP_REQUIREMENTS: frozenset[str] = frozenset({"pillow", "sklearn"})
+
+# Framework choice is an architecture decision; policy and installation are host
+# facts. Keep unsupported but common runtimes visible so the designer reports a
+# capability gap instead of silently selecting a weaker stack.
+ARCHITECTURE_RUNTIME_PACKAGES: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
+    ("numpy", "numpy", "numpy", ("numpy",)),
+    ("scipy", "scipy", "scipy", ("scipy",)),
+    ("pytorch", "torch", "torch", ("torch", "pytorch")),
+    ("tensorflow", "tensorflow", "tensorflow", ("tensorflow", "keras")),
+    ("jax", "jax", "jax", ("jax", "flax", "optax")),
+)
+ARCHITECTURE_EXTERNAL_RUNTIMES: tuple[tuple[str, str], ...] = (
+    ("julia", "julia"),
+    ("matlab", "matlab"),
+)
 
 
 @dataclass(frozen=True)
@@ -152,7 +172,7 @@ def check_environment() -> EnvironmentReport:
             import_name=import_name,
             installed=_is_installed(import_name),
             version=_distribution_version(package),
-            purpose="复现代码可用库（关键）" if package in CRITICAL_REPRO_PACKAGES else "复现代码可用库（可选，缺则降级近似）",
+            purpose="复现代码可用库（关键）" if package in CRITICAL_REPRO_PACKAGES else "复现代码可用库（可选，缺失时报告能力缺口）",
             critical=package in CRITICAL_REPRO_PACKAGES,
         )
         for package, import_name in _repro_requirements()
@@ -166,6 +186,331 @@ def check_environment() -> EnvironmentReport:
         repro=repro,
         mineru=_check_mineru_command(),
     )
+
+
+def _probe_nvidia_devices() -> dict[str, Any]:
+    """Return a small, read-only CUDA hardware hint for architecture planning.
+
+    This intentionally uses ``nvidia-smi`` instead of importing a deep-learning
+    framework. Importability and hardware presence are separate facts; the
+    generated Foundation must still verify that its selected framework can
+    actually use the requested device at runtime.
+    """
+
+    executable = shutil.which("nvidia-smi")
+    if executable is None:
+        return {
+            "nvidia_smi_available": False,
+            "devices": [],
+            "probe_status": "tool_unavailable",
+        }
+
+    try:
+        completed = subprocess.run(
+            [
+                executable,
+                "--query-gpu=name,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {
+            "nvidia_smi_available": True,
+            "devices": [],
+            "probe_status": "probe_failed",
+            "probe_error": f"{type(exc).__name__}: {exc}",
+        }
+
+    if completed.returncode != 0:
+        error = (completed.stderr or completed.stdout or "unknown nvidia-smi error").strip()
+        return {
+            "nvidia_smi_available": True,
+            "devices": [],
+            "probe_status": "probe_failed",
+            "probe_error": error[:500],
+        }
+
+    devices: list[dict[str, Any]] = []
+    for index, raw_line in enumerate(completed.stdout.splitlines()):
+        line = raw_line.strip()
+        if not line:
+            continue
+        name, separator, memory_text = line.rpartition(",")
+        if not separator:
+            devices.append({"index": index, "name": line, "memory_total_mib": None})
+            continue
+        try:
+            memory_total_mib: int | None = int(memory_text.strip())
+        except ValueError:
+            memory_total_mib = None
+        devices.append(
+            {
+                "index": index,
+                "name": name.strip(),
+                "memory_total_mib": memory_total_mib,
+            }
+        )
+    return {
+        "nvidia_smi_available": True,
+        "devices": devices,
+        "probe_status": "ok",
+    }
+
+
+def _architecture_runtime_inventory(report: EnvironmentReport) -> list[dict[str, Any]]:
+    reported = {item.package: item for item in report.repro}
+    runtimes: list[dict[str, Any]] = []
+    for runtime, package, import_name, aliases in ARCHITECTURE_RUNTIME_PACKAGES:
+        package_status = reported.get(package)
+        installed = package_status.installed if package_status is not None else _is_installed(import_name)
+        version = package_status.version if package_status is not None else _distribution_version(package)
+        policy_allowed = package in ALLOWED_REQUIREMENTS
+        runtimes.append(
+            {
+                "runtime": runtime,
+                "aliases": list(aliases),
+                "package": package,
+                "import_name": import_name,
+                "policy_allowed": policy_allowed,
+                "installed": installed,
+                "version": version,
+                "usable_now": policy_allowed and installed,
+                "status": (
+                    "ready"
+                    if policy_allowed and installed
+                    else "package_missing"
+                    if policy_allowed
+                    else "environment_extension_required"
+                ),
+            }
+        )
+    known_packages = {str(item["package"]) for item in runtimes}
+    for item in report.repro:
+        if item.package in known_packages:
+            continue
+        aliases = sorted({item.package, item.import_name})
+        runtimes.append(
+            {
+                "runtime": item.package,
+                "aliases": aliases,
+                "package": item.package,
+                "import_name": item.import_name,
+                "policy_allowed": True,
+                "installed": item.installed,
+                "version": item.version,
+                "usable_now": item.installed,
+                "status": "ready" if item.installed else "package_missing",
+            }
+        )
+    return runtimes
+
+
+def _runtime_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+
+def architecture_execution_capability_gaps(
+    architecture: dict[str, Any],
+    inventory: dict[str, Any],
+) -> list[dict[str, str]]:
+    """Report material host gaps without changing the selected science stack."""
+
+    local_runtime_keys = {
+        "builtin",
+        "builtins",
+        "projectlocal",
+        "pythonstandardlibrary",
+        "standardlibrary",
+        "stdlib",
+    }
+    alias_entries: dict[str, dict[str, Any]] = {}
+    for entry in inventory.get("python_runtime_registry", []):
+        if not isinstance(entry, dict):
+            continue
+        values = [entry.get("runtime"), entry.get("package"), entry.get("import_name")]
+        aliases = entry.get("aliases")
+        if isinstance(aliases, list):
+            values.extend(aliases)
+        for value in values:
+            key = _runtime_key(value)
+            if key:
+                alias_entries[key] = entry
+    external_entries = {
+        _runtime_key(item.get("runtime")): item
+        for item in inventory.get("external_runtime_registry", [])
+        if isinstance(item, dict) and _runtime_key(item.get("runtime"))
+    }
+    accelerators = inventory.get("accelerators")
+    devices = accelerators.get("devices") if isinstance(accelerators, dict) else []
+    visible_accelerator = any(isinstance(item, dict) for item in devices or [])
+
+    gaps: list[dict[str, str]] = []
+    components = architecture.get("components")
+    for index, component in enumerate(components if isinstance(components, list) else []):
+        if not isinstance(component, dict):
+            continue
+        execution = component.get("execution")
+        if not isinstance(execution, dict):
+            continue
+        component_id = str(component.get("id") or f"component_{index}")
+        framework = str(execution.get("primary_framework") or "")
+        framework_key = _runtime_key(framework)
+        device_policy = str(execution.get("device_policy") or "")
+        supporting_libraries = execution.get("supporting_libraries")
+        seen_supporting_keys: set[str] = set()
+        for library in supporting_libraries if isinstance(supporting_libraries, list) else []:
+            library_name = str(library or "")
+            library_key = _runtime_key(library_name)
+            if (
+                not library_key
+                or library_key == framework_key
+                or library_key in local_runtime_keys
+                or library_key in seen_supporting_keys
+            ):
+                continue
+            seen_supporting_keys.add(library_key)
+            entry = alias_entries.get(library_key)
+            if entry is not None:
+                if entry.get("policy_allowed") is not True:
+                    gap_kind = "environment_extension_required"
+                    gap_message = (
+                        "selected supporting library requires an explicit environment "
+                        f"policy extension: {library_name}"
+                    )
+                elif entry.get("installed") is not True:
+                    gap_kind = "runtime_package_missing"
+                    gap_message = (
+                        f"selected supporting library is not installed on this host: {library_name}"
+                    )
+                else:
+                    gap_kind = ""
+                    gap_message = ""
+            else:
+                external_entry = external_entries.get(library_key)
+                if external_entry is not None:
+                    gap_kind = (
+                        "" if external_entry.get("available") is True else "external_runtime_unavailable"
+                    )
+                    gap_message = (
+                        ""
+                        if not gap_kind
+                        else f"required supporting runtime is not visible on this host: {library_name}"
+                    )
+                else:
+                    gap_kind = "runtime_unregistered"
+                    gap_message = (
+                        "selected supporting library has no trusted host registry entry: "
+                        f"{library_name}"
+                    )
+            if gap_kind:
+                gaps.append(
+                    {
+                        "component_id": component_id,
+                        "kind": gap_kind,
+                        "runtime": library_name,
+                        "role": "supporting_library",
+                        "message": gap_message,
+                    }
+                )
+        if device_policy == "external_runtime":
+            entry = external_entries.get(framework_key)
+            if entry is None or entry.get("available") is not True:
+                gaps.append(
+                    {
+                        "component_id": component_id,
+                        "kind": "external_runtime_unavailable",
+                        "runtime": framework,
+                        "message": f"required external runtime is not visible on this host: {framework}",
+                    }
+                )
+            continue
+        if framework_key not in local_runtime_keys:
+            entry = alias_entries.get(framework_key)
+            if entry is None:
+                gap_kind = "runtime_unregistered"
+                gap_message = f"selected runtime has no trusted host registry entry: {framework}"
+            elif entry.get("policy_allowed") is not True:
+                gap_kind = "environment_extension_required"
+                gap_message = f"selected runtime requires an explicit environment policy extension: {framework}"
+            elif entry.get("installed") is not True:
+                gap_kind = "runtime_package_missing"
+                gap_message = f"selected runtime package is not installed on this host: {framework}"
+            else:
+                gap_kind = ""
+                gap_message = ""
+            if gap_kind:
+                gaps.append(
+                    {
+                        "component_id": component_id,
+                        "kind": gap_kind,
+                        "runtime": framework,
+                        "message": gap_message,
+                    }
+                )
+        if device_policy == "accelerator_required" and not visible_accelerator:
+            gaps.append(
+                {
+                    "component_id": component_id,
+                    "kind": "accelerator_unavailable",
+                    "runtime": framework,
+                    "message": "architecture requires an accelerator but the trusted host probe found none",
+                }
+            )
+    return gaps
+
+
+def architecture_capability_inventory(
+    report: EnvironmentReport | None = None,
+) -> dict[str, Any]:
+    """Build trusted host context for the scientific architecture designer.
+
+    The inventory is feasibility evidence, not scientific evidence. In
+    particular, a missing package must never make the designer silently replace
+    a trainable/autograd component with a NumPy approximation. The architecture
+    should declare the scientifically appropriate execution contract and let the
+    Foundation report an explicit dependency or runtime-capability gap.
+    """
+
+    current = report or check_environment()
+    installed = [
+        {
+            "package": item.package,
+            "import_name": item.import_name,
+            "version": item.version,
+        }
+        for item in current.repro
+        if item.installed
+    ]
+    unavailable = [item.package for item in current.repro if not item.installed]
+    return {
+        "evidence_class": "host_capability_only_not_paper_evidence",
+        "python": {
+            "version": current.python_version,
+            "minimum_supported": current.python_required,
+        },
+        "installed_reproduction_packages": installed,
+        "unavailable_allowed_reproduction_packages": unavailable,
+        "accelerators": _probe_nvidia_devices(),
+        "python_runtime_registry": _architecture_runtime_inventory(current),
+        "external_runtime_registry": [
+            {
+                "runtime": runtime,
+                "executable": executable,
+                "available": shutil.which(executable) is not None,
+                "status": "host_tool_visible" if shutil.which(executable) is not None else "tool_missing",
+            }
+            for runtime, executable in ARCHITECTURE_EXTERNAL_RUNTIMES
+        ],
+        "interpretation": {
+            "package_importable_does_not_prove_device_usable": True,
+            "foundation_must_runtime_verify_selected_backend": True,
+            "missing_package_must_not_trigger_silent_scientific_downgrade": True,
+        },
+    }
 
 
 def _check_mineru_command() -> ExternalToolStatus:

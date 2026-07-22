@@ -4,6 +4,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from geng_agent.foundation_snapshot import foundation_snapshot_hash
+from geng_agent.outputs import write_json
 from geng_agent.agentic_task_writers import (
     _build_task_writer_brief,
     _build_task_writer_continuation_brief,
@@ -11,6 +13,7 @@ from geng_agent.agentic_task_writers import (
     _record_is_valid_current_delivery,
     _run_one_task_writer,
     _task_writer_concurrency,
+    run_codex_task_writer_workflow,
     apply_verified_result,
 )
 
@@ -103,6 +106,18 @@ class AutonomousTaskWriterTests(unittest.TestCase):
             )
             self.assertNotEqual(first, second)
 
+    def test_delivery_metadata_warnings_do_not_invalidate_a_successful_full_run(self) -> None:
+        with TemporaryDirectory() as temp:
+            record = _delivery("task_1", Path(temp) / "sandbox")
+            record["result_json"].update({
+                "status": "complete",
+                "summary": "",
+                "local_image_paths": [],
+            })
+            self.assertTrue(_record_is_valid_current_delivery(record))
+
+            record["result_json"]["execution_summary"]["last_returncode"] = 1
+            self.assertFalse(_record_is_valid_current_delivery(record))
     def test_concurrency_equals_task_count(self) -> None:
         self.assertEqual(_task_writer_concurrency(7, 1, run_repro=True), 7)
 
@@ -120,11 +135,14 @@ class AutonomousTaskWriterTests(unittest.TestCase):
                     task_pairs=pairs, facts={}, experiment_index={}, paper={}, paper_path=root / "paper.pdf",
                     paper_context_json="", paper_images=[], paper_thesis=None,
                     analysis_snapshot_hash="snapshot", analysis_artifacts={}, task_root=root / "sandboxes", audit_dir=root,
-                    run_repro=True, initial_records_by_index=existing,
+                    run_repro=True, timeout=321, initial_records_by_index=existing,
                     review_feedback={"revise": {"differences": ["curve differs"]}}, force_task_ids={"revise"})
             self.assertEqual([item["task_id"] for item in records], ["accepted", "revise"])
             self.assertEqual([call["task"]["task_id"] for call in calls], ["revise"])
             self.assertEqual(calls[0]["review_feedback"]["differences"], ["curve differs"])
+            self.assertEqual(calls[0]["timeout"], 321)
+            self.assertEqual(audit["session_timeout_s"], 321.0)
+            self.assertIsNone(audit["overall_runtime_limit_s"])
             self.assertEqual(audit["reused_task_ids"], ["accepted"])
 
     def test_delivery_validation_and_direct_verification_grant_matched(self) -> None:
@@ -134,6 +152,16 @@ class AutonomousTaskWriterTests(unittest.TestCase):
             self.assertTrue(_record_is_valid_current_delivery(record))
             output = root / "case"; audit = output / "audit"; repro = output / "repro_project"
             audit.mkdir(parents=True); repro.mkdir(); (repro / "config.json").write_text("{}", encoding="utf-8")
+            write_json(
+                output / "runtime_result.json",
+                {
+                    "validation": {
+                        "required_files_present": True,
+                        "python_compiles": True,
+                        "local_imports_resolve": True,
+                    }
+                },
+            )
             runtime = apply_verified_result(
                 task_records=[record],
                 verification_result={"schema_version": "1.0", "all_accepted": True, "tasks": [{
@@ -175,7 +203,7 @@ class AutonomousTaskWriterTests(unittest.TestCase):
                 "geng_agent.agentic_task_writers._build_task_writer_brief", return_value="base"
             ), patch(
                 "geng_agent.agentic_task_writers._run_task_writer_codex_session", return_value={"ok": True}
-            ), patch(
+            ) as run_session, patch(
                 "geng_agent.agentic_task_writers._restore_trusted_files"
             ), patch(
                 "geng_agent.agentic_task_writers._collect_task_writer_delivery", side_effect=records
@@ -188,8 +216,9 @@ class AutonomousTaskWriterTests(unittest.TestCase):
                     facts={}, experiment_index={}, paper={}, paper_path=root / "paper.pdf", paper_context_json="",
                     paper_images=[], paper_thesis=None, analysis_snapshot_hash="snapshot",
                     analysis_artifacts={}, task_root=root / "task_root", audit_dir=root, run_repro=True,
-                    task_review_callback=callback,
+                    timeout=456, task_review_callback=callback,
                 )
+            self.assertEqual([call.kwargs["timeout"] for call in run_session.call_args_list], [456, 456])
             self.assertEqual(callback_calls, [1, 2])
             self.assertEqual(result["task_verification"]["verdict"], "accepted")
             self.assertEqual(result["writer_session_count"], 2)
@@ -239,6 +268,69 @@ class AutonomousTaskWriterTests(unittest.TestCase):
             self.assertEqual(callback_calls, [(1, "task_1", "task_1", 1)])
             run_writer.assert_not_called()
             archive_delivery.assert_not_called()
+
+    def test_fresh_workflow_preserves_foundation_snapshot_before_dispatch(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / "case"
+            audit = output / "audit"
+            snapshot = audit / "03b_foundation_snapshot"
+            source = snapshot / "src" / "channel.py"
+            source.parent.mkdir(parents=True)
+            source.write_text("VALUE = 1\n", encoding="utf-8")
+            paper = output / "paper.pdf"
+            paper.parent.mkdir(parents=True, exist_ok=True)
+            paper.write_bytes(b"paper")
+            tasks = {"repro_tasks": [{"task_id": "task_1", "figure_or_claim": "Fig. 1"}]}
+            write_json(output / "engineering_facts.json", {"engineering_facts": []})
+            write_json(output / "repro_tasks.json", tasks)
+            write_json(output / "experiment_index.json", {"experiments": []})
+            digest = __import__("hashlib").sha256(source.read_bytes()).hexdigest()
+            files = [{"path": "src/channel.py", "sha256": digest, "bytes": source.stat().st_size}]
+            snapshot_hash = foundation_snapshot_hash(files)
+            manifest = {
+                "schema_version": "1.0",
+                "workflow_version": "2",
+                "contract_version": "1",
+                "input_hash": "a" * 64,
+                "analysis_snapshot_hash": "b" * 64,
+                "snapshot_hash": snapshot_hash,
+                "files": files,
+                "frozen_files": files,
+                "required_modules": ["src/channel.py"],
+                "validation": {"tests_passed": True, "local_imports_resolve": True},
+            }
+            foundation = {
+                "snapshot_dir": str(snapshot),
+                "snapshot_hash": snapshot_hash,
+                "manifest": manifest,
+            }
+
+            class StopAfterDispatchProbe(RuntimeError):
+                pass
+
+            def probe_dispatch(**kwargs):
+                self.assertTrue(source.is_file(), "manifest cleanup deleted the 03b Foundation snapshot")
+                from geng_agent.agentic_foundation import install_foundation_snapshot
+
+                probe = root / "probe_sandbox"
+                installed = install_foundation_snapshot(probe, kwargs["foundation"])
+                self.assertEqual(installed, {"src/channel.py"})
+                self.assertEqual((probe / "src" / "channel.py").read_bytes(), source.read_bytes())
+                raise StopAfterDispatchProbe
+
+            with patch(
+                "geng_agent.agentic_task_writers._dispatch_task_writers",
+                side_effect=probe_dispatch,
+            ):
+                with self.assertRaises(StopAfterDispatchProbe):
+                    run_codex_task_writer_workflow(
+                        facts={"engineering_facts": []}, tasks=tasks,
+                        experiment_index={"experiments": []}, paper={"chunks": []},
+                        paper_path=paper, paper_context_json="", paper_images=[], paper_thesis=None,
+                        output_dir=output, audit_dir=audit, repro_project_dir=output / "repro_project",
+                        run_repro=True, resume=False, foundation=foundation,
+                    )
 
 
 if __name__ == "__main__":

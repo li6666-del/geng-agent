@@ -434,6 +434,12 @@ def dependency_policy_prompt_text() -> str:
     if unavailable:
         lines.append("白名单中但当前环境未安装，默认不要使用：")
         lines.extend(f"- {item}" for item in unavailable)
+    lines.append(
+        "Architecture execution contract precedence: if scientific_architecture/1.1 "
+        "requires a framework that is unavailable or disallowed, report an explicit "
+        "environment/architecture capability gap. Never silently replace it with a "
+        "standard-library placeholder or a scientifically weaker approximation."
+    )
     return "\n".join(lines)
 
 

@@ -10,6 +10,9 @@
 - 一个 Codex 事实专家只做一轮全局事实扫描，一个任务专家只做一轮初步设计并立即输出 `backfill_handoff`；只有明确点名的实验定义 blocker 才进入定向回补，通常 0–2 轮，第三轮仅作异常熔断。
 - 无条件抽取论文核心主张、作用机制、方法排序和限制，生成 `paper_thesis.json` 作为后续复现锚点。
 - 将论文图表拆成可运行的复现实验任务；任务描述用于导航，最终科学目标始终以论文原文和原图为准。
+- 新案例在任务定稿后生成 `scientific_architecture.json`，统一约束跨任务共享的系统模型、数量形状、单位、归一化、组件接口和不变量；旧案例在 resume 时继续使用 v1，不做静默迁移。
+- `scientific_architecture/1.1` 由 Architecture Agent 按组件选择真实运行栈、设备策略、精度、训练/梯度/检查点能力和共享边界；类型与框架均不绑定通信领域或 PyTorch。宿主能力只决定“当前能否执行”，缺包、缺 GPU 或未启用的运行时会形成显式 capability gap，不能触发 NumPy/CPU/占位实现的静默降级。
+- 单个 Foundation Writer 在并行任务启动前生成共享 `src/` 与契约测试，形成按内容哈希冻结的 canonical snapshot；任务 writer 只能读取共享层，任务私有实现放在 `tasks/`。
 - 第三阶段采用任务级自治 writer：一个任务一个 Codex writer，任务数就是启动并发数；writer 自主写代码、直接运行 full、对比并迭代。
 - 每个 writer 把论文明确事实作为最高约束，只在论文未披露或确有歧义处作显式工程假设；完成 full、支持核心观点且不存在材料性事实冲突后提交 `ready_for_review`，无权授予最终 `matched`。
 - 主持人只做任务覆盖、证据路径和基础代码健康检查，不参与科学结论。
@@ -32,6 +35,8 @@
   -> Python 只硬验收 JSON/基本结构；来源、引用、证据类型和缺失字段写入 analysis_warnings.json，不触发科学内容重写
   -> Codex analysis 基于最终事实抽取 paper_thesis.json
   -> experiment_index v2 记录任务、图表、参数、baseline 和证据定位，不做运行前复现评级
+  -> Architecture Agent 生成 scientific_architecture.json，并由机器检查跨文档引用、形状/单位作用域和 task binding
+  -> Foundation Writer 顺序生成共享科学模块与 tests；验证、哈希冻结后再复制到每个任务 sandbox
   -> 为每个复现任务创建独立 sandbox
   -> 所有任务 writer 同时启动，在独立 sandbox 内自主写代码、选择硬件并直接运行 full
   -> 每个 writer 自行对比论文、修改代码并反复运行，完成可靠 full 后提交 ready_for_review
@@ -86,7 +91,7 @@ MinerU 缺失、超时、非零退出或未识别到目标图时，流程不会�
 
 ## 论文目标图定位
 
-系统会把原始论文文件、全论文页面图以及前两轮最终定稿的 `engineering_facts.json`、`repro_tasks.json`、`experiment_index.json`、可选 `paper_thesis.json` 和 `analysis_warnings.json` 复制到每个 writer sandbox。所有论文页面图直接随 Codex writer 会话发送，不再执行任务页筛选；任务相关事实摘要只用于文本导航，不构成信息边界。
+系统会把原始论文文件、全论文页面图以及最终定稿的 `engineering_facts.json`、`repro_tasks.json`、`experiment_index.json`、v2 的 `scientific_architecture.json`、可选 `paper_thesis.json` 和 `analysis_warnings.json` 复制到每个 writer sandbox。v2 sandbox 还安装同一份只读 Foundation snapshot。所有论文页面图直接随 Codex writer 会话发送，不再执行任务页筛选；任务相关事实摘要只用于文本导航，不构成信息边界。
 
 每个 writer 交付后，专属 task reporter 在独立上下文中读取该任务的 `task_agent_result.json`、执行摘要、本地 PNG/CSV/summary 和完整论文证据，直接判断 `accepted/revise` 并定位论文原图。科学差异只退回对应 writer；裁图或证据定位问题只重跑对应 task reporter。所有任务通过后，Final Report Editor 只读取已验收的紧凑任务包和图片，汇总生成三份最终报告。
 
@@ -106,6 +111,7 @@ set GENG_CODEX_CMD=codex
 
 ```bash
 set GENG_CODEX_ANALYSIS_CMD=codex
+set GENG_CODEX_FOUNDATION_WRITER_CMD=codex
 set GENG_CODEX_TASK_WRITER_CMD=codex
 set GENG_CODEX_TASK_REPORTER_CMD=codex
 set GENG_CODEX_REPORT_EDITOR_CMD=codex
@@ -122,12 +128,13 @@ set GENG_CODEX_REASONING_EFFORT=high
 
 ```bash
 set GENG_CODEX_ANALYSIS_REASONING_EFFORT=xhigh
+set GENG_CODEX_FOUNDATION_WRITER_REASONING_EFFORT=xhigh
 set GENG_CODEX_TASK_WRITER_REASONING_EFFORT=xhigh
 set GENG_CODEX_TASK_REPORTER_REASONING_EFFORT=xhigh
 set GENG_CODEX_REPORT_EDITOR_REASONING_EFFORT=xhigh
 ```
 
-task writer 采用全任务并发：有多少复现任务就同时启动多少个 writer。每个 writer 在自己的 sandbox 内直接调用当前 Python，自行探测 CPU/GPU、选择 backend、声明依赖并运行 smoke/full；主持人不做资源排队、命令拦截、科学迭代超时或中途重试。
+task writer 采用全任务并发：有多少复现任务就同时启动多少个 writer。每个 writer 在自己的 sandbox 内直接调用当前 Python，自行探测 CPU/GPU、选择 backend、声明依赖并运行 smoke/full；主持人不做资源排队、命令拦截或中途重试。科学迭代没有单独的总墙钟上限，但每个 Codex 会话默认最多运行 1800 秒（30 分钟）。
 
 Writer 必须先读取 `repro_tasks.json` 的 `_meta.fact_gap_handoff`，再从抽取事实、原论文 PDF、caption、正文、公式、表格和附录中补找缺失参数；前两阶段的未解决记录只是导航，不是停止依据。论文明确给出的数据、模型、公式、算法和实验协议不可为了贴图而改动；仍找不到的值或实现细节才允许成为可追踪、可调整的科学假设。对 Monte Carlo、批量矩阵运算和分钟级 CPU full，CUDA 可用时应优先实现真实 Torch CUDA 计算路径；仅调用 backend selector 或在报告中写 GPU 名称不算使用 GPU。
 
@@ -177,9 +184,10 @@ python -m geng_agent review paper.pdf --out case_analysis --analysis-only
 --analysis-backend codex     前两阶段 backend，默认 codex；llm 为旧兼容路径
 --analysis-only              只生成最终事实、最终任务、论文主张和实验索引
 --mineru-timeout 1800        MinerU 单篇预解析超时；超时后自动回退页面图定位
---codex-analysis-timeout 600 前两阶段单个 Codex 子进程超时
---codex-agent-timeout 1800   单个任务 writer 子进程超时
---codex-reporter-timeout 1800 最终报告 Codex 子进程超时
+--project-timeout 1800       所有 Codex 会话的公共默认超时（30 分钟）
+--codex-analysis-timeout 1800 Analysis/架构专家单次 Codex 会话超时
+--codex-agent-timeout 1800   Foundation/Task Writer 单次 Codex 会话超时
+--codex-reporter-timeout 1800 Task Reporter/Report Editor 单次 Codex 会话超时
 --run-timeout 120            单次任务运行超时
 --no-resume                  不复用已有阶段产物，从头运行
 ```
@@ -236,6 +244,7 @@ GENG_ENABLE_URL_IMPORT  1 表示允许受 SSRF 防护的 PDF URL 导入 API
 
 ```text
 case_001/
+  workflow.json
   paper_chunks.json
   paper_figure_index.json
   engineering_facts_initial.json
@@ -248,6 +257,8 @@ case_001/
   task_conflicts.json
   experiment_index.json
   paper_thesis.json
+  scientific_architecture.json
+  foundation_manifest.json
   repro_project_manifest.json
   runtime_result.json
   report_assets/
@@ -263,6 +274,7 @@ case_001/
     00_mineru/
     01_*.md/json/txt
     02_*.md/json/txt
+    03b_foundation_snapshot/
     03c_task_writer_sandboxes/
     03c_task_writers_*.json
     04_reporter_*.json/md/txt
@@ -272,7 +284,9 @@ case_001/
     requirements.txt
     tasks_manifest.json
     configs/
+    src/
     tasks/
+    tests/
     outputs/
 ```
 

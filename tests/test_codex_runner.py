@@ -8,8 +8,10 @@ import unittest
 from unittest.mock import patch
 
 from geng_agent.codex_runner import (
+    DEFAULT_CODEX_TIMEOUT_SECONDS,
     DEFAULT_GENG_CODEX_MODEL,
     _clear_ephemeral_capability_cache,
+    resolve_codex_timeout,
     run_codex_subprocess,
 )
 
@@ -32,6 +34,7 @@ class CodexRunnerEphemeralTests(unittest.TestCase):
         help_text: str = "Usage: codex exec [OPTIONS]\n  --ephemeral",
         output_schema: Path | None = None,
         image_paths: list[Path] | None = None,
+        timeout: float | None = 30,
     ):
         calls: list[tuple[list[str], dict]] = []
         writes: list[tuple[Path, dict]] = []
@@ -56,7 +59,7 @@ class CodexRunnerEphemeralTests(unittest.TestCase):
                 audit_dir=Path("case") / "audit",
                 label=f"{role}_worker",
                 sandbox=sandbox,
-                timeout=30,
+                timeout=timeout,
                 command_override=command_override,
                 output_schema=output_schema,
                 image_paths=image_paths,
@@ -65,6 +68,7 @@ class CodexRunnerEphemeralTests(unittest.TestCase):
 
     def test_default_command_is_ephemeral_and_prompt_stays_on_stdin(self) -> None:
         self.assertEqual(DEFAULT_GENG_CODEX_MODEL, "gpt-5.6-sol")
+        self.assertEqual(DEFAULT_CODEX_TIMEOUT_SECONDS, 1800.0)
 
         status, calls, writes = self._invoke()
 
@@ -75,10 +79,22 @@ class CodexRunnerEphemeralTests(unittest.TestCase):
         self.assertEqual(command.count("--ephemeral"), 1)
         self.assertEqual(kwargs["input"], "test prompt")
         self.assertEqual(status["model"], DEFAULT_GENG_CODEX_MODEL)
+        self.assertEqual(status["timeout_s"], 30.0)
         self.assertEqual(status["session_persistence"], "ephemeral")
         self.assertTrue(status["ephemeral_capability"]["supported"])
         self.assertFalse(status["ephemeral_capability"]["cached"])
         self.assertEqual(writes[-1][1]["session_persistence"], "ephemeral")
+
+    def test_none_timeout_resolves_to_the_central_30_minute_limit(self) -> None:
+        status, calls, _ = self._invoke(timeout=None)
+        _, kwargs = next(item for item in calls if "--ephemeral" in item[0])
+        self.assertEqual(kwargs["timeout"], 1800.0)
+        self.assertEqual(status["timeout_s"], 1800.0)
+
+    def test_non_finite_timeout_is_rejected(self) -> None:
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                resolve_codex_timeout(value)
 
     def test_worker_options_and_project_evidence_outputs_are_preserved(self) -> None:
         schema = Path("schemas") / "result.schema.json"
@@ -137,6 +153,7 @@ class CodexRunnerEphemeralTests(unittest.TestCase):
     def test_all_one_shot_roles_are_ephemeral(self) -> None:
         expected_reasoning = {
             "analysis": "xhigh",
+            "foundation_writer": "xhigh",
             "task_writer": "xhigh",
             "task_reporter": "xhigh",
             "report_editor": "xhigh",

@@ -11,6 +11,68 @@ TASK_REPORTER_ROUTE_NONE = "none"
 TASK_REPORTER_ROUTE_WRITER = "writer"
 TASK_REPORTER_ROUTE_REPORTER = "reporter"
 
+def partition_writer_delivery_issues(result: Any) -> tuple[list[str], list[str]]:
+    """Keep execution failures blocking while treating hand-off prose as advisory."""
+
+    blockers: list[str] = []
+    warnings: list[str] = []
+    for issue in writer_delivery_issues(result):
+        if issue.startswith(("writer status must be", "writer summary is empty", "writer must declare")):
+            warnings.append(issue)
+        else:
+            blockers.append(issue)
+    return blockers, warnings
+
+
+def normalize_task_verification(result: Any, expected_task_id: str) -> dict[str, Any]:
+    """Fill non-scientific hand-off metadata without changing verdict or differences."""
+
+    if not isinstance(result, dict):
+        return {}
+    normalized = dict(result)
+    normalized.setdefault("schema_version", "1.0")
+    normalized.setdefault("task_id", str(expected_task_id))
+    verdict = str(normalized.get("verdict") or "")
+    if verdict == TASK_REPORTER_ACCEPTED:
+        normalized["revision_target"] = TASK_REPORTER_ROUTE_NONE
+    elif verdict == TASK_REPORTER_REVISE and str(normalized.get("revision_target") or "") not in {
+        TASK_REPORTER_ROUTE_WRITER,
+        TASK_REPORTER_ROUTE_REPORTER,
+    }:
+        normalized["revision_target"] = TASK_REPORTER_ROUTE_WRITER
+    normalized.setdefault("comparison_summary", "Reporter returned no textual comparison summary.")
+    normalized.setdefault("differences", [])
+    normalized.setdefault("non_material_differences", [])
+    evidence = normalized.get("evidence_files")
+    if not isinstance(evidence, list) or not any(str(value).strip() for value in evidence):
+        normalized["evidence_files"] = ["inputs/task_report_input.json"]
+    normalized.setdefault("feedback", [])
+    if str(normalized.get("confidence") or "") not in {"low", "medium", "high"}:
+        normalized["confidence"] = "medium"
+    normalized.setdefault("local_assets", [])
+    normalized.setdefault("paper_assets", [])
+    normalized.setdefault("remaining_uncertainties", [])
+    return normalized
+
+
+def partition_task_verification_issues(result: Any, expected_task_id: str) -> tuple[list[str], list[str]]:
+    """Separate scientific identity/verdict contradictions from delivery metadata."""
+
+    blockers: list[str] = []
+    warnings: list[str] = []
+    for issue in task_verification_issues(result, expected_task_id):
+        if issue.startswith((
+            "task_verification_result.json is not an object",
+            "task_id must be",
+            "verdict must be",
+            "accepted result cannot contain material differences",
+            "revise result requires concrete differences",
+        )):
+            blockers.append(issue)
+        else:
+            warnings.append(issue)
+    return blockers, warnings
+
 
 def writer_delivery_issues(result: Any) -> list[str]:
     if not isinstance(result, dict):

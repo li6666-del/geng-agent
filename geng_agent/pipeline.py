@@ -6,10 +6,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from .codex_runner import DEFAULT_CODEX_TIMEOUT_SECONDS, resolve_codex_timeout
 from .config import validate_case_output_dir
 from .documents import load_paper
 from .analysis_diagnostics import write_analysis_warnings
-from .agentic_analysis import CODEX_ANALYSIS_BACKEND, run_codex_json_stage
+from .agentic_analysis import (
+    CODEX_ANALYSIS_BACKEND,
+    run_codex_json_stage,
+)
 from .experiment_index import build_local_experiment_index
 from .facts_coverage import (
     compute_fact_coverage,
@@ -96,6 +100,63 @@ SYSTEM_MESSAGE = (
 TARGETED_BACKFILL_MAX_ROUNDS = 3
 
 
+def _select_workflow_version(output_dir: Path, *, resume: bool) -> str:
+    """Keep legacy cases on v1 while making every new/rebuilt case v2."""
+
+    marker = output_dir / "workflow.json"
+    if resume and marker.is_file():
+        try:
+            version = str(json.loads(marker.read_text(encoding="utf-8-sig")).get("workflow_version") or "")
+        except Exception:
+            version = ""
+        if version in {"1", "2"}:
+            return version
+    legacy_artifacts = any(
+        (output_dir / name).exists()
+        for name in ("engineering_facts.json", "repro_tasks.json", "experiment_index.json", "repro_project")
+    )
+    if resume and legacy_artifacts and not (output_dir / "scientific_architecture.json").is_file():
+        write_json(
+            marker,
+            {
+                "workflow_version": "1",
+                "legacy_detected": True,
+                "note": "resume keeps pre-v2 cases on their original workflow",
+            },
+        )
+        return "1"
+    write_json(
+        marker,
+        {
+            "workflow_version": "2",
+            "architecture_contract": "scientific_architecture/1.1",
+            "foundation_contract": "foundation/1",
+        },
+    )
+    return "2"
+
+def _requires_scientific_architecture_v11(
+    output_dir: Path,
+    *,
+    resume: bool,
+) -> bool:
+    """Require 1.1 for new/rebuilt cases while preserving explicit legacy markers."""
+
+    marker = output_dir / "workflow.json"
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8-sig")) if marker.is_file() else {}
+    except Exception:
+        payload = {}
+    contract = str(payload.get("architecture_contract") or "")
+    if contract == "scientific_architecture/1.1":
+        return True
+    if contract == "scientific_architecture/1.0":
+        return False
+    # Older v2 cases did not always record the architecture contract. Preserve
+    # them on resume; a deliberate rebuild must use the current contract.
+    return not resume
+
+
 @dataclass(frozen=True)
 class PipelineResult:
     output_dir: Path
@@ -104,6 +165,7 @@ class PipelineResult:
     risk_report_path: Path
     runtime_passed: bool | None = None
     experiment_index_path: Path | None = None
+    scientific_architecture_path: Path | None = None
     result_review_path: Path | None = None
     result_review_passed: bool | None = None
     reproducibility_verdict: dict[str, Any] | None = None
@@ -167,7 +229,7 @@ class ReviewPipeline:
         mineru_timeout: float = 1800.0,
         json_repair_attempts: int = 1,
         tasks_timeout: float = 300.0,
-        project_timeout: float = 1200.0,
+        project_timeout: float = DEFAULT_CODEX_TIMEOUT_SECONDS,
         analysis_fallback: bool = True,
         analysis_backend: str | None = None,
         codex_analysis_timeout: float | None = None,
@@ -180,6 +242,7 @@ class ReviewPipeline:
             "facts": "facts",
             "tasks": "tasks",
             "experiment_index": "experiment_index",
+            "scientific_architecture": "scientific_architecture",
             "manifest": "manifest",
             "project": "project",
             "runtime": "runtime",
@@ -224,7 +287,7 @@ class ReviewPipeline:
         mineru_timeout: float = 1800.0,
         json_repair_attempts: int = 1,
         tasks_timeout: float = 300.0,
-        project_timeout: float = 1200.0,
+        project_timeout: float = DEFAULT_CODEX_TIMEOUT_SECONDS,
         resume: bool = True,
         analysis_fallback: bool = True,
         analysis_backend: str | None = None,
@@ -238,12 +301,18 @@ class ReviewPipeline:
         output_dir.mkdir(parents=True, exist_ok=True)
         audit_dir = output_dir / "audit"
         audit_dir.mkdir(parents=True, exist_ok=True)
+        workflow_version = _select_workflow_version(output_dir, resume=resume)
         if analysis_backend is None:
             analysis_backend = CODEX_ANALYSIS_BACKEND
         if analysis_backend not in {CODEX_ANALYSIS_BACKEND, "llm"}:
             raise ValueError(f"unknown analysis_backend: {analysis_backend}")
         if analysis_backend == "llm" and self.client is None:
             raise ValueError("analysis_backend='llm' requires an LLM client")
+
+        project_timeout = resolve_codex_timeout(project_timeout)
+        codex_analysis_timeout = resolve_codex_timeout(codex_analysis_timeout or project_timeout)
+        codex_agent_timeout = resolve_codex_timeout(codex_agent_timeout or project_timeout)
+        codex_reporter_timeout = resolve_codex_timeout(codex_reporter_timeout or codex_agent_timeout)
 
         run_start = time.perf_counter()
         cost_marks: list[dict[str, Any]] = []
@@ -729,9 +798,66 @@ class ReviewPipeline:
             resume=resume,
         )
         _mark("experiment_index")
+        scientific_architecture: dict[str, Any] | None = None
+        if workflow_version == "2":
+            try:
+                scientific_architecture = self._load_or_create_scientific_architecture(
+                    output_dir=output_dir,
+                    audit_dir=audit_dir,
+                    facts=facts,
+                    tasks=tasks,
+                    experiment_index=experiment_index,
+                    paper_thesis=paper_thesis,
+                    paper_context=paper_context,
+                    paper_images=paper_images,
+                    resume=resume,
+                    max_attempts=json_repair_attempts + 1,
+                    analysis_backend=analysis_backend,
+                    codex_analysis_timeout=codex_analysis_timeout,
+                )
+            except Exception as exc:
+                requires_v11 = _requires_scientific_architecture_v11(
+                    output_dir,
+                    resume=resume,
+                )
+                scientific_architecture = None
+                write_json(
+                    audit_dir / "02f_scientific_architecture_fallback.json",
+                    {
+                        "policy": "reproduction_first",
+                        "decision": "stop" if requires_v11 else "fallback",
+                        "pipeline_can_continue": not requires_v11,
+                        "fallback": (
+                            None
+                            if requires_v11
+                            else "task_local_writers_without_foundation"
+                        ),
+                        "warning": f"{type(exc).__name__}: {exc}",
+                    },
+                )
+                if requires_v11:
+                    raise RuntimeError(
+                        "scientific_architecture/1.1 is required for this workflow; "
+                        "task-local implementation fallback would discard the selected "
+                        "framework and shared execution contract"
+                    ) from exc
+            else:
+                from .scientific_architecture_normalize import scientific_architecture_normalization_warnings
+
+                analysis_warnings = write_analysis_warnings(
+                    output_dir=output_dir,
+                    audit_dir=audit_dir,
+                    stage="02f_design_scientific_architecture",
+                    groups={
+                        "structural_normalization": scientific_architecture_normalization_warnings(
+                            scientific_architecture
+                        )
+                    },
+                )
+        _mark("scientific_architecture")
         repro_project_dir = output_dir / "repro_project"
 
-        analysis_stage_invocations = 3 + (2 * backfill_round_count)
+        analysis_stage_invocations = 3 + (2 * backfill_round_count) + (1 if scientific_architecture is not None else 0)
         if analysis_only:
             run_cost = _build_run_cost(
                 cost_marks,
@@ -766,6 +892,8 @@ class ReviewPipeline:
                     "facts_count": len(facts.get("engineering_facts", [])),
                     "tasks_count": len(tasks.get("repro_tasks", [])),
                     "experiments_count": len(experiment_index.get("experiments", [])),
+                    "architecture_components_count": len((scientific_architecture or {}).get("components", [])),
+                    "architecture_bindings_count": len((scientific_architecture or {}).get("bindings", [])),
                     "analysis_stage_invocations": analysis_stage_invocations,
                     "task_driven_backfill": facts.get("_meta", {}).get("task_driven_backfill", {}),
                     "task_finalization": tasks.get("_meta", {}).get("task_driven_finalization", {}),
@@ -784,6 +912,10 @@ class ReviewPipeline:
                 risk_report_path=output_dir / "risk_report.json",
                 runtime_passed=None,
                 experiment_index_path=output_dir / "experiment_index.json",
+                scientific_architecture_path=(
+                    output_dir / "scientific_architecture.json"
+                    if scientific_architecture is not None else None
+                ),
             )
         from .agentic_report_editor import run_codex_report_editor_workflow
         from .agentic_task_reporters import (
@@ -821,7 +953,7 @@ class ReviewPipeline:
                 figure_index=figure_index,
                 output_dir=output_dir,
                 audit_dir=audit_dir,
-                timeout=codex_reporter_timeout or codex_agent_timeout or project_timeout or 1800.0,
+                timeout=codex_reporter_timeout,
                 resume=resume,
                 round_no=writer_round,
             )
@@ -849,13 +981,61 @@ class ReviewPipeline:
                     figure_index=figure_index,
                     output_dir=output_dir,
                     audit_dir=audit_dir,
-                    timeout=codex_reporter_timeout or codex_agent_timeout or project_timeout or 1800.0,
+                    timeout=codex_reporter_timeout,
                     resume=False,
                     round_no=writer_round * 100 + 1,
                     include_all_paper_pages=True,
                 )
             return result
 
+        foundation: dict[str, Any] | None = None
+        if scientific_architecture is not None:
+            from .agentic_foundation import run_codex_foundation_writer_workflow
+
+            _begin("foundation")
+            try:
+                foundation = run_codex_foundation_writer_workflow(
+                    facts=facts,
+                    tasks=tasks,
+                    experiment_index=experiment_index,
+                    scientific_architecture=scientific_architecture,
+                    paper=paper,
+                    paper_path=paper_path,
+                    paper_images=paper_images,
+                    paper_thesis=paper_thesis,
+                    output_dir=output_dir,
+                    audit_dir=audit_dir,
+                    timeout=codex_agent_timeout,
+                    resume=resume,
+                )
+            except Exception as exc:
+                architecture_v11 = (
+                    str(scientific_architecture.get("schema_version") or "") == "1.1"
+                )
+                foundation = None
+                write_json(
+                    audit_dir / "03b_foundation_fallback.json",
+                    {
+                        "policy": "reproduction_first",
+                        "decision": "stop" if architecture_v11 else "fallback",
+                        "stage_usable": False,
+                        "pipeline_can_continue": not architecture_v11,
+                        "fallback": (
+                            None
+                            if architecture_v11
+                            else "isolated_task_writers_without_shared_foundation"
+                        ),
+                        "warning": f"{type(exc).__name__}: {exc}",
+                    },
+                )
+                if architecture_v11:
+                    raise RuntimeError(
+                        "Foundation generation failed for scientific_architecture/1.1; "
+                        "isolated task writers cannot preserve its shared implementation "
+                        "and execution contract"
+                    ) from exc
+            finally:
+                _mark("foundation")
         _begin("generation")
         agentic_result = run_codex_task_writer_workflow(
             facts=facts,
@@ -870,10 +1050,11 @@ class ReviewPipeline:
             audit_dir=audit_dir,
             repro_project_dir=repro_project_dir,
             run_repro=run_repro,
-            timeout=codex_agent_timeout or project_timeout or 1800.0,
+            timeout=codex_agent_timeout,
             run_timeout=run_timeout,
             resume=resume,
             task_review_callback=_review_one_task,
+            foundation=foundation,
         )
         manifest = agentic_result["manifest"]
         written_files = [Path(path) for path in agentic_result.get("written_files", [])]
@@ -1012,7 +1193,7 @@ class ReviewPipeline:
             ],
             output_dir=output_dir,
             audit_dir=audit_dir,
-            timeout=codex_reporter_timeout or codex_agent_timeout or project_timeout or 1800.0,
+            timeout=codex_reporter_timeout,
             resume=resume,
         )
         first_editor_status = report_editor_result.get("codex_status")
@@ -1037,7 +1218,7 @@ class ReviewPipeline:
                 ],
                 output_dir=output_dir,
                 audit_dir=audit_dir,
-                timeout=codex_reporter_timeout or codex_agent_timeout or project_timeout or 1800.0,
+                timeout=codex_reporter_timeout,
                 resume=False,
                 attempt_no=2,
                 repair_context=report_editor_result,
@@ -1140,7 +1321,11 @@ class ReviewPipeline:
             "figure_count": mineru_result.get("figure_count", 0),
         }
         if analysis_backend == CODEX_ANALYSIS_BACKEND:
-            run_cost["codex_analysis_timeout_s"] = codex_analysis_timeout or 600.0
+            run_cost["codex_analysis_timeout_s"] = codex_analysis_timeout
+            run_cost["codex_foundation_timeout_s"] = codex_agent_timeout
+            run_cost["codex_task_writer_timeout_s"] = codex_agent_timeout
+            run_cost["codex_task_reporter_timeout_s"] = codex_reporter_timeout
+            run_cost["codex_report_editor_timeout_s"] = codex_reporter_timeout
             run_cost["analysis_agent_count"] = 1
             run_cost["analysis_stage_invocations"] = analysis_stage_invocations
         write_json(
@@ -1182,6 +1367,10 @@ class ReviewPipeline:
             risk_report_path=risk_report_path,
             runtime_passed=runtime_result.get("passed"),
             experiment_index_path=(output_dir / "experiment_index.json") if (output_dir / "experiment_index.json").exists() else None,
+            scientific_architecture_path=(
+                output_dir / "scientific_architecture.json"
+                if (output_dir / "scientific_architecture.json").exists() else None
+            ),
             result_review_path=result_review_markdown_path if result_review_markdown_path.exists() else None,
             result_review_passed=result_review_result.get("passed"),
             reproducibility_verdict=reproducibility_verdict,
@@ -1223,26 +1412,71 @@ class ReviewPipeline:
         schema_stage: str,
         max_attempts: int,
         resume: bool,
+        pre_validation: Callable[[dict[str, Any]], list[ValidationIssue]] | None = None,
         extra_validation: Callable[[dict[str, Any]], list[ValidationIssue]] | None = None,
         request_timeout: float | None = None,
         fallback_factory: Callable[[Exception], dict[str, Any] | None] | None = None,
         candidate_normalizer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        repair_preservation_validator: Callable[[dict[str, Any], dict[str, Any]], list[ValidationIssue]] | None = None,
+        salvage_failed_candidates: bool = False,
         truncation_recovery: Callable[[str], dict[str, Any] | None] | None = None,
         images: list | None = None,
         client: Any = None,
         backend: str = "llm",
         codex_timeout: float | None = None,
     ) -> dict[str, Any]:
+        cache_validation: Callable[[dict[str, Any]], list[ValidationIssue]] | None = None
+        if pre_validation is not None or extra_validation is not None:
+            def _combined_validation(parsed: dict[str, Any]) -> list[ValidationIssue]:
+                issues = pre_validation(parsed) if pre_validation is not None else []
+                if extra_validation is not None:
+                    issues.extend(extra_validation(parsed))
+                return issues
+
+            cache_validation = _combined_validation
+
         if resume and output_path.exists():
             cached = _load_valid_stage_cache(
                 path=output_path,
                 audit_dir=audit_dir,
                 stage_label=stage_label,
                 schema_stage=schema_stage,
-                extra_validation=extra_validation,
+                extra_validation=cache_validation,
             )
             if cached is not None:
                 return cached
+
+        if resume and salvage_failed_candidates and candidate_normalizer is not None:
+            candidates = sorted(
+                audit_dir.glob(f"normalized_{stage_label}_attempt_*.json"),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+            for candidate_path in candidates:
+                try:
+                    candidate = candidate_normalizer(_read_json_file(candidate_path))
+                except Exception:
+                    continue
+                candidate_issues = pre_validation(candidate) if pre_validation is not None else []
+                if not candidate_issues:
+                    candidate_issues.extend(validate_stage(schema_stage, candidate))
+                if not candidate_issues and extra_validation is not None:
+                    candidate_issues.extend(extra_validation(candidate))
+                if candidate_issues:
+                    continue
+                meta = dict(candidate.get("_meta", {})) if isinstance(candidate.get("_meta"), dict) else {}
+                meta.update({
+                    "analysis_backend": backend,
+                    "analysis_stage_label": stage_label,
+                    "analysis_resume_source": candidate_path.name,
+                })
+                candidate["_meta"] = meta
+                write_json(output_path, candidate)
+                write_json(
+                    audit_dir / f"resume_{stage_label}.json",
+                    {"ok": True, "source": candidate_path.name, "mode": "deterministic_normalization"},
+                )
+                return candidate
 
         _clear_stage_outputs(output_dir, cleanup_stage)
         write_text(audit_dir / f"{stage_label}.md", prompt)
@@ -1256,8 +1490,10 @@ class ReviewPipeline:
                     audit_dir=audit_dir,
                     max_attempts=max_attempts,
                     timeout=codex_timeout,
+                    pre_validation=pre_validation,
                     extra_validation=extra_validation,
                     candidate_normalizer=candidate_normalizer,
+                    repair_preservation_validator=repair_preservation_validator,
                     truncation_recovery=truncation_recovery,
                     images=images,
                 )
@@ -1268,6 +1504,7 @@ class ReviewPipeline:
                     schema_stage=schema_stage,
                     audit_dir=audit_dir,
                     max_attempts=max_attempts,
+                    pre_validation=pre_validation,
                     extra_validation=extra_validation,
                     request_timeout=request_timeout,
                     candidate_normalizer=candidate_normalizer,
@@ -1283,7 +1520,8 @@ class ReviewPipeline:
             parsed = fallback_factory(exc)
             if parsed is None:
                 raise
-            issues = validate_stage(schema_stage, parsed)
+            issues = pre_validation(parsed) if pre_validation is not None else []
+            issues.extend(validate_stage(schema_stage, parsed))
             if extra_validation is not None:
                 issues.extend(extra_validation(parsed))
             if issues:
@@ -1316,6 +1554,8 @@ class ReviewPipeline:
         request_timeout: float | None = None,
         fallback_factory: Callable[[Exception], dict[str, Any] | None] | None = None,
         candidate_normalizer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        repair_preservation_validator: Callable[[dict[str, Any], dict[str, Any]], list[ValidationIssue]] | None = None,
+        salvage_failed_candidates: bool = False,
         truncation_recovery: Callable[[str], dict[str, Any] | None] | None = None,
         images: list | None = None,
         client: Any = None,
@@ -1333,10 +1573,13 @@ class ReviewPipeline:
             schema_stage=schema_stage,
             max_attempts=max_attempts,
             resume=resume,
-            extra_validation=final_extra_validation or candidate_extra_validation,
+            pre_validation=candidate_extra_validation,
+            extra_validation=final_extra_validation,
             request_timeout=request_timeout,
             fallback_factory=fallback_factory,
             candidate_normalizer=candidate_normalizer,
+            repair_preservation_validator=repair_preservation_validator,
+            salvage_failed_candidates=salvage_failed_candidates,
             truncation_recovery=truncation_recovery,
             images=images,
             client=client,
@@ -1432,6 +1675,165 @@ class ReviewPipeline:
         )
         return experiment_index
 
+    def _load_or_create_scientific_architecture(
+        self,
+        *,
+        output_dir: Path,
+        audit_dir: Path,
+        facts: dict[str, Any],
+        tasks: dict[str, Any],
+        experiment_index: dict[str, Any],
+        paper_thesis: dict[str, Any] | None,
+        paper_context: str,
+        paper_images: list[Any],
+        resume: bool,
+        max_attempts: int,
+        analysis_backend: str,
+        codex_analysis_timeout: float | None,
+    ) -> dict[str, Any]:
+        from .preflight import (
+            architecture_capability_inventory,
+            architecture_execution_capability_gaps,
+        )
+        from .scientific_architecture import (
+            partition_scientific_architecture_issues,
+        )
+        from .scientific_architecture_normalize import (
+            finalize_scientific_architecture,
+            scientific_architecture_normalization_errors,
+            scientific_architecture_normalization_warnings,
+            validate_scientific_architecture_repair_preservation,
+        )
+
+        requires_v11 = _requires_scientific_architecture_v11(output_dir, resume=resume)
+
+        def _candidate_architecture_issues(parsed: dict[str, Any]) -> list[ValidationIssue]:
+            issues = list(scientific_architecture_normalization_errors(parsed))
+            execution_blockers, _advisory_warnings = (
+                partition_scientific_architecture_issues(
+                    parsed,
+                    facts=facts,
+                    tasks=tasks,
+                    experiment_index=experiment_index,
+                )
+            )
+            issues.extend(execution_blockers)
+            if requires_v11 and str(parsed.get("schema_version") or "") != "1.1":
+                issues.append(
+                    ValidationIssue(
+                        "$.schema_version",
+                        "new or rebuilt workflow v2 cases require scientific_architecture/1.1",
+                    )
+                )
+            return issues
+
+        architecture_path = output_dir / "scientific_architecture.json"
+        cached_architecture_bytes: bytes | None = None
+        if resume and architecture_path.is_file():
+            try:
+                cached_architecture_bytes = architecture_path.read_bytes()
+            except OSError:
+                cached_architecture_bytes = None
+
+        host_capabilities = architecture_capability_inventory()
+        prompt = self.prompt_book.render(
+            "design_scientific_architecture.md",
+            engineering_facts_json=wrap_untrusted("engineering_facts_json", pretty_json(facts)),
+            repro_tasks_json=wrap_untrusted("repro_tasks_json", pretty_json(tasks)),
+            paper_thesis_json=wrap_untrusted("paper_thesis_json", pretty_json(paper_thesis or {})),
+            experiment_index_json=wrap_untrusted("experiment_index_json", pretty_json(experiment_index)),
+            host_capabilities_json=wrap_untrusted(
+                "host_capabilities_json",
+                pretty_json(host_capabilities),
+            ),
+            paper_chunks_json=paper_context,
+        )
+
+        architecture = self._load_or_create_analysis_stage_json(
+            output_path=architecture_path,
+            output_dir=output_dir,
+            audit_dir=audit_dir,
+            prompt=prompt,
+            stage_label="02f_design_scientific_architecture",
+            cleanup_stage="scientific_architecture",
+            schema_stage="scientific_architecture",
+            max_attempts=max_attempts,
+            resume=resume,
+            candidate_extra_validation=_candidate_architecture_issues,
+            candidate_normalizer=finalize_scientific_architecture,
+            repair_preservation_validator=validate_scientific_architecture_repair_preservation,
+            salvage_failed_candidates=True,
+            images=paper_images,
+            backend=analysis_backend,
+            codex_timeout=codex_analysis_timeout,
+            fallback_factory=None,
+        )
+        reused_cached_architecture = False
+        if cached_architecture_bytes is not None and architecture_path.is_file():
+            try:
+                reused_cached_architecture = architecture_path.read_bytes() == cached_architecture_bytes
+            except OSError:
+                reused_cached_architecture = False
+
+        # Keep generation-time evidence immutable on resume. The current host is
+        # a separate observation because the execution mirror may have changed.
+        write_json(
+            audit_dir / "02f_architecture_host_capabilities_current.json",
+            host_capabilities,
+        )
+        generation_inventory_path = audit_dir / "02f_architecture_host_capabilities.json"
+        if not reused_cached_architecture:
+            write_json(generation_inventory_path, host_capabilities)
+        elif not generation_inventory_path.is_file():
+            write_json(
+                audit_dir / "02f_architecture_host_capabilities_generation_unavailable.json",
+                {
+                    "status": "unavailable",
+                    "reason": "cached architecture predates generation-time capability inventory",
+                },
+            )
+        capability_gaps = architecture_execution_capability_gaps(
+            architecture,
+            host_capabilities,
+        )
+        write_json(
+            audit_dir / "02f_architecture_execution_capability_gaps.json",
+            {
+                "ok": not capability_gaps,
+                "policy": "preserve_architecture_and_report_host_gap",
+                "gap_count": len(capability_gaps),
+                "gaps": capability_gaps,
+            },
+        )
+        normalization_warnings = scientific_architecture_normalization_warnings(architecture)
+        final_execution_blockers, cross_document_warnings = (
+            partition_scientific_architecture_issues(
+                architecture,
+                facts=facts,
+                tasks=tasks,
+                experiment_index=experiment_index,
+            )
+        )
+        combined_warnings = normalization_warnings + cross_document_warnings
+        write_json(
+            audit_dir / "02f_scientific_architecture_normalization.json",
+            {
+                "ok": not final_execution_blockers,
+                "policy": "reproduction_first",
+                "execution_blocker_count": len(final_execution_blockers),
+                "warning_count": len(combined_warnings),
+                "warnings": [issue.as_dict() for issue in combined_warnings],
+                "groups": {
+                    "execution_blockers": [
+                        issue.as_dict() for issue in final_execution_blockers
+                    ],
+                    "structural_normalization": [issue.as_dict() for issue in normalization_warnings],
+                    "cross_document_diagnostics": [issue.as_dict() for issue in cross_document_warnings],
+                },
+            },
+        )
+        return architecture
+
     def _render_paper_images(self, *, paper_path: Path, paper: dict[str, Any]) -> list:
         """Render every page of a PDF paper to images for multimodal prompting, so the
         figures/diagrams/axis-labels/in-figure values that plain text extraction drops are
@@ -1476,6 +1878,7 @@ class ReviewPipeline:
         schema_stage: str,
         audit_dir: Path,
         max_attempts: int,
+        pre_validation: Callable[[dict[str, Any]], list[ValidationIssue]] | None = None,
         extra_validation: Callable[[dict[str, Any]], list[ValidationIssue]] | None = None,
         request_timeout: float | None = None,
         candidate_normalizer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
@@ -1529,8 +1932,9 @@ class ReviewPipeline:
             if candidate_normalizer is not None:
                 parsed = candidate_normalizer(parsed)
 
-            issues = validate_stage(schema_stage, parsed)
-            if extra_validation is not None:
+            normalization_issues = pre_validation(parsed) if pre_validation is not None else []
+            issues = normalization_issues or validate_stage(schema_stage, parsed)
+            if not issues and extra_validation is not None:
                 issues.extend(extra_validation(parsed))
             if not issues:
                 write_json(
@@ -1544,6 +1948,8 @@ class ReviewPipeline:
                 audit_dir / f"validation_{stage_label}_attempt_{attempt}.json",
                 {"ok": False, "errors": [issue.as_dict() for issue in issues]},
             )
+            if normalization_issues:
+                raise RuntimeError(f"{stage_label} deterministic normalization conflict: {last_errors}")
             current_prompt = build_json_retry_prompt(prompt, summarize_bad_output(pretty_json(parsed)), last_errors)
 
         raise RuntimeError(f"{stage_label} did not pass JSON validation after {max_attempts} attempts: {last_errors}")

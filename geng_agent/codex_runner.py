@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import math
 import os
 import shlex
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -16,9 +18,11 @@ from .security import codex_safe_env, redact_text
 
 MAX_TRANSCRIPT_CHARS = 200_000
 CODEX_CAPABILITY_TIMEOUT_SECONDS = 5.0
+DEFAULT_CODEX_TIMEOUT_SECONDS = 1800.0
 DEFAULT_GENG_CODEX_MODEL = "gpt-5.6-sol"
 DEFAULT_GENG_CODEX_REASONING_EFFORT = {
     "analysis": "xhigh",
+    "foundation_writer": "xhigh",
     "task_writer": "xhigh",
     "task_reporter": "xhigh",
     "report_editor": "xhigh",
@@ -26,6 +30,15 @@ DEFAULT_GENG_CODEX_REASONING_EFFORT = {
 
 _EPHEMERAL_CAPABILITY_CACHE: dict[tuple[str, ...], dict[str, Any]] = {}
 _EPHEMERAL_CAPABILITY_LOCK = threading.Lock()
+
+
+def resolve_codex_timeout(timeout: float | None) -> float:
+    """Resolve every inference Worker to a finite per-session wall-clock limit."""
+
+    value = float(timeout or DEFAULT_CODEX_TIMEOUT_SECONDS)
+    if not math.isfinite(value):
+        raise ValueError("Codex session timeout must be finite")
+    return max(1.0, value)
 
 
 def run_codex_subprocess(
@@ -44,6 +57,7 @@ def run_codex_subprocess(
     path_prepend: list[Path | str] | None = None,
     reasoning_effort: str | None = None,
 ) -> dict[str, Any]:
+    effective_timeout = resolve_codex_timeout(timeout)
     raw_cmd = command_override or get_config_value("GENG_CODEX_CMD") or "codex"
     model = get_config_value("GENG_CODEX_MODEL") or DEFAULT_GENG_CODEX_MODEL
     resolved_reasoning_effort = _resolve_reasoning_effort(role, reasoning_effort)
@@ -57,6 +71,7 @@ def run_codex_subprocess(
         "ephemeral_capability": None,
         "model": model,
         "reasoning_effort": resolved_reasoning_effort,
+        "timeout_s": effective_timeout,
         "command": None,
         "returncode": None,
         "timed_out": False,
@@ -136,7 +151,7 @@ def run_codex_subprocess(
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=timeout,
+            timeout=effective_timeout,
             check=False,
             input=prompt,
         )
@@ -151,7 +166,7 @@ def run_codex_subprocess(
     except subprocess.TimeoutExpired as exc:
         status["timed_out"] = True
         status["error_kind"] = "timeout"
-        timeout_label = f"{timeout:.0f}s" if timeout is not None else "the configured limit"
+        timeout_label = f"{effective_timeout:.0f}s"
         status["blocked_reason"] = f"agent session timed out after {timeout_label}"
         status["error"] = f"agent session timed out after {timeout_label}"
         out = exc.stdout or b""
@@ -159,7 +174,7 @@ def run_codex_subprocess(
         transcript = (out.decode("utf-8", "replace") if isinstance(out, bytes) else str(out)) + (
             "\n--- stderr ---\n" + (err.decode("utf-8", "replace") if isinstance(err, bytes) else str(err))
         )
-        status["active_duration_s"] = round(float(getattr(exc, "active_elapsed", timeout or 0.0)), 1)
+        status["active_duration_s"] = round(float(getattr(exc, "active_elapsed", effective_timeout)), 1)
         status["excluded_duration_s"] = round(float(getattr(exc, "excluded_elapsed", 0.0)), 1)
     except Exception as exc:
         status["error_kind"] = "subprocess_error"
@@ -171,6 +186,46 @@ def run_codex_subprocess(
     status["transcript"] = str(transcript_path)
     write_json(audit_dir / f"{label}.json", status)
     return status
+
+
+def run_python_unittest_subprocess(
+    *,
+    work_dir: Path,
+    start_dir: str = "tests",
+    timeout: float = 120.0,
+) -> dict[str, Any]:
+    """Run generated contract tests through the centralized subprocess boundary."""
+
+    env = codex_safe_env()
+    python_dir = str(Path(sys.executable).resolve().parent)
+    env["PATH"] = os.pathsep.join([python_dir, env.get("PATH", "")])
+    if os.name == "nt":
+        env["Path"] = env["PATH"]
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-B", "-m", "unittest", "discover", "-s", start_dir, "-v"],
+            cwd=work_dir,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+        return {
+            "passed": completed.returncode == 0,
+            "returncode": completed.returncode,
+            "stdout": completed.stdout[-20_000:],
+            "stderr": completed.stderr[-20_000:],
+        }
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "passed": False,
+            "timed_out": True,
+            "stdout": str(exc.stdout or "")[-20_000:],
+            "stderr": str(exc.stderr or "")[-20_000:],
+        }
 
 
 def _ephemeral_capability(
@@ -283,6 +338,8 @@ def _resolve_reasoning_effort(role: str, explicit: str | None) -> str | None:
         role_name = (
             "TASK_WRITER"
             if role == "task_writer"
+            else "FOUNDATION_WRITER"
+            if role == "foundation_writer"
             else "TASK_REPORTER"
             if role == "task_reporter"
             else "REPORT_EDITOR"

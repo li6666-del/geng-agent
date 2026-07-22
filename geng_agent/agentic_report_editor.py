@@ -7,7 +7,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from .codex_runner import run_codex_subprocess
+from .codex_runner import DEFAULT_CODEX_TIMEOUT_SECONDS, run_codex_subprocess
 from .config import get_config_value
 from .outputs import write_json, write_text
 from .paper_evidence import facts_for_task, safe_label
@@ -36,8 +36,8 @@ def run_codex_report_editor_workflow(
     task_verifications: list[dict[str, Any]],
     output_dir: Path,
     audit_dir: Path,
-    timeout: float,
     resume: bool,
+    timeout: float = DEFAULT_CODEX_TIMEOUT_SECONDS,
     attempt_no: int = 1,
     repair_context: dict[str, Any] | None = None,
     allow_fallback: bool = False,
@@ -144,7 +144,7 @@ def run_codex_report_editor_workflow(
         audit_dir=audit_dir,
         label="04b_report_editor" if attempt_no == 1 else f"04b_report_editor_attempt_{attempt_no:03d}",
         sandbox="workspace-write",
-        timeout=max(1.0, float(timeout or 1800.0)),
+        timeout=timeout,
         command_override=get_config_value("GENG_CODEX_REPORT_EDITOR_CMD"),
         image_paths=image_paths,
     )

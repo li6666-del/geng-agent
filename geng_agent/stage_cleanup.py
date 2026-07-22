@@ -176,6 +176,28 @@ def _clear_stage_outputs(output_dir: Path, stage: str, *, preserve_audit: bool =
             "automation_provenance.json",
         ],
     }
+    v2_downstream = [
+        "scientific_architecture.json",
+        "foundation_manifest.json",
+        "repro_project_manifest.json",
+        "repro_project",
+        "runtime_result.json",
+        "risk_report.json",
+        "generated_files.json",
+        "automation_provenance.json",
+    ]
+    for upstream in ("paper", "facts", "paper_thesis", "tasks", "experiment_index"):
+        stage_outputs[upstream].extend(v2_downstream)
+    stage_outputs["scientific_architecture"] = [
+        "scientific_architecture.json",
+        "foundation_manifest.json",
+        "repro_project_manifest.json",
+        "repro_project",
+        "runtime_result.json",
+        "risk_report.json",
+        "generated_files.json",
+        "automation_provenance.json",
+    ]
     report_outputs = [
         "review.md",
         "review.docx",
@@ -207,7 +229,12 @@ def _clear_stage_audit(output_dir: Path, stage: str) -> None:
         "paper_thesis": ["02d", "03"],
         "tasks": ["02", "03", "04"],
         "experiment_index": ["02", "03", "04"],
-        "manifest": ["03", "04"],
+        "scientific_architecture": ["02f", "03", "04"],
+        # Rebuilding task-writer outputs must preserve the already validated
+        # Foundation snapshot from stage 03b. A broad ``03*`` cleanup deletes
+        # the canonical snapshot before stage 03c can install it into task
+        # sandboxes, making every fresh v2 run fail at the hand-off boundary.
+        "manifest": ["03c", "04"],
         "project": ["04"],
         "result_review": ["04"],
         "reports": ["04"],

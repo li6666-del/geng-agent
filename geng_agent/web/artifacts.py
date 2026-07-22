@@ -33,6 +33,8 @@ STEP_FILES: dict[str, tuple[str, ...]] = {
         "fact_conflicts.json",
         "task_conflicts.json",
     ),
+    "scientific_architecture": ("scientific_architecture.json",),
+    "foundation_manifest": ("foundation_manifest.json", "audit/03b_foundation_snapshot/"),
     "repro_project_manifest": ("repro_project_manifest.json",),
     "repro_project": (
         "repro_project/",

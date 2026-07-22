@@ -50,6 +50,8 @@ const stepText: Record<string, string> = {
   tasks: "定稿复现任务",
   thesis: "提炼论文主张",
   experiment_index: "建立实验索引",
+  scientific_architecture: "设计科学代码架构",
+  foundation: "构建共享科学底座",
   generation: "Writer 复现迭代",
   runtime: "汇总运行证据",
   task_reporters: "逐任务独立核验",

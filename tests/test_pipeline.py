@@ -70,7 +70,348 @@ def task(task_id: str, figure_or_claim: str) -> dict:
     }
 
 
+def architecture_doc(output_dir: Path) -> dict:
+    index = json.loads((output_dir / "experiment_index.json").read_text(encoding="utf-8"))
+    basis = {"status": "unresolved", "evidence_facts": [], "assumption_refs": [], "note": "test fixture"}
+    return {
+        "schema_version": "1.1",
+        "workflow_version": "2",
+        "quantities": [],
+        "components": [
+            {
+                "id": "system",
+                "kind": "system",
+                "module": "src/system.py",
+                "callable": "build_system",
+                "execution": {
+                    "execution_kind": "deterministic_simulation",
+                    "primary_framework": "standard_library",
+                    "supporting_libraries": [],
+                    "device_policy": "cpu",
+                    "precision": "float64",
+                    "trainable": False,
+                    "gradient_mode": "not_applicable",
+                    "checkpoint_policy": "not_applicable",
+                    "shared_implementation": True,
+                    "required_capabilities": ["deterministic_simulation"],
+                    "rationale": "The fixture exercises a shared deterministic implementation.",
+                },
+                "inputs": [],
+                "outputs": [],
+                "parameters": [],
+                "depends_on": [],
+                "basis": basis,
+            }
+        ],
+        "consistency_groups": [
+            {
+                "id": "test",
+                "task_ids": [item["task_id"] for item in index["experiments"]],
+                "shared_quantity_ids": [],
+            }
+        ],
+        "bindings": [
+            {
+                "task_id": item["task_id"], "experiment_id": item["experiment_id"],
+                "consistency_group": "test", "components": ["system"], "overrides": {}, "outputs": [],
+            }
+            for item in index["experiments"]
+        ],
+        "invariants": [],
+    }
+
+
 class PipelineTests(unittest.TestCase):
+    def test_codex_session_defaults_are_30_minutes(self) -> None:
+        self.assertEqual(inspect.signature(ReviewPipeline.run).parameters["project_timeout"].default, 1800.0)
+        self.assertEqual(inspect.signature(ReviewPipeline.run_stage).parameters["project_timeout"].default, 1800.0)
+
+    def test_architecture_candidate_version_gate_preserves_only_explicit_legacy_resume(self) -> None:
+        def collect_issues(*, resume: bool, architecture_contract: str | None) -> list:
+            with TemporaryDirectory() as temp_dir:
+                output_dir = Path(temp_dir) / "case"
+                audit_dir = output_dir / "audit"
+                audit_dir.mkdir(parents=True)
+                if architecture_contract is not None:
+                    write_json(
+                        output_dir / "workflow.json",
+                        {
+                            "workflow_version": "2",
+                            "architecture_contract": f"scientific_architecture/{architecture_contract}",
+                        },
+                    )
+                experiment_index = {
+                    "experiments": [
+                        {
+                            "task_id": "reproduce_fig_4",
+                            "experiment_id": "exp_reproduce_fig_4",
+                        }
+                    ]
+                }
+                write_json(output_dir / "experiment_index.json", experiment_index)
+                current_architecture = architecture_doc(output_dir)
+                legacy_candidate = json.loads(json.dumps(current_architecture))
+                legacy_candidate["schema_version"] = "1.0"
+                legacy_candidate["components"][0].pop("execution")
+                captured: list = []
+
+                def fake_stage(**kwargs):
+                    captured.extend(
+                        kwargs["candidate_extra_validation"](legacy_candidate)
+                    )
+                    write_json(kwargs["output_path"], current_architecture)
+                    return current_architecture
+
+                pipeline = ReviewPipeline()
+                with (
+                    patch(
+                        "geng_agent.preflight.architecture_capability_inventory",
+                        return_value={
+                            "evidence_class": "host_capability_only_not_paper_evidence",
+                            "installed_reproduction_packages": [],
+                        },
+                    ),
+                    patch.object(
+                        pipeline,
+                        "_load_or_create_analysis_stage_json",
+                        side_effect=fake_stage,
+                    ),
+                ):
+                    pipeline._load_or_create_scientific_architecture(
+                        output_dir=output_dir,
+                        audit_dir=audit_dir,
+                        facts=fact_doc(fact("figure_claim", "Fig. 4")),
+                        tasks=task_doc(task("reproduce_fig_4", "Fig. 4")),
+                        experiment_index=experiment_index,
+                        paper_thesis=None,
+                        paper_context="paper context",
+                        paper_images=[],
+                        resume=resume,
+                        max_attempts=1,
+                        analysis_backend=CODEX_ANALYSIS_BACKEND,
+                        codex_analysis_timeout=None,
+                    )
+                return captured
+
+        for label, resume, contract in (
+            ("fresh", False, None),
+            ("rebuild", False, "1.1"),
+            ("explicit_v11_resume", True, "1.1"),
+        ):
+            with self.subTest(label=label):
+                issues = collect_issues(
+                    resume=resume,
+                    architecture_contract=contract,
+                )
+                self.assertTrue(
+                    any(issue.path == "$.schema_version" for issue in issues),
+                    issues,
+                )
+
+        legacy_issues = collect_issues(
+            resume=True,
+            architecture_contract="1.0",
+        )
+        self.assertFalse(
+            any(issue.path == "$.schema_version" for issue in legacy_issues),
+            legacy_issues,
+        )
+
+    def test_architecture_candidate_gate_blocks_execution_defects_but_audits_evidence_debt(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "case"
+            audit_dir = output_dir / "audit"
+            audit_dir.mkdir(parents=True)
+            experiment_index = {
+                "experiments": [
+                    {
+                        "task_id": "reproduce_fig_4",
+                        "experiment_id": "exp_reproduce_fig_4",
+                    }
+                ]
+            }
+            write_json(output_dir / "experiment_index.json", experiment_index)
+            advisory_candidate = architecture_doc(output_dir)
+            advisory_candidate["components"][0]["basis"] = {
+                "status": "paper_explicit",
+                "evidence_facts": [
+                    {"type": "channel_model", "name": "missing paper evidence"}
+                ],
+                "assumption_refs": [],
+                "note": "This evidence reference is intentionally unresolved.",
+            }
+            blocked_candidate = json.loads(json.dumps(advisory_candidate))
+            blocked_candidate["components"][0]["module"] = "../system.py"
+            captured: dict[str, list] = {}
+
+            def fake_stage(**kwargs):
+                validate_candidate = kwargs["candidate_extra_validation"]
+                captured["advisory"] = validate_candidate(advisory_candidate)
+                captured["blocked"] = validate_candidate(blocked_candidate)
+                write_json(kwargs["output_path"], advisory_candidate)
+                return advisory_candidate
+
+            pipeline = ReviewPipeline()
+            with (
+                patch(
+                    "geng_agent.preflight.architecture_capability_inventory",
+                    return_value={
+                        "evidence_class": "host_capability_only_not_paper_evidence",
+                        "installed_reproduction_packages": [],
+                    },
+                ),
+                patch.object(
+                    pipeline,
+                    "_load_or_create_analysis_stage_json",
+                    side_effect=fake_stage,
+                ),
+            ):
+                pipeline._load_or_create_scientific_architecture(
+                    output_dir=output_dir,
+                    audit_dir=audit_dir,
+                    facts=fact_doc(fact("figure_claim", "Fig. 4")),
+                    tasks=task_doc(task("reproduce_fig_4", "Fig. 4")),
+                    experiment_index=experiment_index,
+                    paper_thesis=None,
+                    paper_context="paper context",
+                    paper_images=[],
+                    resume=False,
+                    max_attempts=1,
+                    analysis_backend=CODEX_ANALYSIS_BACKEND,
+                    codex_analysis_timeout=None,
+                )
+
+            self.assertEqual(captured["advisory"], [])
+            self.assertTrue(
+                any(
+                    issue.path == "$.components[0].module"
+                    for issue in captured["blocked"]
+                )
+            )
+            audit = json.loads(
+                (audit_dir / "02f_scientific_architecture_normalization.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertTrue(audit["ok"])
+            self.assertEqual(audit["execution_blocker_count"], 0)
+            self.assertTrue(
+                any(
+                    issue["path"] == "$.components[0].basis.evidence_facts[0]"
+                    for issue in audit["groups"]["cross_document_diagnostics"]
+                )
+            )
+
+    def test_resume_preserves_generation_host_inventory_and_records_current_host_separately(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "case"
+            audit_dir = output_dir / "audit"
+            audit_dir.mkdir(parents=True)
+            write_json(
+                output_dir / "workflow.json",
+                {
+                    "workflow_version": "2",
+                    "architecture_contract": "scientific_architecture/1.1",
+                },
+            )
+            experiment_index = {
+                "experiments": [
+                    {
+                        "task_id": "reproduce_fig_4",
+                        "experiment_id": "exp_reproduce_fig_4",
+                    }
+                ]
+            }
+            write_json(output_dir / "experiment_index.json", experiment_index)
+            architecture = architecture_doc(output_dir)
+            write_json(output_dir / "scientific_architecture.json", architecture)
+            write_json(
+                audit_dir / "02f_architecture_host_capabilities.json",
+                {"marker": "generation"},
+            )
+            current_inventory = {
+                "marker": "current",
+                "python_runtime_registry": [],
+                "external_runtime_registry": [],
+                "accelerators": {"devices": []},
+            }
+            pipeline = ReviewPipeline()
+
+            with (
+                patch(
+                    "geng_agent.preflight.architecture_capability_inventory",
+                    return_value=current_inventory,
+                ),
+                patch.object(
+                    pipeline,
+                    "_load_or_create_analysis_stage_json",
+                    return_value=architecture,
+                ),
+            ):
+                pipeline._load_or_create_scientific_architecture(
+                    output_dir=output_dir,
+                    audit_dir=audit_dir,
+                    facts=fact_doc(fact("figure_claim", "Fig. 4")),
+                    tasks=task_doc(task("reproduce_fig_4", "Fig. 4")),
+                    experiment_index=experiment_index,
+                    paper_thesis=None,
+                    paper_context="paper context",
+                    paper_images=[],
+                    resume=True,
+                    max_attempts=1,
+                    analysis_backend=CODEX_ANALYSIS_BACKEND,
+                    codex_analysis_timeout=None,
+                )
+
+            generation = json.loads(
+                (audit_dir / "02f_architecture_host_capabilities.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            current = json.loads(
+                (audit_dir / "02f_architecture_host_capabilities_current.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            gaps = json.loads(
+                (audit_dir / "02f_architecture_execution_capability_gaps.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(generation["marker"], "generation")
+            self.assertEqual(current["marker"], "current")
+            self.assertTrue(gaps["ok"])
+            self.assertEqual(gaps["gap_count"], 0)
+
+    def test_resume_salvages_a_normalizable_failed_candidate_before_cleanup(self) -> None:
+        with TemporaryDirectory() as temp:
+            output = Path(temp) / "case"
+            audit = output / "audit"
+            audit.mkdir(parents=True)
+            candidate = fact_doc(fact("channel_model", "AWGN"))
+            candidate_path = audit / "normalized_probe_attempt_1.json"
+            write_json(candidate_path, candidate)
+
+            result = ReviewPipeline()._load_or_create_stage_json(
+                output_path=output / "engineering_facts.json",
+                output_dir=output,
+                audit_dir=audit,
+                prompt="must not run",
+                stage_label="probe",
+                cleanup_stage="facts",
+                schema_stage="engineering_facts",
+                max_attempts=1,
+                resume=True,
+                candidate_normalizer=lambda value: value,
+                salvage_failed_candidates=True,
+                backend=CODEX_ANALYSIS_BACKEND,
+            )
+
+            self.assertEqual(result["engineering_facts"][0]["name"], "AWGN")
+            self.assertEqual(result["_meta"]["analysis_resume_source"], candidate_path.name)
+            self.assertTrue((audit / "resume_probe.json").is_file())
+            self.assertTrue((output / "engineering_facts.json").is_file())
+
     def test_analysis_width_and_round_caps_are_not_public_pipeline_options(self) -> None:
         run_params = inspect.signature(ReviewPipeline.run).parameters
         stage_params = inspect.signature(ReviewPipeline.run_stage).parameters
@@ -208,6 +549,171 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("allow_fallback=True", source)
         self.assertIn("report_editor_invocations += int(", source)
 
+    def test_foundation_failure_stops_v11_before_task_writer_but_legacy_falls_back(self) -> None:
+        class WriterReached(RuntimeError):
+            pass
+
+        def exercise(*, schema_version: str, architecture_contract: str, resume: bool) -> None:
+            with TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                paper_path = root / "paper.md"
+                paper_path.write_text(
+                    "# Results\nFig. 4 reports bit error rate versus SNR.",
+                    encoding="utf-8",
+                )
+                output_dir = root / "case"
+                if resume:
+                    output_dir.mkdir()
+                    write_json(
+                        output_dir / "workflow.json",
+                        {
+                            "workflow_version": "2",
+                            "architecture_contract": architecture_contract,
+                        },
+                    )
+
+                initial = fact_doc(
+                    fact("figure_claim", "Fig. 4"),
+                    fact("metric", "bit_error_rate"),
+                )
+                preliminary = task_doc(task("reproduce_fig_4", "Fig. 4"))
+                preliminary["backfill_handoff"] = {
+                    "ready_for_writer": True,
+                    "blocking_request_ids": [],
+                    "reason": "fixture has no missing facts",
+                }
+
+                def fake_analysis_stage(**kwargs):
+                    documents = {
+                        "01_extract_engineering_facts": initial,
+                        "02a_build_preliminary_repro_tasks": preliminary,
+                    }
+                    document = json.loads(json.dumps(documents[kwargs["stage_label"]]))
+                    write_json(kwargs["output_path"], document)
+                    return document
+
+                def fake_thesis(**kwargs):
+                    document = {
+                        "central_claim": "BER decreases with SNR",
+                        "proposed_method": "test method",
+                        "mechanism": "higher SNR improves decoding",
+                        "comparisons": [],
+                        "headline_shape": "decreasing",
+                        "caveats": [],
+                    }
+                    write_json(kwargs["output_dir"] / "paper_thesis.json", document)
+                    return document
+
+                def fake_experiment_index(**kwargs):
+                    document = {
+                        "experiments": [
+                            {
+                                "task_id": "reproduce_fig_4",
+                                "experiment_id": "exp_reproduce_fig_4",
+                            }
+                        ]
+                    }
+                    write_json(kwargs["output_dir"] / "experiment_index.json", document)
+                    return document
+
+                def fake_architecture(**kwargs):
+                    document = architecture_doc(kwargs["output_dir"])
+                    document["schema_version"] = schema_version
+                    write_json(kwargs["output_dir"] / "scientific_architecture.json", document)
+                    return document
+
+                pipeline = ReviewPipeline()
+                mineru_result = {
+                    "ok": True,
+                    "cached": False,
+                    "fallback_used": False,
+                    "duration_s": 0.0,
+                    "figure_count": 0,
+                    "figure_index": {"figures": [], "unmatched_visuals": []},
+                }
+                with (
+                    patch.object(pipeline, "_render_paper_images", return_value=[]),
+                    patch(
+                        "geng_agent.pipeline.run_mineru_layout_stage",
+                        return_value=mineru_result,
+                    ),
+                    patch.object(
+                        pipeline,
+                        "_load_or_create_analysis_stage_json",
+                        side_effect=fake_analysis_stage,
+                    ),
+                    patch.object(
+                        pipeline,
+                        "_load_or_create_paper_thesis",
+                        side_effect=fake_thesis,
+                    ),
+                    patch.object(
+                        pipeline,
+                        "_load_or_create_experiment_index",
+                        side_effect=fake_experiment_index,
+                    ),
+                    patch.object(
+                        pipeline,
+                        "_load_or_create_scientific_architecture",
+                        side_effect=fake_architecture,
+                    ),
+                    patch(
+                        "geng_agent.agentic_foundation.run_codex_foundation_writer_workflow",
+                        side_effect=ValueError("foundation boom"),
+                    ) as foundation_writer,
+                    patch(
+                        "geng_agent.agentic_task_writers.run_codex_task_writer_workflow",
+                        side_effect=WriterReached("task writer reached"),
+                    ) as task_writer,
+                ):
+                    if schema_version == "1.1":
+                        with self.assertRaisesRegex(
+                            RuntimeError,
+                            "Foundation generation failed for scientific_architecture/1.1",
+                        ):
+                            pipeline.run(
+                                paper_path,
+                                output_dir,
+                                resume=resume,
+                                analysis_only=False,
+                            )
+                        task_writer.assert_not_called()
+                    else:
+                        with self.assertRaises(WriterReached):
+                            pipeline.run(
+                                paper_path,
+                                output_dir,
+                                resume=resume,
+                                analysis_only=False,
+                            )
+                        task_writer.assert_called_once()
+
+                foundation_writer.assert_called_once()
+                fallback = json.loads(
+                    (output_dir / "audit" / "03b_foundation_fallback.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(
+                    fallback["decision"],
+                    "stop" if schema_version == "1.1" else "fallback",
+                )
+                self.assertEqual(
+                    fallback["pipeline_can_continue"],
+                    schema_version == "1.0",
+                )
+
+        exercise(
+            schema_version="1.1",
+            architecture_contract="scientific_architecture/1.1",
+            resume=False,
+        )
+        exercise(
+            schema_version="1.0",
+            architecture_contract="scientific_architecture/1.0",
+            resume=True,
+        )
+
     def test_analysis_agent_width_is_not_a_pipeline_option(self) -> None:
         self.assertNotIn("analysis_agent_width", inspect.signature(ReviewPipeline.run).parameters)
 
@@ -294,6 +800,10 @@ class PipelineTests(unittest.TestCase):
             def fake_analysis_stage(**kwargs):
                 label = kwargs["stage_label"]
                 calls.append(label)
+                if label == "02f_design_scientific_architecture":
+                    document = architecture_doc(kwargs["output_dir"])
+                    write_json(kwargs["output_path"], document)
+                    return document
                 documents = {
                     "01_extract_engineering_facts": initial,
                     "02a_build_preliminary_repro_tasks": preliminary,
@@ -330,6 +840,7 @@ class PipelineTests(unittest.TestCase):
                     "02a_build_preliminary_repro_tasks",
                     "02b_round_01_targeted_fact_backfill",
                     "02c_round_01_refresh_repro_tasks",
+                    "02f_design_scientific_architecture",
                 ],
             )
             final_facts = json.loads((output_dir / "engineering_facts.json").read_text(encoding="utf-8"))
@@ -345,9 +856,14 @@ class PipelineTests(unittest.TestCase):
             analysis_result = json.loads(
                 (output_dir / "analysis_result.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(analysis_result["analysis_stage_invocations"], 5)
+            self.assertEqual(analysis_result["analysis_stage_invocations"], 6)
             self.assertFalse((output_dir / "repro_project").exists())
             self.assertFalse((output_dir / "runtime_result.json").exists())
+            host_capabilities = json.loads(
+                (output_dir / "audit" / "02f_architecture_host_capabilities.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(host_capabilities["evidence_class"], "host_capability_only_not_paper_evidence")
+            self.assertIn("installed_reproduction_packages", host_capabilities)
 
     def test_pipeline_runs_second_round_for_new_task_field(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -463,6 +979,10 @@ class PipelineTests(unittest.TestCase):
             def fake_analysis_stage(**kwargs):
                 label = kwargs["stage_label"]
                 calls.append(label)
+                if label == "02f_design_scientific_architecture":
+                    document = architecture_doc(kwargs["output_dir"])
+                    write_json(kwargs["output_path"], document)
+                    return document
                 document = documents[label]
                 write_json(kwargs["output_path"], document)
                 return document
@@ -486,7 +1006,7 @@ class PipelineTests(unittest.TestCase):
             ):
                 pipeline.run(paper_path, output_dir, resume=False, analysis_only=True)
 
-            self.assertEqual(len(calls), 6)
+            self.assertEqual(len(calls), 7)
             summary = json.loads(
                 (output_dir / "audit" / "02b_targeted_fact_backfill_summary.json").read_text(encoding="utf-8")
             )
@@ -496,7 +1016,7 @@ class PipelineTests(unittest.TestCase):
             analysis_result = json.loads(
                 (output_dir / "analysis_result.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(analysis_result["analysis_stage_invocations"], 7)
+            self.assertEqual(analysis_result["analysis_stage_invocations"], 8)
             diagnostics = json.loads(
                 (output_dir / "audit" / "02c_terminal_gap_diagnostics.json").read_text(encoding="utf-8")
             )

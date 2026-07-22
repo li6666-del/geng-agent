@@ -1,15 +1,24 @@
 from __future__ import annotations
 
+import ast
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+import hashlib
 import json
 import shutil
 import sys
 from pathlib import Path
 from typing import Any, Callable
 
+from .agentic_foundation import (
+    foundation_violations,
+    install_foundation_snapshot,
+    restore_foundation_snapshot,
+    validate_foundation_bundle,
+)
 from .verification_result import (
     FINAL_MATCHED_STATUS,
     WRITER_REVIEW_STATUS,
+    partition_writer_delivery_issues,
     verification_result_issues,
     writer_delivery_issues,
 )
@@ -27,12 +36,12 @@ from .task_writer_support import (
     _restore_trusted_files,
     _write_paper_evidence_bundle,
 )
-from .codex_runner import run_codex_subprocess
+from .codex_runner import DEFAULT_CODEX_TIMEOUT_SECONDS, run_codex_subprocess
 from .config import get_config_value
 from .io_runtime import BACKEND_RUNTIME_API_DOC, IO_RUNTIME_API_DOC, inject_io_runtime
 from .json_utils import pretty_json
 from .manifest_utils import expected_generated_paths
-from .outputs import inspect_output_artifacts, write_json, write_text
+from .outputs import inspect_output_artifacts, validate_repro_project, write_json, write_text
 from .paper_evidence import facts_for_task, paper_context_for_task, safe_label, thesis_ordering_anchor_for_task
 from .security import (
     dependency_policy_prompt_text,
@@ -83,12 +92,13 @@ def run_codex_task_writer_workflow(
     audit_dir: Path,
     repro_project_dir: Path,
     run_repro: bool,
-    timeout: float = 1800.0,
+    timeout: float = DEFAULT_CODEX_TIMEOUT_SECONDS,
     run_timeout: float = 120.0,
     resume: bool = True,
     review_feedback: dict[str, dict[str, Any]] | None = None,
     force_task_ids: set[str] | None = None,
     task_review_callback: Callable[[int, dict[str, Any], dict[str, Any], int], dict[str, Any]] | None = None,
+    foundation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Third-round autonomous per-task Codex writer workflow.
 
@@ -98,7 +108,7 @@ def run_codex_task_writer_workflow(
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     audit_dir.mkdir(parents=True, exist_ok=True)
-    del timeout, run_timeout
+    del run_timeout
 
     analysis_artifacts = _collect_writer_analysis_artifacts(output_dir=output_dir)
     missing_analysis_artifacts = _missing_required_analysis_artifacts(analysis_artifacts)
@@ -107,10 +117,17 @@ def run_codex_task_writer_workflow(
             "task writers require finalized first-two-stage artifacts: "
             + ", ".join(missing_analysis_artifacts)
         )
+    if foundation is not None:
+        foundation_issues = validate_foundation_bundle(foundation)
+        if foundation_issues:
+            raise RuntimeError(f"task writers require a valid Foundation snapshot: {foundation_issues[:5]}")
     analysis_snapshot_hash = _analysis_snapshot_hash(
         paper_path=paper_path,
         artifacts=analysis_artifacts,
     )
+    foundation_snapshot_hash = str(foundation["manifest"]["snapshot_hash"]) if foundation is not None else ""
+    if foundation_snapshot_hash:
+        analysis_snapshot_hash = _writer_snapshot_hash(analysis_snapshot_hash, foundation_snapshot_hash)
 
     task_manifest = build_tasks_manifest(tasks)
     task_items = [task for task in tasks.get("repro_tasks", []) if isinstance(task, dict)]
@@ -198,11 +215,13 @@ def run_codex_task_writer_workflow(
         paper_context_json=paper_context_json,
         paper_images=paper_images,
         paper_thesis=paper_thesis,
+        foundation=foundation,
         analysis_snapshot_hash=analysis_snapshot_hash,
         analysis_artifacts=analysis_artifacts,
         task_root=task_root,
         audit_dir=audit_dir,
         run_repro=run_repro,
+        timeout=timeout,
         initial_records_by_index=resume_records,
         review_feedback=review_feedback,
         force_task_ids=force_task_ids,
@@ -216,17 +235,13 @@ def run_codex_task_writer_workflow(
         task_manifest=task_manifest,
         expected_paths=set(expected_paths),
         task_records=task_records,
+        foundation=foundation,
     )
     _restore_trusted_files(repro_project_dir, task_manifest)
     final_task_manifest = _task_manifest_with_configs(task_manifest)
     write_json(repro_project_dir / "tasks_manifest.json", final_task_manifest)
-    validation = {
-        "required_files_present": True,
-        "missing_files": [],
-        "python_compiles": True,
-        "compile_errors": [],
-        "host_validation_skipped": True,
-    }
+    validation = validate_repro_project(repro_project_dir)
+    validation["host_validation_skipped"] = False
     requirement_warnings = validate_requirements(repro_project_dir)
     security_issues = static_scan_repro_project(repro_project_dir)
     syntax_issues = [
@@ -244,6 +259,7 @@ def run_codex_task_writer_workflow(
     )
     manifest["_meta"]["mode"] = "task_writers"
     manifest["_meta"]["analysis_snapshot_hash"] = analysis_snapshot_hash
+    manifest["_meta"]["foundation_snapshot_hash"] = foundation_snapshot_hash or None
     write_json(output_dir / "repro_project_manifest.json", manifest)
 
     runtime_result = _task_writer_runtime_result(
@@ -352,7 +368,17 @@ def _record_is_valid_current_delivery(record: dict[str, Any]) -> bool:
             return False
         if verdict.get("verdict") != "accepted":
             return False
-    return not writer_delivery_issues(record.get("result_json"))
+    blockers, _ = partition_writer_delivery_issues(record.get("result_json"))
+    if blockers:
+        return False
+    task_id = str(record.get('task_id') or '')
+    if task_id and _task_execution_binding_issues(
+        sandbox=sandbox,
+        task_id=task_id,
+        result_doc=record.get('result_json'),
+    ):
+        return False
+    return True
 
 
 def _record_has_accepted_task_verification(record: dict[str, Any]) -> bool:
@@ -370,11 +396,13 @@ def _dispatch_task_writers(
     paper_context_json: str,
     paper_images: list[Any] | None,
     paper_thesis: dict[str, Any] | None,
+    foundation: dict[str, Any] | None = None,
     analysis_snapshot_hash: str,
     analysis_artifacts: dict[str, Path],
     task_root: Path,
     audit_dir: Path,
     run_repro: bool,
+    timeout: float = DEFAULT_CODEX_TIMEOUT_SECONDS,
     initial_records_by_index: dict[int, dict[str, Any]] | None = None,
     review_feedback: dict[str, dict[str, Any]] | None = None,
     force_task_ids: set[str] | None = None,
@@ -396,7 +424,8 @@ def _dispatch_task_writers(
         "parallel_attempted": len(task_pairs) > 1,
         "task_count": len(task_pairs),
         "runtime_capability": "parallel_subagents",
-        "runtime_limit": None,
+        "session_timeout_s": float(timeout),
+        "overall_runtime_limit_s": None,
         "dispatch_batches": [{
             "batch_id": "stage5_all_task_writers",
             "task_ids": [str(task_pairs[index - 1][0].get("task_id") or f"task_{index}") for index in pending_indexes],
@@ -429,11 +458,13 @@ def _dispatch_task_writers(
                     paper_context_json=paper_context_json,
                     paper_images=paper_images,
                     paper_thesis=paper_thesis,
+                    foundation=foundation,
                     analysis_snapshot_hash=analysis_snapshot_hash,
                     analysis_artifacts=analysis_artifacts,
                     task_root=task_root,
                     audit_dir=audit_dir,
                     run_repro=run_repro,
+                    timeout=timeout,
                     review_feedback=feedback_by_id.get(
                         str(task.get("task_id") or manifest_entry.get("task_id") or "")
                     ),
@@ -479,11 +510,13 @@ def _run_one_task_writer(
     paper_context_json: str,
     paper_images: list[Any] | None,
     paper_thesis: dict[str, Any] | None,
+    foundation: dict[str, Any] | None = None,
     analysis_snapshot_hash: str,
     analysis_artifacts: dict[str, Path],
     task_root: Path,
     audit_dir: Path,
     run_repro: bool,
+    timeout: float = DEFAULT_CODEX_TIMEOUT_SECONDS,
     review_feedback: dict[str, Any] | None = None,
     task_review_callback: Callable[[int, dict[str, Any], dict[str, Any], int], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
@@ -505,7 +538,9 @@ def _run_one_task_writer(
         analysis_artifacts=analysis_artifacts,
         full_paper_images=paper_images,
         reuse_existing=reuse_existing,
+        foundation=foundation,
     )
+    execution_binding = _load_task_execution_binding(sandbox, task_id)
     base_prompt = _build_task_writer_brief(
         index=index,
         task=task,
@@ -517,6 +552,8 @@ def _run_one_task_writer(
         paper_thesis=paper_thesis,
         run_repro=run_repro,
         review_feedback=review_feedback,
+        foundation_enabled=foundation is not None,
+        execution_binding=execution_binding,
     )
     session_round = 1
     if reuse_existing:
@@ -568,8 +605,20 @@ def _run_one_task_writer(
             prompt=prompt,
             sandbox=sandbox,
             audit_dir=audit_dir,
+            timeout=timeout,
         )
 
+        if foundation is not None:
+            frozen_issues = foundation_violations(sandbox, foundation)
+            if frozen_issues:
+                restore_foundation_snapshot(sandbox, foundation)
+                writer_status = {
+                    **writer_status,
+                    "ok": False,
+                    "error_kind": "foundation_modified",
+                    "blocked_reason": "task writer changed the frozen scientific foundation",
+                    "foundation_violations": frozen_issues,
+                }
         _restore_trusted_files(sandbox, {"version": 1, "tasks": [manifest_entry]})
         record = _collect_task_writer_delivery(
             index=index,
@@ -578,9 +627,45 @@ def _run_one_task_writer(
             sandbox=sandbox,
             writer_status=writer_status,
         )
+        if (
+            run_repro
+            and record.get('writer_error_kind') == 'shared_component_bypassed'
+            and writer_status.get('ok')
+        ):
+            record['analysis_snapshot_hash'] = analysis_snapshot_hash
+            record['writer_session_count'] = session_round
+            binding_blockers = [
+                str(item)
+                for item in record.get('delivery_blockers', [])
+                if str(item).startswith('shared_component_bypassed:')
+            ]
+            review_feedback = {
+                'error_kind': 'shared_component_bypassed',
+                'verdict': 'revise',
+                'revision_target': 'writer',
+                'differences': binding_blockers,
+                'feedback': [
+                    'Use every shared_implementation component directly in the real scientific path.',
+                    'Import each declared component module, or a shared Foundation composition entrypoint whose src import graph reaches it; task-private heads may compose with, but must not replace, those shared components.',
+                    'Update component_usage with exact module, callable, usage, and evidence_files entries.',
+                ],
+            }
+            _archive_nonterminal_writer_delivery(
+                sandbox=sandbox,
+                output_subdir=output_subdir,
+                round_no=session_round,
+                session_status={
+                    **writer_status,
+                    'ok': False,
+                    'error_kind': 'shared_component_bypassed',
+                    'issues': binding_blockers,
+                },
+            )
+            session_round += 1
+            continue
         record["analysis_snapshot_hash"] = analysis_snapshot_hash
         record["writer_session_count"] = session_round
-        if not writer_status.get("ok") or not run_repro:
+        if not run_repro or not record.get("writer_completed"):
             return record
         if record.get("task_writer_status") != TASK_WRITER_TERMINAL_STATUS:
             _archive_nonterminal_writer_delivery(
@@ -671,6 +756,7 @@ def _run_task_writer_codex_session(
     prompt: str,
     sandbox: Path,
     audit_dir: Path,
+    timeout: float = DEFAULT_CODEX_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     write_text(audit_dir / f"{label}_brief.md", prompt)
     python_dir = Path(sys.executable).resolve().parent
@@ -681,14 +767,14 @@ def _run_task_writer_codex_session(
         audit_dir=audit_dir,
         label=label,
         sandbox="workspace-write",
-        timeout=None,
+        timeout=timeout,
         command_override=get_config_value("GENG_CODEX_TASK_WRITER_CMD"),
         image_paths=sorted(
             path.resolve()
             for path in (sandbox / PAPER_EVIDENCE_DIR / "full_paper_pages").glob("paper_page_*.png")
             if path.is_file()
         ),
-        extra_env={"GENG_PYTHON_EXECUTABLE": sys.executable},
+        extra_env={"GENG_PYTHON_EXECUTABLE": sys.executable, "PYTHONDONTWRITEBYTECODE": "1"},
         path_prepend=[python_dir],
     )
 
@@ -772,9 +858,25 @@ def _collect_task_writer_delivery(
     result_doc = _read_optional_json_object(result_path)
     reported_status = str(result_doc.get("status") or "")
     delivery_issues = writer_delivery_issues(result_doc)
-    status = TASK_WRITER_TERMINAL_STATUS if not delivery_issues else "failed"
-    if not writer_status.get("ok"):
-        status = "failed"
+    delivery_blockers, delivery_warnings = partition_writer_delivery_issues(result_doc)
+    binding_issues = _task_execution_binding_issues(
+        sandbox=sandbox,
+        task_id=task_id,
+        result_doc=result_doc,
+    )
+    if binding_issues:
+        binding_blockers = [f'shared_component_bypassed: {issue}' for issue in binding_issues]
+        delivery_issues.extend(binding_blockers)
+        delivery_blockers.extend(binding_blockers)
+        writer_status = {
+            **writer_status,
+            'ok': False,
+            'error_kind': 'shared_component_bypassed',
+            'blocked_reason': '; '.join(binding_issues),
+            'shared_component_issues': binding_issues,
+        }
+    delivery_usable = not delivery_blockers
+    status = TASK_WRITER_TERMINAL_STATUS if delivery_usable else "failed"
 
     artifacts = inspect_output_artifacts(sandbox, subdir=output_subdir)
     local_images = _collect_writer_images(
@@ -791,10 +893,13 @@ def _collect_task_writer_delivery(
         "output_subdir": output_subdir,
         "sandbox": str(sandbox),
         "writer_status": writer_status,
-        "writer_completed": bool(writer_status.get("ok")),
+        "writer_completed": delivery_usable,
         "task_writer_status": status,
         "writer_reported_status": reported_status or None,
         "delivery_validation_issues": delivery_issues,
+        "delivery_blockers": delivery_blockers,
+        "delivery_warnings": delivery_warnings,
+        "process_warning": None if writer_status.get("ok") else (writer_status.get("error") or writer_status.get("blocked_reason") or "writer process ended after producing a usable delivery"),
         "result_json": result_doc,
         "result_json_path": str(result_path) if result_path.exists() else None,
         "result_markdown_path": str(markdown_path) if markdown_path.exists() else None,
@@ -814,6 +919,787 @@ def _read_optional_json_object(path: Path) -> dict[str, Any]:
     except Exception:
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def _load_task_execution_binding(sandbox: Path, task_id: str) -> dict[str, Any] | None:
+    '''Load the task-scoped scientific execution contract from its sandbox copy.'''
+
+    architecture = _read_optional_json_object(
+        sandbox
+        / PAPER_EVIDENCE_DIR
+        / 'analysis_artifacts'
+        / 'scientific_architecture.json'
+    )
+    return _task_execution_binding_from_architecture(architecture, task_id)
+
+
+def _task_execution_binding_from_architecture(
+    architecture: Any,
+    task_id: str,
+) -> dict[str, Any] | None:
+    '''Resolve a 1.1 binding to concrete component execution records.
+
+    Architecture 1.0 deliberately returns ``None`` so existing cases retain
+    their legacy writer prompt and delivery behavior.
+    '''
+
+    if not isinstance(architecture, dict) or str(architecture.get('schema_version') or '') != '1.1':
+        return None
+    raw_components = architecture.get('components')
+    components_by_id = {
+        str(item.get('id')): item
+        for item in raw_components
+        if isinstance(item, dict) and str(item.get('id') or '')
+    } if isinstance(raw_components, list) else {}
+    raw_bindings = architecture.get('bindings')
+    binding = next(
+        (
+            item
+            for item in raw_bindings
+            if isinstance(item, dict)
+            and str(item.get('task_id') or '') == str(task_id)
+        ),
+        None,
+    ) if isinstance(raw_bindings, list) else None
+    configuration_issues: list[str] = []
+    bound_components: list[dict[str, Any]] = []
+    if not isinstance(binding, dict):
+        configuration_issues.append(f'no scientific_architecture/1.1 binding exists for task {task_id}')
+    else:
+        component_ids = binding.get('components')
+        if not isinstance(component_ids, list):
+            configuration_issues.append('binding.components must be a list of component IDs')
+            component_ids = []
+        for raw_component_id in component_ids:
+            component_id = str(raw_component_id or '')
+            component = components_by_id.get(component_id)
+            if not isinstance(component, dict):
+                label = component_id or '<empty>'
+                configuration_issues.append(f'binding refers to unknown component {label}')
+                continue
+            execution = component.get('execution')
+            bound_components.append(
+                {
+                    'component_id': component_id,
+                    'module': str(component.get('module') or ''),
+                    'callable': str(component.get('callable') or ''),
+                    'execution': dict(execution) if isinstance(execution, dict) else {},
+                }
+            )
+    return {
+        'schema_version': '1.1',
+        'task_id': str(task_id),
+        'experiment_id': str(binding.get('experiment_id') or '') if isinstance(binding, dict) else '',
+        'consistency_group': str(binding.get('consistency_group') or '') if isinstance(binding, dict) else '',
+        'components': bound_components,
+        'configuration_issues': configuration_issues,
+    }
+
+
+def _task_execution_binding_issues(
+    *,
+    sandbox: Path,
+    task_id: str,
+    result_doc: Any,
+    execution_binding: dict[str, Any] | None = None,
+) -> list[str]:
+    '''Apply the low-false-positive static gate for architecture 1.1.'''
+
+    contract = execution_binding or _load_task_execution_binding(sandbox, task_id)
+    if not isinstance(contract, dict) or str(contract.get('schema_version') or '') != '1.1':
+        return []
+    issues = [str(item) for item in contract.get('configuration_issues', []) if str(item)]
+    components = [item for item in contract.get('components', []) if isinstance(item, dict)]
+    usage_items = result_doc.get('component_usage') if isinstance(result_doc, dict) else None
+    usage_by_id: dict[str, dict[str, Any]] = {}
+    if not isinstance(usage_items, list):
+        issues.append('task_agent_result.json must contain component_usage for every bound component')
+        usage_items = []
+    for index, item in enumerate(usage_items):
+        if not isinstance(item, dict):
+            issues.append(f'component_usage[{index}] must be an object')
+            continue
+        component_id = str(item.get('component_id') or '')
+        if not component_id:
+            issues.append(f'component_usage[{index}].component_id is empty')
+        elif component_id in usage_by_id:
+            issues.append(f'component_usage contains duplicate component {component_id}')
+        else:
+            usage_by_id[component_id] = item
+
+    expected_ids = {str(item.get('component_id') or '') for item in components}
+    for unexpected in sorted(set(usage_by_id) - expected_ids):
+        issues.append(f'component_usage declares unbound component {unexpected}')
+
+    source_facts = _inspect_task_execution_source(sandbox, task_id)
+    imported_modules = source_facts['imported_modules']
+    reachable_task_files = source_facts['reachable_task_files']
+    for component in components:
+        component_id = str(component.get('component_id') or '')
+        module = str(component.get('module') or '')
+        callable_name = str(component.get('callable') or '')
+        execution = component.get('execution') if isinstance(component.get('execution'), dict) else {}
+        usage = usage_by_id.get(component_id)
+        if not isinstance(usage, dict):
+            issues.append(f'component_usage is missing bound component {component_id}')
+        else:
+            if str(usage.get('module') or '') != module:
+                issues.append(f'{component_id}: component_usage.module must equal declared module {module}')
+            if str(usage.get('callable') or '') != callable_name:
+                issues.append(f'{component_id}: component_usage.callable must equal declared callable {callable_name}')
+            usage_kind = str(usage.get('usage') or '')
+            if usage_kind not in {'in_scientific_path', 'reference_only', 'not_used'}:
+                issues.append(
+                    f'{component_id}: usage must be in_scientific_path, reference_only, or not_used'
+                )
+            evidence = usage.get('evidence_files')
+            evidence_items = (
+                [str(item).strip() for item in evidence if str(item).strip()]
+                if isinstance(evidence, list)
+                else []
+            )
+            if not evidence_items:
+                issues.append(f'{component_id}: evidence_files must identify the task scientific path')
+            for raw_evidence in evidence_items:
+                relative = _sandbox_evidence_source(sandbox, raw_evidence)
+                if relative is None:
+                    issues.append(
+                        f'{component_id}: evidence file {raw_evidence!r} must exist inside the sandbox'
+                    )
+                elif relative.casefold() not in reachable_task_files:
+                    issues.append(
+                        f'{component_id}: evidence file {raw_evidence!r} is not in the assigned task import closure'
+                    )
+            if execution.get('shared_implementation') is True and usage_kind != 'in_scientific_path':
+                declared = usage_kind or 'undeclared'
+                issues.append(
+                    f'{component_id}: shared_implementation must be used in_scientific_path, not {declared}'
+                )
+
+        expected_import = _normalize_python_module(module)
+        if not expected_import:
+            issues.append(f'{component_id}: declared component module is empty')
+        elif expected_import not in imported_modules:
+            issues.append(
+                f'{component_id}: expected module {expected_import} is not reachable from the assigned task entry through task-local and src import graphs'
+            )
+        elif callable_name and not _declared_callable_is_called(
+            source_facts,
+            module=expected_import,
+            callable_name=callable_name,
+        ):
+            issues.append(
+                f'{component_id}: declared callable {expected_import}.{callable_name} is imported but not called from the assigned task scientific path'
+            )
+    return _dedupe_strings(issues)
+
+
+def _normalize_python_module(module: str) -> str:
+    value = str(module or '').strip().replace('\\', '/').lstrip('./')
+    if value.endswith('/__init__.py'):
+        value = value[:-12]
+    elif value.endswith('.py'):
+        value = value[:-3]
+    return value.strip('/').replace('/', '.')
+
+
+def _inspect_task_execution_source(sandbox: Path, task_id: str) -> dict[str, Any]:
+    '''Inspect only the source closure rooted at the assigned task entrypoint.'''
+
+    module_paths, module_names = _task_module_index(sandbox)
+    entry = _assigned_task_entrypoint(sandbox, task_id)
+    imported_modules: set[str] = set()
+    reachable_task_files: set[str] = set()
+    pending = [entry.resolve()] if entry is not None else []
+    visited: set[Path] = set()
+    while pending:
+        path = pending.pop()
+        if path in visited:
+            continue
+        visited.add(path)
+        module_name = module_names.get(path)
+        if not module_name:
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding='utf-8-sig'), filename=str(path))
+        except (OSError, UnicodeError, SyntaxError):
+            continue
+        reachable_task_files.add(path.relative_to(sandbox.resolve()).as_posix().casefold())
+        imported = _imports_from_local_module(
+            tree,
+            module_name=module_name,
+            is_package=path.name == '__init__.py',
+        )
+        imported_modules.update(imported)
+        for imported_name in imported:
+            candidate = module_paths.get(imported_name)
+            if candidate is not None and candidate not in visited:
+                pending.append(candidate)
+    reachable_src_modules = _reachable_local_src_modules(sandbox, imported_modules)
+    callable_usage = _static_callable_usage(
+        sandbox,
+        entry=entry,
+        reachable_task_paths=visited,
+        reachable_src_modules=reachable_src_modules,
+    )
+    return {
+        'imported_modules': reachable_src_modules,
+        'direct_imported_modules': imported_modules,
+        'reachable_task_files': reachable_task_files,
+        'called_symbols': callable_usage,
+    }
+
+
+def _assigned_task_entrypoint(sandbox: Path, task_id: str) -> Path | None:
+    '''Prefer the trusted manifest entry, then fall back to a task-id filename.'''
+
+    manifest = _read_optional_json_object(sandbox / 'tasks_manifest.json')
+    raw_entries = manifest.get('tasks') if isinstance(manifest, dict) else None
+    for entry in raw_entries if isinstance(raw_entries, list) else []:
+        if not isinstance(entry, dict) or str(entry.get('task_id') or '') != str(task_id):
+            continue
+        candidates: list[str] = []
+        script = str(entry.get('script') or '').strip()
+        module = str(entry.get('module') or '').strip()
+        if script:
+            candidates.append(script)
+        if module:
+            candidates.append(f"tasks/{module.replace('.', '/')}.py")
+        for raw in candidates:
+            path = _safe_task_source_path(sandbox, raw)
+            if path is not None:
+                return path
+
+    raw_task_id = str(task_id or '').strip()
+    fallback_names = [raw_task_id]
+    slug = ''.join(
+        character if character.isalnum() or character == '_' else '_'
+        for character in raw_task_id
+    ).strip('_').lower()
+    if slug and slug[0].isdigit():
+        slug = f't_{slug}'
+    if slug and slug not in fallback_names:
+        fallback_names.append(slug)
+    for name in fallback_names:
+        path = _safe_task_source_path(sandbox, f'tasks/{name}.py')
+        if path is not None:
+            return path
+    return None
+
+
+def _safe_task_source_path(sandbox: Path, raw: str) -> Path | None:
+    value = str(raw or '').strip().replace('\\', '/')
+    if not value:
+        return None
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = sandbox / candidate
+    try:
+        resolved = candidate.resolve()
+        resolved.relative_to((sandbox / 'tasks').resolve())
+    except (OSError, ValueError):
+        return None
+    if not resolved.is_file() or resolved.is_symlink() or resolved.suffix.lower() != '.py':
+        return None
+    return resolved
+
+
+def _task_module_index(sandbox: Path) -> tuple[dict[str, Path], dict[Path, str]]:
+    module_paths: dict[str, Path] = {}
+    module_names: dict[Path, str] = {}
+    for path in _task_source_files(sandbox):
+        resolved = path.resolve()
+        relative = path.relative_to(sandbox).with_suffix('')
+        parts = list(relative.parts)
+        if parts and parts[-1] == '__init__':
+            parts.pop()
+        module_name = '.'.join(parts)
+        if not module_name:
+            continue
+        module_names[resolved] = module_name
+        module_paths[module_name] = resolved
+        if module_name.startswith('tasks.'):
+            module_paths.setdefault(module_name[len('tasks.'):], resolved)
+    return module_paths, module_names
+
+
+def _sandbox_evidence_source(sandbox: Path, raw: str) -> str | None:
+    '''Resolve an optional line suffix and require a real sandbox file.'''
+
+    value = str(raw or '').strip().replace('\\', '/')
+    prefix, separator, suffix = value.rpartition(':')
+    compact_suffix = suffix.replace('-', '')
+    if separator and (
+        suffix.casefold() == 'line'
+        or compact_suffix.isdigit()
+        or (suffix[:1].casefold() == 'l' and suffix[1:].isdigit())
+    ):
+        value = prefix
+    fragment_prefix, fragment, fragment_line = value.rpartition('#L')
+    if fragment and fragment_line.isdigit():
+        value = fragment_prefix
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = sandbox / candidate
+    try:
+        resolved = candidate.resolve()
+        relative = resolved.relative_to(sandbox.resolve())
+    except (OSError, ValueError):
+        return None
+    if not resolved.is_file() or resolved.is_symlink():
+        return None
+    return relative.as_posix()
+
+
+def _declared_callable_is_called(
+    source_facts: dict[str, Any],
+    *,
+    module: str,
+    callable_name: str,
+) -> bool:
+    target = '.'.join(
+        part
+        for part in (
+            _normalize_python_module(module),
+            str(callable_name or '').strip().replace(':', '.').strip('.'),
+        )
+        if part
+    )
+    if not target:
+        return False
+    for raw_symbol in source_facts.get('called_symbols', set()):
+        symbol = str(raw_symbol or '')
+        if symbol == target or symbol.startswith(f'{target}.'):
+            return True
+        if target.endswith('.__call__') and symbol == target[:-9]:
+            return True
+    return False
+
+
+def _static_callable_usage(
+    sandbox: Path,
+    *,
+    entry: Path | None,
+    reachable_task_paths: set[Path],
+    reachable_src_modules: set[str],
+) -> set[str]:
+    '''Return call targets reachable from the assigned task entry symbols.'''
+
+    _task_paths, task_names = _task_module_index(sandbox)
+    src_paths = _src_module_index(sandbox)
+    selected: dict[str, Path] = {}
+    for path in reachable_task_paths:
+        module_name = task_names.get(path.resolve())
+        if module_name:
+            selected[module_name] = path.resolve()
+    for module_name, path in src_paths.items():
+        if module_name in reachable_src_modules or any(
+            value.startswith(f'{module_name}.')
+            for value in reachable_src_modules
+        ):
+            selected[module_name] = path.resolve()
+
+    graph: dict[str, set[str]] = {}
+    aliases: dict[str, str] = {}
+    for module_name, path in selected.items():
+        analysis = _analyze_static_module(path, module_name)
+        aliases.update(analysis['aliases'])
+        for owner, targets in analysis['graph'].items():
+            graph.setdefault(owner, set()).update(targets)
+
+    if entry is None:
+        return set()
+    entry_module = task_names.get(entry.resolve())
+    if not entry_module:
+        return set()
+    roots = {f'{entry_module}.__module__'}
+    return _walk_static_calls(roots, graph=graph, aliases=aliases)
+
+
+def _src_module_index(sandbox: Path) -> dict[str, Path]:
+    module_paths: dict[str, Path] = {}
+    src_root = sandbox / 'src'
+    if not src_root.is_dir():
+        return module_paths
+    for path in src_root.rglob('*.py'):
+        if not path.is_file() or path.is_symlink():
+            continue
+        relative = path.relative_to(sandbox).with_suffix('')
+        parts = list(relative.parts)
+        if parts and parts[-1] == '__init__':
+            parts.pop()
+        module_name = '.'.join(parts)
+        if module_name:
+            module_paths[module_name] = path.resolve()
+    return module_paths
+
+
+def _analyze_static_module(path: Path, module_name: str) -> dict[str, Any]:
+    graph: dict[str, set[str]] = {}
+    aliases: dict[str, str] = {}
+    try:
+        tree = ast.parse(path.read_text(encoding='utf-8-sig'), filename=str(path))
+    except (OSError, UnicodeError, SyntaxError):
+        return {
+            'graph': graph,
+            'aliases': aliases,
+        }
+    is_package = path.name == '__init__.py'
+    module_aliases: dict[str, str] = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            symbol = f'{module_name}.{node.name}'
+            module_aliases[node.name] = symbol
+        elif isinstance(node, ast.ClassDef):
+            module_aliases[node.name] = f'{module_name}.{node.name}'
+
+    module_owner = f'{module_name}.__module__'
+    module_scanner = _StaticCallScanner(
+        owner=module_owner,
+        aliases=module_aliases,
+        graph=graph,
+        module_name=module_name,
+        is_package=is_package,
+    )
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for default in list(node.args.defaults) + [
+                item for item in node.args.kw_defaults if item is not None
+            ]:
+                module_scanner.visit(default)
+            continue
+        if isinstance(node, ast.ClassDef):
+            continue
+        module_scanner.visit(node)
+    module_aliases = module_scanner.aliases
+
+    for local_name, target in module_aliases.items():
+        if not local_name or '.' in local_name:
+            continue
+        exported = f'{module_name}.{local_name}'
+        if target and target != exported:
+            aliases[exported] = target
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            owner = f'{module_name}.{node.name}'
+            _analyze_static_function(
+                node,
+                owner=owner,
+                base_aliases=module_aliases,
+                graph=graph,
+                module_name=module_name,
+                is_package=is_package,
+            )
+            continue
+        if not isinstance(node, ast.ClassDef):
+            continue
+        class_symbol = f'{module_name}.{node.name}'
+        method_symbols = {
+            item.name: f'{class_symbol}.{item.name}'
+            for item in node.body
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        if '__init__' in method_symbols:
+            graph.setdefault(class_symbol, set()).add(method_symbols['__init__'])
+        class_aliases = dict(module_aliases)
+        class_aliases.update(method_symbols)
+        for item in node.body:
+            if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            owner = method_symbols[item.name]
+            function_aliases = dict(class_aliases)
+            positional = list(item.args.posonlyargs) + list(item.args.args)
+            if positional:
+                function_aliases[positional[0].arg] = class_symbol
+            _analyze_static_function(
+                item,
+                owner=owner,
+                base_aliases=function_aliases,
+                graph=graph,
+                module_name=module_name,
+                is_package=is_package,
+            )
+    return {
+        'graph': graph,
+        'aliases': aliases,
+    }
+
+
+def _analyze_static_function(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    *,
+    owner: str,
+    base_aliases: dict[str, str],
+    graph: dict[str, set[str]],
+    module_name: str,
+    is_package: bool,
+) -> None:
+    aliases = dict(base_aliases)
+    positional = list(node.args.posonlyargs) + list(node.args.args)
+    defaults = list(node.args.defaults)
+    for argument, default in zip(positional[-len(defaults):], defaults):
+        target = _static_reference(default, aliases)
+        if target:
+            aliases[argument.arg] = target
+    for argument, default in zip(node.args.kwonlyargs, node.args.kw_defaults):
+        if default is None:
+            continue
+        target = _static_reference(default, aliases)
+        if target:
+            aliases[argument.arg] = target
+    scanner = _StaticCallScanner(
+        owner=owner,
+        aliases=aliases,
+        graph=graph,
+        module_name=module_name,
+        is_package=is_package,
+    )
+    for statement in node.body:
+        scanner.visit(statement)
+
+
+class _StaticCallScanner(ast.NodeVisitor):
+    def __init__(
+        self,
+        *,
+        owner: str,
+        aliases: dict[str, str],
+        graph: dict[str, set[str]],
+        module_name: str,
+        is_package: bool,
+    ) -> None:
+        self.owner = owner
+        self.aliases = dict(aliases)
+        self.graph = graph
+        self.module_name = module_name
+        self.is_package = is_package
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        return
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        return
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        return
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        return
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            bound = alias.asname or alias.name.split('.')[0]
+            self.aliases[bound] = alias.name if alias.asname else alias.name.split('.')[0]
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        base = _static_import_base(
+            node,
+            module_name=self.module_name,
+            is_package=self.is_package,
+        )
+        for alias in node.names:
+            if alias.name == '*':
+                continue
+            target = '.'.join(part for part in (base, alias.name) if part)
+            self.aliases[alias.asname or alias.name] = target
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self.visit(node.value)
+        value = _static_reference(node.value, self.aliases)
+        if not value:
+            return
+        for target in node.targets:
+            name = _static_reference(target, self.aliases)
+            if name:
+                self.aliases[name] = value
+            if isinstance(target, ast.Name):
+                self.aliases[target.id] = value
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        if node.value is None:
+            return
+        self.visit(node.value)
+        value = _static_reference(node.value, self.aliases)
+        if not value:
+            return
+        name = _static_reference(node.target, self.aliases)
+        if name:
+            self.aliases[name] = value
+        if isinstance(node.target, ast.Name):
+            self.aliases[node.target.id] = value
+
+    def visit_Call(self, node: ast.Call) -> None:
+        target = _static_reference(node.func, self.aliases)
+        if target:
+            self.graph.setdefault(self.owner, set()).add(target)
+        self.generic_visit(node)
+
+
+def _static_reference(node: ast.AST | None, aliases: dict[str, str]) -> str:
+    if isinstance(node, ast.Name):
+        return aliases.get(node.id, node.id)
+    if isinstance(node, ast.Attribute):
+        parent = _static_reference(node.value, aliases)
+        value = f'{parent}.{node.attr}' if parent else node.attr
+        return aliases.get(value, value)
+    if isinstance(node, ast.Call):
+        return _static_reference(node.func, aliases)
+    if isinstance(node, ast.Subscript):
+        return _static_reference(node.value, aliases)
+    return ''
+
+
+def _static_import_base(
+    node: ast.ImportFrom,
+    *,
+    module_name: str,
+    is_package: bool,
+) -> str:
+    base = str(node.module or '')
+    if not node.level:
+        return base
+    package = module_name if is_package else module_name.rpartition('.')[0]
+    package_parts = package.split('.') if package else []
+    trim = max(0, node.level - 1)
+    if trim:
+        package_parts = package_parts[:-trim] if trim <= len(package_parts) else []
+    prefix = '.'.join(package_parts)
+    return '.'.join(part for part in (prefix, base) if part)
+
+
+def _canonical_static_symbol(symbol: str, aliases: dict[str, str]) -> str:
+    current = str(symbol or '')
+    seen: set[str] = set()
+    while current and current not in seen:
+        seen.add(current)
+        parts = current.split('.')
+        replacement = ''
+        suffix: list[str] = []
+        for length in range(len(parts), 0, -1):
+            prefix = '.'.join(parts[:length])
+            target = aliases.get(prefix)
+            if target:
+                replacement = target
+                suffix = parts[length:]
+                break
+        if not replacement:
+            break
+        current = '.'.join([replacement, *suffix])
+    return current
+
+
+def _walk_static_calls(
+    roots: set[str],
+    *,
+    graph: dict[str, set[str]],
+    aliases: dict[str, str],
+) -> set[str]:
+    called: set[str] = set()
+    pending = list(roots)
+    visited: set[str] = set()
+    while pending:
+        raw_owner = pending.pop()
+        owner = _canonical_static_symbol(raw_owner, aliases)
+        if owner in visited:
+            continue
+        visited.add(owner)
+        targets = set(graph.get(owner, set()))
+        if owner != raw_owner:
+            targets.update(graph.get(raw_owner, set()))
+        for raw_target in targets:
+            target = _canonical_static_symbol(raw_target, aliases)
+            if not target:
+                continue
+            called.add(target)
+            if target not in visited:
+                pending.append(target)
+    return called
+
+
+def _reachable_local_src_modules(sandbox: Path, roots: set[str]) -> set[str]:
+    '''Follow static imports through local Foundation modules under src/.'''
+
+    src_root = sandbox / 'src'
+    module_paths: dict[str, Path] = {}
+    if src_root.is_dir():
+        for path in src_root.rglob('*.py'):
+            if not path.is_file() or path.is_symlink():
+                continue
+            relative = path.relative_to(sandbox).with_suffix('')
+            parts = list(relative.parts)
+            if parts and parts[-1] == '__init__':
+                parts.pop()
+            module_name = '.'.join(parts)
+            if module_name:
+                module_paths[module_name] = path
+
+    reachable = set(roots)
+    pending = list(roots)
+    visited: set[str] = set()
+    while pending:
+        module_name = pending.pop()
+        if module_name in visited:
+            continue
+        visited.add(module_name)
+        path = module_paths.get(module_name)
+        if path is None:
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding='utf-8-sig'), filename=str(path))
+        except (OSError, UnicodeError, SyntaxError):
+            continue
+        imported = _imports_from_local_module(
+            tree,
+            module_name=module_name,
+            is_package=path.name == '__init__.py',
+        )
+        for candidate in imported:
+            if candidate not in reachable:
+                reachable.add(candidate)
+                pending.append(candidate)
+    return reachable
+
+
+def _imports_from_local_module(
+    tree: ast.AST,
+    *,
+    module_name: str,
+    is_package: bool,
+) -> set[str]:
+    imported: set[str] = set()
+    package = module_name if is_package else module_name.rpartition('.')[0]
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+            continue
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        base = str(node.module or '')
+        if node.level:
+            package_parts = package.split('.') if package else []
+            trim = max(0, node.level - 1)
+            if trim:
+                package_parts = package_parts[:-trim] if trim <= len(package_parts) else []
+            prefix = '.'.join(package_parts)
+            base = '.'.join(value for value in (prefix, base) if value)
+        if base:
+            imported.add(base)
+        for alias in node.names:
+            if alias.name != '*':
+                imported.add('.'.join(value for value in (base, alias.name) if value))
+    return imported
+
+
+def _dedupe_strings(values: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value)
+        if text and text not in seen:
+            seen.add(text)
+            result.append(text)
+    return result
 
 
 def _collect_writer_images(
@@ -858,6 +1744,7 @@ def _prepare_task_writer_sandbox(
     analysis_artifacts: dict[str, Path] | None = None,
     full_paper_images: list[Any] | None = None,
     reuse_existing: bool = False,
+    foundation: dict[str, Any] | None = None,
 ) -> None:
     if reuse_existing and sandbox.exists():
         _remove_legacy_writer_scoring_state(sandbox)
@@ -872,6 +1759,15 @@ def _prepare_task_writer_sandbox(
             analysis_artifacts=analysis_artifacts,
             full_paper_images=full_paper_images,
         )
+        if foundation is not None:
+            frozen_issues = foundation_violations(sandbox, foundation)
+            if frozen_issues:
+                restore_foundation_snapshot(sandbox, foundation)
+                remaining_issues = foundation_violations(sandbox, foundation)
+                if remaining_issues:
+                    raise RuntimeError(
+                        f"cached task sandbox no longer matches frozen foundation: {remaining_issues}"
+                    )
         return
     if sandbox.exists():
         shutil.rmtree(sandbox)
@@ -879,7 +1775,14 @@ def _prepare_task_writer_sandbox(
     single_manifest = {"version": 1, "tasks": [manifest_entry]}
     inject_io_runtime(sandbox)
     write_task_scaffolding(sandbox, single_manifest)
-    _write_minimal_shared_project_files(sandbox, task, manifest_entry)
+    _write_minimal_shared_project_files(
+        sandbox,
+        task,
+        manifest_entry,
+        foundation_enabled=foundation is not None,
+    )
+    if foundation is not None:
+        install_foundation_snapshot(sandbox, foundation)
     _write_paper_evidence_bundle(
         repro_project_dir=sandbox,
         paper_path=paper_path,
@@ -899,7 +1802,49 @@ def _remove_legacy_writer_scoring_state(sandbox: Path) -> None:
             path.unlink()
 
 
-def _write_minimal_shared_project_files(sandbox: Path, task: dict[str, Any], manifest_entry: dict[str, Any]) -> None:
+def _write_minimal_shared_project_files(
+    sandbox: Path,
+    task: dict[str, Any],
+    manifest_entry: dict[str, Any],
+    *,
+    foundation_enabled: bool = False,
+) -> None:
+    if foundation_enabled:
+        task_id = str(task.get('task_id') or manifest_entry.get('task_id') or 'task')
+        module = str(manifest_entry.get('module') or 'task')
+        write_text(sandbox / 'README.md', f'# Task writer sandbox\n\nTask: `{task_id}`\n')
+        write_json(
+            sandbox / 'config.json',
+            {'run_profile': 'full', 'task_id': task_id, 'seed': 1, 'backend': 'auto'},
+        )
+        write_json(
+            sandbox / 'config_smoke.json',
+            {
+                'run_profile': 'smoke',
+                'task_id': task_id,
+                'seed': 1,
+                'smoke': True,
+                'backend': 'auto',
+            },
+        )
+        task_script = sandbox / 'tasks' / f'{module}.py'
+        if not task_script.exists():
+            write_text(
+                task_script,
+                '\n'.join(
+                    [
+                        'from __future__ import annotations',
+                        '',
+                        'def main(config_path=None) -> int:',
+                        '''    raise RuntimeError('task writer did not implement this task yet')''',
+                        '',
+                        '''if __name__ == '__main__':''',
+                        '    raise SystemExit(main())',
+                        '',
+                    ]
+                ),
+            )
+        return
     task_id = str(task.get("task_id") or manifest_entry.get("task_id") or "task")
     module = str(manifest_entry.get("module") or "task")
     write_text(sandbox / "README.md", f"# Task writer sandbox\n\nTask: `{task_id}`\n")
@@ -942,6 +1887,8 @@ def _build_task_writer_brief(
     paper_thesis: dict[str, Any] | None,
     run_repro: bool,
     review_feedback: dict[str, Any] | None = None,
+    foundation_enabled: bool = False,
+    execution_binding: dict[str, Any] | None = None,
 ) -> str:
     task_id = str(task.get("task_id") or manifest_entry.get("task_id") or f"task_{index}")
     module = str(manifest_entry.get("module") or "")
@@ -955,6 +1902,53 @@ def _build_task_writer_brief(
         if run_repro
         else "Do not run full config because --run-repro is disabled; prepare the code but do not write a final task result."
     )
+    execution_binding_section = ''
+    component_usage_template = ''
+    hardware_instruction = (
+        'Inspect the available hardware yourself and choose CPU, CUDA, memory use, batch size, and parallelism appropriate to the task. '
+        'For Monte Carlo, batched matrix operations, large sweeps, or a CPU full likely to take minutes, prefer a real Torch CUDA implementation when CUDA is available.'
+    )
+    if isinstance(execution_binding, dict):
+        component_usage_example = [
+            {
+                'component_id': str(component.get('component_id') or ''),
+                'module': str(component.get('module') or ''),
+                'callable': str(component.get('callable') or ''),
+                'usage': 'in_scientific_path',
+                'evidence_files': [f'tasks/{module}.py:line'],
+            }
+            for component in execution_binding.get('components', [])
+            if isinstance(component, dict)
+        ]
+        component_usage_key = json.dumps('component_usage')
+        component_usage_template = (
+            f'  {component_usage_key}: {pretty_json(component_usage_example)},'
+        )
+        execution_binding_section = f'''## Mandatory scientific execution binding (architecture 1.1)
+The resolved component contract for this task is:
+```json
+{pretty_json(execution_binding)}
+```
+
+- Consume the listed `module` / `callable` implementations in the real computation that produces the submitted CSV, summary, and figure. A task may import a declared component itself or import a shared Foundation composition entrypoint whose local `src/**/*.py` import graph reaches it.
+- Every component with `execution.shared_implementation=true` must be reported as `in_scientific_path`. An audit-only call, shape check, reference comparison, or unused import does not count.
+- Do not mirror or rewrite a shared trainable model under `tasks/`. Reuse its Foundation model/trainer/checkpoint path so all bound tasks execute the same implementation.
+- Add `component_usage` to `task_agent_result.json`, with one exact entry per bound component:
+```json
+{pretty_json(component_usage_example)}
+```
+'''
+        hardware_instruction = (
+            'Follow each bound component execution.primary_framework and execution.device_policy exactly. '
+            'Do not substitute Torch, CUDA, NumPy, CPU, or another framework/device heuristic for the architecture contract. '
+            'Record evidence that expensive computation ran under the declared policy.'
+        )
+    ownership_instruction = (
+        "The shared `src/**/*.py`, Foundation tests, and `configs/foundation*` files are frozen. "
+        "Import and reuse them, but never edit, delete, replace, or shadow them. Put all task-private science and helpers under `tasks/`."
+        if foundation_enabled
+        else "You may create or edit any task-private code, config, helper, dependency, and output needed for this task."
+    )
     return f"""# Role: autonomous Codex task writer
 
 You own exactly one reproduction task. Write the code, run the assigned full experiment, compare the result directly with the complete paper, and keep revising and rerunning while a paper-grounded material scientific blocker remains. Your handoff is `ready_for_review`; only the independent reporter may grant final `matched`.
@@ -965,14 +1959,17 @@ You own exactly one reproduction task. Write the code, run the assigned full exp
 - Assigned task_id: `{task_id}`
 - Assigned module: `tasks.{module}`
 - Output directory: `outputs/{output_subdir}/`
-- You own this isolated sandbox. You may create or edit any code, config, helper, dependency, and output needed for this task.
+- You own the task-private portion of this isolated sandbox. {ownership_instruction}
 - Do not edit `src/_io.py`, `src/_backend.py`, `run_experiment.py`, `tasks_manifest.json`, `tasks/__init__.py`, or any other task module.
+- Read your binding in `scientific_architecture.json` when present and preserve its shared shapes, units, normalization, component identities, and invariants.
 - {full_instruction}
 - You may run smoke with `python -m tasks.{module} config_smoke.json`.
 - Run Python and dependencies directly. The host does not guard commands, allocate hardware, define scientific thresholds, or interrupt your scientific loop.
-- Inspect the available hardware yourself and choose CPU, CUDA, memory use, batch size, and parallelism appropriate to the task. For Monte Carlo, batched matrix operations, large sweeps, or a CPU full likely to take minutes, prefer a real Torch CUDA implementation when CUDA is available.
+- {hardware_instruction}
 - Calling `_backend.select_backend()` is not GPU acceleration by itself. If CUDA is selected, the expensive computation must actually run on CUDA tensors. If CPU is selected despite available CUDA, record a concrete task-specific reason.
 - There is no cycle limit. Keep iterating toward the paper until the result is honestly ready for independent review; external process failures are handled by the host.
+
+{execution_binding_section}
 
 ## Paper-faithful core-claim objective
 Your target is a faithful implementation that supports the assigned figure's core scientific claim. Pursue close numerical and visual agreement, but never trade away explicit paper facts to obtain it. Reproduce every observable detail that can be grounded or responsibly inferred:
@@ -1025,6 +2022,7 @@ Stopping rule:
 - `task_agent_result.json`: write this delivery only after a successful full and direct paper comparison; it is a strict JSON object with:
 ```json
 {{
+{component_usage_template}
   "task_id": "{task_id}",
   "status": "ready_for_review",
   "summary": "one Chinese sentence",
@@ -1089,6 +2087,7 @@ If feedback is present, investigate every reported difference against the paper'
 - `paper_evidence/analysis_artifacts/engineering_facts.json`
 - `paper_evidence/analysis_artifacts/repro_tasks.json`
 - `paper_evidence/analysis_artifacts/experiment_index.json`
+- `paper_evidence/analysis_artifacts/scientific_architecture.json` when present; it is mandatory in workflow v2
 - `paper_evidence/analysis_artifacts/paper_thesis.json` when present
 - `paper_evidence/analysis_artifacts/analysis_warnings.json` when present
 - `paper_evidence/full_paper_pages/index.json` and every page image listed there
@@ -1143,26 +2142,42 @@ def _merge_task_writer_deliveries(
     task_manifest: dict[str, Any],
     expected_paths: set[str],
     task_records: list[dict[str, Any]],
+    foundation: dict[str, Any] | None = None,
 ) -> set[str]:
-    _write_final_shared_project_files(repro_project_dir, task_records)
+    _write_final_shared_project_files(
+        repro_project_dir, task_records, write_placeholders=foundation is None
+    )
+    if foundation is not None:
+        expected_paths.update(install_foundation_snapshot(repro_project_dir, foundation))
     configs_dir = repro_project_dir / "configs"
     configs_dir.mkdir(parents=True, exist_ok=True)
     combined_requirements: list[str] = ["numpy", "matplotlib"]
+    if foundation is not None:
+        combined_requirements.clear()
+    copied_task_files: dict[str, tuple[str, str]] = {}
     for record in task_records:
         sandbox = Path(str(record.get("sandbox") or ""))
         module = str(record.get("module") or "")
         output_subdir = str(record.get("output_subdir") or record.get("task_id") or "")
         if not sandbox.exists():
             continue
-        script_source = sandbox / "tasks" / f"{module}.py"
-        script_target = repro_project_dir / "tasks" / f"{module}.py"
-        if script_source.exists():
-            _copy_python_without_bom(script_source, script_target)
-        lib_source = sandbox / "tasks" / f"{module}_lib.py"
-        if lib_source.exists():
-            lib_target = repro_project_dir / "tasks" / f"{module}_lib.py"
-            _copy_python_without_bom(lib_source, lib_target)
-            expected_paths.add(f"tasks/{module}_lib.py")
+        for source in _task_owned_files(sandbox):
+            relative = source.relative_to(sandbox).as_posix()
+            content_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+            previous = copied_task_files.get(relative)
+            if previous is not None and previous[0] != content_hash:
+                raise RuntimeError(
+                    "task writer source collision for "
+                    f"{relative}: {previous[1]} and {record.get('task_id')} supplied different content"
+                )
+            target = repro_project_dir / Path(relative)
+            if source.suffix.lower() == ".py":
+                _copy_python_without_bom(source, target)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+            copied_task_files[relative] = (content_hash, str(record.get("task_id") or module))
+            expected_paths.add(relative)
         for config_name, target_name in (
             ("config.json", f"{module}_config.json"),
             ("config_smoke.json", f"{module}_config_smoke.json"),
@@ -1192,7 +2207,50 @@ def _merge_task_writer_deliveries(
     return expected_paths
 
 
-def _write_final_shared_project_files(repro_project_dir: Path, task_records: list[dict[str, Any]]) -> None:
+def _task_source_files(sandbox: Path) -> list[Path]:
+    """Return every task-owned Python module, including transitive helpers.
+
+    A writer sandbox contains exactly one task scaffold. Copying the complete
+    task package is safer than guessing a single ``<module>_lib.py`` filename
+    and keeps imports such as ``from tasks import _fig6_full_dd`` intact.
+    """
+
+    return [path for path in _task_owned_files(sandbox) if path.suffix.lower() == ".py"]
+
+
+def _task_owned_files(sandbox: Path) -> list[Path]:
+    """Return the complete task package dependency closure without following links."""
+
+    task_root = sandbox / "tasks"
+    if not task_root.is_dir():
+        return []
+    safe: list[Path] = []
+    task_root_resolved = task_root.resolve()
+    for path in sorted(task_root.rglob("*")):
+        if not path.is_file() or path.is_symlink():
+            continue
+        relative = path.relative_to(task_root).as_posix()
+        if relative == "__init__.py" or "__pycache__" in path.parts or path.suffix.lower() in {".pyc", ".pyo"}:
+            continue
+        try:
+            path.resolve().relative_to(task_root_resolved)
+        except ValueError:
+            continue
+        safe.append(path)
+    return safe
+
+
+def _writer_snapshot_hash(analysis_hash: str, foundation_hash: str) -> str:
+    payload = f"{analysis_hash}::{foundation_hash}".encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _write_final_shared_project_files(
+    repro_project_dir: Path,
+    task_records: list[dict[str, Any]],
+    *,
+    write_placeholders: bool = True,
+) -> None:
     write_text(
         repro_project_dir / "README.md",
         "# Task-writer reproduction project\n\n"
@@ -1208,7 +2266,8 @@ def _write_final_shared_project_files(repro_project_dir: Path, task_records: lis
         },
     )
     write_json(repro_project_dir / "config_smoke.json", {"run_profile": "smoke", "task_writer_mode": True, "smoke": True})
-    for name in ("channel.py", "modulation.py", "metrics.py", "simulation.py"):
+    placeholder_names = ("channel.py", "modulation.py", "metrics.py", "simulation.py") if write_placeholders else ()
+    for name in placeholder_names:
         write_text(
             repro_project_dir / "src" / name,
             '"""Shared placeholder for task-writer mode; task-specific logic lives in tasks/*.py."""\n',
@@ -1292,7 +2351,9 @@ def _task_writer_runtime_result(
     all_checks_passed = (
         total > 0
         and passed == total
+        and validation.get("required_files_present") is True
         and validation.get("python_compiles") is not False
+        and validation.get("local_imports_resolve") is True
         and not blocking_security
     )
     return {
@@ -1371,11 +2432,11 @@ def apply_verified_result(
 
     for record in task_records:
         task_id = str(record.get("task_id") or "")
-        delivery_issues = writer_delivery_issues(record.get("result_json"))
-        if delivery_issues:
+        delivery_blockers, _ = partition_writer_delivery_issues(record.get("result_json"))
+        if delivery_blockers:
             raise ValueError(
                 f"cannot grant matched from an invalid writer delivery for {task_id}: "
-                + "; ".join(delivery_issues)
+                + "; ".join(delivery_blockers)
             )
 
     verdict_by_id = {

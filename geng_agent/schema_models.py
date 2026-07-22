@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypeAlias
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator, model_validator
 
 MAX_MANIFEST_FILES = 64
 MAX_FILE_CHARS = 2_000_000
@@ -261,6 +261,170 @@ class ExperimentIndexDocument(StrictModel):
     experiments: list[ExperimentIndexItem]
 
 
+class ArchitectureBasis(StrictModel):
+    status: Literal["paper_explicit", "paper_derived", "assumed", "unresolved"]
+    evidence_facts: list[RequiredFactRef] = Field(default_factory=list)
+    assumption_refs: list[str] = Field(default_factory=list)
+    note: str = ""
+
+
+class ArchitectureQuantity(StrictModel):
+    id: NonEmptyStr
+    role: NonEmptyStr
+    dtype: str = ""
+    shape: list[str] = Field(default_factory=list)
+    unit: str = ""
+    scale: str = ""
+    normalization: str = ""
+    scope: Literal["global", "consistency_group", "experiment", "runtime"]
+    default: Any = None
+    basis: ArchitectureBasis
+
+
+class ArchitectureExecutionContract(StrictModel):
+    execution_kind: NonEmptyStr
+    primary_framework: NonEmptyStr
+    supporting_libraries: list[NonEmptyStr]
+    device_policy: Literal[
+        "cpu",
+        "framework_default",
+        "accelerator_preferred",
+        "accelerator_required",
+        "external_runtime",
+    ]
+    precision: str
+    trainable: bool
+    gradient_mode: Literal["required", "not_required", "not_applicable"]
+    checkpoint_policy: Literal["required", "optional", "not_applicable"]
+    shared_implementation: bool
+    required_capabilities: list[NonEmptyStr]
+    rationale: NonEmptyStr
+
+
+class ArchitectureComponent(StrictModel):
+    id: NonEmptyStr
+    kind: NonEmptyStr
+    module: NonEmptyStr
+    callable: str = ""
+    execution: ArchitectureExecutionContract | None = None
+    inputs: list[NonEmptyStr] = Field(default_factory=list)
+    outputs: list[NonEmptyStr] = Field(default_factory=list)
+    parameters: list[NonEmptyStr] = Field(default_factory=list)
+    depends_on: list[NonEmptyStr] = Field(default_factory=list)
+    basis: ArchitectureBasis
+
+
+class ArchitectureConsistencyGroup(StrictModel):
+    id: NonEmptyStr
+    task_ids: list[NonEmptyStr] = Field(default_factory=list)
+    shared_quantity_ids: list[NonEmptyStr] = Field(default_factory=list)
+
+
+class ArchitectureBinding(StrictModel):
+    task_id: NonEmptyStr
+    experiment_id: NonEmptyStr
+    consistency_group: NonEmptyStr
+    components: list[NonEmptyStr] = Field(min_length=1)
+    allowed_overrides: list[NonEmptyStr] = Field(default_factory=list)
+    overrides: dict[str, Any] = Field(default_factory=dict)
+    outputs: list[NonEmptyStr] = Field(default_factory=list)
+
+
+class ArchitectureInvariant(StrictModel):
+    id: NonEmptyStr
+    kind: Literal["reference", "shape", "unit", "normalization", "global_override", "consistency", "foundation_ownership", "other"] = "other"
+    subjects: list[NonEmptyStr] = Field(default_factory=list)
+    task_ids: list[NonEmptyStr] = Field(default_factory=list)
+    severity: Literal["error", "warning"]
+    description: str = ""
+    expression: str = ""
+    basis: ArchitectureBasis
+
+
+class ScientificArchitectureDocument(StrictModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "allOf": [
+                {
+                    "if": {
+                        "properties": {"schema_version": {"const": "1.1"}},
+                        "required": ["schema_version"],
+                    },
+                    "then": {
+                        "properties": {
+                            "components": {
+                                "items": {
+                                    "required": ["callable", "execution"],
+                                    "properties": {
+                                        "callable": {"type": "string", "minLength": 1, "pattern": r"\S"},
+                                        "execution": {
+                                            "$ref": "#/$defs/ArchitectureExecutionContract"
+                                        },
+                                    },
+                                }
+                            }
+                        }
+                    },
+                }
+            ]
+        }
+    )
+
+    schema_version: Literal["1.0", "1.1"]
+    workflow_version: Literal["2"] = "2"
+    quantities: list[ArchitectureQuantity]
+    components: list[ArchitectureComponent] = Field(min_length=1)
+    consistency_groups: list[ArchitectureConsistencyGroup] = Field(default_factory=list)
+    bindings: list[ArchitectureBinding] = Field(min_length=1)
+    invariants: list[ArchitectureInvariant] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_v11_execution_contract(self) -> ScientificArchitectureDocument:
+        if self.schema_version != "1.1":
+            return self
+
+        violations: list[str] = []
+        components_by_id = {component.id: component for component in self.components}
+        consistency_group_ids = [group.id for group in self.consistency_groups]
+        declared_consistency_groups = set(consistency_group_ids)
+        duplicate_consistency_groups = sorted(
+            group_id
+            for group_id in declared_consistency_groups
+            if consistency_group_ids.count(group_id) > 1
+        )
+        for group_id in duplicate_consistency_groups:
+            violations.append(f"consistency group {group_id!r} is declared more than once")
+        tasks_by_component: dict[str, set[str]] = {}
+        for component in self.components:
+            if not component.callable.strip():
+                violations.append(f"component {component.id!r} needs a non-empty callable")
+            if component.execution is None:
+                violations.append(f"component {component.id!r} needs an execution contract")
+        for binding in self.bindings:
+            if binding.consistency_group not in declared_consistency_groups:
+                violations.append(
+                    f"binding for task {binding.task_id!r} refers to undeclared "
+                    f"consistency group {binding.consistency_group!r}"
+                )
+            for component_id in binding.components:
+                tasks_by_component.setdefault(component_id, set()).add(binding.task_id)
+        for component_id, task_ids in tasks_by_component.items():
+            component = components_by_id.get(component_id)
+            if (
+                len(task_ids) > 1
+                and component is not None
+                and component.execution is not None
+                and not component.execution.shared_implementation
+            ):
+                violations.append(
+                    f"component {component_id!r} is bound to multiple tasks and needs "
+                    "shared_implementation=true"
+                )
+        if violations:
+            raise ValueError("scientific architecture 1.1: " + "; ".join(violations))
+        return self
+
+
 class TaskVerificationResult(StrictModel):
     task_id: NonEmptyStr
     verdict: Literal["accepted", "revise"]
@@ -352,6 +516,7 @@ SCHEMA_MODELS: dict[str, type[BaseModel]] = {
     "repro_tasks": ReproTasksDocument,
     "paper_thesis": PaperThesisDocument,
     "experiment_index": ExperimentIndexDocument,
+    "scientific_architecture": ScientificArchitectureDocument,
     "task_verification_result": IsolatedTaskVerificationDocument,
     "verification_result": VerificationResultDocument,
     "repro_project_manifest": ReproProjectManifest,
@@ -365,6 +530,7 @@ SCHEMA_FILENAMES: dict[str, str] = {
     "repro_tasks": "repro_tasks.schema.json",
     "paper_thesis": "paper_thesis.schema.json",
     "experiment_index": "experiment_index.schema.json",
+    "scientific_architecture": "scientific_architecture.schema.json",
     "task_verification_result": "task_verification_result.schema.json",
     "verification_result": "verification_result.schema.json",
     "repro_project_manifest": "repro_project_manifest.schema.json",
