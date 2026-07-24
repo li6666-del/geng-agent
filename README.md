@@ -8,15 +8,15 @@
 
 - 解析 PDF/TXT/Markdown 论文，保留全文分块、页面图像和带 caption/page/bbox 的图候选索引，供 Codex 直接查证。
 - 一个 Codex 事实专家只做一轮全局事实扫描，一个任务专家只做一轮初步设计并立即输出 `backfill_handoff`；只有明确点名的实验定义 blocker 才进入定向回补，通常 0–2 轮，第三轮仅作异常熔断。
-- 无条件抽取论文核心主张、作用机制、方法排序和限制，生成 `paper_thesis.json` 作为后续复现锚点。
-- 将论文图表拆成可运行的复现实验任务；任务描述用于导航，最终科学目标始终以论文原文和原图为准。
-- 新案例在任务定稿后生成 `scientific_architecture.json`，统一约束跨任务共享的系统模型、数量形状、单位、归一化、组件接口和不变量；旧案例在 resume 时继续使用 v1，不做静默迁移。
+- 定向回补后抽取论文核心主张、作用机制、方法排序和限制，再由 Task Designer 生成最终任务；每个任务内嵌唯一的 `scientific_acceptance` 契约，以稳定 ID 描述核心结论、关键数值目标和信息缺口。
+- 将论文图表拆成可运行的复现实验任务；论文证据负责选择“什么结论重要”，宿主只执行统一的材料性策略和数值计算，不用像素、配色或版式替代科学判断。
+- 任务定稿后生成 `scientific_architecture.json`，统一约束跨任务共享的系统模型、数量形状、单位、归一化、组件接口、不变量及验收 criterion 到输出量的绑定。新契约会使旧 case 缓存失效，不提供旧结构兼容层。
 - `scientific_architecture/1.1` 由 Architecture Agent 按组件选择真实运行栈、设备策略、精度、训练/梯度/检查点能力和共享边界；类型与框架均不绑定通信领域或 PyTorch。宿主能力只决定“当前能否执行”，缺包、缺 GPU 或未启用的运行时会形成显式 capability gap，不能触发 NumPy/CPU/占位实现的静默降级。
 - 单个 Foundation Writer 在并行任务启动前生成共享 `src/` 与契约测试，形成按内容哈希冻结的 canonical snapshot；任务 writer 只能读取共享层，任务私有实现放在 `tasks/`。
 - 第三阶段采用任务级自治 writer：一个任务一个 Codex writer，任务数就是启动并发数；writer 自主写代码、直接运行 full、对比并迭代。
-- 每个 writer 把论文明确事实作为最高约束，只在论文未披露或确有歧义处作显式工程假设；完成 full、支持核心观点且不存在材料性事实冲突后提交 `ready_for_review`，无权授予最终 `matched`。
+- 每个 writer 把论文明确事实和任务验收 ID 作为最高约束，只在论文未披露或确有歧义处作显式工程假设；它保留“运行—比较—修改—重跑”的自迭代，但只能因运行无效、核心结论失败或关键数值对称倍率达到 10 倍而重跑，且必须给出证据对应的因果修改计划。
 - 主持人只做任务覆盖、证据路径和基础代码健康检查，不参与科学结论。
-- 每个 writer 交付后立即启动对应的独立 Codex task reporter，直接核对论文与本地产物；Reporter 只为违反明确事实或核心观点未得到支持的材料性问题打回任务，合理假设和非材料差异作为限制记录。已通过任务不重跑，全部通过后才启动 Final Report Editor。
+- 每个 writer 交付后立即启动对应的独立 Codex task reporter，按 criterion ID 核对论文与本地产物。宿主可得出 `reproduced`、`reproduced_with_assumptions`、`inconclusive_missing_information` 或 `not_reproduced`；后两者是可报告终态，不会被当作流水线故障或逼迫 Writer 无限重跑。所有任务进入终态后启动 Final Report Editor。
 - 固定生成主审查报告 `review.md/docx`、本地复现报告 `reproduction_report.md/docx` 和论文对比报告 `result_review.md/docx`；对比报告不附带 writer 迭代流水账。
 - 提供极简 Web UI，可上传 PDF 或填写 PDF 链接并实时查看阶段进度。
 
@@ -31,18 +31,18 @@
   -> 单个 Codex 任务专家生成 repro_tasks_preliminary.json，并提出结构化事实缺口
   -> 程序按稳定请求键和 required_fields 跨任务合并去重；任务专家先选择真正阻塞 Writer 的 request_id
   -> 每轮按字段记录论文证据、未找到位置或冲突，并把搜索结果写入累计台账
-  -> 没有 blocker 时直接交给 Writer；有 blocker 时只回补选中项，任务刷新后再次软交接，同一未解字段最多搜索两次
+  -> 有 blocker 时只回补选中项，同一未解字段最多搜索两次；没有 blocker 时直接进入主张提炼
   -> Python 只硬验收 JSON/基本结构；来源、引用、证据类型和缺失字段写入 analysis_warnings.json，不触发科学内容重写
-  -> Codex analysis 基于最终事实抽取 paper_thesis.json
+  -> Codex analysis 基于最终事实抽取 paper_thesis.json；Task Designer 随后生成唯一、权威、带 scientific_acceptance 的最终任务契约
   -> experiment_index v2 记录任务、图表、参数、baseline 和证据定位，不做运行前复现评级
   -> Architecture Agent 生成 scientific_architecture.json，并由机器检查跨文档引用、形状/单位作用域和 task binding
   -> Foundation Writer 顺序生成共享科学模块与 tests；验证、哈希冻结后再复制到每个任务 sandbox
   -> 为每个复现任务创建独立 sandbox
   -> 所有任务 writer 同时启动，在独立 sandbox 内自主写代码、选择硬件并直接运行 full
-  -> 每个 writer 自行对比论文、修改代码并反复运行，完成可靠 full 后提交 ready_for_review
-  -> 每个任务完成后立刻启动独立 task reporter，按“明确事实忠实 + 核心观点支持”的材料性门槛裁决，并在 MinerU 父图内定位目标子图
-  -> Python 按 Reporter 提交且完成视觉复检的坐标从原 PDF 高分辨率裁切；边界不可靠时自动回退完整父图
-  -> 全部任务通过后系统授予 matched，Final Report Editor 统一组织三份报告
+  -> 每个 writer 按验收 ID 自行比较并迭代；只有运行无效、核心结论失败或关键数值倍率达到 10 倍才允许带因果计划重跑
+  -> 每个任务完成后立刻启动独立 task reporter，提交 criterion 级观察；宿主计算倍率并决定复现、带假设复现、信息不足或未复现
+  -> 可用时从原 PDF 高分辨率裁切；边界不可靠、无 crop 或无图任务直接使用父图或 CSV/表格/summary/文本证据，不回退 Writer
+  -> 全部任务进入可报告终态后，Final Report Editor 统一组织三份报告；只有全部成功复现时才授予 matched
   -> 输出 review、reproduction_report、result_review 的 Markdown/Word 版本
 ```
 
@@ -93,9 +93,9 @@ MinerU 缺失、超时、非零退出或未识别到目标图时，流程不会�
 
 系统会把原始论文文件、全论文页面图以及最终定稿的 `engineering_facts.json`、`repro_tasks.json`、`experiment_index.json`、v2 的 `scientific_architecture.json`、可选 `paper_thesis.json` 和 `analysis_warnings.json` 复制到每个 writer sandbox。v2 sandbox 还安装同一份只读 Foundation snapshot。所有论文页面图直接随 Codex writer 会话发送，不再执行任务页筛选；任务相关事实摘要只用于文本导航，不构成信息边界。
 
-每个 writer 交付后，专属 task reporter 在独立上下文中读取该任务的 `task_agent_result.json`、执行摘要、本地 PNG/CSV/summary 和完整论文证据，直接判断 `accepted/revise` 并定位论文原图。科学差异只退回对应 writer；裁图或证据定位问题只重跑对应 task reporter。所有任务通过后，Final Report Editor 只读取已验收的紧凑任务包和图片，汇总生成三份最终报告。
+每个 writer 交付后，专属 task reporter 在独立上下文中读取该任务的 `task_agent_result.json`、执行摘要、本地 PNG/CSV/summary 和完整论文证据，按稳定 criterion ID 提交观察。宿主统一计算关键数值的对称倍率：两个有限、非零同号量的倍率小于 10 时，单纯参数差异不构成重跑理由；零值、符号、阈值或更严格数值准确性只有在任务把它明确写成核心结论时才按该结论裁决。裁图或证据定位问题只重跑对应 Reporter，绝不重跑 Writer。所有任务进入终态后，Final Report Editor 汇总生成三份最终报告。
 
-对 PDF，系统优先把 MinerU 的整图候选连同 caption、页码和归一化 bbox 交给 task reporter。Reporter 只在候选父图内部标注目标子图，并显式复检目标身份、面板边界、坐标轴、图例和关键注释；Python 再从原 PDF 确定性裁切。任一复检项不确定时使用完整父图，避免“为了紧凑而斩断图”。
+对 PDF，系统优先把 MinerU 的整图候选连同 caption、页码和归一化 bbox 交给 task reporter。Reporter 可在候选父图内部标注目标子图，Python 再从原 PDF 确定性裁切；任一边界不确定时使用完整父图。图像不是全局必需产物：图类任务应有可读结果图或等价的 CSV、表格、summary、文本证据，无图任务和信息不足终态可直接用结构化证据成文。
 
 每个 task reporter 都拥有独立工作区，绝不接收其他实验的本地产物或结论；最终编辑器没有科学裁决权。任务级或编辑器级进程失败会分别记录在对应 audit 状态中。
 
@@ -134,11 +134,13 @@ set GENG_CODEX_TASK_REPORTER_REASONING_EFFORT=xhigh
 set GENG_CODEX_REPORT_EDITOR_REASONING_EFFORT=xhigh
 ```
 
-task writer 采用全任务并发：有多少复现任务就同时启动多少个 writer。每个 writer 在自己的 sandbox 内直接调用当前 Python，自行探测 CPU/GPU、选择 backend、声明依赖并运行 smoke/full；主持人不做资源排队、命令拦截或中途重试。科学迭代没有单独的总墙钟上限，但每个 Codex 会话默认最多运行 1800 秒（30 分钟）。
+task writer 采用全任务并发：有多少复现任务就同时启动多少个 writer。每个 writer 在自己的 sandbox 内直接调用当前 Python，自行探测 CPU/GPU、选择 backend、声明依赖并运行 smoke/full；主持人不做资源排队或科学判断。每个 Codex 会话默认最多运行 1800 秒（30 分钟），后续迭代只在材料性原因成立且有具体因果修改方案时启动。
 
 Writer 必须先读取 `repro_tasks.json` 的 `_meta.fact_gap_handoff`，再从抽取事实、原论文 PDF、caption、正文、公式、表格和附录中补找缺失参数；前两阶段的未解决记录只是导航，不是停止依据。论文明确给出的数据、模型、公式、算法和实验协议不可为了贴图而改动；仍找不到的值或实现细节才允许成为可追踪、可调整的科学假设。对 Monte Carlo、批量矩阵运算和分钟级 CPU full，CUDA 可用时应优先实现真实 Torch CUDA 计算路径；仅调用 backend selector 或在报告中写 GPU 名称不算使用 GPU。
 
-Writer 使用直接的对比迭代：运行 full，先核验明确事实和核心观点，再区分材料性问题、合理的论文空白假设与非材料差异。只有材料性问题且存在论文证据支撑的修改方向时才修改并重新 full；不得盲从与论文冲突的 Reporter 建议，也不得为非阻塞差异机械重跑。Writer 只能提交带完整运行与图像证据的 `ready_for_review`；最终 `matched` 由 Reporter 直接核验论文后授予。
+Writer 使用直接的对比迭代：运行 full 后逐项核验 `scientific_acceptance`。只有 `invalid_run`、`core_conclusion_failed` 或 `key_numeric_ratio_ge_10` 三类材料性原因，且存在论文证据、受影响 criterion ID、具体修改目标和可预测影响时，才修改并重新 full；配色、字体、线宽、布局、像素、裁图紧凑度及其他呈现差异不得触发重跑。若运行有效但结论不支持，或论文信息不足且没有证据支持的下一步修正，Writer 应立即交给 Reporter 形成 `not_reproduced` 或 `inconclusive_missing_information`，不无限自改。
+
+恢复缓存采用内容寻址：论文 PDF 内容、最终任务契约、相关输入、schema、prompt 与宿主策略版本任一变化都会使对应缓存失效。同一路径替换 PDF 不会复用旧解析；旧 case 无迁移兼容承诺。
 
 旧 LLM analysis 兼容路径必须显式开启：
 
@@ -294,9 +296,9 @@ case_001/
 
 - `review.md/docx`：主报告，概述事实、任务、运行、风险和结果审查状态。
 - `reproduction_report.md/docx`：逐任务记录本地代码实际采用的关键参数、随机种子、后端、统计设置和显式假设。
-- `result_review.md/docx`：逐任务并排展示本地复现图和 reporter 裁切的论文原图，并给出最终差异、原因与不确定性；不包含 writer 自我迭代附录。
-- `verification_result.json`：Reporter 对论文证据与本地结果的逐任务直接裁决。
-- `runtime_result.json`：执行摘要、产物汇总和最终独立验收状态；候选阶段不计为最终 matched。
+- `result_review.md/docx`：逐任务展示可用的本地复现图、论文原图或等价结构化证据，并给出 criterion 级终态、原因与不确定性；不包含 writer 自我迭代附录。
+- `verification_result.json`：Reporter 观察和宿主派生的逐任务终态；`inconclusive_missing_information` 与 `not_reproduced` 是正常可报告结果。
+- `runtime_result.json`：执行摘要、产物汇总和最终独立验收状态；所有任务进入终态即可报告，只有全部成功复现才计为 matched。
 - `analysis_warnings.json`：前两阶段来源、引用、证据契约和缺失字段的非阻断诊断，供 Writer 继续核对全文。
 - `risk_report.json`：可复现性风险、缺失信息、前两阶段兜底、运行异常和审计摘要。
 - `audit/`：Codex prompt、stdout/stderr、JSON 校验、运行日志、图片证据等完整审计链。
@@ -305,14 +307,14 @@ case_001/
 
 每个任务 writer 只拥有自己的 sandbox，允许修改本任务代码、私有配置、README 和 requirements。它必须：
 
-1. 阅读任务事实、论文证据和完整目标图，生成本任务复现代码与配置。
+1. 阅读任务事实、论文证据和 `scientific_acceptance` 契约，生成本任务复现代码与配置。
 2. 自行探测硬件并选择 CPU/GPU、并行度、批量大小和依赖。
 3. 在 `--run-repro` 开启时直接运行自己的 smoke/full。
-4. 先核验论文明确的数据、模型、公式、核心算法和实验协议，再对照曲线、baseline、数值形状、坐标轴、统计量与呈现细节。
-5. 只在论文未披露或确有歧义处提出显式合理假设；材料性问题存在具体修正方向时修改并重跑，非材料差异只记录，禁止机械重复 full。
-6. 成功 full 已忠于明确事实、支持任务核心观点且只剩公开假设或非材料差异时输出 `ready_for_review`；Writer 不能输出最终 matched。
+4. 先核验论文明确的数据、模型、公式、核心算法和实验协议，再按稳定 ID 对照核心结论和关键数值目标。
+5. 只在论文未披露或确有歧义处提出显式合理假设；三类材料性原因之一成立且存在具体因果修正方向时修改并重跑，其他差异只记录。
+6. 核心结论得到支持且关键数值倍率小于 10 时立即输出 `ready_for_review`；运行有效但忠实结果失败或无法判断时也应停止自改并提交 Reporter。Writer 不能输出最终 matched。
 
-主持人同时启动所有 writers。每个 Writer 交付后，只有其对应的 task reporter 会立刻在独立上下文中审查该任务；科学差异仅让该 Writer 在原 sandbox 继续修改和 full，其他任务不受影响。所有任务通过后，Final Report Editor 只读取已验收任务包与图片，负责三份人工报告的语言组织与排版。
+主持人同时启动所有 writers。每个 Writer 交付后，只有其对应的 task reporter 会立刻在独立上下文中审查该任务；只有宿主确认的三类材料性原因才让该 Writer 在原 sandbox 继续修改和 full，其他任务不受影响。所有任务进入终态后，Final Report Editor 读取终态任务包、可用图片和结构化证据，负责三份人工报告的语言组织与排版。
 
 ## 安全边界
 
@@ -321,8 +323,8 @@ case_001/
 - 静态扫描会检查高风险文件操作、系统命令、网络行为等。
 - 每个 writer 使用独立 sandbox 隔离任务文件；运行权限和资源决策由 writer 自己负责。
 - 主持人会确定性清理 Python BOM；静态扫描发现语法错误时 runtime 不得显示通过。
-- `matched` 要求 Reporter 确认明确论文事实未被违反、任务核心观点得到本地结果支持且 full 证据可信；论文未披露部分允许采用公开、合理的假设，剩余非材料差异不阻断通过。
+- `matched` 要求全部任务的有效 full 支持核心结论，所有可比较关键数值的宿主计算倍率小于 10；论文未披露部分允许采用公开、合理的假设。样式、像素和裁图差异不参与该结论。
 
 ## 项目定位
 
-耿同学 agent 的目标是提供忠于论文证据并能检验核心观点的复现结果，不是替代人工科研判断。`matched` 只表示明确事实与核心观点经独立 task reporter 核验通过；它允许对论文未披露细节作出透明、合理的工程假设，不表示恢复了作者未公开代码。
+耿同学 agent 的目标是提供忠于论文证据并能检验核心观点的复现结果，不是替代人工科研判断。`matched` 只表示明确事实、核心观点和宿主管理的材料性数值门槛通过；`inconclusive_missing_information` 与 `not_reproduced` 则如实保留信息不足或忠实失败的科学结果。任何终态都不表示恢复了作者未公开代码。

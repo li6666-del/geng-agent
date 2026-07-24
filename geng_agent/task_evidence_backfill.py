@@ -664,6 +664,15 @@ def reconcile_final_tasks(
             candidate = draft
             restored_task_ids.append(task_id)
         final = copy.deepcopy(candidate)
+        # The acceptance contract is a single authority snapshot. A refresh may
+        # omit it while updating facts; in that case retain the previous snapshot,
+        # but never field-merge two contracts into a drifting hybrid.
+        if not isinstance(final.get("scientific_acceptance"), dict) and isinstance(
+            draft.get("scientific_acceptance"), dict
+        ):
+            final["scientific_acceptance"] = copy.deepcopy(
+                draft["scientific_acceptance"]
+            )
 
         refs = [item for item in final.get("required_facts", []) if isinstance(item, dict)]
         ref_keys = {(_normalize(item.get("type")), _normalize(item.get("name"))) for item in refs}
@@ -704,6 +713,44 @@ def reconcile_final_tasks(
         final["missing_fact_requests"] = requests
         final_tasks.append(final)
 
+    preliminary_ids = {str(item.get("task_id") or "") for item in preliminary}
+    added_candidate_task_ids: list[str] = []
+    final_task_ids = set(preliminary_ids)
+    discarded_candidate_task_ids: list[str] = []
+    for raw_candidate in candidate_tasks.get("repro_tasks", []):
+        if not isinstance(raw_candidate, dict):
+            continue
+        task_id = str(raw_candidate.get("task_id") or "")
+        if not task_id or task_id in final_task_ids:
+            continue
+        if not _has_material_task_basis(raw_candidate):
+            discarded_candidate_task_ids.append(task_id)
+            continue
+        final = copy.deepcopy(raw_candidate)
+        refs = [
+            item for item in final.get("required_facts", []) if isinstance(item, dict)
+        ]
+        ref_keys = {
+            (_normalize(item.get("type")), _normalize(item.get("name")))
+            for item in refs
+        }
+        for ref in resolved_by_task.get(task_id, []):
+            key = (_normalize(ref.get("type")), _normalize(ref.get("name")))
+            if key not in ref_keys:
+                refs.append(ref)
+                ref_keys.add(key)
+        final["required_facts"] = refs
+        final["missing_fact_requests"] = [
+            copy.deepcopy(request)
+            for request in final.get("missing_fact_requests", [])
+            if isinstance(request, dict)
+            and (_normalize(request.get("type")), _normalize(request.get("name")))
+            not in resolved_keys
+        ]
+        final_tasks.append(final)
+        added_candidate_task_ids.append(task_id)
+        final_task_ids.add(task_id)
+
     meta = (
         copy.deepcopy(preliminary_tasks.get("_meta", {}))
         if isinstance(preliminary_tasks.get("_meta"), dict)
@@ -716,11 +763,58 @@ def reconcile_final_tasks(
         "candidate_task_count": len(candidate_by_id),
         "final_task_count": len(final_tasks),
         "restored_task_ids": restored_task_ids,
-        "discarded_candidate_task_ids": sorted(
-            set(candidate_by_id) - {str(item.get("task_id") or "") for item in preliminary}
-        ),
+        "added_candidate_task_ids": added_candidate_task_ids,
+        "discarded_candidate_task_ids": discarded_candidate_task_ids,
     }
     return {"repro_tasks": final_tasks, "_meta": meta}
+
+
+def _has_material_task_basis(task: dict[str, Any]) -> bool:
+    required_facts = task.get("required_facts")
+    if any(
+        isinstance(ref, dict)
+        and str(ref.get("type") or "").strip()
+        and str(ref.get("name") or "").strip()
+        for ref in (required_facts if isinstance(required_facts, list) else [])
+    ):
+        return True
+
+    acceptance = task.get("scientific_acceptance")
+    if isinstance(acceptance, dict):
+        conclusions = acceptance.get("core_conclusions")
+        for conclusion in (conclusions if isinstance(conclusions, list) else []):
+            if (
+                isinstance(conclusion, dict)
+                and str(conclusion.get("statement") or "").strip()
+                and _explicit_paper_anchor(conclusion.get("paper_anchor"))
+            ):
+                return True
+        numeric_targets = acceptance.get("key_numeric_targets")
+        for target in (numeric_targets if isinstance(numeric_targets, list) else []):
+            if not isinstance(target, dict):
+                continue
+            if (
+                str(target.get("name") or "").strip()
+                and target.get("paper_magnitude") is not None
+                and str(target.get("evidence_quality") or "") != "unavailable"
+            ):
+                return True
+
+    if _explicit_paper_anchor(task.get("figure_or_claim")):
+        return bool(str(task.get("metric") or task.get("target") or "").strip())
+    return False
+
+
+def _explicit_paper_anchor(value: Any) -> bool:
+    text = str(value or "").strip()
+    return bool(
+        re.search(
+            r"(?:fig(?:ure)?|table|eq(?:uation)?)\s*[.(:#-]*\s*(?:\d+|[ivx]+)|"
+            r"(?:\u56fe|\u8868|\u5f0f)\s*(?:\d+|[\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e]+)",
+            text,
+            re.IGNORECASE,
+        )
+    )
 
 
 def _request_fields(request: dict[str, Any]) -> list[dict[str, Any]]:

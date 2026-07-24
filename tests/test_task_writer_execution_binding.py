@@ -55,6 +55,7 @@ def _architecture(version: str = '1.1') -> dict:
                 'allowed_overrides': [],
                 'overrides': {},
                 'outputs': [],
+                'acceptance_bindings': [],
             }
         ],
     }
@@ -487,7 +488,7 @@ class TaskWriterExecutionBindingTests(unittest.TestCase):
 
         self.assertEqual(issues, [])
 
-    def test_collection_reports_shared_component_bypassed(self) -> None:
+    def test_collection_reports_shared_component_advisory_without_blocking(self) -> None:
         with TemporaryDirectory() as temp:
             sandbox = Path(temp)
             _write_binding(sandbox)
@@ -503,28 +504,25 @@ class TaskWriterExecutionBindingTests(unittest.TestCase):
                 writer_status={'ok': True},
             )
 
-        self.assertFalse(record['writer_completed'])
-        self.assertEqual(record['writer_error_kind'], 'shared_component_bypassed')
-        self.assertTrue(any(item.startswith('shared_component_bypassed:') for item in record['delivery_blockers']))
+        self.assertTrue(record['writer_completed'])
+        self.assertIsNone(record['writer_error_kind'])
+        self.assertFalse(record['delivery_blockers'])
+        self.assertTrue(
+            any(item.startswith('shared_component_advisory:') for item in record['delivery_warnings'])
+        )
 
-    def test_binding_failure_reopens_same_writer_with_concrete_feedback(self) -> None:
+    def test_binding_advisory_does_not_reopen_writer(self) -> None:
         with TemporaryDirectory() as temp:
             root = Path(temp)
-            failed = {
-                'task_id': 'fig_1',
-                'writer_completed': False,
-                'task_writer_status': 'failed',
-                'writer_error_kind': 'shared_component_bypassed',
-                'delivery_blockers': [
-                    'shared_component_bypassed: shared_model is reference_only'
-                ],
-            }
             ready = {
                 'task_id': 'fig_1',
                 'writer_completed': True,
                 'task_writer_status': 'ready_for_review',
                 'writer_error_kind': None,
                 'delivery_blockers': [],
+                'delivery_warnings': [
+                    'shared_component_advisory: shared_model is reference_only'
+                ],
             }
             with patch(
                 'geng_agent.agentic_task_writers._prepare_task_writer_sandbox'
@@ -538,7 +536,7 @@ class TaskWriterExecutionBindingTests(unittest.TestCase):
                 'geng_agent.agentic_task_writers._restore_trusted_files'
             ), patch(
                 'geng_agent.agentic_task_writers._collect_task_writer_delivery',
-                side_effect=[failed, ready],
+                return_value=ready,
             ), patch(
                 'geng_agent.agentic_task_writers._archive_nonterminal_writer_delivery'
             ) as archive:
@@ -565,9 +563,8 @@ class TaskWriterExecutionBindingTests(unittest.TestCase):
                     run_repro=True,
                 )
 
-        self.assertEqual(run_session.call_count, 2)
-        self.assertEqual(archive.call_count, 1)
-        self.assertIn('shared_component_bypassed', run_session.call_args_list[1].kwargs['prompt'])
+        self.assertEqual(run_session.call_count, 1)
+        self.assertEqual(archive.call_count, 0)
         self.assertEqual(result['task_writer_status'], 'ready_for_review')
 
     def test_foundation_scaffold_removes_legacy_numpy_and_communication_stubs(self) -> None:

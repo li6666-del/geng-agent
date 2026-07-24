@@ -1,28 +1,17 @@
-"""Local repair of second-round reproduction-task generation.
+"""Permissive local normalization for reproduction-task generation.
 
-This mirrors ``facts_normalize`` for the ``repro_tasks`` stage. In real runs the LLM
-designs sensible tasks but trips strict validation on cosmetic issues: a ``metric``
-or ``expected_trend.direction`` enum synonym outside the closed ``Literal`` set,
-``required_facts`` emitted as bare strings or dicts with extra keys (``fact_id``,
-``source_chunk_id``) instead of ``{type, name}``, stray top-level metadata
-(``paper_id``, ``venue`` …), or a truncated JSON stream. Strict all-or-nothing
-validation then discards the whole task set and forces the generic local fallback.
-
-Three conservative, auditable layers run *before* the strict schema check:
-
-1. normalization     - map enum synonyms, strip unknown keys, repair ``required_facts``
-   refs against the actually-extracted facts, coerce nested shapes. Logged to ``_meta``.
-2. partial acceptance - drop only the individual tasks that still cannot validate,
-   keep the rest (the schema already requires >= 1 task, which acts as the floor).
-3. truncation salvage - recover the largest parseable prefix of ``repro_tasks``.
-
-Traceability is preserved: a ``required_facts`` ref is kept only if it resolves to a
-real extracted fact; refs and tasks that cannot be repaired are dropped and recorded.
+The Task Designer may omit legacy descriptive fields or use near-miss enum and
+reference shapes. The normalizer preserves every recoverable scientific task,
+repairs cosmetic structure, and supplies only the minimum deterministic hand-off
+needed by the Writer. When no task can be recovered, it creates one explicit
+fallback task whose uncertainty remains visible downstream instead of terminating
+the pipeline on schema shape alone.
 """
 
 from __future__ import annotations
 
 import copy
+import math
 import re
 from typing import Any, get_args
 
@@ -66,9 +55,52 @@ _TASK_KEYS = {
     "baseline_definitions",
     "statistical_protocol",
     "validation_anchors",
+    "scientific_acceptance",
 }
 _TREND_KEYS = {"x_axis", "y_axis", "direction", "reason"}
 _COMPARISON_KEYS = {"baselines", "curve_groups", "tolerance"}
+_SCIENTIFIC_ACCEPTANCE_KEYS = {
+    "contract_version",
+    "core_conclusions",
+    "key_numeric_targets",
+    "information_gaps",
+}
+_CONCLUSION_KINDS = {
+    "ordering",
+    "trend",
+    "crossing",
+    "threshold",
+    "scaling",
+    "gain_loss",
+    "mechanism",
+    "absolute_level",
+    "other",
+}
+_NUMERIC_EVIDENCE_QUALITIES = {
+    "paper_explicit",
+    "paper_derived",
+    "visual_estimate",
+    "unavailable",
+}
+_GAP_DISPOSITIONS = {
+    "assume_and_disclose",
+    "single_sensitivity_if_core",
+    "terminal_inconclusive",
+}
+_STYLE_ONLY_RE = re.compile(
+    r"(?:pixel[\s_-]*perfect|exact[\s_-]*pixels?|plot[\s_-]*styling|"
+    r"marker[\s_-]*style|line[\s_-]*(?:width|colou?r)|font[\s_-]*(?:size|family)|"
+    r"\u50cf\u7d20\u7ea7|\u9010\u50cf\u7d20|\u7ed8\u56fe\u6837\u5f0f|\u66f2\u7ebf\u989c\u8272|\u7ebf\u6761\u989c\u8272|\u7ebf\u5bbd|\u5b57\u4f53|\u6807\u8bb0\u6837\u5f0f|\u6392\u7248\u4e00\u81f4)",
+    re.IGNORECASE,
+)
+_SCIENTIFIC_IMAGE_RE = re.compile(
+    r"(?:image[\s_-]*reconstruct|pixel[\s_-]*reconstruct|reconstruct(?:ion|ed)?[\s_-]*(?:image|pixel)|"
+    r"per[\s_-]*pixel[\s_-]*(?:loss|error|accuracy)|psnr|ssim|super[\s_-]*resolution|"
+    r"semantic[\s_-]*segment|object[\s_-]*detect|image[\s_-]*(?:quality|distortion)|"
+    r"\u56fe\u50cf\u91cd\u5efa|\u50cf\u7d20\u7ea7(?:\u635f\u5931|\u8bef\u5dee|\u51c6\u786e\u7387|\u91cd\u5efa)|"
+    r"\u5cf0\u503c\u4fe1\u566a\u6bd4|\u7ed3\u6784\u76f8\u4f3c|\u8bed\u4e49\u5206\u5272|\u76ee\u6807\u68c0\u6d4b)",
+    re.IGNORECASE,
+)
 _ASSUMPTION_KEYS = {
     "name",
     "default_value",
@@ -300,9 +332,23 @@ def normalize_repro_tasks_candidate(data: Any, facts: Any) -> tuple[dict[str, An
     fact_keys, name_to_types, alias_to_key = _build_fact_index(facts)
     tasks = out.get("repro_tasks")
     if isinstance(tasks, list):
-        for index, task in enumerate(tasks):
-            if isinstance(task, dict):
-                _normalize_task(task, index, coercions, fact_keys, name_to_types, alias_to_key)
+        normalized_tasks: list[dict[str, Any]] = []
+        for index, raw_task in enumerate(tasks):
+            if isinstance(raw_task, dict):
+                task = raw_task
+            elif isinstance(raw_task, str) and raw_task.strip():
+                task = {"target": raw_task.strip(), "figure_or_claim": raw_task.strip()}
+                coercions.append(
+                    f"tasks[{index}] converted a text-only task into a minimal scientific task"
+                )
+            else:
+                coercions.append(
+                    f"tasks[{index}] ignored an entry with no recoverable scientific goal"
+                )
+                continue
+            _normalize_task(task, index, coercions, fact_keys, name_to_types, alias_to_key)
+            normalized_tasks.append(task)
+        out["repro_tasks"] = normalized_tasks
     else:
         out["repro_tasks"] = []
         if tasks is not None:
@@ -316,6 +362,7 @@ def normalize_repro_tasks_candidate(data: Any, facts: Any) -> tuple[dict[str, An
 
 
 def _normalize_task(task: dict[str, Any], index: int, coercions: list[str], fact_keys: set[tuple[str, str]], name_to_types: dict[str, set[str]], alias_to_key: dict[str, tuple[str, str]]) -> None:
+    _ensure_minimum_task_fields(task, index, coercions)
     extra = [key for key in task if key not in _TASK_KEYS]
     for key in extra:
         task.pop(key, None)
@@ -335,6 +382,8 @@ def _normalize_task(task: dict[str, Any], index: int, coercions: list[str], fact
     comparison = task.get("comparison")
     if isinstance(comparison, dict):
         _normalize_comparison(comparison, index, coercions)
+
+    _normalize_scientific_acceptance(task, index, coercions)
 
     for key in ("expected_artifacts", "output_columns"):
         value = task.get(key)
@@ -360,6 +409,83 @@ def _normalize_task(task: dict[str, Any], index: int, coercions: list[str], fact
             task.get(key), key, index, coercions, fact_keys, name_to_types, alias_to_key
         )
 
+
+def _ensure_minimum_task_fields(
+    task: dict[str, Any],
+    index: int,
+    coercions: list[str],
+) -> None:
+    """Preserve a runnable scientific hand-off without requiring legacy prose fields."""
+
+    task_id = _acceptance_text(task.get("task_id"))
+    if not task_id:
+        task_id = f"task_{index + 1}"
+        coercions.append(f"tasks[{index}].task_id -> {task_id!r}")
+    task["task_id"] = task_id
+
+    goal = _recover_task_scientific_goal(task, task_id)
+    if not _acceptance_text(task.get("target")):
+        task["target"] = goal
+        coercions.append(f"tasks[{index}].target recovered from scientific task semantics")
+    else:
+        task["target"] = _acceptance_text(task.get("target"))
+
+    if not _acceptance_text(task.get("figure_or_claim")):
+        task["figure_or_claim"] = task["target"]
+        coercions.append(f"tasks[{index}].figure_or_claim -> target")
+    else:
+        task["figure_or_claim"] = _acceptance_text(task.get("figure_or_claim"))
+
+    if not _acceptance_text(task.get("metric_formula")):
+        task["metric_formula"] = (
+            "Use the paper-defined or task-appropriate metric computation and "
+            "disclose any necessary assumption."
+        )
+        coercions.append(f"tasks[{index}].metric_formula -> non-blocking default")
+
+    if not isinstance(task.get("expected_trend"), dict):
+        task["expected_trend"] = {
+            "x_axis": "",
+            "y_axis": "",
+            "direction": "unknown",
+            "reason": "Judge the task by its scientific acceptance conclusions.",
+        }
+        coercions.append(f"tasks[{index}].expected_trend -> advisory unknown trend")
+
+    if not isinstance(task.get("comparison"), dict):
+        task["comparison"] = {
+            "baselines": [],
+            "curve_groups": [],
+            "tolerance": "host scientific materiality policy",
+        }
+        coercions.append(f"tasks[{index}].comparison -> advisory host policy")
+
+    if not _acceptance_text(task.get("risk_if_unreproducible")):
+        task["risk_if_unreproducible"] = (
+            "This task's primary paper conclusion would remain unsupported."
+        )
+        coercions.append(f"tasks[{index}].risk_if_unreproducible -> scientific default")
+
+
+def _recover_task_scientific_goal(task: dict[str, Any], task_id: str) -> str:
+    for key in ("target", "figure_or_claim", "claim", "title", "description"):
+        value = _acceptance_text(task.get(key))
+        if value:
+            return value
+    acceptance = task.get("scientific_acceptance")
+    if isinstance(acceptance, dict):
+        conclusions = acceptance.get("core_conclusions")
+        for item in conclusions if isinstance(conclusions, list) else []:
+            if isinstance(item, dict):
+                statement = _acceptance_text(item.get("statement"))
+                if statement:
+                    return statement
+    trend = task.get("expected_trend")
+    if isinstance(trend, dict):
+        reason = _acceptance_text(trend.get("reason"))
+        if reason:
+            return reason
+    return f"Reproduce the primary scientific result assigned to {task_id}."
 
 def _normalize_trend(trend: dict[str, Any], index: int, coercions: list[str]) -> None:
     extra = [key for key in trend if key not in _TREND_KEYS]
@@ -393,6 +519,354 @@ def _normalize_comparison(comparison: dict[str, Any], index: int, coercions: lis
     if not (isinstance(tolerance, str) and tolerance.strip()):
         comparison["tolerance"] = "unspecified"
         coercions.append(f"tasks[{index}].comparison.tolerance -> 'unspecified'")
+
+
+def _normalize_scientific_acceptance(
+    task: dict[str, Any], index: int, coercions: list[str]
+) -> None:
+    """Keep a permissive, deterministic scientific contract on every task.
+
+    This is shared semantics for later agents, not a format gate. A missing or
+    cosmetic near miss is repaired into the smallest honest task-level contract.
+    """
+    raw = task.get("scientific_acceptance")
+    acceptance = copy.deepcopy(raw) if isinstance(raw, dict) else {}
+    if not isinstance(raw, dict):
+        coercions.append(
+            f"tasks[{index}].scientific_acceptance generated from task semantics"
+        )
+
+    extra = [key for key in acceptance if key not in _SCIENTIFIC_ACCEPTANCE_KEYS]
+    for key in extra:
+        acceptance.pop(key, None)
+    if extra:
+        coercions.append(
+            f"tasks[{index}].scientific_acceptance dropped unknown keys {sorted(extra)}"
+        )
+
+    if acceptance.get("contract_version") != "1.0":
+        acceptance["contract_version"] = "1.0"
+        coercions.append(
+            f"tasks[{index}].scientific_acceptance.contract_version -> '1.0'"
+        )
+
+    used_claim_ids: set[str] = set()
+    claim_aliases: dict[str, str] = {}
+    conclusions: list[dict[str, str]] = []
+    raw_conclusions = acceptance.get("core_conclusions")
+    for position, item in enumerate(
+        raw_conclusions if isinstance(raw_conclusions, list) else []
+    ):
+        if not isinstance(item, dict):
+            statement = _acceptance_text(item)
+            if not statement:
+                continue
+            item = {"statement": statement}
+            coercions.append(
+                f"tasks[{index}].scientific_acceptance.core_conclusions[{position}] recovered from text"
+            )
+        statement = _acceptance_text(item.get("statement"))
+        if not statement or _is_presentation_only(statement):
+            if statement:
+                coercions.append(
+                    f"tasks[{index}].scientific_acceptance.core_conclusions[{position}] "
+                    "dropped presentation-only criterion"
+                )
+            continue
+        raw_id = _acceptance_text(item.get("claim_id"))
+        claim_id = _stable_contract_id(
+            raw_id,
+            task_id=_acceptance_text(task.get("task_id")),
+            kind="claim",
+            position=position,
+            used=used_claim_ids,
+        )
+        if raw_id:
+            claim_aliases.setdefault(raw_id, claim_id)
+            claim_aliases.setdefault(_contract_id_token(raw_id), claim_id)
+        raw_kind = _acceptance_text(item.get("kind")).casefold()
+        conclusions.append(
+            {
+                "claim_id": claim_id,
+                "statement": statement,
+                "kind": raw_kind if raw_kind in _CONCLUSION_KINDS else "other",
+                "regime": (
+                    _acceptance_text(item.get("regime")) or "paper-defined regime"
+                ),
+                "paper_anchor": (
+                    _acceptance_text(item.get("paper_anchor"))
+                    or _acceptance_text(task.get("figure_or_claim"))
+                    or "paper result targeted by this task"
+                ),
+            }
+        )
+
+    generated_conclusion = False
+    if not conclusions:
+        generated_conclusion = True
+        default = _default_core_conclusion(task)
+        default["claim_id"] = _stable_contract_id(
+            "",
+            task_id=_acceptance_text(task.get("task_id")),
+            kind="claim",
+            position=0,
+            used=used_claim_ids,
+        )
+        conclusions.append(default)
+        coercions.append(
+            f"tasks[{index}].scientific_acceptance added a minimal core conclusion"
+        )
+
+    used_target_ids: set[str] = set()
+    numeric_targets: list[dict[str, Any]] = []
+    raw_targets = acceptance.get("key_numeric_targets")
+    for position, item in enumerate(
+        raw_targets if isinstance(raw_targets, list) else []
+    ):
+        if not isinstance(item, dict):
+            target_text = _acceptance_text(item)
+            if not target_text:
+                continue
+            item = {"name": target_text, "paper_magnitude": target_text}
+            coercions.append(
+                f"tasks[{index}].scientific_acceptance.key_numeric_targets[{position}] recovered from text"
+            )
+        name = (
+            _acceptance_text(item.get("name"))
+            or f"key numeric target {position + 1}"
+        )
+        if _is_presentation_only(name):
+            coercions.append(
+                f"tasks[{index}].scientific_acceptance.key_numeric_targets[{position}] "
+                "dropped presentation-only target"
+            )
+            continue
+        magnitude, magnitude_unit = _numeric_magnitude_and_unit(
+            item.get("paper_magnitude"), item.get("unit")
+        )
+        evidence_quality = _acceptance_text(
+            item.get("evidence_quality")
+        ).casefold()
+        if evidence_quality not in _NUMERIC_EVIDENCE_QUALITIES or magnitude is None:
+            evidence_quality = "unavailable"
+        numeric_targets.append(
+            {
+                "target_id": _stable_contract_id(
+                    _acceptance_text(item.get("target_id")),
+                    task_id=_acceptance_text(task.get("task_id")),
+                    kind="target",
+                    position=position,
+                    used=used_target_ids,
+                ),
+                "name": name,
+                "paper_magnitude": magnitude,
+                "unit": magnitude_unit,
+                "regime": (
+                    _acceptance_text(item.get("regime")) or "paper-defined regime"
+                ),
+                "evidence_quality": evidence_quality,
+            }
+        )
+
+    used_gap_ids: set[str] = set()
+    gaps: list[dict[str, Any]] = []
+    raw_gaps = acceptance.get("information_gaps")
+    for position, item in enumerate(raw_gaps if isinstance(raw_gaps, list) else []):
+        if not isinstance(item, dict):
+            gap_text = _acceptance_text(item)
+            if not gap_text:
+                continue
+            item = {"description": gap_text}
+            coercions.append(
+                f"tasks[{index}].scientific_acceptance.information_gaps[{position}] recovered from text"
+            )
+        raw_refs = (
+            item.get("affects_claim_ids")
+            if isinstance(item.get("affects_claim_ids"), list)
+            else []
+        )
+        affects: list[str] = []
+        for raw_ref in raw_refs:
+            ref = _acceptance_text(raw_ref)
+            if not ref:
+                continue
+            normalized = (
+                claim_aliases.get(ref)
+                or claim_aliases.get(_contract_id_token(ref))
+                or _contract_id_token(ref)
+            )
+            if normalized and normalized not in affects:
+                affects.append(normalized)
+        raw_disposition = _acceptance_text(item.get("disposition")).casefold()
+        gaps.append(
+            {
+                "gap_id": _stable_contract_id(
+                    _acceptance_text(item.get("gap_id")),
+                    task_id=_acceptance_text(task.get("task_id")),
+                    kind="gap",
+                    position=position,
+                    used=used_gap_ids,
+                ),
+                "description": (
+                    _acceptance_text(item.get("description"))
+                    or "A paper-specific acceptance detail remains unavailable."
+                ),
+                "affects_claim_ids": affects,
+                "disposition": (
+                    raw_disposition
+                    if raw_disposition in _GAP_DISPOSITIONS
+                    else "assume_and_disclose"
+                ),
+            }
+        )
+
+    if generated_conclusion:
+        gaps.append(
+            {
+                "gap_id": _stable_contract_id(
+                    "",
+                    task_id=_acceptance_text(task.get("task_id")),
+                    kind="gap_acceptance_evidence",
+                    position=len(gaps),
+                    used=used_gap_ids,
+                ),
+                "description": (
+                    "The task designer did not provide a paper-specific scientific "
+                    "acceptance contract; the minimal conclusion was derived from the "
+                    "task target or expected trend."
+                ),
+                "affects_claim_ids": [conclusions[0]["claim_id"]],
+                "disposition": "assume_and_disclose",
+            }
+        )
+
+    task["scientific_acceptance"] = {
+        "contract_version": "1.0",
+        "core_conclusions": conclusions,
+        "key_numeric_targets": numeric_targets,
+        "information_gaps": gaps,
+    }
+
+
+def _default_core_conclusion(task: dict[str, Any]) -> dict[str, str]:
+    trend = task.get("expected_trend")
+    trend = trend if isinstance(trend, dict) else {}
+    direction = _acceptance_text(trend.get("direction")).casefold()
+    if direction in {"decreasing", "increasing", "flat"}:
+        x_axis = _acceptance_text(trend.get("x_axis")) or "the swept variable"
+        y_axis = (
+            _acceptance_text(trend.get("y_axis"))
+            or _acceptance_text(task.get("metric"))
+            or "the metric"
+        )
+        statement = f"{y_axis} is {direction} as {x_axis} changes"
+        reason = _acceptance_text(trend.get("reason"))
+        if reason:
+            statement += f"; {reason}"
+        kind = "trend"
+    else:
+        statement = (
+            _acceptance_text(task.get("target"))
+            or _acceptance_text(task.get("figure_or_claim"))
+            or "Reproduce the task's primary scientific result."
+        )
+        kind = "other"
+    return {
+        "claim_id": "",
+        "statement": statement,
+        "kind": kind,
+        "regime": "paper-defined regime",
+        "paper_anchor": (
+            _acceptance_text(task.get("figure_or_claim"))
+            or "paper result targeted by this task"
+        ),
+    }
+
+
+def _stable_contract_id(
+    value: str,
+    *,
+    task_id: str,
+    kind: str,
+    position: int,
+    used: set[str],
+) -> str:
+    base = _contract_id_token(value)
+    if not base:
+        task_token = _contract_id_token(task_id) or "task"
+        base = f"{task_token}_{kind}_{position + 1}"
+    candidate = base
+    suffix = 2
+    while candidate in used:
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+    used.add(candidate)
+    return candidate
+
+
+def _contract_id_token(value: Any) -> str:
+    token = re.sub(
+        r"[^a-zA-Z0-9_.:-]+", "_", _acceptance_text(value)
+    ).strip("_.:-")
+    return token.casefold()
+
+
+def _is_presentation_only(value: str) -> bool:
+    return bool(_STYLE_ONLY_RE.search(value)) and not bool(
+        _SCIENTIFIC_IMAGE_RE.search(value)
+    )
+
+
+def _numeric_magnitude_and_unit(value: Any, unit: Any) -> tuple[float | None, str]:
+    declared_unit = (
+        unit.strip()
+        if isinstance(unit, str)
+        else str(unit).strip() if unit is not None else ""
+    )
+    if not isinstance(value, str):
+        return _finite_float_or_none(value), declared_unit or "unspecified"
+
+    text = value.strip()
+    if not text:
+        return None, declared_unit or "unspecified"
+    power_match = re.search(
+        r"(?:([-+]?(?:\d+(?:\.\d*)?|\.\d+))\s*[x\u00d7]\s*)?10\s*(?:\^|\*\*)\s*([-+]?\d+)",
+        text,
+        re.IGNORECASE,
+    )
+    if power_match:
+        coefficient = float(power_match.group(1) or "1")
+        magnitude = coefficient * 10 ** int(power_match.group(2))
+        span = power_match.span()
+    else:
+        number_match = re.search(
+            r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?",
+            text,
+        )
+        if number_match is None:
+            return None, declared_unit or f"paper text: {text}"
+        magnitude = _finite_float_or_none(number_match.group())
+        span = number_match.span()
+    residual = (text[: span[0]] + " " + text[span[1] :]).strip(" \t=:;,()[]")
+    if declared_unit and residual and residual.casefold() not in declared_unit.casefold():
+        preserved_unit = f"{declared_unit}; source unit: {residual}"
+    else:
+        preserved_unit = declared_unit or residual or "unspecified"
+    return _finite_float_or_none(magnitude), preserved_unit
+
+
+def _finite_float_or_none(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _acceptance_text(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ""
 
 
 def _normalize_required_facts(items: Any, index: int, coercions: list[str], fact_keys: set[tuple[str, str]], name_to_types: dict[str, set[str]], alias_to_key: dict[str, tuple[str, str]]) -> list[dict[str, str]]:
@@ -621,25 +1095,79 @@ def _task_rejection_reason(task: Any) -> str | None:
     return None
 
 
-def select_valid_repro_tasks(data: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _fallback_scientific_goal(facts: Any) -> str:
+    if isinstance(facts, dict):
+        fact_items = facts.get("engineering_facts")
+        for item in fact_items if isinstance(fact_items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            name = _acceptance_text(item.get("name"))
+            if name:
+                return f"Reproduce the paper's primary scientific result associated with {name}."
+    return "Reproduce the paper's primary scientific conclusion."
+
+
+def _minimum_task_seed(source: Any, index: int, facts: Any) -> dict[str, Any]:
+    source = source if isinstance(source, dict) else {}
+    task_id = _acceptance_text(source.get("task_id")) or f"task_{index + 1}"
+    goal = _recover_task_scientific_goal(source, task_id)
+    if goal == f"Reproduce the primary scientific result assigned to {task_id}.":
+        goal = _fallback_scientific_goal(facts)
+    seed: dict[str, Any] = {
+        "task_id": task_id,
+        "target": goal,
+        "figure_or_claim": _acceptance_text(source.get("figure_or_claim")) or goal,
+    }
+    if isinstance(source.get("scientific_acceptance"), dict):
+        seed["scientific_acceptance"] = copy.deepcopy(source["scientific_acceptance"])
+    return seed
+
+
+def finalize_repro_tasks(data: Any, facts: Any) -> dict[str, Any]:
+    """Normalize every recoverable task and guarantee a minimal scientific hand-off."""
+
+    normalized, coercions = normalize_repro_tasks_candidate(data, facts)
+    fact_keys, name_to_types, alias_to_key = _build_fact_index(facts)
+    raw_tasks = normalized.get("repro_tasks")
+    tasks = raw_tasks if isinstance(raw_tasks, list) else []
+    empty_recovery = False
+    if not tasks:
+        empty_recovery = True
+        seed = _minimum_task_seed({}, 0, facts)
+        _normalize_task(seed, 0, coercions, fact_keys, name_to_types, alias_to_key)
+        tasks = [seed]
+        coercions.append("repro_tasks added one minimal task because no scientific task was recoverable")
+
     kept: list[dict[str, Any]] = []
-    dropped: list[dict[str, Any]] = []
-    tasks = data.get("repro_tasks")
-    if not isinstance(tasks, list):
-        return kept, dropped
+    repaired: list[dict[str, Any]] = []
     for index, task in enumerate(tasks):
         reason = _task_rejection_reason(task)
         if reason is None:
             kept.append(task)
-        else:
-            dropped.append({"index": index, "task_id": task.get("task_id") if isinstance(task, dict) else None, "reason": reason})
-    return kept, dropped
+            continue
+        seed = _minimum_task_seed(task, index, facts)
+        _normalize_task(seed, index, coercions, fact_keys, name_to_types, alias_to_key)
+        second_reason = _task_rejection_reason(seed)
+        if second_reason is None:
+            kept.append(seed)
+            repaired.append(
+                {
+                    "index": index,
+                    "task_id": seed.get("task_id"),
+                    "reason": reason,
+                }
+            )
+            continue
+        coercions.append(
+            f"tasks[{index}] could not retain malformed metadata ({second_reason}); "
+            "a generic scientific hand-off will replace it"
+        )
 
-
-def finalize_repro_tasks(data: Any, facts: Any) -> dict[str, Any]:
-    """Normalize, drop irreparable tasks, and assemble a strict-schema-clean document."""
-    normalized, coercions = normalize_repro_tasks_candidate(data, facts)
-    kept, dropped = select_valid_repro_tasks(normalized)
+    if not kept:
+        empty_recovery = True
+        seed = _minimum_task_seed({}, 0, facts)
+        _normalize_task(seed, 0, coercions, fact_keys, name_to_types, alias_to_key)
+        kept = [seed]
 
     doc: dict[str, Any] = {"repro_tasks": kept}
     meta = dict(normalized["_meta"]) if isinstance(normalized.get("_meta"), dict) else {}
@@ -647,15 +1175,15 @@ def finalize_repro_tasks(data: Any, facts: Any) -> dict[str, Any]:
         meta["normalization_used"] = True
         meta["coercion_count"] = len(coercions)
         meta["coercions"] = coercions[:50]
-    if dropped:
-        meta["partial_acceptance_used"] = True
-        meta["dropped_task_count"] = len(dropped)
-        meta["kept_task_count"] = len(kept)
-        meta["dropped_tasks"] = dropped[:50]
+    if repaired:
+        meta["minimum_handoff_repair_used"] = True
+        meta["repaired_task_count"] = len(repaired)
+        meta["repaired_tasks"] = repaired[:50]
+    if empty_recovery:
+        meta["empty_task_recovery_used"] = True
     if meta:
         doc["_meta"] = meta
     return doc
-
 
 def recover_truncated_repro_tasks(raw: str) -> dict[str, Any] | None:
     """Best-effort recovery of a truncated tasks payload by salvaging complete objects

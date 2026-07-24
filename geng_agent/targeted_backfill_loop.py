@@ -144,7 +144,24 @@ def run_targeted_backfill_loop(
 
         previous_ledger = copy.deepcopy(ledger)
         before_requests = copy.deepcopy(known_requests)
-        backfill_result = run_backfill(round_index, actionable, facts, tasks, ledger)
+        try:
+            backfill_result = run_backfill(
+                round_index, actionable, facts, tasks, ledger
+            )
+        except Exception as exc:
+            stop_reason = "backfill_error"
+            round_summary = {
+                "round": round_index,
+                "phase": "backfill",
+                "request_count": len(actionable),
+                "error": f"{type(exc).__name__}: {exc}",
+                "degraded_to_writer": True,
+                "handoff": final_handoff,
+            }
+            round_summaries.append(round_summary)
+            if on_round is not None:
+                on_round(round_index, round_summary)
+            break
         cumulative_backfill, _ = merge_engineering_facts(
             cumulative_backfill, backfill_result
         )
@@ -162,9 +179,26 @@ def run_targeted_backfill_loop(
         cumulative_resolution = cumulative_resolution_from_ledger(
             known_requests, facts, ledger
         )
-        candidate_tasks = refresh_tasks(
-            round_index, tasks, facts, cumulative_resolution, ledger
-        )
+        try:
+            candidate_tasks = refresh_tasks(
+                round_index, tasks, facts, cumulative_resolution, ledger
+            )
+        except Exception as exc:
+            stop_reason = "task_refresh_error"
+            round_summary = {
+                "round": round_index,
+                "phase": "task_refresh",
+                "request_count": len(actionable),
+                "error": f"{type(exc).__name__}: {exc}",
+                "degraded_to_writer": True,
+                "new_facts_retained": True,
+                "cumulative_resolution": cumulative_resolution,
+                "handoff": final_handoff,
+            }
+            round_summaries.append(round_summary)
+            if on_round is not None:
+                on_round(round_index, round_summary)
+            break
         candidate_tasks = normalize_tasks(candidate_tasks, facts)
         candidate_handoff = _task_backfill_handoff(candidate_tasks)
         candidate_requests = collect_missing_fact_requests(candidate_tasks)

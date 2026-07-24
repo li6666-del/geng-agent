@@ -9,6 +9,23 @@ from geng_agent.status import inspect_case_status
 
 
 class StatusTests(unittest.TestCase):
+    def test_optional_v2_stages_are_advisory_not_resume_blockers(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            case = Path(temp_dir) / "case"
+            case.mkdir()
+            write_json(case / "workflow.json", {"workflow_version": "2"})
+
+            status = inspect_case_status(case)
+            by_name = {item["stage"]: item for item in status["stages"]}
+
+            self.assertEqual(status["next_stage"], "paper")
+            for name in (
+                "paper_thesis", "scientific_architecture", "foundation_manifest",
+                "review_docx", "reproduction_report_docx", "result_review_docx",
+            ):
+                self.assertFalse(by_name[name]["required"])
+                self.assertTrue(by_name[name]["advisory"])
+
     def test_status_reports_resume_from_generate_project(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

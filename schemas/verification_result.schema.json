@@ -1,23 +1,181 @@
 {
   "$defs": {
+    "CoreConclusionAssessment": {
+      "additionalProperties": false,
+      "properties": {
+        "claim_id": {
+          "default": "",
+          "title": "Claim Id",
+          "type": "string"
+        },
+        "status": {
+          "default": "unassessable_missing_information",
+          "enum": [
+            "supported",
+            "unsupported",
+            "unassessable_missing_information"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "local_observation": {
+          "default": "",
+          "title": "Local Observation",
+          "type": "string"
+        },
+        "evidence_files": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Evidence Files",
+          "type": "array"
+        }
+      },
+      "title": "CoreConclusionAssessment",
+      "type": "object"
+    },
+    "KeyNumericComparison": {
+      "additionalProperties": false,
+      "properties": {
+        "target_id": {
+          "default": "",
+          "title": "Target Id",
+          "type": "string"
+        },
+        "name": {
+          "default": "",
+          "title": "Name",
+          "type": "string"
+        },
+        "paper_magnitude": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Paper Magnitude"
+        },
+        "local_magnitude": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Local Magnitude"
+        },
+        "symmetric_ratio": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Symmetric Ratio"
+        },
+        "unavailable_reason": {
+          "default": "",
+          "title": "Unavailable Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "paper_magnitude",
+        "local_magnitude"
+      ],
+      "title": "KeyNumericComparison",
+      "type": "object"
+    },
     "TaskVerificationResult": {
       "additionalProperties": false,
       "properties": {
         "task_id": {
-          "minLength": 1,
+          "default": "",
           "title": "Task Id",
           "type": "string"
         },
-        "verdict": {
+        "outcome": {
+          "default": "inconclusive_missing_information",
           "enum": [
-            "accepted",
-            "revise"
+            "reproduced",
+            "reproduced_with_assumptions",
+            "inconclusive_missing_information",
+            "not_reproduced",
+            "execution_failed"
           ],
-          "title": "Verdict",
+          "title": "Outcome",
           "type": "string"
         },
+        "host_action": {
+          "default": "complete",
+          "enum": [
+            "complete",
+            "rerun_writer"
+          ],
+          "title": "Host Action",
+          "type": "string"
+        },
+        "rerun_reason": {
+          "default": "none",
+          "enum": [
+            "none",
+            "core_conclusion_failed",
+            "key_numeric_ratio_ge_10",
+            "invalid_run"
+          ],
+          "title": "Rerun Reason",
+          "type": "string"
+        },
+        "run_valid": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Run Valid"
+        },
+        "core_conclusions": {
+          "items": {
+            "$ref": "#/$defs/CoreConclusionAssessment"
+          },
+          "title": "Core Conclusions",
+          "type": "array"
+        },
+        "key_numeric_comparisons": {
+          "items": {
+            "$ref": "#/$defs/KeyNumericComparison"
+          },
+          "title": "Key Numeric Comparisons",
+          "type": "array"
+        },
+        "max_key_numeric_ratio": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Max Key Numeric Ratio"
+        },
         "comparison_summary": {
-          "minLength": 1,
+          "default": "",
           "title": "Comparison Summary",
           "type": "string"
         },
@@ -28,12 +186,17 @@
           "title": "Differences",
           "type": "array"
         },
-        "evidence_files": {
+        "non_material_differences": {
           "items": {
-            "minLength": 1,
             "type": "string"
           },
-          "minItems": 1,
+          "title": "Non Material Differences",
+          "type": "array"
+        },
+        "evidence_files": {
+          "items": {
+            "type": "string"
+          },
           "title": "Evidence Files",
           "type": "array"
         },
@@ -45,6 +208,7 @@
           "type": "array"
         },
         "confidence": {
+          "default": "medium",
           "enum": [
             "high",
             "medium",
@@ -52,17 +216,15 @@
           ],
           "title": "Confidence",
           "type": "string"
+        },
+        "remaining_uncertainties": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Remaining Uncertainties",
+          "type": "array"
         }
       },
-      "required": [
-        "task_id",
-        "verdict",
-        "comparison_summary",
-        "differences",
-        "evidence_files",
-        "feedback",
-        "confidence"
-      ],
       "title": "TaskVerificationResult",
       "type": "object"
     }
@@ -70,28 +232,36 @@
   "additionalProperties": false,
   "properties": {
     "schema_version": {
-      "const": "1.0",
+      "const": "2.0",
+      "default": "2.0",
       "title": "Schema Version",
       "type": "string"
     },
-    "all_accepted": {
-      "title": "All Accepted",
+    "all_terminal": {
+      "default": false,
+      "title": "All Terminal",
       "type": "boolean"
+    },
+    "all_successful": {
+      "default": false,
+      "title": "All Successful",
+      "type": "boolean"
+    },
+    "outcome_counts": {
+      "additionalProperties": {
+        "type": "integer"
+      },
+      "title": "Outcome Counts",
+      "type": "object"
     },
     "tasks": {
       "items": {
         "$ref": "#/$defs/TaskVerificationResult"
       },
-      "minItems": 1,
       "title": "Tasks",
       "type": "array"
     }
   },
-  "required": [
-    "schema_version",
-    "all_accepted",
-    "tasks"
-  ],
   "title": "VerificationResultDocument",
   "type": "object"
 }

@@ -153,7 +153,34 @@ def build_fallback_repro_tasks(*, facts: dict[str, Any], paper: dict[str, Any], 
                 "comparison": {
                     "baselines": ["local deterministic fallback baseline"],
                     "curve_groups": ["fallback_simulated"],
-                    "tolerance": "complete figure-detail comparison; inspect the original paper figure and use explicit assumptions when numeric targets cannot be recovered",
+                    "tolerance": "conclusion-level scientific comparison; disclose assumptions when numeric targets are unavailable and treat presentation details as non-blocking",
+                },
+                "scientific_acceptance": {
+                    "contract_version": "1.0",
+                    "core_conclusions": [
+                        {
+                            "claim_id": "fallback_primary_trend",
+                            "statement": (
+                                f"{trend['y_axis']} is {trend['direction']} as "
+                                f"{trend['x_axis']} changes"
+                            ),
+                            "kind": "trend",
+                            "regime": "paper-defined regime",
+                            "paper_anchor": "primary result curve detected by local fallback",
+                        }
+                    ],
+                    "key_numeric_targets": [],
+                    "information_gaps": [
+                        {
+                            "gap_id": "fallback_paper_specific_acceptance",
+                            "description": (
+                                "The local fallback could identify a primary metric trend "
+                                "but not a paper-specific acceptance magnitude."
+                            ),
+                            "affects_claim_ids": ["fallback_primary_trend"],
+                            "disposition": "assume_and_disclose",
+                        }
+                    ],
                 },
                 "required_facts": fact_refs,
                 "assumptions": [

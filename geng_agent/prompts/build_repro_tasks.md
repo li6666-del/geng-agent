@@ -24,10 +24,20 @@
 6. impact 仅作为兼容性描述，不是程序继续回补的门禁；是否继续由后续任务专家根据能否负责任地交给 Writer 判断。
 
 任务规格原则：
-1. 每个任务必须分别给出 formula_chain、parameter_matrix、baseline_definitions、statistical_protocol 和 validation_anchors。
-2. 每个规格项标记 `evidenced|assumed|not_applicable|unresolved`，并通过 evidence_facts 引用事实。
+1. 只填写会改变实现、运行或核心结论验收的 formula_chain、parameter_matrix、baseline_definitions、statistical_protocol 和 validation_anchors；不适用的部分可省略或留空，不得用通用占位文本凑结构。
+2. 实际填写的规格项标记 `evidenced|assumed|unresolved` 并尽量引用 evidence_facts；引用暂时无法精确解析时保留内容并标记 unresolved。
 3. 无法从当前证据确定的规格可以保留 unresolved 或空数组，不要为了填满格式而发明内容。
 4. 图中可读的近似数值、方法排序、交点、端点、阈值和坐标范围写入 validation_anchors，明确其为视觉估读时不得伪装成精确数据。
+
+科学验收契约原则：
+1. `scientific_acceptance` 是 Task Designer、Architecture、Writer 和 Reporter 共享的最小科学语义，`contract_version` 固定为 `1.0`。
+2. core_conclusions 只写论文核心科学结论，使用在本任务内稳定且唯一的 claim_id；kind 取 `ordering|trend|crossing|threshold|scaling|gain_loss|mechanism|absolute_level|other`。
+3. 像素、颜色、字体、线宽、marker、排版和绘图风格不得成为 core_conclusion。论文若明确要求比统一默认规则更紧的数值精度，必须把该精度本身写成 core_conclusion。
+4. key_numeric_targets 只列会实质影响论文结论的关键量级；paper_magnitude 无法可靠取得时写 null 且 evidence_quality=`unavailable`，不要猜数。
+5. information_gaps 用稳定 gap_id，按实际影响选择 `assume_and_disclose|single_sensitivity_if_core|terminal_inconclusive`，并尽量关联 affects_claim_ids。
+6. 当前证据不足时允许列表为空、字段暂缺或转成 information_gap；不得为了结构完整性发明论文结论，后续本地 normalizer 会补最小可交接语义。
+7. 数值量级阈值和非阻塞视觉差异由宿主统一策略控制，不得在任务内自定义另一套阈值。
+8. expected_trend、comparison.tolerance 和 validation_anchors 继续保留为说明材料，但不覆盖 scientific_acceptance 的判定权威。
 
 软交接规则：
 1. 初步任务设计完成后，立即判断当前信息是否已经足以让能够阅读全文、作出显式假设并运行迭代的 Writer 开始工作。
@@ -117,6 +127,36 @@
       "parameter_matrix": [],
       "baseline_definitions": [],
       "statistical_protocol": [],
+      "scientific_acceptance": {
+        "contract_version": "1.0",
+        "core_conclusions": [
+          {
+            "claim_id": "fig_4_primary_trend",
+            "statement": "the paper's core scientific ordering, trend, mechanism, or threshold",
+            "kind": "ordering|trend|crossing|threshold|scaling|gain_loss|mechanism|absolute_level|other",
+            "regime": "the parameter regime in which the claim applies",
+            "paper_anchor": "Fig. 4 / Section / Equation"
+          }
+        ],
+        "key_numeric_targets": [
+          {
+            "target_id": "fig_4_key_magnitude",
+            "name": "a conclusion-relevant magnitude, not a styling coordinate",
+            "paper_magnitude": null,
+            "unit": "",
+            "regime": "",
+            "evidence_quality": "paper_explicit|paper_derived|visual_estimate|unavailable"
+          }
+        ],
+        "information_gaps": [
+          {
+            "gap_id": "fig_4_acceptance_gap",
+            "description": "",
+            "affects_claim_ids": ["fig_4_primary_trend"],
+            "disposition": "assume_and_disclose|single_sensitivity_if_core|terminal_inconclusive"
+          }
+        ]
+      },
       "validation_anchors": []
     }
   ]

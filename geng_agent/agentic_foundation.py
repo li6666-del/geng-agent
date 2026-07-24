@@ -27,11 +27,18 @@ from .foundation_snapshot import (
     validate_foundation_relpath,
     validate_foundation_snapshot,
 )
-from .io_runtime import inject_io_runtime
+from .io_runtime import BACKEND_RUNTIME_PY, IO_RUNTIME_PY, inject_io_runtime
 from .json_utils import pretty_json
 from .outputs import _missing_local_imports, write_json, write_text
 from .scientific_architecture import foundation_module_paths
-from .security import ALLOWED_REQUIREMENTS, split_requirement_issues, static_scan_repro_project, validate_requirements
+from .security import (
+    ALLOWED_REQUIREMENTS,
+    FOUNDATION_STATIC_SECURITY_ADVISORY_CATEGORIES,
+    split_requirement_issues,
+    split_static_security_issues,
+    static_scan_repro_project,
+    validate_requirements,
+)
 from .task_writer_support import (
     PAPER_EVIDENCE_DIR,
     _analysis_snapshot_hash,
@@ -147,9 +154,16 @@ def run_codex_foundation_writer_workflow(
     if not status.get("ok"):
         raise RuntimeError(f"foundation writer failed: {status.get('error') or status.get('blocked_reason') or 'unknown error'}")
 
-    trusted_after = _trusted_hashes(sandbox)
-    trusted_changed = sorted(path for path, digest in trusted_before.items() if trusted_after.get(path) != digest)
-    inject_io_runtime(sandbox)
+    try:
+        # This must be the first inspection after the agent returns. Nothing
+        # below may read or replace an agent-controlled path until the complete
+        # sandbox has been walked without following links or reparse points.
+        _assert_foundation_sandbox_layout_safe(sandbox)
+        trusted_after = _trusted_hashes(sandbox)
+        trusted_changed = sorted(path for path, digest in trusted_before.items() if trusted_after.get(path) != digest)
+        _restore_trusted_runtime_atomically(sandbox)
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeError(f"foundation writer produced an unsafe filesystem layout: {exc}") from exc
     issues, test_result = _validate_foundation_delivery(
         sandbox=sandbox,
         architecture=scientific_architecture,
@@ -2270,6 +2284,35 @@ def _foundation_brief(architecture: dict[str, Any]) -> str:
         }
         for component in _architecture_components(architecture)
     ]
+    acceptance_output_contracts: list[dict[str, Any]] = []
+    raw_bindings = architecture.get("bindings")
+    for binding in raw_bindings if isinstance(raw_bindings, list) else []:
+        if not isinstance(binding, dict):
+            continue
+        binding_outputs = {
+            str(output_id)
+            for output_id in binding.get("outputs", [])
+        } if isinstance(binding.get("outputs"), list) else set()
+        raw_acceptance = binding.get("acceptance_bindings")
+        for acceptance in raw_acceptance if isinstance(raw_acceptance, list) else []:
+            if not isinstance(acceptance, dict):
+                continue
+            criterion_id = str(acceptance.get("criterion_id") or "")
+            output_ids = [
+                str(output_id)
+                for output_id in acceptance.get("output_quantity_ids", [])
+                if str(output_id) in binding_outputs
+            ] if isinstance(acceptance.get("output_quantity_ids"), list) else []
+            if not criterion_id or not output_ids:
+                continue
+            acceptance_output_contracts.append(
+                {
+                    "task_id": str(binding.get("task_id") or ""),
+                    "criterion_id": criterion_id,
+                    "criterion_kind": str(acceptance.get("criterion_kind") or ""),
+                    "output_quantity_ids": output_ids,
+                }
+            )
     execution_contract_required = _architecture_requires_execution_contracts(architecture)
     result_template: dict[str, Any] = {
         "status": "ready_for_tasks",
@@ -2372,10 +2415,20 @@ stack.
 {pretty_json(component_contracts)}
 ```
 
+## Measurable acceptance output interfaces
+The optional mappings below are routing hints from task criterion IDs to shared
+quantities. Implement the listed quantity interfaces so Task Writers can measure
+them. Do not decide whether a paper conclusion is supported, compute an acceptance
+verdict, or restate the task's scientific contract. Unknown or absent mappings do
+not create Foundation work.
+```json
+{pretty_json(acceptance_output_contracts)}
+```
 ## Ownership and safety
 - You may create/edit `src/**/*.py` except `src/_io.py` and `src/_backend.py`.
 - You may create `tests/**/*.py`, `configs/foundation*.json|yaml`, `requirements.txt`, and `README.foundation.md`.
 - Do not create or edit `tasks/`, `outputs/`, reports, task configs, or harness/runtime files.
+- Foundation tests verify interfaces, shapes, units, execution capabilities, and reusable scientific mechanics only. Never add tests for paper-claim success, paper-value closeness, plot styling, crop geometry, or pixel similarity; those are downstream observations, not Foundation invariants.
 - Do not duplicate paper-explicit channel, normalization, metric, baseline, or shape logic inside separate modules. Implement one shared definition and expose a clear callable interface.
 - Keep unresolved paper details explicit in arguments/defaults and comments. Never hard-code target curves or fabricate paper values.
 - Declare only allowlisted Python dependencies in `requirements.txt`.
@@ -2402,9 +2455,9 @@ stack.
   downgrade the framework/capability and do not claim `ready_for_tasks`.
 
 ## Verification
-1. Read the complete scientific architecture and trace each component and invariant to its basis.
+1. Read the complete scientific architecture; implement each component and exposed binding output. Treat acceptance mappings only as output-routing hints.
 2. Implement the required modules, using package `__init__.py` files where needed.
-3. Add focused `unittest` tests under `tests/` for dimensions, units/normalization, deterministic seeds, component composition, and at least one important cross-task invariant.
+3. Add focused `unittest` tests under `tests/` for dimensions, units/normalization, deterministic seeds, component composition, and applicable cross-task interface invariants. Do not test the paper-result verdict.
 4. Run `python -m unittest discover -s tests -v` and fix every failure.
 5. Write `foundation_result.json` only after tests pass:
 ```json
@@ -2428,6 +2481,19 @@ def _validate_foundation_delivery(
     warnings: list[dict[str, str]] = []
     if trusted_changed:
         issues.extend({"file": path, "message": "Foundation Writer modified a host-trusted runtime file"} for path in trusted_changed)
+    try:
+        # Perform the no-follow layout gate before reading foundation_result.json
+        # or invoking any validator that reads generated source/config files.
+        _foundation_project_files(sandbox)
+    except (OSError, RuntimeError, ValueError) as exc:
+        issues.append({"file": ".", "message": str(exc)})
+        return issues, {
+            "passed": False,
+            "skipped": True,
+            "reason": "unsafe Foundation filesystem layout",
+            "warnings": warnings,
+        }
+
     result_path = sandbox / "foundation_result.json"
     result: dict[str, Any] = {}
     try:
@@ -2457,9 +2523,25 @@ def _validate_foundation_delivery(
         architecture=architecture,
         result=result,
     )
-    issues.extend(execution_issues)
+    # Execution-contract findings are static proof gaps, not observed runtime
+    # failures. Preserve them in the audit, but let the concrete syntax/import
+    # checks and host unittests below decide whether the Foundation is usable.
+    for item in execution_issues:
+        message = str(item.get("message") or "")
+        warning = {str(k): str(v) for k, v in item.items()}
+        warning["severity"] = "warning"
+        warning["category"] = (
+            "execution_capability_advisory"
+            if (
+                "environment_extension_required" in message
+                or "host capability gap" in message
+                or "trusted host" in message
+                or "external runtime" in message
+            )
+            else "static_contract_advisory"
+        )
+        warnings.append(warning)
     warnings.extend(execution_warnings)
-
     required_modules = _required_foundation_modules(architecture)
     for relative in sorted(required_modules):
         if not (sandbox / Path(relative)).is_file():
@@ -2503,10 +2585,12 @@ def _validate_foundation_delivery(
             item = {str(k): str(v) for k, v in raw.items()}
             item["severity"] = "warning"
             warnings.append(item)
-    issues.extend(
-        {str(k): str(v) for k, v in item.items()}
-        for item in static_scan_repro_project(sandbox)
+    blocking_security, security_warnings = split_static_security_issues(
+        static_scan_repro_project(sandbox),
+        advisory_categories=FOUNDATION_STATIC_SECURITY_ADVISORY_CATEGORIES,
     )
+    issues.extend(blocking_security)
+    warnings.extend(security_warnings)
     if issues:
         return issues, {
             "passed": False,
@@ -2538,8 +2622,7 @@ def _copy_foundation_snapshot(*, sandbox: Path, snapshot_dir: Path) -> list[dict
 
 
 def _foundation_project_files(sandbox: Path) -> list[Path]:
-    if path_is_foundation_link(sandbox):
-        raise RuntimeError("Foundation sandbox root is a link or reparse point")
+    _assert_foundation_sandbox_layout_safe(sandbox)
     candidates: set[Path] = set()
     for root_name in ("src", "tests", "configs"):
         root = sandbox / root_name
@@ -2573,6 +2656,76 @@ def _foundation_project_files(sandbox: Path) -> list[Path]:
         candidates,
         key=lambda path: path.relative_to(sandbox).as_posix(),
     )
+
+
+def _assert_foundation_sandbox_layout_safe(sandbox: Path) -> None:
+    """Reject links, special files, and agent-owned hardlinks without traversal."""
+
+    if path_is_foundation_link(sandbox):
+        raise RuntimeError("Foundation sandbox root is a link or reparse point")
+    if not sandbox.is_dir():
+        raise RuntimeError("Foundation sandbox root is not a directory")
+    files, _, links, special = scan_foundation_tree(sandbox)
+    if links:
+        relative = links[0].relative_to(sandbox).as_posix()
+        raise RuntimeError(f"Foundation output contains a link or reparse point: {relative}")
+    if special:
+        relative = special[0].relative_to(sandbox).as_posix()
+        raise RuntimeError(f"Foundation output contains a non-regular entry: {relative}")
+    for path in files:
+        relative_path = path.relative_to(sandbox)
+        if relative_path.parts and relative_path.parts[0] == PAPER_EVIDENCE_DIR:
+            continue
+        if path.lstat().st_nlink > 1:
+            relative = relative_path.as_posix()
+            raise RuntimeError(f"Foundation output contains a hard-linked regular file: {relative}")
+
+
+def _restore_trusted_runtime_atomically(sandbox: Path) -> None:
+    """Restore host-owned runtime files without ever opening their targets."""
+
+    if path_is_foundation_link(sandbox):
+        raise RuntimeError("Foundation sandbox root is a link or reparse point")
+    src_dir = sandbox / "src"
+    if path_is_foundation_link(src_dir):
+        raise RuntimeError("Foundation-owned directory is a link or reparse point: src")
+    if not src_dir.is_dir():
+        raise RuntimeError("Foundation-owned path is not a directory: src")
+
+    for name, content in (
+        ("_io.py", IO_RUNTIME_PY),
+        ("_backend.py", BACKEND_RUNTIME_PY),
+    ):
+        target = src_dir / name
+        if path_is_foundation_link(target):
+            raise RuntimeError(f"Foundation output contains a link or reparse point: src/{name}")
+        if target.exists() and not target.is_file():
+            raise RuntimeError(f"Foundation output contains a non-regular entry: src/{name}")
+        if target.exists() and target.lstat().st_nlink > 1:
+            raise RuntimeError(f"Foundation output contains a hard-linked regular file: src/{name}")
+        if path_is_foundation_link(src_dir) or not src_dir.is_dir():
+            raise RuntimeError("Foundation-owned directory changed into an unsafe path: src")
+
+        descriptor, temp_name = tempfile.mkstemp(prefix=f".{name}.trusted-", dir=src_dir)
+        temp_path = Path(temp_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if path_is_foundation_link(src_dir):
+                raise RuntimeError("Foundation-owned directory changed into a link or reparse point: src")
+            if path_is_foundation_link(target):
+                raise RuntimeError(f"Foundation output changed into a link or reparse point: src/{name}")
+            os.replace(temp_path, target)
+        except Exception:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            raise
+        finally:
+            temp_path.unlink(missing_ok=True)
 
 
 def _is_frozen_path(relative: str) -> bool:

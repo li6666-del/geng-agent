@@ -205,7 +205,7 @@ class CodexAnalysisStageTests(unittest.TestCase):
             )
             self.assertEqual((temp / "attempts.txt").read_text(encoding="utf-8"), "1")
 
-    def test_scientific_validation_failure_does_not_trigger_format_repair(self) -> None:
+    def test_scientific_validation_failure_is_retried_until_attempts_are_exhausted(self) -> None:
         with TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
             cmd = _write_analysis_script(
@@ -252,8 +252,19 @@ class CodexAnalysisStageTests(unittest.TestCase):
                 else:
                     os.environ["GENG_CODEX_ANALYSIS_CMD"] = old_cmd
 
-            self.assertEqual((temp / "attempts.txt").read_text(encoding="utf-8"), "1")
-            self.assertTrue((audit_dir / "scientific_validation_01_science_gate_attempt_1.json").is_file())
+            self.assertEqual((temp / "attempts.txt").read_text(encoding="utf-8"), "2")
+            first = json.loads(
+                (audit_dir / "scientific_validation_01_science_gate_attempt_1.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            second = json.loads(
+                (audit_dir / "scientific_validation_01_science_gate_attempt_2.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertTrue(first["repair_will_retry"])
+            self.assertFalse(second["repair_will_retry"])
 
     def test_codex_analysis_stage_retries_bad_json(self) -> None:
         with TemporaryDirectory() as temp_dir:

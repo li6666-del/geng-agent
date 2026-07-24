@@ -25,7 +25,13 @@ def derive_reproducibility_verdict(
 
     reasons: list[str] = []
     risk_level = _risk_level(risk_report)
-
+    scientific_verdict = _verdict_from_terminal_task_outcomes(
+        risk_report=risk_report,
+        result_review=result_review,
+        risk_level=risk_level,
+    )
+    if scientific_verdict is not None:
+        return scientific_verdict
     if runtime_result.get("passed") is False and not _has_partial_output(runtime_result):
         reasons.append("guarded runtime execution did not pass and produced no usable output")
         return _result(
@@ -116,7 +122,7 @@ def derive_reproducibility_verdict(
         )
 
     if alignment in {"match", "matched", "high", "exact"} and credibility == "high":
-        if risk_level == "low":
+        if risk_level in {"", "low"}:
             verdict = "fully_reproduced"
             confidence = "high"
         elif risk_level == "medium":
@@ -149,6 +155,99 @@ def derive_reproducibility_verdict(
     )
 
 
+def _verdict_from_terminal_task_outcomes(
+    *,
+    risk_report: dict[str, Any],
+    result_review: dict[str, Any],
+    risk_level: str,
+) -> dict[str, Any] | None:
+    """Make host-derived task outcomes authoritative when they are complete.
+
+    This prevents a generic medium-credibility summary from turning a purely
+    inconclusive or negative reproduction into a positive "partial" label.
+    """
+
+    verification: dict[str, Any] | None = None
+    for container in (risk_report, result_review):
+        candidate = container.get("verification_result")
+        if isinstance(candidate, dict):
+            verification = candidate
+            break
+    if not isinstance(verification, dict) or verification.get("all_terminal") is not True:
+        return None
+    raw_tasks = verification.get("tasks")
+    if not isinstance(raw_tasks, list) or not raw_tasks:
+        return None
+    if any(
+        not isinstance(item, dict) or item.get("host_action") != "complete"
+        for item in raw_tasks
+    ):
+        return None
+
+    known_outcomes = {
+        "reproduced",
+        "reproduced_with_assumptions",
+        "inconclusive_missing_information",
+        "not_reproduced",
+        "execution_failed",
+    }
+    outcomes = [str(item.get("outcome") or "") for item in raw_tasks]
+    if any(outcome not in known_outcomes for outcome in outcomes):
+        return None
+    counts = {outcome: outcomes.count(outcome) for outcome in sorted(known_outcomes)}
+    reasons = [
+        "host-derived terminal task outcomes: "
+        + ", ".join(
+            f"{outcome}={count}" for outcome, count in counts.items() if count
+        )
+    ]
+    total = len(outcomes)
+    success_count = counts["reproduced"] + counts["reproduced_with_assumptions"]
+
+    if success_count == total:
+        if counts["reproduced_with_assumptions"]:
+            reasons.append("all core conclusions were supported with a material core assumption")
+            return _result(
+                "mostly_reproduced",
+                "medium",
+                reasons,
+                "Report the supported conclusions together with the material core assumption.",
+            )
+        return _result(
+            "fully_reproduced",
+            "high",
+            reasons,
+            "Report the reproduced core conclusions and retain the task-level evidence.",
+        )
+
+    if success_count:
+        reasons.append("at least one task reproduced its core conclusion and at least one did not")
+        return _result(
+            "partially_reproduced",
+            "medium",
+            reasons,
+            "Report reproduction task by task; do not generalize successful tasks to unresolved or negative ones.",
+        )
+
+    inconclusive_count = counts["inconclusive_missing_information"]
+    if inconclusive_count:
+        reasons.append("no task produced positive reproduction evidence and decisive information remains missing")
+        return _result(
+            "inconclusive",
+            "low",
+            reasons,
+            "Report the missing information and negative task outcomes without claiming reproduction.",
+        )
+
+    reasons.append("no task reproduced its assigned core conclusion")
+    return _result(
+        "failed_to_reproduce",
+        "high" if counts["not_reproduced"] == total else "medium",
+        reasons,
+        "Report the negative result and execution failures; do not apply a positive reproduction label.",
+    )
+
+
 def _result(verdict: str, confidence: str, reasons: list[str], recommended_action: str) -> dict[str, Any]:
     if verdict not in VERDICTS:
         raise ValueError(f"unknown reproducibility verdict: {verdict}")
@@ -169,24 +268,17 @@ def _has_partial_output(runtime_result: dict[str, Any]) -> bool:
 
 
 def _risk_level(risk_report: dict[str, Any]) -> str:
-    level = _normalized_label(risk_report.get("risk_level"))
-    if level:
+    # Engineering, dependency, packaging, and security risk remain reportable
+    # but do not change the scientific reproduction label.
+    level = _normalized_label(risk_report.get("scientific_risk_level"))
+    if level in {"low", "medium", "high"}:
         return level
     dimensions = risk_report.get("risk_dimensions")
     if not isinstance(dimensions, dict):
         return ""
-    levels = {
-        _normalized_label(dimension.get("level"))
-        for dimension in dimensions.values()
-        if isinstance(dimension, dict)
-    }
-    if "high" in levels:
-        return "high"
-    if "medium" in levels:
-        return "medium"
-    if "low" in levels:
-        return "low"
-    return ""
+    alignment = dimensions.get("result_alignment")
+    level = _normalized_label(alignment.get("level")) if isinstance(alignment, dict) else ""
+    return level if level in {"low", "medium", "high"} else ""
 
 
 def _normalized_label(value: Any) -> str:

@@ -19,7 +19,10 @@ from .verification_result import (
     FINAL_MATCHED_STATUS,
     WRITER_REVIEW_STATUS,
     partition_writer_delivery_issues,
+    rerun_evidence_path_issues,
+    task_verification_issues,
     verification_result_issues,
+    writer_revision_allowed,
     writer_delivery_issues,
 )
 from .task_writer_support import (
@@ -44,16 +47,34 @@ from .manifest_utils import expected_generated_paths
 from .outputs import inspect_output_artifacts, validate_repro_project, write_json, write_text
 from .paper_evidence import facts_for_task, paper_context_for_task, safe_label, thesis_ordering_anchor_for_task
 from .security import (
+    FOUNDATION_STATIC_SECURITY_ADVISORY_CATEGORIES,
     dependency_policy_prompt_text,
     redact_text,
+    split_static_security_issues,
     static_scan_repro_project,
     validate_requirements,
 )
+from .scientific_materiality import CORE_RESULT_STOP_POLICY, TERMINAL_SCIENTIFIC_OUTCOMES
 from .stage_cleanup import _clear_stage_outputs
 from .task_scripts import build_tasks_manifest, write_task_scaffolding
 
 
 TASK_WRITER_TERMINAL_STATUS = WRITER_REVIEW_STATUS
+DEFAULT_MAX_EVIDENCE_RERUNS = 8
+
+
+def _external_writer_rerun_budget() -> int:
+    """Return a generous emergency cap, optionally overridden by configuration."""
+
+    raw = get_config_value("GENG_TASK_WRITER_MAX_EVIDENCE_RERUNS")
+    if not raw:
+        return DEFAULT_MAX_EVIDENCE_RERUNS
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_EVIDENCE_RERUNS
+    return value if value >= 0 else DEFAULT_MAX_EVIDENCE_RERUNS
+
 
 WRITER_PAPER_FIDELITY_POLICY = """## Highest law: fidelity to the paper's established facts
 Fidelity outranks visual closeness, convenience, prior code, and reporter advice in both an initial implementation and every repair session.
@@ -159,13 +180,18 @@ def run_codex_task_writer_workflow(
         _record_is_valid_current_delivery(record) for record in cached_records
     )
     cached_all_verified = cached_all_current and all(
-        _record_has_accepted_task_verification(record) for record in cached_records
+        _record_has_terminal_task_verification(record) for record in cached_records
+    )
+    cached_foundation_current = (
+        foundation is None
+        or not foundation_violations(repro_project_dir, foundation)
     )
     if (
         resume
         and not force_task_ids
         and cached is not None
         and cached_all_current
+        and cached_foundation_current
         and (not run_repro or (cached_runtime_passed and cached_all_deliveries))
         and (task_review_callback is None or cached_all_verified)
     ):
@@ -196,7 +222,7 @@ def run_codex_task_writer_workflow(
         "backend": CODEX_PROJECT_BACKEND,
         "mode": "task_writers",
         "stop_rule": (
-            "accepted_by_isolated_task_reporter_or_external_blocker"
+            "terminal_scientific_outcome_or_external_blocker"
             if task_review_callback is not None
             else "ready_for_review_or_external_blocker"
         ),
@@ -243,7 +269,20 @@ def run_codex_task_writer_workflow(
     validation = validate_repro_project(repro_project_dir)
     validation["host_validation_skipped"] = False
     requirement_warnings = validate_requirements(repro_project_dir)
-    security_issues = static_scan_repro_project(repro_project_dir)
+    foundation_integrity_issues = (
+        foundation_violations(repro_project_dir, foundation)
+        if foundation is not None
+        else []
+    )
+    if foundation is not None:
+        validation["foundation_integrity_checked"] = True
+        validation["foundation_integrity_ok"] = not foundation_integrity_issues
+        validation["foundation_violations"] = foundation_integrity_issues
+    security_issues = _classify_task_writer_security_issues(
+        static_scan_repro_project(repro_project_dir),
+        foundation=foundation,
+        foundation_integrity_issues=foundation_integrity_issues,
+    )
     syntax_issues = [
         issue for issue in security_issues if "syntax error" in str(issue.get("message") or "").lower()
     ]
@@ -296,8 +335,8 @@ def run_codex_task_writer_workflow(
                     "writer_completed": record.get("writer_completed"),
                     "writer_error_kind": record.get("writer_error_kind"),
                     "blocked_reason": record.get("blocked_reason"),
-                    "task_reporter_verdict": (
-                        record.get("task_verification", {}).get("verdict")
+                    "task_reporter_outcome": (
+                        record.get("task_verification", {}).get("outcome")
                         if isinstance(record.get("task_verification"), dict)
                         else None
                     ),
@@ -356,35 +395,40 @@ def _load_task_writer_resume_records(
 
 
 def _record_is_valid_current_delivery(record: dict[str, Any]) -> bool:
-    sandbox = Path(str(record.get("sandbox") or ""))
+    raw_sandbox = str(record.get("sandbox") or "").strip()
+    if not raw_sandbox:
+        return False
+    sandbox = Path(raw_sandbox)
     if not sandbox.is_dir():
         return False
     status = str(record.get("task_writer_status") or "")
     if status not in {WRITER_REVIEW_STATUS, FINAL_MATCHED_STATUS}:
         return False
     if status == FINAL_MATCHED_STATUS:
-        verdict = record.get("verification_result")
-        if record.get("verification_verified") is not True or not isinstance(verdict, dict):
+        verification = record.get("verification_result")
+        if record.get("verification_verified") is not True or not isinstance(verification, dict):
             return False
-        if verdict.get("verdict") != "accepted":
+        if verification.get("outcome") not in {"reproduced", "reproduced_with_assumptions"}:
             return False
-    blockers, _ = partition_writer_delivery_issues(record.get("result_json"))
-    if blockers:
+    if record.get("writer_completed") is not True:
         return False
-    task_id = str(record.get('task_id') or '')
-    if task_id and _task_execution_binding_issues(
-        sandbox=sandbox,
-        task_id=task_id,
-        result_doc=record.get('result_json'),
-    ):
-        return False
-    return True
+    result = record.get("result_json")
+    artifacts = record.get("artifacts")
+    return bool(isinstance(result, dict) and result) or bool(
+        isinstance(artifacts, dict)
+        and artifacts.get("has_artifacts")
+    )
+def _record_has_terminal_task_verification(record: dict[str, Any]) -> bool:
+    """Return whether the Reporter reached any normal scientific terminal outcome."""
 
-
-def _record_has_accepted_task_verification(record: dict[str, Any]) -> bool:
     verification = record.get("task_verification")
-    return isinstance(verification, dict) and verification.get("verdict") == "accepted"
-
+    task_id = str(record.get("task_id") or "")
+    return (
+        isinstance(verification, dict)
+        and verification.get("host_action") == "complete"
+        and verification.get("outcome") in TERMINAL_SCIENTIFIC_OUTCOMES
+        and not task_verification_issues(verification, task_id)
+    )
 
 def _dispatch_task_writers(
     *,
@@ -416,7 +460,7 @@ def _dispatch_task_writers(
         for index, record in existing.items()
         if _task_writer_runtime_task_passed(record)
         and str(record.get("task_id") or "") not in forced
-        and (task_review_callback is None or _record_has_accepted_task_verification(record))
+        and (task_review_callback is None or _record_has_terminal_task_verification(record))
     }
     pending_indexes = [index for index in range(1, len(task_pairs) + 1) if index not in by_index]
     audit: dict[str, Any] = {
@@ -476,10 +520,22 @@ def _dispatch_task_writers(
                     by_index[index] = future.result()
                 except Exception as exc:
                     task, manifest_entry = task_pairs[index - 1]
+                    failed_task_id = str(
+                        task.get("task_id")
+                        or manifest_entry.get("task_id")
+                        or f"task_{index}"
+                    )
                     by_index[index] = _failed_task_record(
                         index=index,
-                        task_id=str(task.get("task_id") or manifest_entry.get("task_id") or f"task_{index}"),
+                        task_id=failed_task_id,
                         module=str(manifest_entry.get("module") or ""),
+                        output_subdir=str(
+                            manifest_entry.get("output_subdir") or failed_task_id
+                        ),
+                        sandbox=(
+                            task_root
+                            / f"{index:02d}_{safe_label(failed_task_id)}"
+                        ),
                         error=f"{type(exc).__name__}: {exc}",
                     )
                 audit["attempts"].append(
@@ -495,6 +551,77 @@ def _dispatch_task_writers(
     audit["completed_task_count"] = len(records)
     write_json(audit_path, audit)
     return records, audit
+def _rerun_evidence_fingerprint(evidence: Any) -> str:
+    """Return an order-stable scientific rerun identity for loop detection."""
+
+    value = evidence if isinstance(evidence, dict) else {}
+
+    def _normalized_list(key: str) -> list[str]:
+        raw = value.get(key)
+        if not isinstance(raw, list):
+            return []
+        return sorted({str(item).strip().casefold() for item in raw if str(item).strip()})
+
+    payload = {
+        "rerun_reason": str(value.get("rerun_reason") or "none").strip().casefold(),
+        "contract_item_ids": _normalized_list("contract_item_ids"),
+        "change_targets": _normalized_list("change_targets"),
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+
+def _writer_source_config_fingerprint(sandbox: Path) -> str:
+    """Hash task-owned source and run configuration, excluding outputs."""
+
+    digest = hashlib.sha256()
+    paths = list(_task_owned_files(sandbox))
+    for name in ("config.json", "config_smoke.json", "requirements.txt"):
+        path = sandbox / name
+        if path.is_file() and not path.is_symlink():
+            paths.append(path)
+    for path in sorted(set(paths), key=lambda item: item.relative_to(sandbox).as_posix()):
+        relative = path.relative_to(sandbox).as_posix()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        try:
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            digest.update(b"<unreadable>")
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _record_source_config_fingerprint(record: dict[str, Any], fallback: Path) -> str:
+    raw_sandbox = str(record.get("sandbox") or "").strip()
+    sandbox = Path(raw_sandbox) if raw_sandbox else fallback
+    return _writer_source_config_fingerprint(sandbox)
+
+
+def _terminalize_rerun_request(
+    *,
+    record: dict[str, Any],
+    verification: dict[str, Any] | None,
+    stop_reason: str,
+    uncertainty: str,
+) -> dict[str, Any]:
+    terminal = dict(verification or {})
+    terminal["host_action"] = "complete"
+    terminal["rerun_reason"] = "none"
+    terminal["outcome"] = (
+        "execution_failed" if terminal.get("run_valid") is False else "not_reproduced"
+    )
+    uncertainties = terminal.get("remaining_uncertainties")
+    if not isinstance(uncertainties, list):
+        uncertainties = []
+        terminal["remaining_uncertainties"] = uncertainties
+    uncertainties.append(uncertainty)
+    record["task_verification"] = terminal
+    if isinstance(record.get("task_reporter"), dict):
+        record["task_reporter"]["task_verification"] = terminal
+    record["scientific_stop_reason"] = stop_reason
+    return terminal
 
 
 def _run_one_task_writer(
@@ -556,8 +683,24 @@ def _run_one_task_writer(
         execution_binding=execution_binding,
     )
     session_round = 1
+    seen_rerun_requests: set[str] = set()
+    evidence_based_reruns = 0
+    rerun_budget = _external_writer_rerun_budget()
+    required_change_baseline: str | None = None
     if reuse_existing:
         archive_round = _next_writer_progress_round(sandbox)
+        if task_review_callback is None:
+            existing_record = _collect_task_writer_delivery(
+                index=index,
+                task=task,
+                manifest_entry=manifest_entry,
+                sandbox=sandbox,
+                writer_status={'ok': True, 'source': 'resumed_existing_delivery'},
+            )
+            existing_record['analysis_snapshot_hash'] = analysis_snapshot_hash
+            existing_record['writer_session_count'] = max(1, archive_round)
+            if existing_record.get('task_writer_status') == TASK_WRITER_TERMINAL_STATUS:
+                return existing_record
         if task_review_callback is not None:
             existing_record = _collect_task_writer_delivery(
                 index=index,
@@ -576,9 +719,21 @@ def _run_one_task_writer(
                     record=existing_record,
                     session_round=archive_round,
                 )
-                if review_action in {"accepted", "failed"}:
+                if review_action in {"terminal", "failed"}:
                     return existing_record
-                review_feedback = returned_feedback
+                if review_action == "writer_revision":
+                    evidence = (
+                        returned_feedback.get("rerun_evidence")
+                        if isinstance(returned_feedback, dict)
+                        else None
+                    )
+                    seen_rerun_requests.add(_rerun_evidence_fingerprint(evidence))
+                    evidence_based_reruns = 1
+                    review_feedback = returned_feedback
+                    required_change_baseline = _record_source_config_fingerprint(
+                        existing_record,
+                        sandbox,
+                    )
         _archive_nonterminal_writer_delivery(
             sandbox=sandbox,
             output_subdir=output_subdir,
@@ -626,57 +781,26 @@ def _run_one_task_writer(
             manifest_entry=manifest_entry,
             sandbox=sandbox,
             writer_status=writer_status,
+            require_stopping_assessment=False,
         )
-        if (
-            run_repro
-            and record.get('writer_error_kind') == 'shared_component_bypassed'
-            and writer_status.get('ok')
-        ):
-            record['analysis_snapshot_hash'] = analysis_snapshot_hash
-            record['writer_session_count'] = session_round
-            binding_blockers = [
-                str(item)
-                for item in record.get('delivery_blockers', [])
-                if str(item).startswith('shared_component_bypassed:')
-            ]
-            review_feedback = {
-                'error_kind': 'shared_component_bypassed',
-                'verdict': 'revise',
-                'revision_target': 'writer',
-                'differences': binding_blockers,
-                'feedback': [
-                    'Use every shared_implementation component directly in the real scientific path.',
-                    'Import each declared component module, or a shared Foundation composition entrypoint whose src import graph reaches it; task-private heads may compose with, but must not replace, those shared components.',
-                    'Update component_usage with exact module, callable, usage, and evidence_files entries.',
-                ],
-            }
-            _archive_nonterminal_writer_delivery(
-                sandbox=sandbox,
-                output_subdir=output_subdir,
-                round_no=session_round,
-                session_status={
-                    **writer_status,
-                    'ok': False,
-                    'error_kind': 'shared_component_bypassed',
-                    'issues': binding_blockers,
-                },
-            )
-            session_round += 1
-            continue
         record["analysis_snapshot_hash"] = analysis_snapshot_hash
         record["writer_session_count"] = session_round
-        if not run_repro or not record.get("writer_completed"):
-            return record
-        if record.get("task_writer_status") != TASK_WRITER_TERMINAL_STATUS:
-            _archive_nonterminal_writer_delivery(
-                sandbox=sandbox,
-                output_subdir=output_subdir,
-                round_no=session_round,
-                session_status=writer_status,
-            )
-            session_round += 1
-            continue
-        if task_review_callback is None:
+        if required_change_baseline is not None:
+            current_state = _record_source_config_fingerprint(record, sandbox)
+            if current_state == required_change_baseline:
+                _terminalize_rerun_request(
+                    record=record,
+                    verification=review_feedback,
+                    stop_reason="writer_continuation_without_source_change",
+                    uncertainty=(
+                        "The Reporter-authorized continuation changed neither task source "
+                        "nor run configuration; the flow stopped instead of spending "
+                        "another unchanged scientific run."
+                    ),
+                )
+                return record
+            required_change_baseline = None
+        if not run_repro or task_review_callback is None:
             return record
         review_action, returned_feedback = _attach_task_reporter_review(
             callback=task_review_callback,
@@ -685,10 +809,46 @@ def _run_one_task_writer(
             record=record,
             session_round=session_round,
         )
-        if review_action in {"accepted", "failed"}:
+        if review_action in {"terminal", "failed"}:
             return record
         if review_action == "writer_revision":
+            evidence = (
+                returned_feedback.get("rerun_evidence")
+                if isinstance(returned_feedback, dict)
+                else None
+            )
+            rerun_fingerprint = _rerun_evidence_fingerprint(evidence)
+            if rerun_fingerprint in seen_rerun_requests:
+                _terminalize_rerun_request(
+                    record=record,
+                    verification=returned_feedback,
+                    stop_reason="repeated_rerun_request_without_new_causal_plan",
+                    uncertainty=(
+                        "The same causal rerun request recurred after one Writer attempt; "
+                        "the flow stopped instead of repeating unchanged work."
+                    ),
+                )
+                return record
+            if (
+                evidence_based_reruns >= rerun_budget
+            ):
+                _terminalize_rerun_request(
+                    record=record,
+                    verification=returned_feedback,
+                    stop_reason="external_rerun_budget_exhausted",
+                    uncertainty=(
+                        "The externally configured operational rerun budget was exhausted; "
+                        "the latest scientific result was retained for reporting."
+                    ),
+                )
+                return record
+            seen_rerun_requests.add(rerun_fingerprint)
+            evidence_based_reruns += 1
             review_feedback = returned_feedback
+            required_change_baseline = _record_source_config_fingerprint(
+                record,
+                sandbox,
+            )
             _archive_nonterminal_writer_delivery(
                 sandbox=sandbox,
                 output_subdir=output_subdir,
@@ -697,9 +857,6 @@ def _run_one_task_writer(
             )
             session_round += 1
             continue
-        record["task_writer_status"] = "failed"
-        record["writer_error_kind"] = "task_reporter_unresolved"
-        record["blocked_reason"] = "task reporter returned an unresolved non-writer revision"
         return record
 
 
@@ -711,31 +868,93 @@ def _attach_task_reporter_review(
     record: dict[str, Any],
     session_round: int,
 ) -> tuple[str, dict[str, Any] | None]:
-    task_reporter = callback(index, task, record, session_round)
+    expected_task_id = str(task.get("task_id") or record.get("task_id") or "")
+    try:
+        task_reporter = callback(index, task, record, session_round)
+    except Exception as exc:
+        message = redact_text(f"{type(exc).__name__}: {exc}")[:1000]
+        task_reporter = {
+            "ok": False,
+            "task_id": expected_task_id,
+            "task_verification": {},
+            "error": message,
+            "error_kind": "task_reporter_callback_failed",
+        }
+        record["task_reporter"] = task_reporter
+        record["task_reporter_error_kind"] = "task_reporter_callback_failed"
+        warnings = record.setdefault("delivery_warnings", [])
+        if isinstance(warnings, list):
+            warnings.append("task Reporter failed; the host will synthesize a terminal outcome")
+        return "failed", None
+
     record["task_reporter"] = task_reporter
     verification = task_reporter.get("task_verification") if isinstance(task_reporter, dict) else None
     if isinstance(verification, dict):
         record["task_verification"] = verification
     if not isinstance(task_reporter, dict) or not task_reporter.get("ok"):
-        record["task_writer_status"] = "failed"
-        record["writer_error_kind"] = "task_reporter_failed"
-        record["blocked_reason"] = (
+        record["task_reporter_error_kind"] = "task_reporter_failed"
+        record["task_reporter_error"] = (
             task_reporter.get("error")
             if isinstance(task_reporter, dict)
             else "task reporter callback failed"
         )
+        warnings = record.setdefault("delivery_warnings", [])
+        if isinstance(warnings, list):
+            warnings.append("task Reporter was unavailable; preserving the Writer delivery")
         return "failed", None
-    if isinstance(verification, dict) and verification.get("verdict") == "accepted":
-        record["task_reporter_accepted"] = True
-        return "accepted", None
-    if isinstance(verification, dict) and verification.get("revision_target") == "writer":
-        return "writer_revision", verification
-    record["task_writer_status"] = "failed"
-    record["writer_error_kind"] = "task_reporter_unresolved"
-    record["blocked_reason"] = "task reporter returned an unresolved non-writer revision"
-    return "failed", None
-
-
+    if not isinstance(verification, dict):
+        record["task_reporter_error_kind"] = "task_reporter_missing_result"
+        record["task_reporter_error"] = "task reporter produced no usable scientific note"
+        warnings = record.setdefault("delivery_warnings", [])
+        if isinstance(warnings, list):
+            warnings.append("task Reporter produced no note; preserving the Writer delivery")
+        return "failed", None
+    if verification.get("host_action") == "rerun_writer":
+        path_issues = rerun_evidence_path_issues(
+            verification,
+            task_reporter.get("workspace"),
+        )
+        if path_issues:
+            warnings = record.setdefault("delivery_warnings", [])
+            if isinstance(warnings, list):
+                warnings.extend(path_issues)
+            _terminalize_rerun_request(
+                record=record,
+                verification=verification,
+                stop_reason="untrusted_rerun_paper_evidence",
+                uncertainty=(
+                    "Reporter suggested a rerun without trusted existing paper evidence; "
+                    "the host declined it and retained a terminal outcome."
+                ),
+            )
+        elif writer_revision_allowed(verification, expected_task_id):
+            return "writer_revision", verification
+        else:
+            # A malformed rerun request is not a reason to burn another full run.
+            _terminalize_rerun_request(
+                record=record,
+                verification=verification,
+                stop_reason="incomplete_causal_rerun_plan",
+                uncertainty=(
+                    "Reporter suggested a rerun without a complete causal plan; "
+                    "the host recorded a terminal outcome."
+                ),
+            )
+    issues = task_verification_issues(record.get("task_verification"), expected_task_id)
+    if issues:
+        warnings = record.setdefault("delivery_warnings", [])
+        if isinstance(warnings, list):
+            warnings.extend(issues)
+    final_verification = record.get("task_verification")
+    record["task_reporter_successful"] = (
+        isinstance(final_verification, dict)
+        and final_verification.get("outcome") in {
+            "reproduced",
+            "reproduced_with_assumptions",
+        }
+    )
+    record["task_reporter_terminal"] = True
+    return "terminal", None
 def _next_writer_progress_round(sandbox: Path) -> int:
     progress_root = sandbox / "writer_progress"
     rounds: list[int] = []
@@ -794,21 +1013,23 @@ The previous Codex session for `{task_id}` ended without a valid `ready_for_revi
 
 {WRITER_PAPER_FIDELITY_POLICY}
 
+{CORE_RESULT_STOP_POLICY}
+
 Before acting:
 1. Read the existing task code, configs, outputs, and `writer_progress/` archives.
 2. Inspect the latest local CSV/summary/PNG against the complete paper evidence.
-3. Classify every reporter item before editing: (a) a paper-grounded violation of an explicit fact or failure of the core claim; (b) a reasonable choice inside paper-silent or ambiguous space; or (c) a non-material numerical, statistical, visual, or presentation difference.
-4. Create a concrete modification plan only for category (a). For category (b), keep or revise the explicit assumption according to evidence. For category (c), record the caveat without changing faithful code merely to satisfy the reporter.
-5. Run a fresh full with `python -m tasks.{module} config.json` after a meaningful code, model, parameter, or configuration change. Never rerun unchanged code solely to answer non-blocking feedback.
-6. Keep iterating while a paper-grounded material blocker remains and a concrete change is available. Do not emit `explained_gap`, `failed`, or final `matched` as a scientific terminal state.
-7. Write `task_agent_result.json` with status `ready_for_review` once the latest successful full respects explicit paper facts, supports the task's core claim, and leaves only disclosed assumptions or non-material differences.
+3. Classify every reporter item before editing: (a) a paper-grounded violation of an explicit fact, failure of any assigned core conclusion, or a key numerical mismatch by a factor of 10 or more; (b) a reasonable choice inside paper-silent or ambiguous space; or (c) a numerical mismatch below a factor of 10 or another non-material statistical, visual, or presentation difference.
+4. Create a concrete modification plan only for category (a). For category (b), keep or revise the explicit assumption according to evidence only before the mandatory stop condition is met. For category (c), record the caveat without changing faithful code merely to satisfy the reporter. Once the stop condition is met, do not change any assumption, seed, dataset filter, configuration, or epoch count.
+5. Run a fresh full with `python -m tasks.{module} config.json` only after a meaningful change that is permitted by the mandatory stopping policy. Never rerun unchanged code solely to answer non-blocking feedback.
+6. Keep iterating only while a permitted paper-grounded material blocker remains and a new concrete causal change is available. If the result is still unsupported or unassessable but no such change exists, stop scientific modification and submit it for an honest terminal report.
+7. Write `task_agent_result.json` with status `ready_for_review` after the latest full attempt. This means ready for independent classification, not a claim that reproduction succeeded.
 
 ## Isolated task reporter feedback
 ```json
 {feedback_text}
 ```
 
-Investigate every reported difference, but do not obey it blindly. Fix and rerun only for a material, paper-grounded blocker. If a suggestion conflicts with explicit paper evidence, preserve the faithful implementation and document that conflict. If it concerns an acceptable paper-silent assumption or a non-material difference, retain it as a caveat and resubmit without manufacturing scientific activity.
+Investigate the causal rerun note, but do not obey it blindly. Make the specified change only if it remains consistent with the paper. If the same plan already failed, evidence is incomplete, or the issue is non-material, preserve the faithful result and resubmit without another unchanged run.
 
 The original task brief follows.
 
@@ -848,6 +1069,7 @@ def _collect_task_writer_delivery(
     manifest_entry: dict[str, Any],
     sandbox: Path,
     writer_status: dict[str, Any],
+    require_stopping_assessment: bool = False,
 ) -> dict[str, Any]:
     """Collect writer-owned outputs without repairing or format-gating them."""
     task_id = str(task.get("task_id") or manifest_entry.get("task_id") or f"task_{index}")
@@ -857,28 +1079,37 @@ def _collect_task_writer_delivery(
     markdown_path, _ = _task_result_file_path(sandbox, output_subdir, "task_agent_result.md")
     result_doc = _read_optional_json_object(result_path)
     reported_status = str(result_doc.get("status") or "")
-    delivery_issues = writer_delivery_issues(result_doc)
-    delivery_blockers, delivery_warnings = partition_writer_delivery_issues(result_doc)
+    delivery_issues = writer_delivery_issues(
+        result_doc,
+        require_stopping_assessment=require_stopping_assessment,
+    )
+    delivery_blockers, delivery_warnings = partition_writer_delivery_issues(
+        result_doc,
+        require_stopping_assessment=require_stopping_assessment,
+    )
+    artifacts = inspect_output_artifacts(
+        sandbox,
+        subdir=output_subdir,
+        declared_artifacts=task.get("expected_artifacts"),
+    )
     binding_issues = _task_execution_binding_issues(
         sandbox=sandbox,
         task_id=task_id,
         result_doc=result_doc,
     )
     if binding_issues:
-        binding_blockers = [f'shared_component_bypassed: {issue}' for issue in binding_issues]
-        delivery_issues.extend(binding_blockers)
-        delivery_blockers.extend(binding_blockers)
-        writer_status = {
-            **writer_status,
-            'ok': False,
-            'error_kind': 'shared_component_bypassed',
-            'blocked_reason': '; '.join(binding_issues),
-            'shared_component_issues': binding_issues,
-        }
-    delivery_usable = not delivery_blockers
+        binding_warnings = [f'shared_component_advisory: {issue}' for issue in binding_issues]
+        delivery_issues.extend(binding_warnings)
+        delivery_warnings.extend(binding_warnings)
+    # Writer JSON is self-reported disclosure. A malformed/incomplete object
+    # stays visible as warnings, while readable scientific artifacts still
+    # advance to the independent Reporter.
+    delivery_usable = bool(result_doc) or bool(artifacts.get("has_artifacts"))
+    if not delivery_usable:
+        blocker = "writer produced neither a readable result note nor a scientific artifact"
+        delivery_blockers.append(blocker)
+        delivery_issues.append(blocker)
     status = TASK_WRITER_TERMINAL_STATUS if delivery_usable else "failed"
-
-    artifacts = inspect_output_artifacts(sandbox, subdir=output_subdir)
     local_images = _collect_writer_images(
         sandbox=sandbox,
         output_subdir=output_subdir,
@@ -1854,8 +2085,6 @@ def _write_minimal_shared_project_files(
         sandbox / "config_smoke.json",
         {"run_profile": "smoke", "task_id": task_id, "seed": 1, "smoke": True, "backend": "auto"},
     )
-    for name in ("channel.py", "modulation.py", "metrics.py", "simulation.py"):
-        write_text(sandbox / "src" / name, '"""Task-private workflow stub; prefer tasks/<module>_lib.py."""\n')
     task_script = sandbox / "tasks" / f"{module}.py"
     if not task_script.exists():
         write_text(
@@ -1955,6 +2184,8 @@ You own exactly one reproduction task. Write the code, run the assigned full exp
 
 {WRITER_PAPER_FIDELITY_POLICY}
 
+{CORE_RESULT_STOP_POLICY}
+
 ## Ownership
 - Assigned task_id: `{task_id}`
 - Assigned module: `tasks.{module}`
@@ -1967,105 +2198,70 @@ You own exactly one reproduction task. Write the code, run the assigned full exp
 - Run Python and dependencies directly. The host does not guard commands, allocate hardware, define scientific thresholds, or interrupt your scientific loop.
 - {hardware_instruction}
 - Calling `_backend.select_backend()` is not GPU acceleration by itself. If CUDA is selected, the expensive computation must actually run on CUDA tensors. If CPU is selected despite available CUDA, record a concrete task-specific reason.
-- There is no cycle limit. Keep iterating toward the paper until the result is honestly ready for independent review; external process failures are handled by the host.
+- There is no arbitrary wall-clock cycle limit, but the mandatory core-result stopping policy is a hard upper boundary on scientific iteration. External process failures are handled by the host.
 
 {execution_binding_section}
 
-## Paper-faithful core-claim objective
-Your target is a faithful implementation that supports the assigned figure's core scientific claim. Pursue close numerical and visual agreement, but never trade away explicit paper facts to obtain it. Reproduce every observable detail that can be grounded or responsibly inferred:
-- scientific content: all curves, baselines, parameter settings, sample regimes, statistics, ordering, crossings, slopes, saturation points, extrema, and annotations;
-- axes: variables, units, transforms, linear/log scale, limits, tick locations, and normalization;
-- presentation: subplot structure, aspect ratio, legend entries/order/location, labels, markers, line styles, colors, error bars, reference lines, and captions visible in the target;
-- numerical agreement: compare key coordinates, relative gaps, thresholds, and curve shapes, using tolerances appropriate to the paper evidence and its visual resolution.
+## Paper-faithful core objective
+Use `task.scientific_acceptance` as a short navigation list, not a format gate. Recover any missing intended claim from the task and paper. Prioritize paper-explicit models, equations, algorithms, baselines, regimes, axes, and statistics, then decide whether the scientific conclusion is supported. Do not spend runs reproducing pixels, typography, colors, crop boundaries, private code identity, or other presentation details.
 
-The core claim normally consists of the claimed method identity, comparison direction, ordering, trend, crossing or threshold region, scaling behavior, gain/loss region, or other conclusion the figure is used to establish. Exact pixels, styling, undisclosed nuisance parameters, and small numerical offsets are secondary unless the paper's claim depends on them. The paper itself is the authority. If the upstream task description conflicts with the paper, follow the paper and record the correction.
+The core conclusion is normally a method identity, comparison direction, ordering, trend, crossing/threshold region, scaling behavior, gain/loss region, mechanism, or an explicitly claimed absolute level. Numerical agreement below a factor of 10 is non-material unless the paper itself makes tighter accuracy a core conclusion.
 
-## Mandatory self-iteration protocol
-You are not a one-shot report writer. You are the coder, runner, and first-pass reviewer for this task. Missing parameters, modeling uncertainty, non-identifiability, or an imperfect result are reasons to investigate rather than stop reflexively; only a paper-grounded material blocker should trigger scientific changes and another full.
+## Self-iteration protocol
+You are the coder, runner, and first reviewer. You should compare and improve your own implementation, but another full run must have a scientific reason and a concrete causal change.
 
 For each cycle:
-1. Before writing code, open `paper_evidence/analysis_artifacts/manifest.json`, verify the finalized facts/tasks/index are present, and inspect the copied original paper plus the complete rendered-page index. Task-scoped facts and text previews are navigation hints only and may be incomplete.
-2. Inspect the assigned task, finalized upstream artifacts, and the full paper. Build your checklist from the actual target figure: identity, panels, curves, baselines, equations, parameters, axes, scales, statistics, annotations, and style.
-3. Resolve missing parameters in this order: finalized facts/tasks/thesis/index; copied original paper under `paper_evidence/source/`; captions and neighboring text; equations, tables, appendices, references, and all available page images. Record the source for every recovered value.
-   Read `repro_tasks.json` `_meta.fact_gap_handoff` as prior-search context. Its unresolved entries are navigation aids, not permission to stop: inspect the full paper yourself, then make an explicit testable assumption only when the evidence remains unavailable. Read optional `analysis_warnings.json` the same way: warnings identify uncertain upstream evidence but never override the paper or excuse an incomplete search.
-4. Only after that search fails, make a bold but scientifically plausible explicit value or implementation assumption. Put it in code/config and `parameter_resolution`; never silently invent it or relabel it as a paper fact. An assumption may complete an unspecified step but must not replace an explicit model, data-generating law, objective, or core algorithm.
-5. Implement or revise the task code and configuration. Do not digitize or hard-code the target curves as the simulated result.
-6. Run smoke only as a quick sanity check, then run full directly with `python -m tasks.{module} config.json` when enabled.
-7. Inspect the local CSV/summary/PNG side by side with the paper figure. First verify fidelity to explicit facts and support for the core claim; then classify remaining differences as material blockers, acceptable paper-silent assumptions, or non-material numerical/presentation differences.
-8. For every material blocker, form a concrete hypothesis about equations, parameters, assumptions, normalization, statistics, backend precision, axis scaling, or baseline implementation. Modify code/config/model and run full again. Do not modify faithful scientific code solely for typography or pixel-level agreement.
-9. Record each cycle in `task_agent_result.md`: evidence searched, recovered parameters or assumptions, backend/device, command, duration, return code, the core-claim comparison, material blockers, non-material caveats, the concrete modification plan, changed files, and the result after modification.
+1. Inspect the finalized artifacts, complete paper, assigned acceptance hints, Foundation/binding, and existing code/results.
+2. Search the complete paper before filling a missing parameter. If still absent, make and disclose a scientifically plausible assumption; do not relabel it as a paper fact.
+3. Implement the paper-faithful task, run smoke when useful, then run full with `python -m tasks.{module} config.json`.
+4. Compare explicit scientific facts, each core conclusion, and Task-Designer key numeric targets. Record material and non-material differences separately.
+5. Rerun only for `invalid_run`, `core_conclusion_failed`, or `key_numeric_ratio_ge_10`, and only after recording paper evidence, the specific code/config change, its target, and predicted effect.
+6. Stop changing the science immediately when the conclusions are supported and available key ratios are below 10. Also stop when a valid faithful result remains unsupported or unassessable but there is no new evidence-based causal change. In that case, hand the result to the Reporter; do not loop forever or tune toward the picture.
+7. Never rerun unchanged code. A repeated ineffective plan, seed fishing, broad hyperparameter sweep, extra epochs without a causal hypothesis, or report-only change is not progress.
 
-Do not stop while a material scientific blocker remains and an evidence-based change is available. Conversely, do not keep changing a paper-faithful implementation after the core claim is supported merely because exact values, undisclosed choices, or presentation details could still be debated. Never rerun unchanged code merely to consume a cycle. Do not emit `explained_gap`, self-declare `failed`, or claim final `matched`; hand off only as `ready_for_review` after a successful full and direct paper comparison.
-
-## Comparison-driven iteration loop
-Do not score, rank, or maintain a hypothesis queue. There is no fixed iteration count. Use the direct loop below until explicit paper facts are respected and the core claim is supported:
-
-1. Run full and compare the local CSV/summary/PNG with the paper figure across explicit model/data/algorithm fidelity, core-claim support, curves/baselines, numerical shape, axes/scales, statistics, annotations, and style.
-2. If a material scientific blocker remains, write a concrete modification plan before editing. State the paper evidence, what appears wrong, which parameter/equation/baseline/config choice will change, which files will change, and what direction the result should move.
-3. Apply that modification plan. Keep each iteration coherent enough that its effect can be understood; do not change unrelated parts merely to create activity.
-4. Run smoke if useful, then run a fresh full. Compare the same figure details again and record whether each targeted difference improved, worsened, or stayed unchanged.
-5. Keep, revert, or revise the change based on the comparison, then write the next modification plan and repeat.
-
-When a value or implementation detail is missing, search the complete paper first. If it is still absent, choose a scientifically plausible value, algorithm, or small range, label it as assumed, run it, and revise it from the comparison result. For a material assumption, prefer a small sensitivity check when practical so the core claim is not supported only at one finely tuned point. Never repeat an unchanged full and never count prose, metadata, locator, or report-only edits as progress.
-
-Your only normal handoff decision is `ready_for_review`: the latest full is successful, explicit paper facts remain intact, the task's core claim is supported, assumptions are disclosed, and no paper-grounded material blocker remains. Before handing off, revisit the complete paper, assumptions, equations, parameter ranges, baseline definitions, numerical methods, and statistics. Do not delay handoff for non-material styling differences or merely because another undocumented implementation is conceivable. External Codex/runtime failure is handled by the host and must not be converted into a scientific conclusion.
-
-Stopping rule:
-- If an explicit paper fact is materially violated, or the core claim is unsupported, and a concrete paper-grounded change is available, continue iterating and rerun full.
-- If the latest full respects explicit facts, supports the core claim, and only disclosed paper-silent assumptions or non-material differences remain, write the review delivery.
-- Never hide or hand-wave a material gap. Record it and use it to drive the next evidence-based modification; disclose non-material gaps as caveats without manufacturing another run.
-- If this Codex session ends before `ready_for_review`, the host will reopen the same sandbox and require you to continue.
-- The reporter may return concrete differences. The host then reopens this same sandbox; accepted tasks are not rerun.
-
+Your normal handoff is always `ready_for_review` after the latest full and honest comparison. It does not assert final success: the independent Reporter may classify it as reproduced, reproduced with assumptions, inconclusive, or not reproduced. Only the Reporter plus host may request another Writer run, and only with a complete causal rerun note.
 ## Required final files
-- `task_agent_result.md`: Chinese audit log of your implementation and scientific iteration. It will not be appended to the final report.
-- `task_agent_result.json`: write this delivery only after a successful full and direct paper comparison; it is a strict JSON object with:
+Always write the handoff after the latest full attempt, including when the run failed or the scientific result remains unsupported. Structure is intentionally small; missing optional prose or images must not trigger another scientific run.
+
+- `task_agent_result.md`: Chinese audit log of evidence, implementation, each meaningful comparison/change, assumptions, and remaining uncertainty.
+- `task_agent_result.json`:
 ```json
 {{
 {component_usage_template}
   "task_id": "{task_id}",
   "status": "ready_for_review",
   "summary": "one Chinese sentence",
-  "differences": [],
-  "possible_causes": [],
+  "differences": ["material scientific differences"],
   "remaining_uncertainties": [],
   "evidence_files": [],
   "local_image_paths": [],
   "parameter_resolution": [
-    {{"name": "parameter", "value": "value", "source": "paper|derived|assumed", "evidence": "file/page/equation or assumption rationale"}}
+    {{"name": "parameter", "value": "value", "source": "paper|derived|assumed", "evidence": "page/equation or rationale"}}
   ],
-  "detail_comparison": {{
-    "curves_and_baselines": "comparison and tolerance",
-    "axes_and_scales": "comparison and tolerance",
-    "numerical_shape": "comparison and tolerance",
-    "statistics": "comparison and tolerance",
-    "annotations_and_style": "comparison and tolerance"
-  }},
   "iteration_records": [
     {{
       "full_run_index": 1,
-      "comparison": ["measured local-vs-paper differences after this full"],
-      "modification_plan": ["specific changes proposed after this comparison; empty only when terminal"],
-      "changes_applied": ["code/config/model/parameter changes applied before the next full"],
-      "outcome": "improved|worsened|unchanged|continuing|ready_for_review"
+      "scientific_reason": "initial_run|invalid_run|core_conclusion_failed|key_numeric_ratio_ge_10",
+      "comparison": ["local observation versus the paper conclusion"],
+      "causal_change": "specific change made before this run, or empty for initial run",
+      "outcome": "supported|unsupported|unassessable|invalid"
     }}
   ],
   "execution_summary": {{
     "commands": [],
-    "full_run_count": 0,
-    "last_returncode": null,
+    "full_run_count": 1,
+    "last_returncode": 0,
     "cuda_available": false,
     "backend_requested": "auto|cpu|cuda",
     "backend": "cpu|cuda|other",
     "device": "human-readable device name",
-    "actual_compute_device_evidence": "how the expensive computation was verified on this device",
+    "actual_compute_device_evidence": "how expensive computation was placed",
     "backend_choice_reason": "task-specific reason",
     "full_durations_s": []
   }}
 }}
 ```
-- A delivery without a successful full execution, local result images, and a concrete comparison summary is invalid and will be relaunched.
-
+A readable PNG is useful for a figure task but optional when structured CSV/JSON/table/text evidence represents the result. Do not manufacture an image merely to pass a gate.
 ## Independent reporter feedback from a previous delivery
 ```json
 {feedback_text}
@@ -2144,8 +2340,14 @@ def _merge_task_writer_deliveries(
     task_records: list[dict[str, Any]],
     foundation: dict[str, Any] | None = None,
 ) -> set[str]:
-    _write_final_shared_project_files(
-        repro_project_dir, task_records, write_placeholders=foundation is None
+    _write_final_shared_project_files(repro_project_dir, task_records)
+    expected_paths.update(
+        {
+            "README.md",
+            "requirements.txt",
+            "config.json",
+            "config_smoke.json",
+        }
     )
     if foundation is not None:
         expected_paths.update(install_foundation_snapshot(repro_project_dir, foundation))
@@ -2156,10 +2358,13 @@ def _merge_task_writer_deliveries(
         combined_requirements.clear()
     copied_task_files: dict[str, tuple[str, str]] = {}
     for record in task_records:
-        sandbox = Path(str(record.get("sandbox") or ""))
+        raw_sandbox = str(record.get("sandbox") or "").strip()
+        if not raw_sandbox:
+            continue
+        sandbox = Path(raw_sandbox)
         module = str(record.get("module") or "")
         output_subdir = str(record.get("output_subdir") or record.get("task_id") or "")
-        if not sandbox.exists():
+        if not sandbox.is_dir():
             continue
         for source in _task_owned_files(sandbox):
             relative = source.relative_to(sandbox).as_posix()
@@ -2248,8 +2453,6 @@ def _writer_snapshot_hash(analysis_hash: str, foundation_hash: str) -> str:
 def _write_final_shared_project_files(
     repro_project_dir: Path,
     task_records: list[dict[str, Any]],
-    *,
-    write_placeholders: bool = True,
 ) -> None:
     write_text(
         repro_project_dir / "README.md",
@@ -2266,12 +2469,6 @@ def _write_final_shared_project_files(
         },
     )
     write_json(repro_project_dir / "config_smoke.json", {"run_profile": "smoke", "task_writer_mode": True, "smoke": True})
-    placeholder_names = ("channel.py", "modulation.py", "metrics.py", "simulation.py") if write_placeholders else ()
-    for name in placeholder_names:
-        write_text(
-            repro_project_dir / "src" / name,
-            '"""Shared placeholder for task-writer mode; task-specific logic lives in tasks/*.py."""\n',
-        )
 
 
 def _task_manifest_with_configs(task_manifest: dict[str, Any]) -> dict[str, Any]:
@@ -2330,6 +2527,7 @@ def _task_writer_runtime_result(
     valid_csv_files: list[str] = []
     valid_png_files: list[str] = []
     valid_summary_json_files: list[str] = []
+    valid_artifact_files: list[str] = []
     for record in task_records:
         if not _task_writer_runtime_task_passed(record):
             continue
@@ -2338,22 +2536,30 @@ def _task_writer_runtime_result(
         csv_files = artifacts.get("csv_files") if isinstance(artifacts.get("csv_files"), list) else []
         png_files = artifacts.get("png_files") if isinstance(artifacts.get("png_files"), list) else []
         summary_files = artifacts.get("summary_json_files") if isinstance(artifacts.get("summary_json_files"), list) else []
+        artifact_files = (
+            artifacts.get("artifact_files")
+            if isinstance(artifacts.get("artifact_files"), list)
+            else []
+        )
         valid_csv_files.extend(f"{output_subdir}/{item}" for item in csv_files if isinstance(item, str))
         valid_png_files.extend(f"{output_subdir}/{item}" for item in png_files if isinstance(item, str))
         valid_summary_json_files.extend(
             f"{output_subdir}/{item}" for item in summary_files if isinstance(item, str)
         )
+        valid_artifact_files.extend(
+            f"{output_subdir}/{item}" for item in artifact_files if isinstance(item, str)
+        )
     blocking_security = any(
-        "syntax error" in str(issue.get("message") or "").lower()
+        not isinstance(issue, dict)
+        or str(issue.get("severity") or "error").strip().lower() != "warning"
         for issue in security_issues
-        if isinstance(issue, dict)
     )
     all_checks_passed = (
         total > 0
         and passed == total
         and validation.get("required_files_present") is True
         and validation.get("python_compiles") is not False
-        and validation.get("local_imports_resolve") is True
+        and validation.get("foundation_integrity_ok") is not False
         and not blocking_security
     )
     return {
@@ -2374,6 +2580,7 @@ def _task_writer_runtime_result(
             "valid_csv_files": valid_csv_files,
             "valid_png_files": valid_png_files,
             "valid_summary_json_files": valid_summary_json_files,
+            "valid_artifact_files": valid_artifact_files,
         },
         "per_task": [
             {
@@ -2384,13 +2591,18 @@ def _task_writer_runtime_result(
                 "task_writer_status": record.get("task_writer_status"),
                 "writer_error_kind": record.get("writer_error_kind"),
                 "blocked_reason": record.get("blocked_reason"),
-                "task_reporter_verdict": (
-                    record.get("task_verification", {}).get("verdict")
+                "task_reporter_outcome": (
+                    record.get("task_verification", {}).get("outcome")
                     if isinstance(record.get("task_verification"), dict)
                     else None
                 ),
-                "task_reporter_revision_target": (
-                    record.get("task_verification", {}).get("revision_target")
+                "task_reporter_host_action": (
+                    record.get("task_verification", {}).get("host_action")
+                    if isinstance(record.get("task_verification"), dict)
+                    else None
+                ),
+                "task_reporter_rerun_reason": (
+                    record.get("task_verification", {}).get("rerun_reason")
                     if isinstance(record.get("task_verification"), dict)
                     else None
                 ),
@@ -2403,14 +2615,81 @@ def _task_writer_runtime_result(
         "requirements_warnings": requirement_warnings,
         "requirements_issues": [],
         "security_issues": security_issues,
+        "foundation_integrity_violations": (
+            validation.get("foundation_violations")
+            if isinstance(validation.get("foundation_violations"), list)
+            else []
+        ),
     }
+
+
+def _classify_task_writer_security_issues(
+    issues: list[dict[str, Any]],
+    *,
+    foundation: dict[str, Any] | None,
+    foundation_integrity_issues: list[dict[str, Any]] | None = None,
+) -> list[dict[str, str]]:
+    """Apply the Foundation-only advisory exception to strict scanner findings.
+
+    The global scanner remains fail-closed. A finding is downgraded only when
+    its category is explicitly approved for Foundation code, its file is owned
+    by the validated Foundation manifest, and the assembled project still
+    matches the Foundation hashes and frozen layout. Task Writer files
+    therefore remain strict even when a Foundation is installed in the same
+    project. Omitting the integrity result is deliberately fail-closed.
+    """
+
+    foundation_paths: set[str] = set()
+    foundation_is_current = (
+        isinstance(foundation, dict)
+        and foundation_integrity_issues is not None
+        and not foundation_integrity_issues
+    )
+    if foundation_is_current:
+        assert isinstance(foundation, dict)
+        manifest = foundation.get("manifest")
+        files = manifest.get("files") if isinstance(manifest, dict) else None
+        for item in files if isinstance(files, list) else []:
+            if isinstance(item, dict):
+                path = str(item.get("path") or "").replace("\\", "/")
+                if path:
+                    foundation_paths.add(path)
+
+    classified: list[dict[str, str]] = []
+    for issue in issues:
+        issue_file = str(issue.get("file") or "").replace("\\", "/")
+        advisory_categories = (
+            FOUNDATION_STATIC_SECURITY_ADVISORY_CATEGORIES
+            if issue_file in foundation_paths
+            else frozenset()
+        )
+        blocking, warnings = split_static_security_issues(
+            [issue],
+            advisory_categories=advisory_categories,
+        )
+        classified.extend(warnings or blocking)
+    return classified
 
 
 def _task_writer_runtime_task_passed(record: dict[str, Any]) -> bool:
-    return bool(record.get("writer_completed")) and str(record.get("task_writer_status") or "") in {
+    delivery_passed = bool(record.get("writer_completed")) and str(record.get("task_writer_status") or "") in {
         WRITER_REVIEW_STATUS,
         FINAL_MATCHED_STATUS,
     }
+    if not delivery_passed:
+        return False
+    verification = (
+        record.get("verification_result")
+        if isinstance(record.get("verification_result"), dict)
+        else record.get("task_verification")
+    )
+    if isinstance(verification, dict):
+        return (
+            verification.get("run_valid") is True
+            and verification.get("outcome") != "execution_failed"
+        )
+    # Build-only workflows have no independent scientific verification yet.
+    return True
 
 
 def apply_verified_result(
@@ -2421,36 +2700,33 @@ def apply_verified_result(
     audit_dir: Path,
     repro_project_dir: Path,
 ) -> dict[str, Any]:
-    """Grant final matched after direct independent paper comparison."""
+    """Attach every normal scientific terminal outcome to the Writer records."""
 
     expected_task_ids = [str(record.get("task_id") or "") for record in task_records]
     result_issues = verification_result_issues(verification_result, expected_task_ids)
     if result_issues:
-        raise ValueError("cannot grant matched from an invalid verification result: " + "; ".join(result_issues))
-    if not verification_result.get("all_accepted"):
-        raise ValueError("cannot grant matched while any task requires revision")
+        raise ValueError("cannot finalize incomplete task outcomes: " + "; ".join(result_issues))
+    if not verification_result.get("all_terminal"):
+        raise ValueError("cannot finalize while a task still requests a Writer rerun")
 
-    for record in task_records:
-        task_id = str(record.get("task_id") or "")
-        delivery_blockers, _ = partition_writer_delivery_issues(record.get("result_json"))
-        if delivery_blockers:
-            raise ValueError(
-                f"cannot grant matched from an invalid writer delivery for {task_id}: "
-                + "; ".join(delivery_blockers)
-            )
-
-    verdict_by_id = {
+    outcome_by_id = {
         str(item.get("task_id")): item
         for item in verification_result.get("tasks", [])
         if isinstance(item, dict) and str(item.get("task_id") or "")
     }
     for record in task_records:
         task_id = str(record.get("task_id") or "")
-        task_verdict = verdict_by_id.get(task_id)
-        if not isinstance(task_verdict, dict) or task_verdict.get("verdict") != "accepted":
-            raise ValueError(f"cannot grant matched without accepted verdict for {task_id}")
-        record["task_writer_status"] = FINAL_MATCHED_STATUS
-        record["verification_result"] = task_verdict
+        task_outcome = outcome_by_id.get(task_id)
+        if not isinstance(task_outcome, dict):
+            raise ValueError(f"missing terminal outcome for {task_id}")
+        outcome = str(task_outcome.get("outcome") or "inconclusive_missing_information")
+        record["task_writer_status"] = (
+            FINAL_MATCHED_STATUS
+            if outcome in {"reproduced", "reproduced_with_assumptions"}
+            else WRITER_REVIEW_STATUS
+        )
+        record["scientific_outcome"] = outcome
+        record["verification_result"] = task_outcome
         record["verification_verified"] = True
 
     previous_runtime = _read_optional_json_object(output_dir / "runtime_result.json")
@@ -2473,7 +2749,12 @@ def apply_verified_result(
         ),
     )
     runtime_result["verification_verified"] = True
-    runtime_result["verification_mode"] = "direct_paper_comparison"
+    runtime_result["verification_mode"] = "host_derived_core_conclusion_outcomes"
+    runtime_result["scientific_all_terminal"] = True
+    runtime_result["scientific_all_successful"] = bool(
+        verification_result.get("all_successful")
+    )
+    runtime_result["scientific_outcome_counts"] = verification_result.get("outcome_counts", {})
     write_json(output_dir / "runtime_result.json", runtime_result)
     write_json(
         audit_dir / "03c_task_writers_records.json",
@@ -2481,15 +2762,21 @@ def apply_verified_result(
     )
     status_path = audit_dir / "03c_task_writers_status.json"
     status = _read_optional_json_object(status_path)
+    all_successful = bool(verification_result.get("all_successful"))
     status.update(
         {
-            "stop_class": "verified_matched",
-            "stopped_reason": "all tasks passed direct independent paper verification",
-            "runtime": {"passed": True, "coverage": runtime_result.get("coverage")},
+            "stop_class": "verified_matched" if all_successful else "verified_terminal",
+            "stopped_reason": (
+                "all tasks reproduced the assigned core conclusions"
+                if all_successful
+                else "all tasks reached reportable scientific terminal outcomes"
+            ),
+            "runtime": {"passed": runtime_result.get("passed"), "coverage": runtime_result.get("coverage")},
             "tasks": [
                 {
                     "task_id": record.get("task_id"),
-                    "status": FINAL_MATCHED_STATUS,
+                    "status": record.get("task_writer_status"),
+                    "scientific_outcome": record.get("scientific_outcome"),
                     "verification_verified": True,
                 }
                 for record in task_records
@@ -2500,12 +2787,16 @@ def apply_verified_result(
     config_path = repro_project_dir / "config.json"
     config = _read_optional_json_object(config_path)
     config["task_statuses"] = {
-        str(record.get("task_id")): FINAL_MATCHED_STATUS for record in task_records
+        str(record.get("task_id")): str(record.get("task_writer_status") or WRITER_REVIEW_STATUS)
+        for record in task_records
+    }
+    config["scientific_outcomes"] = {
+        str(record.get("task_id")): str(record.get("scientific_outcome") or "")
+        for record in task_records
     }
     config["verification_verified"] = True
     write_json(config_path, config)
     return runtime_result
-
 
 def _task_writer_alignment_summary(task_records: list[dict[str, Any]]) -> dict[str, Any]:
     if not task_records:
@@ -2584,19 +2875,29 @@ def _task_writer_stopped_reason(task_records: list[dict[str, Any]]) -> str:
     }.get(stop_class, stop_class)
 
 
-def _failed_task_record(*, index: int, task_id: str, module: str, error: str) -> dict[str, Any]:
+def _failed_task_record(
+    *,
+    index: int,
+    task_id: str,
+    module: str,
+    output_subdir: str,
+    sandbox: Path,
+    error: str,
+) -> dict[str, Any]:
     return {
         "index": index,
         "task_id": task_id,
         "module": module,
+        "output_subdir": output_subdir,
+        "sandbox": str(sandbox),
         "task_writer_status": "failed",
         "writer_completed": False,
         "writer_status": {"ok": False, "error": redact_text(error)[:1000]},
         "result_json": {"task_id": task_id, "status": "failed", "summary": redact_text(error)[:500]},
+        "execution_summary": {},
+        "artifacts": {},
         "local_images": [],
     }
-
-
 def _task_writer_blocked_by_codex(record: dict[str, Any]) -> bool:
     return str(record.get("writer_error_kind") or "") in {
         "codex_usage_limit",

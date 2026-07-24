@@ -9,7 +9,27 @@ that stage starts clean, plus atomic clearing of generated project code."""
 from .pipeline_helpers import _remove_path_inside
 
 
-def _clear_stage_outputs(output_dir: Path, stage: str, *, preserve_audit: bool = False) -> None:
+def _clear_stage_outputs(
+    output_dir: Path,
+    stage: str,
+    *,
+    preserve_audit: bool = False,
+    preserve_paths: set[str] | None = None,
+) -> None:
+    """Remove invalid downstream products for ``stage``.
+
+    ``preserve_paths`` lets the normal pipeline commit a replacement stage
+    before invalidating its downstream products. An old usable case therefore
+    remains intact when replacement generation fails.
+
+    Explicit operator restarts may omit ``preserve_paths`` to retain the
+    original destructive reset semantics.
+    """
+    preserved = {
+        Path(path).as_posix().lstrip("./")
+        for path in (preserve_paths or set())
+        if isinstance(path, str) and path.strip()
+    }
     stage_outputs = {
         "paper": [
             "paper_chunks.json",
@@ -214,6 +234,8 @@ def _clear_stage_outputs(output_dir: Path, stage: str, *, preserve_audit: bool =
     if stage in stage_outputs:
         outputs.extend(report_outputs)
     for rel_path in dict.fromkeys(outputs):
+        if Path(rel_path).as_posix().lstrip("./") in preserved:
+            continue
         _remove_path_inside(output_dir, output_dir / rel_path)
     if not preserve_audit:
         _clear_stage_audit(output_dir, stage)

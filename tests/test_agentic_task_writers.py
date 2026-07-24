@@ -9,9 +9,12 @@ from geng_agent.outputs import write_json
 from geng_agent.agentic_task_writers import (
     _build_task_writer_brief,
     _build_task_writer_continuation_brief,
+    _collect_task_writer_delivery,
     _dispatch_task_writers,
+    _record_has_terminal_task_verification,
     _record_is_valid_current_delivery,
     _run_one_task_writer,
+    _task_writer_runtime_task_passed,
     _task_writer_concurrency,
     run_codex_task_writer_workflow,
     apply_verified_result,
@@ -40,7 +43,85 @@ def _delivery(task_id: str, sandbox: Path) -> dict:
 
 
 class AutonomousTaskWriterTests(unittest.TestCase):
-    def test_initial_writer_prompt_makes_paper_fidelity_the_highest_law(self) -> None:
+    def test_cached_terminal_requires_v2_host_outcome(self) -> None:
+        record = {
+            "task_id": "task_1",
+            "task_verification": {
+                "schema_version": "1.0",
+                "task_id": "task_1",
+                "verdict": "accepted",
+            },
+        }
+        self.assertFalse(_record_has_terminal_task_verification(record))
+
+        record["task_verification"] = {
+            "schema_version": "2.0",
+            "task_id": "task_1",
+            "outcome": "not_reproduced",
+            "host_action": "complete",
+            "rerun_reason": "none",
+            "run_valid": True,
+        }
+        self.assertTrue(_record_has_terminal_task_verification(record))
+
+        record["task_verification"]["host_action"] = "rerun_writer"
+        self.assertFalse(_record_has_terminal_task_verification(record))
+
+    def test_runtime_pass_requires_valid_verification_but_preserves_build_only(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            failed = _delivery("failed", root / "failed")
+            failed["task_verification"] = {
+                "task_id": "failed",
+                "outcome": "execution_failed",
+                "host_action": "complete",
+                "rerun_reason": "none",
+                "run_valid": False,
+            }
+            build_only = _delivery("build_only", root / "build_only")
+
+            self.assertFalse(_task_writer_runtime_task_passed(failed))
+            self.assertTrue(_task_writer_runtime_task_passed(build_only))
+
+    def test_stopping_assessment_is_advisory(self) -> None:
+        with TemporaryDirectory() as temp:
+            sandbox = Path(temp)
+            output = sandbox / "outputs" / "task_1"
+            output.mkdir(parents=True)
+            result = {
+                "task_id": "task_1",
+                "status": "ready_for_review",
+                "summary": "done",
+                "local_image_paths": ["outputs/task_1/plot.png"],
+                "execution_summary": {"full_run_count": 1, "last_returncode": 0},
+            }
+            write_json(output / "task_agent_result.json", result)
+            (output / "plot.png").write_bytes(b"png")
+            kwargs = {
+                "index": 1,
+                "task": {"task_id": "task_1"},
+                "manifest_entry": {
+                    "task_id": "task_1",
+                    "module": "task_1",
+                    "output_subdir": "task_1",
+                },
+                "sandbox": sandbox,
+                "writer_status": {"ok": True},
+            }
+
+            normal = _collect_task_writer_delivery(**kwargs)
+            explicitly_checked = _collect_task_writer_delivery(
+                **kwargs,
+                require_stopping_assessment=True,
+            )
+
+            self.assertEqual(normal["task_writer_status"], "ready_for_review")
+            self.assertEqual(explicitly_checked["task_writer_status"], "ready_for_review")
+            self.assertTrue(any(
+                "stopping_assessment" in warning
+                for warning in explicitly_checked["delivery_warnings"]
+            ))
+    def test_initial_writer_prompt_uses_scientific_materiality_without_format_gate(self) -> None:
         prompt = _build_task_writer_brief(
             index=1,
             task={"task_id": "task_1", "figure_or_claim": "Fig. 1"},
@@ -56,10 +137,17 @@ class AutonomousTaskWriterTests(unittest.TestCase):
         self.assertIn("Highest law: fidelity to the paper's established facts", prompt)
         self.assertIn("may never overwrite higher-priority evidence", prompt)
         self.assertIn("An assumed algorithm is acceptable only", prompt)
-        self.assertIn("the core claim is supported", prompt)
-        self.assertNotIn("A trend-only, ordering-only, or merely visually similar result is not enough", prompt)
-
-    def test_repair_prompt_rechecks_reporter_feedback_against_paper_evidence(self) -> None:
+        self.assertIn("Core-result stopping policy", prompt)
+        self.assertIn("Missing or imperfect structure is not itself a scientific failure", prompt)
+        self.assertIn("A ratio below 10 is non-material", prompt)
+        self.assertIn("Another Writer execution is allowed only", prompt)
+        self.assertIn("core_conclusion_failed", prompt)
+        self.assertIn("key_numeric_ratio_ge_10", prompt)
+        self.assertIn("invalid_run", prompt)
+        self.assertIn("ready_for_review", prompt)
+        self.assertNotIn("stopping_assessment", prompt)
+        self.assertNotIn("pixel-level", prompt)
+    def test_repair_prompt_requires_causal_scientific_change(self) -> None:
         prompt = _build_task_writer_continuation_brief(
             base_prompt="base",
             task_id="task_1",
@@ -72,8 +160,11 @@ class AutonomousTaskWriterTests(unittest.TestCase):
         self.assertIn("Reporter feedback is evidence to investigate, not authority", prompt)
         self.assertIn("Classify every reporter item before editing", prompt)
         self.assertIn("Never rerun unchanged code solely to answer non-blocking feedback", prompt)
-        self.assertIn("If a suggestion conflicts with explicit paper evidence", prompt)
-
+        self.assertIn("Investigate the causal rerun note", prompt)
+        self.assertIn("failure of any assigned core conclusion", prompt)
+        self.assertIn("numerical mismatch below a factor of 10", prompt)
+        self.assertIn("permitted by the mandatory stopping policy", prompt)
+        self.assertIn("do not change any assumption, seed, dataset filter, configuration, or epoch count", prompt)
     def test_analysis_warnings_are_collected_as_optional_writer_evidence(self) -> None:
         with TemporaryDirectory() as temp:
             root = Path(temp)
@@ -117,7 +208,20 @@ class AutonomousTaskWriterTests(unittest.TestCase):
             self.assertTrue(_record_is_valid_current_delivery(record))
 
             record["result_json"]["execution_summary"]["last_returncode"] = 1
-            self.assertFalse(_record_is_valid_current_delivery(record))
+            self.assertTrue(_record_is_valid_current_delivery(record))
+
+    def test_binding_advisory_does_not_invalidate_cached_delivery(self) -> None:
+        with TemporaryDirectory() as temp:
+            record = _delivery('task_1', Path(temp) / 'sandbox')
+            record['result_json']['delivery_warnings'] = [
+                'shared_component_advisory: shared_model is not proven by static scanning'
+            ]
+            with patch(
+                'geng_agent.agentic_task_writers._task_execution_binding_issues',
+                side_effect=AssertionError('cached delivery must not run the advisory scanner'),
+            ):
+                self.assertTrue(_record_is_valid_current_delivery(record))
+
     def test_concurrency_equals_task_count(self) -> None:
         self.assertEqual(_task_writer_concurrency(7, 1, run_repro=True), 7)
 
@@ -145,13 +249,17 @@ class AutonomousTaskWriterTests(unittest.TestCase):
             self.assertIsNone(audit["overall_runtime_limit_s"])
             self.assertEqual(audit["reused_task_ids"], ["accepted"])
 
-    def test_delivery_validation_and_direct_verification_grant_matched(self) -> None:
+    def test_terminal_success_grants_matched(self) -> None:
         with TemporaryDirectory() as temp:
             root = Path(temp)
             record = _delivery("task_1", root / "sandbox")
             self.assertTrue(_record_is_valid_current_delivery(record))
-            output = root / "case"; audit = output / "audit"; repro = output / "repro_project"
-            audit.mkdir(parents=True); repro.mkdir(); (repro / "config.json").write_text("{}", encoding="utf-8")
+            output = root / "case"
+            audit = output / "audit"
+            repro = output / "repro_project"
+            audit.mkdir(parents=True)
+            repro.mkdir()
+            (repro / "config.json").write_text("{}", encoding="utf-8")
             write_json(
                 output / "runtime_result.json",
                 {
@@ -162,18 +270,40 @@ class AutonomousTaskWriterTests(unittest.TestCase):
                     }
                 },
             )
+            verification = {
+                "schema_version": "2.0",
+                "all_terminal": True,
+                "all_successful": True,
+                "outcome_counts": {"reproduced": 1},
+                "tasks": [{
+                    "task_id": "task_1",
+                    "outcome": "reproduced",
+                    "host_action": "complete",
+                    "rerun_reason": "none",
+                    "run_valid": True,
+                    "core_conclusions": [],
+                    "key_numeric_comparisons": [],
+                    "comparison_summary": "direct match",
+                    "differences": [],
+                    "evidence_files": ["local.csv"],
+                    "feedback": [],
+                    "confidence": "high",
+                }],
+            }
+
             runtime = apply_verified_result(
                 task_records=[record],
-                verification_result={"schema_version": "1.0", "all_accepted": True, "tasks": [{
-                    "task_id": "task_1", "verdict": "accepted", "comparison_summary": "direct match",
-                    "differences": [], "evidence_files": ["paper.png", "local.png"], "feedback": [],
-                    "confidence": "high"}]},
-                output_dir=output, audit_dir=audit, repro_project_dir=repro)
+                verification_result=verification,
+                output_dir=output,
+                audit_dir=audit,
+                repro_project_dir=repro,
+            )
+
             self.assertTrue(runtime["passed"])
             self.assertEqual(record["task_writer_status"], "matched")
+            self.assertEqual(record["scientific_outcome"], "reproduced")
             self.assertTrue(record["verification_verified"])
-
-    def test_one_writer_continues_only_its_own_loop_after_task_reporter_revision(self) -> None:
+    def test_one_writer_reruns_once_for_complete_causal_request(self) -> None:
         with TemporaryDirectory() as temp:
             root = Path(temp)
             records = [
@@ -181,22 +311,50 @@ class AutonomousTaskWriterTests(unittest.TestCase):
                 _delivery("task_1", root / "sandbox"),
             ]
             callback_calls = []
+            reporter_workspace = root / "reporter_workspace"
+            paper_evidence = reporter_workspace / "paper_evidence"
+            paper_evidence.mkdir(parents=True)
+            (paper_evidence / "index.json").write_text("{}", encoding="utf-8")
 
             def callback(index, task, record, round_no):
                 callback_calls.append(round_no)
-                verdict = "revise" if len(callback_calls) == 1 else "accepted"
+                if len(callback_calls) == 1:
+                    verification = {
+                        "core_conclusions": [{
+                            "claim_id": "claim_order",
+                            "status": "unsupported",
+                            "local_observation": "local ordering contradicts the paper",
+                            "evidence_files": ["outputs/task_1/results.csv"],
+                        }],
+                        "schema_version": "2.0",
+                        "task_id": "task_1",
+                        "outcome": "not_reproduced",
+                        "host_action": "rerun_writer",
+                        "rerun_reason": "core_conclusion_failed",
+                        "run_valid": True,
+                        "rerun_evidence": {
+                            "rerun_reason": "core_conclusion_failed",
+                            "contract_item_ids": ["claim_order"],
+                            "paper_evidence_files": ["paper_evidence/index.json"],
+                            "causal_change": "correct the paper-defined normalization",
+                            "change_targets": ["tasks/task_1.py:normalize"],
+                            "predicted_effect": "restore the paper ordering",
+                        },
+                    }
+                else:
+                    verification = {
+                        "schema_version": "2.0",
+                        "task_id": "task_1",
+                        "outcome": "reproduced",
+                        "host_action": "complete",
+                        "rerun_reason": "none",
+                        "run_valid": True,
+                    }
                 return {
                     "ok": True,
                     "task_id": "task_1",
-                    "task_verification": {
-                        "task_id": "task_1", "verdict": verdict,
-                        "revision_target": "writer" if verdict == "revise" else "none",
-                        "comparison_summary": "comparison",
-                        "differences": ["adjust parameter"] if verdict == "revise" else [],
-                        "evidence_files": ["evidence.png"],
-                        "feedback": ["change parameter"] if verdict == "revise" else [],
-                        "confidence": "high",
-                    },
+                    "workspace": str(reporter_workspace),
+                    "task_verification": verification,
                 }
 
             with patch("geng_agent.agentic_task_writers._prepare_task_writer_sandbox"), patch(
@@ -209,21 +367,99 @@ class AutonomousTaskWriterTests(unittest.TestCase):
                 "geng_agent.agentic_task_writers._collect_task_writer_delivery", side_effect=records
             ), patch(
                 "geng_agent.agentic_task_writers._archive_nonterminal_writer_delivery"
+            ), patch(
+                "geng_agent.agentic_task_writers._record_source_config_fingerprint",
+                side_effect=["initial-source", "changed-source"],
             ):
                 result = _run_one_task_writer(
-                    index=1, reuse_existing=False, task={"task_id": "task_1"},
+                    index=1,
+                    reuse_existing=False,
+                    task={"task_id": "task_1"},
                     manifest_entry={"task_id": "task_1", "module": "task_1", "output_subdir": "task_1"},
-                    facts={}, experiment_index={}, paper={}, paper_path=root / "paper.pdf", paper_context_json="",
-                    paper_images=[], paper_thesis=None, analysis_snapshot_hash="snapshot",
-                    analysis_artifacts={}, task_root=root / "task_root", audit_dir=root, run_repro=True,
-                    timeout=456, task_review_callback=callback,
+                    facts={},
+                    experiment_index={},
+                    paper={},
+                    paper_path=root / "paper.pdf",
+                    paper_context_json="",
+                    paper_images=[],
+                    paper_thesis=None,
+                    analysis_snapshot_hash="snapshot",
+                    analysis_artifacts={},
+                    task_root=root / "task_root",
+                    audit_dir=root,
+                    run_repro=True,
+                    timeout=456,
+                    task_review_callback=callback,
                 )
+
             self.assertEqual([call.kwargs["timeout"] for call in run_session.call_args_list], [456, 456])
             self.assertEqual(callback_calls, [1, 2])
-            self.assertEqual(result["task_verification"]["verdict"], "accepted")
+            self.assertEqual(result["task_verification"]["outcome"], "reproduced")
             self.assertEqual(result["writer_session_count"], 2)
+    def test_non_material_difference_does_not_reopen_writer(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            record = _delivery("task_1", root / "sandbox")
 
-    def test_resume_reviews_existing_delivery_without_rerunning_writer(self) -> None:
+            def callback(index, task, record, round_no):
+                return {
+                    "ok": True,
+                    "task_id": "task_1",
+                    "task_verification": {
+                        "schema_version": "2.0",
+                        "task_id": "task_1",
+                        "outcome": "reproduced",
+                        "host_action": "complete",
+                        "rerun_reason": "none",
+                        "run_valid": True,
+                        "key_numeric_comparisons": [{
+                            "target_id": "anchor",
+                            "paper_magnitude": 1.0,
+                            "local_magnitude": 5.0,
+                            "symmetric_ratio": 5.0,
+                        }],
+                        "comparison_summary": "curve differs by factor 5",
+                        "non_material_differences": ["curve position differs by factor 5"],
+                    },
+                }
+
+            with patch("geng_agent.agentic_task_writers._prepare_task_writer_sandbox"), patch(
+                "geng_agent.agentic_task_writers._build_task_writer_brief", return_value="base"
+            ), patch(
+                "geng_agent.agentic_task_writers._run_task_writer_codex_session", return_value={"ok": True}
+            ) as run_session, patch(
+                "geng_agent.agentic_task_writers._restore_trusted_files"
+            ), patch(
+                "geng_agent.agentic_task_writers._collect_task_writer_delivery", return_value=record
+            ), patch(
+                "geng_agent.agentic_task_writers._archive_nonterminal_writer_delivery"
+            ) as archive_delivery:
+                result = _run_one_task_writer(
+                    index=1,
+                    reuse_existing=False,
+                    task={"task_id": "task_1"},
+                    manifest_entry={"task_id": "task_1", "module": "task_1", "output_subdir": "task_1"},
+                    facts={},
+                    experiment_index={},
+                    paper={},
+                    paper_path=root / "paper.pdf",
+                    paper_context_json="",
+                    paper_images=[],
+                    paper_thesis=None,
+                    analysis_snapshot_hash="snapshot",
+                    analysis_artifacts={},
+                    task_root=root / "task_root",
+                    audit_dir=root,
+                    run_repro=True,
+                    task_review_callback=callback,
+                )
+
+            self.assertEqual(run_session.call_count, 1)
+            archive_delivery.assert_not_called()
+            self.assertEqual(result["task_verification"]["host_action"], "complete")
+            self.assertEqual(result["task_verification"]["outcome"], "reproduced")
+            self.assertNotIn("writer_error_kind", result)
+    def test_resume_reviews_existing_terminal_delivery_without_rerunning_writer(self) -> None:
         with TemporaryDirectory() as temp:
             root = Path(temp)
             existing = _delivery("task_1", root / "task_root" / "01_task_1")
@@ -235,14 +471,13 @@ class AutonomousTaskWriterTests(unittest.TestCase):
                     "ok": True,
                     "task_id": "task_1",
                     "task_verification": {
+                        "schema_version": "2.0",
                         "task_id": "task_1",
-                        "verdict": "accepted",
-                        "revision_target": "none",
-                        "comparison_summary": "existing full result matches the paper",
-                        "differences": [],
-                        "evidence_files": ["paper.png", "local.png"],
-                        "feedback": [],
-                        "confidence": "high",
+                        "outcome": "reproduced",
+                        "host_action": "complete",
+                        "rerun_reason": "none",
+                        "run_valid": True,
+                        "comparison_summary": "existing full result supports the paper conclusion",
                     },
                 }
 
@@ -256,16 +491,52 @@ class AutonomousTaskWriterTests(unittest.TestCase):
                 "geng_agent.agentic_task_writers._archive_nonterminal_writer_delivery"
             ) as archive_delivery:
                 result = _run_one_task_writer(
-                    index=1, reuse_existing=True, task={"task_id": "task_1"},
+                    index=1,
+                    reuse_existing=True,
+                    task={"task_id": "task_1"},
                     manifest_entry={"task_id": "task_1", "module": "task_1", "output_subdir": "task_1"},
-                    facts={}, experiment_index={}, paper={}, paper_path=root / "paper.pdf", paper_context_json="",
-                    paper_images=[], paper_thesis=None, analysis_snapshot_hash="snapshot",
-                    analysis_artifacts={}, task_root=root / "task_root", audit_dir=root, run_repro=True,
+                    facts={},
+                    experiment_index={},
+                    paper={},
+                    paper_path=root / "paper.pdf",
+                    paper_context_json="",
+                    paper_images=[],
+                    paper_thesis=None,
+                    analysis_snapshot_hash="snapshot",
+                    analysis_artifacts={},
+                    task_root=root / "task_root",
+                    audit_dir=root,
+                    run_repro=True,
                     task_review_callback=callback,
                 )
 
-            self.assertEqual(result["task_verification"]["verdict"], "accepted")
+            self.assertEqual(result["task_verification"]["outcome"], "reproduced")
             self.assertEqual(callback_calls, [(1, "task_1", "task_1", 1)])
+            run_writer.assert_not_called()
+            archive_delivery.assert_not_called()
+    def test_resume_accepts_existing_writer_only_delivery_without_rerunning_writer(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            existing = _delivery('task_1', root / 'task_root' / '01_task_1')
+            with patch('geng_agent.agentic_task_writers._prepare_task_writer_sandbox'), patch(
+                'geng_agent.agentic_task_writers._build_task_writer_brief', return_value='base'
+            ), patch(
+                'geng_agent.agentic_task_writers._collect_task_writer_delivery', return_value=existing
+            ), patch(
+                'geng_agent.agentic_task_writers._run_task_writer_codex_session'
+            ) as run_writer, patch(
+                'geng_agent.agentic_task_writers._archive_nonterminal_writer_delivery'
+            ) as archive_delivery:
+                result = _run_one_task_writer(
+                    index=1, reuse_existing=True, task={'task_id': 'task_1'},
+                    manifest_entry={'task_id': 'task_1', 'module': 'task_1', 'output_subdir': 'task_1'},
+                    facts={}, experiment_index={}, paper={}, paper_path=root / 'paper.pdf', paper_context_json='',
+                    paper_images=[], paper_thesis=None, analysis_snapshot_hash='snapshot',
+                    analysis_artifacts={}, task_root=root / 'task_root', audit_dir=root, run_repro=True,
+                    task_review_callback=None,
+                )
+
+            self.assertEqual(result['task_writer_status'], 'ready_for_review')
             run_writer.assert_not_called()
             archive_delivery.assert_not_called()
 

@@ -10,17 +10,16 @@ This module adds three conservative, auditable layers that run *before* the stri
 schema check, so the LLM's real extraction is kept whenever possible:
 
 1. normalization  - map enum synonyms to allowed values, fix null/empty fields,
-   strip unknown keys. Never invents facts; every change is logged to ``_meta``.
-2. partial acceptance - drop only the individual facts that still cannot be
-   validated (or whose ``chunk_id`` has no provenance), keep the rest.
+   and retain unknown scientific payload under ``value``. Every change is logged.
+2. partial acceptance - drop only individual facts that cannot be represented by
+   the structural schema; incomplete provenance is retained and marked unverified.
 3. truncation salvage - when the JSON stream is cut off, recover the largest
    parseable prefix of the ``engineering_facts`` array.
 
 This module does not judge scientific content or remove facts because they are
 approximate visual reads, appendix formulas, bounds, or apparent contradictions.
-Those observations stay available with their source and confidence. Only records
-that cannot satisfy the structural schema or point to nonexistent evidence are
-rejected; those structural rejections and all coercions remain auditable.
+Those observations stay available with their source and confidence. Structural
+rejections, provenance uncertainty, and all coercions remain auditable.
 """
 
 from __future__ import annotations
@@ -235,11 +234,23 @@ def normalize_engineering_facts_candidate(data: Any) -> tuple[dict[str, Any], li
 
 
 def _normalize_fact(fact: dict[str, Any], index: int, coercions: list[str]) -> None:
-    extra = [key for key in fact if key not in _FACT_KEYS]
-    for key in extra:
-        fact.pop(key, None)
-    if extra:
-        coercions.append(f"facts[{index}] dropped unknown keys {sorted(extra)}")
+    value = fact.get("value")
+    if not isinstance(value, dict):
+        value = {} if value is None else {"value": value}
+        fact["value"] = value
+        coercions.append(f"facts[{index}].value -> object")
+    extra_payload = {
+        key: copy.deepcopy(fact.pop(key))
+        for key in list(fact)
+        if key not in _FACT_KEYS
+    }
+    if extra_payload:
+        extensions = value.get("_extensions")
+        if not isinstance(extensions, dict):
+            extensions = {"_previous": copy.deepcopy(extensions)} if extensions is not None else {}
+        extensions.update(extra_payload)
+        value["_extensions"] = extensions
+        coercions.append(f"facts[{index}] retained unknown keys {sorted(extra_payload)}")
 
     raw_type = fact.get("type")
     mapped_type, changed = _map_enum(raw_type, _ALLOWED_FACT_TYPES, FACT_TYPE_SYNONYMS, "other")
@@ -259,14 +270,14 @@ def _normalize_fact(fact: dict[str, Any], index: int, coercions: list[str]) -> N
         fact["used_for_reproduction"] = used
         coercions.append(f"facts[{index}].used_for_reproduction {raw_used!r} -> {used!r}")
 
-    value = fact.get("value")
-    if not isinstance(value, dict):
-        fact["value"] = {} if value is None else {"value": value}
-        coercions.append(f"facts[{index}].value -> object")
-
     source = fact.get("source")
-    if isinstance(source, dict):
-        _normalize_source(source, index, coercions)
+    if not isinstance(source, dict):
+        if source is not None:
+            value["_source_original"] = copy.deepcopy(source)
+        source = {}
+        fact["source"] = source
+        coercions.append(f"facts[{index}].source synthesized as unverified")
+    _normalize_source(source, index, coercions, value)
 
     raw_evidence_kind = fact.get("evidence_kind")
     inferred_kind = (
@@ -288,12 +299,26 @@ def _normalize_fact(fact: dict[str, Any], index: int, coercions: list[str]) -> N
         coercions.append(f"facts[{index}].derivation coerced to string")
 
 
-def _normalize_source(source: dict[str, Any], index: int, coercions: list[str]) -> None:
-    extra = [key for key in source if key not in _SOURCE_KEYS]
-    for key in extra:
-        source.pop(key, None)
-    if extra:
-        coercions.append(f"facts[{index}].source dropped unknown keys {sorted(extra)}")
+def _normalize_source(
+    source: dict[str, Any],
+    index: int,
+    coercions: list[str],
+    fact_value: dict[str, Any],
+) -> None:
+    extra_payload = {
+        key: copy.deepcopy(source.pop(key))
+        for key in list(source)
+        if key not in _SOURCE_KEYS
+    }
+    if extra_payload:
+        extensions = fact_value.get("_source_extensions")
+        if not isinstance(extensions, dict):
+            extensions = (
+                {"_previous": copy.deepcopy(extensions)} if extensions is not None else {}
+            )
+        extensions.update(extra_payload)
+        fact_value["_source_extensions"] = extensions
+        coercions.append(f"facts[{index}].source retained unknown keys {sorted(extra_payload)}")
 
     # source_kind: map figure synonyms to "figure", everything else to "text". New fields are
     # filled silently (the model may omit them); only an actually-changed value is logged.
@@ -304,11 +329,23 @@ def _normalize_source(source: dict[str, Any], index: int, coercions: list[str]) 
             coercions.append(f"facts[{index}].source.source_kind {raw_kind!r} -> {kind!r}")
         source["source_kind"] = kind
     else:
-        source["source_kind"] = "text"
+        source["source_kind"] = (
+            "figure"
+            if str(source.get("figure_ref") or "").strip()
+            else "text"
+        )
 
     # chunk_id is optional for figure sources; ensure the key exists (may be null).
     if "chunk_id" not in source:
         source["chunk_id"] = None
+    elif source.get("chunk_id") is not None and not isinstance(
+        source.get("chunk_id"), str
+    ):
+        raw_chunk_id = source.get("chunk_id")
+        source["chunk_id"] = str(raw_chunk_id)
+        coercions.append(
+            f"facts[{index}].source.chunk_id {raw_chunk_id!r} -> {source['chunk_id']!r}"
+        )
 
     if not isinstance(source.get("figure_ref"), str):
         source["figure_ref"] = "" if source.get("figure_ref") is None else str(source.get("figure_ref"))
@@ -332,12 +369,9 @@ def _normalize_source(source: dict[str, Any], index: int, coercions: list[str]) 
             coercions.append(f"facts[{index}].source.page {page!r} -> {coerced!r}")
 
     quote = source.get("quote")
-    if quote is None:
-        source["quote"] = ""
-        coercions.append(f"facts[{index}].source.quote -> '' (will be dropped if no evidence)")
-    elif not isinstance(quote, str):
-        source["quote"] = str(quote)
-        coercions.append(f"facts[{index}].source.quote coerced to string")
+    if not isinstance(quote, str) or not quote.strip():
+        source["quote"] = "Source details unavailable; retained as unverified evidence."
+        coercions.append(f"facts[{index}].source.quote -> unverified placeholder")
 
 
 def _normalize_missing(missing: Any, coercions: list[str]) -> list[dict[str, Any]]:
@@ -363,23 +397,56 @@ def _fact_rejection_reason(
 ) -> str | None:
     if not isinstance(fact, dict):
         return "not a JSON object"
+    del valid_chunk_ids, valid_pages
     try:
         EngineeringFact.model_validate(fact)
     except ValidationError as exc:
         error = exc.errors()[0]
         loc = ".".join(str(part) for part in error.get("loc", ()))
         return f"{loc or '$'}: {error.get('msg', 'invalid value')}"
+    return None
+
+
+def _source_verification_issues(
+    fact: dict[str, Any],
+    valid_chunk_ids: set[str] | None,
+    valid_pages: set[int] | None,
+) -> list[str]:
     source = fact.get("source") if isinstance(fact.get("source"), dict) else {}
+    reasons: list[str] = []
     if source.get("source_kind") == "figure":
-        # figure-sourced fact must cite a page the model actually saw (a rendered page image)
         page = source.get("page")
-        if valid_pages is not None and (not isinstance(page, int) or page not in valid_pages):
-            return "source.page is not a known/rendered paper page (figure source)"
+        if not isinstance(page, int):
+            reasons.append("figure source has no paper page")
+        elif valid_pages is not None and page not in valid_pages:
+            reasons.append("figure source page was not rendered for inspection")
     else:
         chunk_id = source.get("chunk_id")
-        if valid_chunk_ids is not None and chunk_id not in valid_chunk_ids:
-            return "source.chunk_id not found in paper_chunks.json"
-    return None
+        if not isinstance(chunk_id, str) or not chunk_id.strip():
+            reasons.append("text source has no chunk id")
+        elif valid_chunk_ids is not None and chunk_id not in valid_chunk_ids:
+            reasons.append("text source chunk id is absent from paper_chunks.json")
+    quote = source.get("quote")
+    if not isinstance(quote, str) or quote.startswith("Source details unavailable;"):
+        reasons.append("source quote is incomplete")
+    return list(dict.fromkeys(reasons))
+
+
+def _mark_unverified(fact: dict[str, Any], reasons: list[str]) -> None:
+    value = fact.get("value")
+    if not isinstance(value, dict):
+        value = {"value": copy.deepcopy(value)}
+        fact["value"] = value
+    prior = value.get("_provenance")
+    prior_reasons = (
+        prior.get("reasons", [])
+        if isinstance(prior, dict) and isinstance(prior.get("reasons"), list)
+        else []
+    )
+    value["_provenance"] = {
+        "verified": False,
+        "reasons": list(dict.fromkeys([*map(str, prior_reasons), *reasons])),
+    }
 
 
 def select_valid_engineering_facts(
@@ -393,6 +460,11 @@ def select_valid_engineering_facts(
     for index, fact in enumerate(facts):
         reason = _fact_rejection_reason(fact, valid_chunk_ids, valid_pages)
         if reason is None:
+            provenance_issues = _source_verification_issues(
+                fact, valid_chunk_ids, valid_pages
+            )
+            if provenance_issues:
+                _mark_unverified(fact, provenance_issues)
             kept.append(fact)
         else:
             dropped.append(
@@ -408,7 +480,7 @@ def select_valid_engineering_facts(
 def finalize_engineering_facts(
     data: Any, valid_chunk_ids: set[str] | None, valid_pages: set[int] | None = None
 ) -> dict[str, Any]:
-    """Normalize facts and reject only irreparable structural/source records."""
+    """Normalize facts, retaining structurally valid facts with provenance flags."""
     normalized, coercions = normalize_engineering_facts_candidate(data)
     kept, dropped = select_valid_engineering_facts(normalized, valid_chunk_ids, valid_pages)
 
@@ -429,6 +501,15 @@ def finalize_engineering_facts(
         meta["dropped_fact_count"] = len(dropped)
         meta["kept_fact_count"] = len(kept)
         meta["dropped_facts"] = dropped[:50]
+    unverified = [
+        fact
+        for fact in kept
+        if isinstance(fact.get("value"), dict)
+        and isinstance(fact["value"].get("_provenance"), dict)
+        and fact["value"]["_provenance"].get("verified") is False
+    ]
+    if unverified:
+        meta["unverified_fact_count"] = len(unverified)
     if meta:
         doc["_meta"] = meta
     return doc

@@ -41,6 +41,46 @@ FactType = Literal[
 ]
 
 Confidence = Literal["high", "medium", "low"]
+ReporterRerunReason = Literal[
+    "none",
+    "core_conclusion_failed",
+    "key_numeric_ratio_ge_10",
+    "invalid_run",
+]
+CoreConclusionKind = Literal[
+    "ordering",
+    "trend",
+    "crossing",
+    "threshold",
+    "scaling",
+    "gain_loss",
+    "mechanism",
+    "absolute_level",
+    "other",
+]
+CoreConclusionStatus = Literal[
+    "supported",
+    "unsupported",
+    "unassessable_missing_information",
+]
+NumericEvidenceQuality = Literal[
+    "paper_explicit",
+    "paper_derived",
+    "visual_estimate",
+    "unavailable",
+]
+InformationGapDisposition = Literal[
+    "assume_and_disclose",
+    "single_sensitivity_if_core",
+    "terminal_inconclusive",
+]
+TaskScientificOutcome = Literal[
+    "reproduced",
+    "reproduced_with_assumptions",
+    "inconclusive_missing_information",
+    "not_reproduced",
+    "execution_failed",
+]
 MissingImpact = Literal["low", "medium", "high"]
 EvidenceKind = Literal["paper_explicit", "paper_derived", "visual_estimate"]
 TaskSpecificationStatus = Literal["evidenced", "assumed", "not_applicable", "unresolved"]
@@ -79,6 +119,31 @@ ReproducibilityVerdict = Literal[
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class CoreConclusionAssessment(StrictModel):
+    claim_id: str = ""
+    status: CoreConclusionStatus = "unassessable_missing_information"
+    local_observation: str = ""
+    evidence_files: list[str] = Field(default_factory=list)
+
+
+class KeyNumericComparison(StrictModel):
+    target_id: str = ""
+    name: str = ""
+    paper_magnitude: float | None = Field(allow_inf_nan=False)
+    local_magnitude: float | None = Field(allow_inf_nan=False)
+    symmetric_ratio: float | None = Field(default=None, ge=1, allow_inf_nan=False)
+    unavailable_reason: str = ""
+
+
+class ReporterRerunEvidence(StrictModel):
+    rerun_reason: ReporterRerunReason = "none"
+    contract_item_ids: list[str] = Field(default_factory=list)
+    paper_evidence_files: list[str] = Field(default_factory=list)
+    causal_change: str = ""
+    change_targets: list[str] = Field(default_factory=list)
+    predicted_effect: str = ""
 
 
 class FactSource(StrictModel):
@@ -168,6 +233,38 @@ class TaskSpecificationItem(StrictModel):
     evidence_facts: list[RequiredFactRef] = Field(default_factory=list)
     note: str = ""
 
+class ScientificCoreConclusion(StrictModel):
+    claim_id: str = ""
+    statement: str = ""
+    kind: CoreConclusionKind = "other"
+    regime: str = ""
+    paper_anchor: str = ""
+
+
+class ScientificNumericTarget(StrictModel):
+    target_id: str = ""
+    name: str = ""
+    paper_magnitude: float | None = Field(default=None, allow_inf_nan=False)
+    unit: str = ""
+    regime: str = ""
+    evidence_quality: NumericEvidenceQuality = "unavailable"
+
+
+class ScientificInformationGap(StrictModel):
+    gap_id: str = ""
+    description: str = ""
+    affects_claim_ids: list[str] = Field(default_factory=list)
+    disposition: InformationGapDisposition = "assume_and_disclose"
+
+
+class ScientificAcceptance(StrictModel):
+    """Small shared vocabulary, not a completeness gate."""
+
+    contract_version: Literal["1.0"] = "1.0"
+    core_conclusions: list[ScientificCoreConclusion] = Field(default_factory=list)
+    key_numeric_targets: list[ScientificNumericTarget] = Field(default_factory=list)
+    information_gaps: list[ScientificInformationGap] = Field(default_factory=list)
+
 
 class ReproTask(StrictModel):
     task_id: NonEmptyStr
@@ -184,6 +281,7 @@ class ReproTask(StrictModel):
     assumptions: list[Assumption]
     risk_if_unreproducible: NonEmptyStr
     formula_chain: list[TaskSpecificationItem] = Field(default_factory=list)
+    scientific_acceptance: ScientificAcceptance = Field(default_factory=ScientificAcceptance)
     parameter_matrix: list[TaskSpecificationItem] = Field(default_factory=list)
     baseline_definitions: list[TaskSpecificationItem] = Field(default_factory=list)
     statistical_protocol: list[TaskSpecificationItem] = Field(default_factory=list)
@@ -319,6 +417,12 @@ class ArchitectureConsistencyGroup(StrictModel):
     task_ids: list[NonEmptyStr] = Field(default_factory=list)
     shared_quantity_ids: list[NonEmptyStr] = Field(default_factory=list)
 
+class ArchitectureAcceptanceBinding(StrictModel):
+    criterion_id: str = ""
+    criterion_kind: Literal["core_conclusion", "key_numeric_target"] = "core_conclusion"
+    output_quantity_ids: list[str] = Field(default_factory=list)
+
+
 
 class ArchitectureBinding(StrictModel):
     task_id: NonEmptyStr
@@ -328,6 +432,7 @@ class ArchitectureBinding(StrictModel):
     allowed_overrides: list[NonEmptyStr] = Field(default_factory=list)
     overrides: dict[str, Any] = Field(default_factory=dict)
     outputs: list[NonEmptyStr] = Field(default_factory=list)
+    acceptance_bindings: list[ArchitectureAcceptanceBinding] = Field(default_factory=list)
 
 
 class ArchitectureInvariant(StrictModel):
@@ -357,9 +462,13 @@ class ScientificArchitectureDocument(StrictModel):
                                     "required": ["callable", "execution"],
                                     "properties": {
                                         "callable": {"type": "string", "minLength": 1, "pattern": r"\S"},
-                                        "execution": {
-                                            "$ref": "#/$defs/ArchitectureExecutionContract"
-                                        },
+                                        # ArchitectureComponent already constrains this
+                                        # field to ArchitectureExecutionContract | None.
+                                        # The v1.1 condition only needs to exclude the
+                                        # nullable branch. Keeping a raw $ref here makes
+                                        # Pydantic 2.13 resolve json_schema_extra before
+                                        # its generated $defs are registered (KeyError).
+                                        "execution": {"not": {"type": "null"}},
                                     },
                                 }
                             }
@@ -383,78 +492,51 @@ class ScientificArchitectureDocument(StrictModel):
         if self.schema_version != "1.1":
             return self
 
-        violations: list[str] = []
-        components_by_id = {component.id: component for component in self.components}
-        consistency_group_ids = [group.id for group in self.consistency_groups]
-        declared_consistency_groups = set(consistency_group_ids)
-        duplicate_consistency_groups = sorted(
-            group_id
-            for group_id in declared_consistency_groups
-            if consistency_group_ids.count(group_id) > 1
-        )
-        for group_id in duplicate_consistency_groups:
-            violations.append(f"consistency group {group_id!r} is declared more than once")
-        tasks_by_component: dict[str, set[str]] = {}
-        for component in self.components:
-            if not component.callable.strip():
-                violations.append(f"component {component.id!r} needs a non-empty callable")
-            if component.execution is None:
-                violations.append(f"component {component.id!r} needs an execution contract")
-        for binding in self.bindings:
-            if binding.consistency_group not in declared_consistency_groups:
-                violations.append(
-                    f"binding for task {binding.task_id!r} refers to undeclared "
-                    f"consistency group {binding.consistency_group!r}"
-                )
-            for component_id in binding.components:
-                tasks_by_component.setdefault(component_id, set()).add(binding.task_id)
-        for component_id, task_ids in tasks_by_component.items():
-            component = components_by_id.get(component_id)
-            if (
-                len(task_ids) > 1
-                and component is not None
-                and component.execution is not None
-                and not component.execution.shared_implementation
-            ):
-                violations.append(
-                    f"component {component_id!r} is bound to multiple tasks and needs "
-                    "shared_implementation=true"
-                )
+        violations = [
+            f"component {component.id!r} needs a non-empty callable"
+            for component in self.components
+            if not component.callable.strip()
+        ] + [
+            f"component {component.id!r} needs an execution contract"
+            for component in self.components
+            if component.execution is None
+        ]
         if violations:
             raise ValueError("scientific architecture 1.1: " + "; ".join(violations))
         return self
 
 
 class TaskVerificationResult(StrictModel):
-    task_id: NonEmptyStr
-    verdict: Literal["accepted", "revise"]
-    comparison_summary: NonEmptyStr
-    differences: list[str]
-    evidence_files: list[NonEmptyStr] = Field(min_length=1)
-    feedback: list[str]
-    confidence: Confidence
-
-
-class IsolatedTaskVerificationDocument(StrictModel):
-    schema_version: Literal["1.0"]
-    task_id: NonEmptyStr
-    verdict: Literal["accepted", "revise"]
-    revision_target: Literal["none", "writer", "reporter"]
-    comparison_summary: NonEmptyStr
-    differences: list[str]
+    task_id: str = ""
+    outcome: TaskScientificOutcome = "inconclusive_missing_information"
+    host_action: Literal["complete", "rerun_writer"] = "complete"
+    rerun_reason: ReporterRerunReason = "none"
+    run_valid: bool | None = None
+    core_conclusions: list[CoreConclusionAssessment] = Field(default_factory=list)
+    key_numeric_comparisons: list[KeyNumericComparison] = Field(default_factory=list)
+    max_key_numeric_ratio: float | None = Field(default=None, ge=1, allow_inf_nan=False)
+    comparison_summary: str = ""
+    differences: list[str] = Field(default_factory=list)
     non_material_differences: list[str] = Field(default_factory=list)
-    evidence_files: list[NonEmptyStr] = Field(min_length=1)
-    feedback: list[str]
-    confidence: Confidence
-    local_assets: list[str] = Field(default_factory=list)
-    paper_assets: list[str] = Field(default_factory=list)
+    evidence_files: list[str] = Field(default_factory=list)
+    feedback: list[str] = Field(default_factory=list)
+    confidence: Confidence = "medium"
     remaining_uncertainties: list[str] = Field(default_factory=list)
 
 
+class IsolatedTaskVerificationDocument(TaskVerificationResult):
+    schema_version: Literal["2.0"] = "2.0"
+    rerun_evidence: ReporterRerunEvidence | None = None
+    local_assets: list[str] = Field(default_factory=list)
+    paper_assets: list[str] = Field(default_factory=list)
+
+
 class VerificationResultDocument(StrictModel):
-    schema_version: Literal["1.0"]
-    all_accepted: bool
-    tasks: list[TaskVerificationResult] = Field(min_length=1)
+    schema_version: Literal["2.0"] = "2.0"
+    all_terminal: bool = False
+    all_successful: bool = False
+    outcome_counts: dict[str, int] = Field(default_factory=dict)
+    tasks: list[TaskVerificationResult] = Field(default_factory=list)
 
 
 class ManifestTextFile(StrictModel):

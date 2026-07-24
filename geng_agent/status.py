@@ -29,6 +29,15 @@ STAGES = [
     ("result_review_docx", "result_review.docx", None),
 ]
 
+# These stages enrich a case or package it for humans, but their absence must
+# not make a scientifically usable case look incomplete. The pipeline already
+# has explicit fallbacks for the architecture/Foundation pair and report DOCX
+# rendering.
+OPTIONAL_STAGES = {
+    "paper_thesis", "scientific_architecture", "foundation_manifest",
+    "review_docx", "reproduction_report_docx", "result_review_docx",
+}
+
 RESUME_LABELS = {
     "paper": "01_extract_engineering_facts",
     "engineering_facts": "01_extract_engineering_facts",
@@ -59,8 +68,12 @@ def inspect_case_status(output_dir: Path) -> dict[str, Any]:
         if workflow_version == "1" and name in {"scientific_architecture", "foundation_manifest"}:
             continue
         status = inspect_stage(output_dir, name, rel_path, schema_stage)
+        required = name not in OPTIONAL_STAGES
+        status["required"] = required
+        if not required and not status["ok"]:
+            status["advisory"] = True
         stage_status.append(status)
-        if next_stage is None and not status["ok"]:
+        if next_stage is None and required and not status["ok"]:
             next_stage = name
 
     try:

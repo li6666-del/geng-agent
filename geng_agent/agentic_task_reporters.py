@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -14,13 +16,13 @@ from .paper_evidence import safe_label, thesis_ordering_anchor_for_task
 from .paper_crop import PAPER_TARGET_METADATA_FILE, finalize_paper_target
 from .schemas import validate_stage
 from .security import redact_text
+from .scientific_materiality import CORE_RESULT_STOP_POLICY, SCIENTIFIC_POLICY_ID
 from .task_writer_support import PAPER_EVIDENCE_DIR, TRUSTED_PROJECT_FILES, _write_paper_evidence_bundle
 from .verification_result import (
-    TASK_REPORTER_ACCEPTED,
-    TASK_REPORTER_ROUTE_REPORTER,
     aggregate_task_verifications,
     normalize_task_verification,
     partition_task_verification_issues,
+    rerun_evidence_path_issues,
     task_verification_issues,
 )
 
@@ -28,7 +30,9 @@ from .verification_result import (
 TASK_VERIFICATION_FILE = "task_verification_result.json"
 REPORT_ASSETS_DIR = "report_assets"
 WRITER_SOURCE_DIR = "source"
-_WRITER_SOURCE_SUFFIXES = frozenset({".cfg", ".ini", ".json", ".lock", ".md", ".py", ".toml", ".txt", ".yaml", ".yml"})
+_WRITER_SOURCE_MAX_BYTES = 10_000_000
+_WRITER_OUTPUT_MAX_FILE_BYTES = 256 * 1024 * 1024
+_WRITER_OUTPUT_MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
 _WRITER_SOURCE_EXCLUDED_DIRS = frozenset(
     {
         ".git",
@@ -46,28 +50,12 @@ _WRITER_SOURCE_EXCLUDED_DIRS = frozenset(
 )
 _WRITER_SOURCE_EXCLUDED_FILES = frozenset({"task_agent_result.json", "task_agent_result.md"})
 
-REPORTER_CONVERGENCE_POLICY = """## Convergence and materiality policy
-Your job is to decide whether another Writer iteration is scientifically necessary, not to discover every conceivable imperfection.
-
-### Evidence boundary
-- Strictly enforce paper-explicit data, system models, equations, core algorithm steps, experiment protocols, baseline identities, metric definitions, axes, and stated scan ranges. A Writer may not change these merely to fit the target figure.
-- Accept explicit, scientifically plausible value or implementation assumptions where the paper is silent, incomplete, or genuinely ambiguous. An assumed algorithm may complete an unspecified step, but it may not replace a model, data-generating law, objective, or core algorithm that the paper defines.
-- Treat the Writer's assumptions as disclosed hypotheses, not paper facts. Assess whether they are reasonable and whether the core conclusion remains supported; do not reject merely because another undocumented implementation is possible.
-
-### Acceptance gate
-Return `accepted` when the implementation respects explicit paper facts, the full run is credible, and the assigned core claim is supported. The core claim may be expressed by method identity, comparison direction, ordering, trend, crossing or threshold region, scaling behavior, gain/loss region, or another conclusion the target figure is used to establish.
-
-Acceptance may be conditional on disclosed paper-silent assumptions. Record those assumptions and residual uncertainty in `comparison_summary`, `non_material_differences`, and `remaining_uncertainties`; keep `differences` empty. Exact pixel alignment, plotting style, unavailable author code, unspecified seeds/sample counts/solvers, plausible baseline completion, and small numerical offsets are non-blocking unless the paper's core claim depends on them.
-
-### Revision gate
-Return `revise` to the Writer only when all of the following are true:
-1. There is a material blocker: either a substantive violation of explicit paper data/model/core algorithm/protocol, or failure to support the assigned core claim.
-2. The blocker can affect the scientific interpretation rather than only presentation or unknowable implementation identity.
-3. You can cite paper evidence and give a concrete change likely to resolve it.
-
-Do not issue speculative revisions. Do not demand proof of equivalence to private author code. Do not send the Writer back for reasonable assumptions inside paper-silent space, non-material residuals, crop problems, or report wording. Put such matters in non-blocking fields and converge.
+REPORTER_CONVERGENCE_POLICY = """## Convergence and materiality
+- Enforce paper-explicit scientific facts. Accept reasonable, disclosed choices where the paper is silent.
+- A numerical difference below a factor of 10, plotting style, crop quality, seed/sample-count choice, or merely possible alternative implementation is non-material unless the paper explicitly makes it a core conclusion.
+- Recommend another Writer run only for `invalid_run`, `core_conclusion_failed`, or `key_numeric_ratio_ge_10`, and only with paper evidence plus a concrete causal code/config change and predicted effect.
+- Do not speculate. Unsupported but faithfully implemented results without a justified next change are reportable `not_reproduced`; unavailable decisive information is reportable `inconclusive_missing_information`.
 """
-
 
 def run_codex_task_reporter_workflow(
     *,
@@ -98,6 +86,9 @@ def run_codex_task_reporter_workflow(
         task=task,
         task_record=task_record,
         paper_path=paper_path,
+        facts=facts,
+        experiment_index=experiment_index,
+        paper_thesis=paper_thesis,
         figure_candidates=figure_candidates,
     )
     status_path = task_audit_dir / "status.json"
@@ -181,23 +172,51 @@ def run_codex_task_reporter_workflow(
         image_paths=image_paths,
     )
     verification_path = workspace / TASK_VERIFICATION_FILE
-    verification = normalize_task_verification(_read_json_object(verification_path), task_id)
+    run_valid_hint = _task_record_run_valid_hint(task_record)
+    raw_verification = _read_json_object(verification_path)
+    rerun_path_issues = rerun_evidence_path_issues(raw_verification, workspace)
+    if rerun_path_issues:
+        raw_verification = json.loads(json.dumps(raw_verification, ensure_ascii=False))
+        raw_verification["rerun_evidence"] = None
+        uncertainties = raw_verification.get("remaining_uncertainties")
+        if not isinstance(uncertainties, list):
+            uncertainties = []
+            raw_verification["remaining_uncertainties"] = uncertainties
+        uncertainties.append(
+            "A requested rerun referenced untrusted or missing paper evidence; "
+            "the host declined the rerun and retained a terminal outcome."
+        )
+    verification = normalize_task_verification(
+        raw_verification,
+        task_id,
+        task=task,
+        run_valid_hint=run_valid_hint,
+    )
     schema_warnings = [
         f"{issue.path}: {issue.message}"
         for issue in validate_stage("task_verification_result", verification)
     ]
     validation_issues, contract_warnings = partition_task_verification_issues(verification, task_id)
-    validation_warnings = schema_warnings + contract_warnings + _evidence_path_issues(verification, workspace)
-    process_usable = bool(codex_status.get("ok")) or bool(verification)
-    scientific_accepted = (
+    validation_warnings = (
+        schema_warnings
+        + contract_warnings
+        + rerun_path_issues
+        + _evidence_path_issues(verification, workspace)
+    )
+    process_usable = bool(codex_status.get("ok")) or bool(raw_verification)
+    scientific_terminal = (
         process_usable
         and not validation_issues
-        and str(verification.get("verdict") or "") == TASK_REPORTER_ACCEPTED
+        and verification.get("host_action") == "complete"
     )
+    scientific_successful = verification.get("outcome") in {
+        "reproduced",
+        "reproduced_with_assumptions",
+    }
     crop_result: dict[str, Any] = {"status": "not_applicable", "issues": []}
     asset_issues: list[str] = []
     copied_assets: list[str] = []
-    if scientific_accepted:
+    if scientific_successful:
         crop_result = finalize_paper_target(
             paper_path=paper_path,
             workspace=workspace,
@@ -214,7 +233,11 @@ def run_codex_task_reporter_workflow(
             crop_result=crop_result,
             require_verified_pdf_crop=paper_path.suffix.lower() == ".pdf",
         )
-        if not asset_issues:
+        has_declared_assets = any(
+            verification.get(key) for key in ("local_assets", "paper_assets")
+            if isinstance(verification.get(key), list)
+        )
+        if not asset_issues and has_declared_assets:
             try:
                 copied_assets = _copy_task_assets(
                     source=workspace / REPORT_ASSETS_DIR / safe_label(task_id),
@@ -248,12 +271,13 @@ def run_codex_task_reporter_workflow(
         "validation_warnings": validation_warnings,
         "asset_issues": asset_issues,
         "asset_paths": copied_assets,
-        "scientific_accepted": scientific_accepted,
+        "scientific_successful": scientific_successful,
+        "scientific_terminal": scientific_terminal,
+        "scientific_outcome": verification.get("outcome"),
         "crop_status": crop_result.get("status"),
         "crop_result": crop_result,
-        "accepted": scientific_accepted,
-        "paper_asset_verified": scientific_accepted and not asset_issues,
-        "revision_target": verification.get("revision_target") if isinstance(verification, dict) else None,
+        "terminal": scientific_terminal,
+        "paper_asset_verified": scientific_successful and not asset_issues,
         "error": None if ok else _task_reporter_reason(codex_status, validation_issues, []),
     }
     write_json(status_path, status)
@@ -270,19 +294,249 @@ def task_verifications_document(results: list[dict[str, Any]]) -> dict[str, Any]
     )
 
 
-def _writer_source_paths(source_sandbox: Path) -> list[Path]:
-    if not source_sandbox.is_dir():
-        return []
-    paths: list[Path] = []
-    for path in sorted(source_sandbox.rglob("*")):
-        if not path.is_file() or path.is_symlink():
+def _task_record_run_valid_hint(task_record: dict[str, Any]) -> bool | None:
+    """Prefer host-owned execution evidence; self-report formatting is advisory."""
+
+    host_execution = task_record.get("host_execution")
+    if isinstance(host_execution, dict):
+        passed = host_execution.get("passed")
+        if isinstance(passed, bool):
+            return passed
+        returncode = host_execution.get("returncode")
+        if isinstance(returncode, int) and not isinstance(returncode, bool):
+            return returncode == 0
+    host_returncode = task_record.get("host_run_returncode")
+    if isinstance(host_returncode, int) and not isinstance(host_returncode, bool):
+        return host_returncode == 0
+
+    execution = (
+        task_record.get("execution_summary")
+        if isinstance(task_record.get("execution_summary"), dict)
+        else {}
+    )
+    try:
+        full_run_count = int(execution.get("full_run_count"))
+    except (TypeError, ValueError):
+        return None
+    last_returncode = execution.get("last_returncode")
+    if (
+        full_run_count >= 1
+        and isinstance(last_returncode, int)
+        and not isinstance(last_returncode, bool)
+    ):
+        return last_returncode == 0
+    return None
+
+
+
+def _manifest_declared_source_paths(source_sandbox: Path) -> set[str]:
+    declared = set(TRUSTED_PROJECT_FILES)
+    manifest_path = source_sandbox / "tasks_manifest.json"
+    if _path_is_link_like(source_sandbox) or not manifest_path.is_file() or _path_is_link_like(manifest_path):
+        return declared
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return declared
+    tasks = manifest.get("tasks") if isinstance(manifest, dict) else None
+    for item in tasks if isinstance(tasks, list) else []:
+        if not isinstance(item, dict):
             continue
-        relative = path.relative_to(source_sandbox)
+        values: list[Any] = [
+            item.get("script"),
+            item.get("entrypoint"),
+            item.get("config_full"),
+            item.get("config_smoke"),
+        ]
+        if isinstance(item.get("source_files"), list):
+            values.extend(item["source_files"])
+        for value in values:
+            raw = str(value or "").replace("\\", "/").strip().lstrip("./")
+            candidate = Path(raw)
+            if raw and not candidate.is_absolute() and ".." not in candidate.parts:
+                declared.add(candidate.as_posix())
+    return declared
+
+def _path_is_link_like(path: Path) -> bool:
+    """Detect links and Windows reparse points without following them."""
+
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return False
+    attributes = int(getattr(metadata, "st_file_attributes", 0))
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+    return stat.S_ISLNK(metadata.st_mode) or bool(attributes & reparse_flag)
+
+
+def _safe_writer_tree_files(
+    *,
+    root: Path,
+    source_root: Path,
+) -> tuple[list[tuple[Path, Path]], list[str]]:
+    """Enumerate regular files without traversing a link or escaping the Writer sandbox."""
+
+    warnings: list[str] = []
+    if _path_is_link_like(source_root):
+        return [], ["assigned writer sandbox is a symbolic link or reparse point"]
+    try:
+        relative_root = root.relative_to(source_root)
+        source_root_resolved = source_root.resolve(strict=True)
+    except (OSError, ValueError):
+        return [], ["assigned writer input root is missing or outside its sandbox"]
+    current = source_root
+    for part in relative_root.parts:
+        current = current / part
+        if _path_is_link_like(current):
+            return [], [f"writer input root rejected symbolic link: {relative_root.as_posix()}"]
+    try:
+        root_resolved = root.resolve(strict=True)
+        root_resolved.relative_to(source_root_resolved)
+    except (OSError, ValueError):
+        return [], ["assigned writer input root resolves outside its sandbox"]
+    if not root.is_dir():
+        return [], []
+
+    pending = [root]
+    files: list[tuple[Path, Path]] = []
+    while pending:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as iterator:
+                entries = sorted(iterator, key=lambda entry: entry.name)
+        except OSError as exc:
+            relative = directory.relative_to(root).as_posix() or "."
+            warnings.append(f"writer input directory skipped {relative}: {type(exc).__name__}")
+            continue
+        for entry in entries:
+            path = Path(entry.path)
+            relative = path.relative_to(root)
+            if _path_is_link_like(path):
+                warnings.append(f"writer input skipped symbolic link: {relative.as_posix()}")
+                continue
+            try:
+                resolved = path.resolve(strict=True)
+                resolved.relative_to(root_resolved)
+                resolved.relative_to(source_root_resolved)
+            except (OSError, ValueError):
+                warnings.append(f"writer input skipped path outside its sandbox: {relative.as_posix()}")
+                continue
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(path)
+                elif entry.is_file(follow_symlinks=False):
+                    files.append((relative, path))
+                else:
+                    warnings.append(f"writer input skipped non-regular file: {relative.as_posix()}")
+            except OSError as exc:
+                warnings.append(f"writer input skipped {relative.as_posix()}: {type(exc).__name__}")
+    return sorted(files, key=lambda item: item[0].as_posix()), warnings
+
+
+def _copy_regular_file_without_links(*, source: Path, target: Path, source_root: Path) -> None:
+    if _path_is_link_like(source_root) or _path_is_link_like(source):
+        raise ValueError("source is a symbolic link or reparse point")
+    source_root_resolved = source_root.resolve(strict=True)
+    resolved = source.resolve(strict=True)
+    resolved.relative_to(source_root_resolved)
+    flags = os.O_RDONLY | int(getattr(os, "O_BINARY", 0)) | int(getattr(os, "O_NOFOLLOW", 0))
+    descriptor = os.open(source, flags)
+    try:
+        opened = os.fstat(descriptor)
+        current = source.lstat()
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            raise ValueError("source changed or is not a regular file")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source_handle = os.fdopen(descriptor, "rb")
+        descriptor = -1
+        try:
+            with source_handle, target.open("wb") as target_handle:
+                shutil.copyfileobj(source_handle, target_handle, length=1024 * 1024)
+        except Exception:
+            target.unlink(missing_ok=True)
+            raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _copy_writer_output_snapshot(
+    *,
+    source_sandbox: Path,
+    source_output: Path,
+    target_root: Path,
+) -> tuple[list[str], list[str]]:
+    files, warnings = _safe_writer_tree_files(root=source_output, source_root=source_sandbox)
+    copied: list[str] = []
+    total_bytes = 0
+    for relative, source in files:
+        if relative.name.lower().startswith("paper_target") or REPORT_ASSETS_DIR in {
+            part.lower() for part in relative.parts
+        }:
+            continue
+        try:
+            size = source.stat().st_size
+        except OSError as exc:
+            warnings.append(f"writer output skipped {relative.as_posix()}: {type(exc).__name__}")
+            continue
+        if size > _WRITER_OUTPUT_MAX_FILE_BYTES:
+            warnings.append(
+                f"writer output skipped {relative.as_posix()}: {size} bytes exceeds the per-file resource limit"
+            )
+            continue
+        if total_bytes + size > _WRITER_OUTPUT_MAX_TOTAL_BYTES:
+            warnings.append(
+                f"writer output skipped {relative.as_posix()}: cumulative input exceeds the total resource limit"
+            )
+            continue
+        try:
+            _copy_regular_file_without_links(
+                source=source,
+                target=target_root / relative,
+                source_root=source_sandbox,
+            )
+        except (OSError, ValueError) as exc:
+            warnings.append(f"writer output skipped {relative.as_posix()}: {type(exc).__name__}")
+            continue
+        total_bytes += size
+        copied.append(relative.as_posix())
+    return copied, warnings
+
+
+
+def _looks_like_text_source(path: Path) -> bool:
+    try:
+        size = path.stat().st_size
+        if size <= 0 or size > _WRITER_SOURCE_MAX_BYTES:
+            return False
+        sample = path.read_bytes()[:8192]
+    except OSError:
+        return False
+    if b"\x00" in sample:
+        return False
+    try:
+        sample.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def _writer_source_paths(source_sandbox: Path) -> list[Path]:
+    files, _ = _safe_writer_tree_files(root=source_sandbox, source_root=source_sandbox)
+    declared = _manifest_declared_source_paths(source_sandbox)
+    paths: list[Path] = []
+    for relative, path in files:
+        relative_name = relative.as_posix()
         if relative.name.lower() in _WRITER_SOURCE_EXCLUDED_FILES:
             continue
         if any(part.lower() in _WRITER_SOURCE_EXCLUDED_DIRS for part in relative.parts[:-1]):
             continue
-        if path.suffix.lower() not in _WRITER_SOURCE_SUFFIXES:
+        if relative_name not in declared and not _looks_like_text_source(path):
+            continue
+        try:
+            if path.stat().st_size > _WRITER_SOURCE_MAX_BYTES:
+                continue
+        except OSError:
             continue
         paths.append(path)
     return paths
@@ -298,6 +552,7 @@ def _sha256_file(path: Path) -> str:
 
 def _writer_source_inventory(source_sandbox: Path) -> list[dict[str, Any]]:
     inventory: list[dict[str, Any]] = []
+    declared = _manifest_declared_source_paths(source_sandbox)
     for path in _writer_source_paths(source_sandbox):
         try:
             stat = path.stat()
@@ -306,7 +561,7 @@ def _writer_source_inventory(source_sandbox: Path) -> list[dict[str, Any]]:
                 {
                     "sandbox_relative_path": relative,
                     "size": stat.st_size,
-                    "mtime_ns": stat.st_mtime_ns,
+                    "declared_by_manifest": relative in declared,
                     "sha256": _sha256_file(path),
                     "ownership": "host_trusted" if relative in TRUSTED_PROJECT_FILES else "writer_owned",
                 }
@@ -328,9 +583,8 @@ def _copy_writer_source_snapshot(
         source = source_sandbox / Path(relative)
         target = target_root / Path(relative)
         try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, target)
-        except OSError as exc:
+            _copy_regular_file_without_links(source=source, target=target, source_root=source_sandbox)
+        except (OSError, ValueError) as exc:
             warnings.append(f"writer source snapshot skipped {relative}: {type(exc).__name__}")
             continue
         copied_item = dict(item)
@@ -355,13 +609,29 @@ def _prepare_task_reporter_input(
     source_sandbox = Path(raw_sandbox) if raw_sandbox else inputs_dir / "missing_writer_sandbox"
     output_subdir = str(task_record.get("output_subdir") or task_id)
     source_output = source_sandbox / "outputs" / output_subdir
-    output_available = source_sandbox.is_dir() and source_output.is_dir()
-    if output_available:
-        shutil.copytree(source_output, writer_dir / "outputs", ignore=_ignore_report_assets)
+    copied_output_files, output_warnings = _copy_writer_output_snapshot(
+        source_sandbox=source_sandbox,
+        source_output=source_output,
+        target_root=writer_dir / "outputs",
+    )
+    output_available = bool(copied_output_files)
+    metadata_warnings: list[str] = []
     for name in ("task_agent_result.json", "task_agent_result.md"):
         source = source_sandbox / name
-        if source.is_file():
-            shutil.copy2(source, writer_dir / name)
+        if not source.is_file() or _path_is_link_like(source):
+            continue
+        try:
+            size = source.stat().st_size
+            if size > _WRITER_OUTPUT_MAX_FILE_BYTES:
+                metadata_warnings.append(f"writer metadata skipped {name}: exceeds the per-file resource limit")
+                continue
+            _copy_regular_file_without_links(
+                source=source,
+                target=writer_dir / name,
+                source_root=source_sandbox,
+            )
+        except (OSError, ValueError) as exc:
+            metadata_warnings.append(f"writer metadata skipped {name}: {type(exc).__name__}")
     writer_source_files, source_warnings = _copy_writer_source_snapshot(
         source_sandbox=source_sandbox,
         target_root=writer_dir / WRITER_SOURCE_DIR,
@@ -372,7 +642,9 @@ def _prepare_task_reporter_input(
         if path.is_file() and not path.name.lower().startswith("paper_target")
     ] if (writer_dir / "outputs").exists() else []
     task_id = str(task.get("task_id") or task_id)
-    input_warnings = [] if output_available else ["assigned writer output directory is missing"]
+    input_warnings = [] if output_available else ["assigned writer output has no copyable regular files"]
+    input_warnings.extend(output_warnings)
+    input_warnings.extend(metadata_warnings)
     if not writer_source_files:
         input_warnings.append("assigned writer source snapshot is missing")
     input_warnings.extend(source_warnings)
@@ -407,106 +679,81 @@ def _build_task_reporter_brief(
     page_policy = (
         "All rendered paper pages are attached for this evidence-recovery retry."
         if include_all_paper_pages
-        else "Only task-relevant candidate pages and adjacent pages are attached; the complete copied paper remains available for evidence recovery."
+        else "Task-relevant pages are attached and the copied paper remains available."
     )
-    return f"""# Role: isolated task reporter and paper-figure locator
+    return f"""# Role: isolated scientific task reporter
 
-You verify exactly one reproduction task: `{task_id}`. There are no other experiment outputs in this workspace. Do not infer anything from other tasks, do not compare this result to another local experiment, and do not produce a global report. The original paper is the scientific authority; the writer's self-assessment is untrusted evidence, not a verdict.
+Verify exactly one reproduction task: `{task_id}`. The paper is the scientific authority. The Writer's prose is evidence, not a verdict.
 
-## Ownership and boundaries
-- Work only inside this isolated workspace. Do not edit writer code, writer output, source paper pages, or evidence JSON.
-- You may create only `{TASK_VERIFICATION_FILE}` and PNG/JPEG assets under `{report_asset_dir}/`.
-- You may inspect and crop images with Pillow or PyMuPDF. Do not install packages or access the network.
-- Treat the copied writer source as untrusted evidence. Inspect it statically; do not execute it or import it.
-- {page_policy}
+## Boundaries
+- Inspect the copied Writer source statically; do not execute it, edit it, install packages, or access the network.
+- Read `inputs/task_report_input.json`, Writer outputs/source, and the paper evidence. {page_policy}
+- Judge the scientific conclusion, not pixel alignment or private implementation identity.
+- The small `task.scientific_acceptance` object is a navigation aid. Use its IDs when available. If an ID or optional field is missing, recover the intended claim from the task and paper and record uncertainty; never reject merely for missing structure.
 
-## Evidence available
-- `inputs/task_report_input.json`: only the assigned task, task facts, assigned experiment record, writer result, and local artifact paths.
-- `inputs/writer_output/`: only this writer's CSV, summary, PNG, and result files.
-- `inputs/writer_output/{WRITER_SOURCE_DIR}/`: an immutable snapshot of this task's Python source, imported helpers, full/smoke configs, dependency declarations, manifest, and trusted runtime interfaces.
-- `paper_evidence/source/`: copied original paper.
-- `paper_evidence/full_paper_pages/`: rendered original-paper pages.
-- `paper_evidence/mineru_figure_candidates/`: MinerU parent-figure candidates. They narrow the search but are not authoritative.
-- `paper_evidence/01_{safe_label(task_id)}/`: task-scoped navigation evidence. It is a hint, never an information boundary.
+## Scientific decision
+Trace paper-explicit equations, models, algorithms, baselines, parameters, and metric definitions into the implementation. Then compare the full result with each core conclusion. Classify each conclusion as:
+- `supported`;
+- `unsupported`; or
+- `unassessable_missing_information` when the paper or available evidence is insufficient.
 
-## Direct scientific verification
-Start with the source snapshot. Read the assigned task module, every imported task helper, `config.json`, `config_smoke.json`, and dependency declarations. Trace paper-explicit equations, models, objectives, algorithm steps, baselines, parameters, statistics, and device claims into the actual implementation before judging the output. Distinguish host-trusted plumbing from writer-owned scientific code. When source is available, do not rely only on the Writer's prose disclosure; cite relevant source paths in `evidence_files` and make revision feedback code-specific.
-
-Then independently inspect the complete assigned target and cross-check the implementation against the submitted CSV, summary, PNG, and execution record. Check target identity and subfigure, all panels, curves and baselines, model/equation logic, parameter settings, axes/scales, numerical anchors and curve shape, statistical reliability, annotations, and presentation. Classify each residual by materiality: explicit-fact violation, core-claim failure, acceptable paper-silent assumption, or non-material difference. If the source snapshot is missing or incomplete, record that as uncertainty; do not invent an implementation defect from outputs alone.
-
-If the task description conflicts with the paper, follow the paper. Return work to the Writer only for a material blocker that passes the revision gate below. If the problem is only paper-location ambiguity, insufficient page visibility, or a crop/evidence packaging defect that you can resolve yourself, target the reporter instead.
+For each Task-Designer key numeric target, report only the observed local magnitude (or why it is unavailable). Do not select new key quantities and do not calculate a paper/local ratio; the host owns the paper target and arithmetic.
 
 {REPORTER_CONVERGENCE_POLICY}
 
-## Required result
-Before any crop is considered complete, write `{TASK_VERIFICATION_FILE}` exactly as JSON:
+{CORE_RESULT_STOP_POLICY}
+
+## Output
+Write `{TASK_VERIFICATION_FILE}` as one JSON object. This is deliberately a small evidence note, not a format gate:
 ```json
 {{
-  "schema_version": "1.0",
+  "schema_version": "2.0",
   "task_id": "{task_id}",
-  "verdict": "accepted|revise",
-  "revision_target": "none|writer|reporter",
-  "comparison_summary": "concise direct paper-versus-local finding",
-  "differences": ["material differences; must be empty when accepted"],
-  "non_material_differences": ["minor remaining differences"],
-  "evidence_files": ["existing relative paths inside this workspace"],
-  "feedback": ["concrete next actions; required for revise"],
+  "run_valid": true,
+  "core_conclusions": [
+    {{
+      "claim_id": "claim id from task.scientific_acceptance",
+      "status": "supported|unsupported|unassessable_missing_information",
+      "local_observation": "what the full local result shows",
+      "evidence_files": ["existing relative evidence path"]
+    }}
+  ],
+  "key_numeric_comparisons": [
+    {{
+      "target_id": "target id from task.scientific_acceptance",
+      "local_magnitude": 1.0,
+      "unavailable_reason": ""
+    }}
+  ],
+  "rerun_evidence": null,
+  "comparison_summary": "direct paper-versus-local conclusion",
+  "differences": ["material scientific differences"],
+  "non_material_differences": ["style or sub-order-of-magnitude differences"],
+  "evidence_files": ["existing relative evidence path"],
+  "feedback": [],
   "confidence": "low|medium|high",
-  "local_assets": ["{report_asset_dir}/local_result.png"],
-  "paper_assets": ["{report_asset_dir}/paper_target.png"],
-  "remaining_uncertainties": ["explicit uncertainty"]
+  "local_assets": [],
+  "paper_assets": [],
+  "remaining_uncertainties": []
 }}
 ```
-- `accepted` requires no material blocker, `revision_target: "none"`, and medium or high confidence. It explicitly includes conditional acceptance based on reasonable, disclosed choices in paper-silent or ambiguous space.
-- `revise` requires a paper-grounded material blocker, concrete differences, actionable feedback, and `revision_target: "writer"` or `"reporter"`. A possible alternative implementation or a cosmetic/numerical residual is not enough.
-- Cite only files that exist within this workspace.
 
-## Figure localization and crop
-First verify every MinerU candidate against its caption and the original page. A candidate is only a parent-figure proposal; reject it if its figure identity is wrong. Locate the exact target figure, subfigure, table, formula, or text claim. For a target such as Fig. 9(a), identify the complete `(a)` panel without cutting axes, legend, curves, labels, panel marker, or essential annotations.
-
-Write `{PAPER_TARGET_METADATA_FILE}` as JSON when a MinerU candidate is available:
+Only when another Writer run has a concrete scientific basis, replace `rerun_evidence: null` with:
 ```json
 {{
-  "target": "Fig. 9(a)",
-  "candidate_status": "accepted|rejected_wrong_identity|rejected_incomplete_boundary|unverified",
-  "candidate_id": null,
-  "rejected_candidate_id": "page_0013_visual_001",
-  "source_page": 13,
-  "child_bbox_relative": [0.0, 0.0, 0.33, 0.48],
-  "manual_crop": {{
-    "source_page": 13,
-    "source_image": "paper_evidence/full_paper_pages/paper_page_013.png",
-    "bbox_pixels": [40, 80, 430, 390],
-    "output": "report_assets/{safe_label(task_id)}/paper_target.png"
-  }},
-  "confidence": "high",
-  "included_elements": ["panel label", "x axis", "y axis", "legend"],
-  "remaining_risks": [],
-  "visual_check": {{
-    "target_identity_confirmed": true,
-    "figure_content_complete": true,
-    "panel_boundary_complete": true,
-    "axes_and_labels_complete": true,
-    "legend_and_annotations_complete": true,
-    "caption_complete": true,
-    "no_adjacent_content": true,
-    "compared_against_parent": true
-  }}
+  "rerun_reason": "invalid_run|core_conclusion_failed|key_numeric_ratio_ge_10",
+  "contract_item_ids": ["affected claim_id or target_id"],
+  "paper_evidence_files": ["paper evidence path"],
+  "causal_change": "specific code or configuration change",
+  "change_targets": ["file/function/config key"],
+  "predicted_effect": "why this change should resolve the blocker"
 }}
 ```
-- `candidate_status: accepted` means you directly confirmed that the candidate is the requested figure. Only then may `candidate_id` be populated for deterministic replacement.
-- If the candidate is the wrong figure, set `candidate_status: rejected_wrong_identity`, set `candidate_id` to null, put its id in `rejected_candidate_id`, and provide `manual_crop`. Python must preserve or regenerate that manual page crop.
-- If the candidate has the right figure identity but omits required content or includes neighboring material, use `candidate_status: rejected_incomplete_boundary` and provide a tighter `manual_crop`.
-- If identity remains uncertain, use `candidate_status: unverified`; never guess a candidate id merely because its caption mentions the requested number.
-- `child_bbox_relative` uses `[x0,y0,x1,y1]` in `[0,1]`, relative to the complete MinerU parent figure.
-- For a whole-figure task, the final crop must contain the complete plot/panel, every axis and label, legend and essential annotation, plus the figure number and complete caption. Keep the crop tight and exclude neighboring figures, body paragraphs, headers, and footers.
-- Select a whole-figure `candidate_id` only when that candidate already satisfies the complete-and-clean rule. If it omits the caption or includes adjacent content, do not accept it: provide a `manual_crop` from the full paper page instead.
-- Re-open your provisional crop and compare it with the parent figure before finishing. Set every `visual_check` field to true only after direct visual confirmation. If identity, panel boundary, axes, legend, labels, curves, or essential annotations are uncertain, omit the child bbox or mark the corresponding check false so Python deliberately falls back to the complete parent figure.
-- A crop packaging problem belongs to the reporter. Never send a scientifically accepted Writer back merely because the crop needs repair.
+All five evidence parts are needed to spend another full run. If the result is unsupported but no evidence-based causal change exists, leave `rerun_evidence` null: the correct terminal result is `not_reproduced`. If missing paper information prevents assessment, leave it null and use `unassessable_missing_information`.
 
-When and only when your scientific verdict is `accepted`, save the representative unmodified local image as `{report_asset_dir}/local_result.png`. You may save a provisional `{report_asset_dir}/paper_target.png`, but Python will replace it from the original PDF whenever a valid MinerU candidate and bbox are available. Use numbered files only when several panels are essential.
+## Optional report assets
+For a figure task, make a best-effort readable local image and paper crop under `{report_asset_dir}/` when convenient. For tables, text claims, failed runs, or unavailable crops, CSV/JSON/table/text evidence is enough. Crop identity, boundaries, typography, and other packaging defects never reopen the Writer and never invalidate the scientific note.
 """
-
 
 def _copy_task_figure_candidates(
     *,
@@ -600,11 +847,18 @@ def _task_only_facts(facts: dict[str, Any], task: dict[str, Any]) -> dict[str, A
         if isinstance(fact, dict)
         and (str(fact.get("type") or ""), str(fact.get("name") or "").lower()) in required
     ]
+    high_impact_missing = [
+        item
+        for item in facts.get("missing_information", [])
+        if isinstance(item, dict)
+        and str(item.get("impact") or "").strip().lower()
+        in {"high", "critical", "severe"}
+    ]
     return {
         "paper_domain": facts.get("paper_domain"),
         "paper_repro_type": facts.get("paper_repro_type"),
         "engineering_facts": selected,
-        "missing_information": [],
+        "missing_information": high_impact_missing,
     }
 
 
@@ -613,35 +867,65 @@ def _task_reporter_input_hash(
     task: dict[str, Any],
     task_record: dict[str, Any],
     paper_path: Path,
+    facts: dict[str, Any],
+    experiment_index: dict[str, Any],
+    paper_thesis: dict[str, Any] | None,
     figure_candidates: list[dict[str, Any]],
 ) -> str:
-    stat = paper_path.stat() if paper_path.exists() else None
     raw_sandbox = str(task_record.get("sandbox") or "").strip()
     sandbox = Path(raw_sandbox) if raw_sandbox else paper_path.parent / "__missing_writer_sandbox__"
     output_subdir = str(task_record.get("output_subdir") or task.get("task_id") or "")
+    task_id = str(task.get("task_id") or "")
     payload = {
-        "prompt_version": "isolated_task_reporter_v3_writer_source_mineru_crop_spec",
+        "prompt_version": "isolated_task_reporter_v7_content_addressed_sources",
+        "scientific_policy_id": SCIENTIFIC_POLICY_ID,
         "task": task,
+        "task_facts": _task_only_facts(facts, task),
+        "experiment": _experiment_for_task(experiment_index, task_id),
+        "paper_thesis": paper_thesis or {},
         "result": task_record.get("result_json"),
         "execution": task_record.get("execution_summary"),
-        "output_inventory": _file_inventory(sandbox / "outputs" / output_subdir),
+        "output_inventory": _file_inventory(sandbox / "outputs" / output_subdir, source_root=sandbox),
         "writer_source_inventory": _writer_source_inventory(sandbox),
         "figure_candidates": figure_candidates,
-        "paper": {"size": stat.st_size if stat else None, "mtime_ns": stat.st_mtime_ns if stat else None},
+        "paper_sha256": _sha256_file(paper_path) if paper_path.is_file() else None,
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
-
-def _file_inventory(root: Path) -> list[dict[str, Any]]:
-    if not root.is_dir():
-        return []
-    inventory: list[dict[str, Any]] = []
-    for path in sorted(root.rglob("*")):
-        if not path.is_file() or path.is_symlink():
+def _file_inventory(root: Path, *, source_root: Path) -> list[dict[str, Any]]:
+    files, warnings = _safe_writer_tree_files(root=root, source_root=source_root)
+    inventory: list[dict[str, Any]] = [{"warning": warning} for warning in warnings]
+    total_bytes = 0
+    for relative, path in files:
+        if relative.name.lower().startswith("paper_target") or REPORT_ASSETS_DIR in {
+            part.lower() for part in relative.parts
+        }:
             continue
-        stat = path.stat()
-        inventory.append({"path": path.relative_to(root).as_posix(), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns})
+        try:
+            file_stat = path.stat()
+            if file_stat.st_size > _WRITER_OUTPUT_MAX_FILE_BYTES:
+                inventory.append({
+                    "path": relative.as_posix(),
+                    "size": file_stat.st_size,
+                    "skipped": "per_file_resource_limit",
+                })
+                continue
+            if total_bytes + file_stat.st_size > _WRITER_OUTPUT_MAX_TOTAL_BYTES:
+                inventory.append({
+                    "path": relative.as_posix(),
+                    "size": file_stat.st_size,
+                    "skipped": "total_resource_limit",
+                })
+                continue
+            inventory.append({
+                "path": relative.as_posix(),
+                "size": file_stat.st_size,
+                "sha256": _sha256_file(path),
+            })
+            total_bytes += file_stat.st_size
+        except OSError:
+            continue
     return inventory
 
 
@@ -655,7 +939,7 @@ def _load_task_reporter_cache(
     status = _read_json_object(status_path)
     if (
         not status.get("ok")
-        or not status.get("accepted")
+        or not status.get("terminal")
         or status.get("input_hash") != input_hash
         or not isinstance(status.get("task_verification"), dict)
     ):
@@ -691,29 +975,14 @@ def _accepted_asset_issues(
     crop_result: dict[str, Any],
     require_verified_pdf_crop: bool = False,
 ) -> list[str]:
+    """Validate only assets that were supplied; missing visual packaging is non-blocking."""
+
+    del crop_result, require_verified_pdf_crop
     issues: list[str] = []
-    crop_status = str(crop_result.get("status") or "")
-    if crop_status in {"", "unresolved", "not_applicable"}:
-        issues.append("accepted result does not have a finalized paper target image")
-    if require_verified_pdf_crop and crop_status in {
-        "fallback_parent_figure",
-        "legacy_reporter_crop",
-        "reporter_provided_crop",
-    }:
-        issues.append(
-            "PDF paper target lacks a verified exact crop; provide an accepted complete candidate "
-            "or a manual page crop with source page and bbox provenance"
-        )
-    selection_reason = str(crop_result.get("selection_reason") or "")
-    if selection_reason.startswith("reporter_rejected") and crop_result.get("source_mode") == "verified_mineru_candidate":
-        issues.append("a reporter-rejected MinerU candidate replaced the paper target")
-    if crop_result.get("output_path") and not crop_result.get("output_sha256"):
-        issues.append("finalized paper target is missing provenance hash")
     asset_root = (workspace / REPORT_ASSETS_DIR / safe_label(task_id)).resolve()
     for key in ("local_assets", "paper_assets"):
         values = verification.get(key)
-        if not isinstance(values, list) or not any(str(value).strip() for value in values):
-            issues.append(f"accepted result must provide {key}")
+        if not isinstance(values, list):
             continue
         for raw_path in values:
             path = workspace / str(raw_path)
@@ -725,13 +994,12 @@ def _accepted_asset_issues(
                 resolved = path
                 owned = False
             if not owned:
-                issues.append(f"{key} must be a direct file in the assigned task asset directory: {raw_path}")
+                issues.append(f"ignored {key} outside the assigned asset directory: {raw_path}")
             elif not resolved.is_file() or is_symlink or resolved.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
-                issues.append(f"missing or unsupported {key} file: {raw_path}")
+                issues.append(f"ignored missing or unsupported {key}: {raw_path}")
             elif resolved.stat().st_size > 20_000_000:
-                issues.append(f"oversized {key} file: {raw_path}")
+                issues.append(f"ignored oversized {key}: {raw_path}")
     return issues
-
 
 def _normalize_verification_paths(
     *,
@@ -819,11 +1087,10 @@ def _task_reporter_failure(
         "validation_issues": [message],
         "asset_issues": [],
         "asset_paths": [],
-        "scientific_accepted": False,
+        "scientific_successful": False,
         "crop_status": "unresolved",
         "crop_result": {"status": "unresolved", "issues": [message]},
-        "accepted": False,
-        "revision_target": TASK_REPORTER_ROUTE_REPORTER,
+        "terminal": False,
         "error": message,
     }
     write_json(status_path, status)
@@ -845,14 +1112,10 @@ def _task_reporter_reason(
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:
-    if not path.is_file() or path.is_symlink() or path.stat().st_size > 2_000_000:
+    if not path.is_file() or path.is_symlink():
         return {}
     try:
         value = json.loads(path.read_text(encoding="utf-8-sig"))
     except Exception:
         return {}
     return value if isinstance(value, dict) else {}
-
-
-def _ignore_report_assets(_directory: str, names: list[str]) -> set[str]:
-    return {name for name in names if name.lower().startswith("paper_target") or name.lower() == "report_assets"}

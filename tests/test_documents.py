@@ -191,10 +191,10 @@ class DocumentTests(unittest.TestCase):
         findings = risk.get("findings", [])
         lost = [f for f in findings if f.get("type") == "pdf_images_lost"]
         self.assertEqual(len(lost), 1, "pdf_images_lost must be auto-injected for pdf")
-        self.assertIn("text chunks", lost[0]["message"])
-        self.assertIn("图片、图表", lost[0]["message"])  # Chinese note about lost visuals/figures
+        self.assertIn("PDF 文本抽取", lost[0]["message"])
+        self.assertIn("图表", lost[0]["message"])
         self.assertTrue(lost[0].get("always_injected_for_pdfs"))
-        self.assertEqual(lost[0]["severity"], "high")
+        self.assertEqual(lost[0]["severity"], "advisory")
 
         # non-pdf should not inject it
         risk_md = build_risk_report(facts, tasks, validation, paper_format="md")

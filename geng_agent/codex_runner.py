@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
 import math
 import os
+import site
 import shlex
 import shutil
 import subprocess
 import sys
+import sysconfig
 import threading
 import time
 from pathlib import Path
@@ -13,7 +16,7 @@ from typing import Any
 
 from .config import get_config_value
 from .outputs import write_json, write_text
-from .security import codex_safe_env, redact_text
+from .security import build_safe_env, codex_safe_env, redact_text
 
 
 MAX_TRANSCRIPT_CHARS = 200_000
@@ -30,6 +33,361 @@ DEFAULT_GENG_CODEX_REASONING_EFFORT = {
 
 _EPHEMERAL_CAPABILITY_CACHE: dict[tuple[str, ...], dict[str, Any]] = {}
 _EPHEMERAL_CAPABILITY_LOCK = threading.Lock()
+
+_FOUNDATION_UNITTEST_GUARD = r"""
+import builtins
+import dis
+import json
+import os
+import sys
+
+import threading
+
+_PATH_STATE = threading.local()
+_CONFIG = json.loads(sys.argv[1])
+
+
+def _real_path(value):
+    try:
+        path = os.fspath(value)
+    except TypeError:
+        return None
+    if isinstance(path, bytes):
+        path = os.fsdecode(path)
+    if not isinstance(path, str) or not path:
+        return None
+    if not os.path.isabs(path):
+        path = os.path.join(os.getcwd(), path)
+    previous = getattr(_PATH_STATE, "resolving", False)
+    _PATH_STATE.resolving = True
+    try:
+        return os.path.normcase(os.path.realpath(path))
+    finally:
+        _PATH_STATE.resolving = previous
+
+
+def _lexical_path(value):
+    try:
+        path = os.fspath(value)
+    except TypeError:
+        return None
+    if isinstance(path, bytes):
+        path = os.fsdecode(path)
+    if not isinstance(path, str) or not path:
+        return None
+    if not os.path.isabs(path):
+        path = os.path.join(os.getcwd(), path)
+    return os.path.normcase(os.path.abspath(os.path.normpath(path)))
+
+
+def _inside(path, root):
+    try:
+        return os.path.commonpath((path, root)) == root
+    except (TypeError, ValueError):
+        return False
+
+
+_WORK_DIR = _real_path(_CONFIG["work_dir"])
+_SENSITIVE_ROOTS = tuple(
+    path
+    for path in (_real_path(item) for item in _CONFIG["sensitive_roots"])
+    if path is not None
+)
+_TRUSTED_READ_ROOTS = tuple(
+    path
+    for path in (_real_path(item) for item in _CONFIG["trusted_read_roots"])
+    if path is not None
+)
+
+
+def _deny(message):
+    raise PermissionError("Foundation runtime guard: " + message)
+
+
+def _is_sensitive(path):
+    if path is None:
+        return False
+    return any(_inside(path, root) for root in _SENSITIVE_ROOTS)
+
+
+def _require_allowed_read(path, event):
+    if path is None and event in {"os.listdir", "os.scandir"}:
+        path = "."
+    if isinstance(path, int):
+        if path not in (0, 1, 2):
+            _deny(f"{event} via an external file descriptor")
+        return
+    lexical = _lexical_path(path)
+    resolved = _real_path(path)
+    if lexical is None or resolved is None:
+        _deny(f"{event} with an unresolved path: {path!r}")
+    if _inside(lexical, _WORK_DIR) and not _inside(resolved, _WORK_DIR):
+        _deny(f"{event} follows a case symlink outside the sandbox: {path!r}")
+    if _is_sensitive(resolved):
+        _deny(f"host credential read blocked: {path!r}")
+    if _inside(resolved, _WORK_DIR):
+        return
+    if any(_inside(resolved, root) for root in _TRUSTED_READ_ROOTS):
+        return
+    _deny(f"{event} outside case and trusted runtime roots: {path!r}")
+
+
+def _require_case_write(path, event):
+    if isinstance(path, int):
+        if path not in (0, 1, 2):
+            _deny(f"{event} via an external file descriptor")
+        return
+    resolved = _real_path(path)
+    if resolved is None or not _inside(resolved, _WORK_DIR):
+        _deny(f"{event} outside the case sandbox: {path!r}")
+
+
+def _require_case_chdir(path, event):
+    lexical = _lexical_path(path)
+    resolved = _real_path(path)
+    if lexical is None or resolved is None:
+        _deny(f"{event} with an unresolved path: {path!r}")
+    if not _inside(lexical, _WORK_DIR) or not _inside(resolved, _WORK_DIR):
+        _deny(f"{event} outside the case sandbox: {path!r}")
+
+
+def _open_is_write(mode, flags):
+    if isinstance(mode, str) and any(marker in mode for marker in ("w", "a", "x", "+")):
+        return True
+    if not isinstance(flags, int):
+        return False
+    write_flags = (
+        os.O_WRONLY
+        | os.O_RDWR
+        | os.O_APPEND
+        | os.O_CREAT
+        | os.O_TRUNC
+    )
+    tmpfile_flag = getattr(os, "O_TMPFILE", 0)
+    return bool(flags & write_flags) or bool(tmpfile_flag and flags & tmpfile_flag == tmpfile_flag)
+
+
+_MUTATING_PATH_ARGUMENTS = {
+    "os.chmod": (0,),
+    "os.chown": (0,),
+    "os.link": (0, 1),
+    "os.mkdir": (0,),
+    "os.remove": (0,),
+    "os.rename": (0, 1),
+    "os.replace": (0, 1),
+    "os.rmdir": (0,),
+    "os.symlink": (1,),
+    "os.truncate": (0,),
+    "os.utime": (0,),
+    "shutil.copyfile": (1,),
+    "shutil.copymode": (1,),
+    "shutil.copystat": (1,),
+    "shutil.copytree": (1,),
+    "shutil.move": (0, 1),
+    "shutil.rmtree": (0,),
+}
+
+_READ_PATH_EVENTS = {
+    "os.listdir",
+    "os.scandir",
+    "glob.glob",
+    "glob.glob/2",
+}
+
+
+def _glob_anchor(args):
+    pattern = args[0] if args else "."
+    root_dir = args[2] if len(args) > 2 else None
+    try:
+        pattern = os.fspath(pattern)
+        if root_dir is not None and not os.path.isabs(pattern):
+            pattern = os.path.join(os.fspath(root_dir), pattern)
+    except TypeError:
+        return pattern
+    separators = {os.sep}
+    if os.altsep:
+        separators.add(os.altsep)
+    first_magic = min(
+        (pattern.find(marker) for marker in ("*", "?", "[") if marker in pattern),
+        default=-1,
+    )
+    if first_magic < 0:
+        return pattern
+    prefix = pattern[:first_magic]
+    while prefix and prefix[-1] not in separators:
+        prefix = prefix[:-1]
+    return prefix or "."
+
+
+def _is_case_frame(frame):
+    if frame is None:
+        return False
+    code_filename = frame.f_code.co_filename
+    if (
+        isinstance(code_filename, str)
+        and code_filename.startswith("<")
+        and code_filename.endswith(">")
+    ):
+        return False
+    filename = _real_path(code_filename)
+    return filename is not None and _inside(filename, _WORK_DIR)
+
+
+def _caller_opcode(frame):
+    if frame is None:
+        return ""
+    current = ""
+    try:
+        for instruction in dis.get_instructions(frame.f_code):
+            if instruction.offset > frame.f_lasti:
+                break
+            current = instruction.opname
+    except (TypeError, ValueError):
+        return ""
+    return current
+
+def _is_import_statement(frame):
+    return _caller_opcode(frame).endswith("IMPORT_NAME")
+
+
+
+_ORIGINAL_EVAL = builtins.eval
+_ORIGINAL_EXEC = builtins.exec
+_ORIGINAL_COMPILE = builtins.compile
+_ORIGINAL_IMPORT = builtins.__import__
+_ORIGINAL_STAT = os.stat
+_ORIGINAL_LSTAT = os.lstat
+_ORIGINAL_ACCESS = os.access
+_ORIGINAL_READLINK = os.readlink
+
+
+def _guarded_eval(*args, **kwargs):
+    if _is_case_frame(sys._getframe(1)):
+        _deny("eval called directly by case code")
+    return _ORIGINAL_EVAL(*args, **kwargs)
+
+
+def _guarded_exec(*args, **kwargs):
+    if _is_case_frame(sys._getframe(1)):
+        _deny("exec called directly by case code")
+    return _ORIGINAL_EXEC(*args, **kwargs)
+
+
+def _guarded_compile(*args, **kwargs):
+    if _is_case_frame(sys._getframe(1)):
+        _deny("compile called directly by case code")
+    return _ORIGINAL_COMPILE(*args, **kwargs)
+
+
+def _guarded_import(*args, **kwargs):
+    caller = sys._getframe(1)
+    if _is_case_frame(caller) and not _is_import_statement(caller):
+        _deny("__import__ called directly by case code")
+    return _ORIGINAL_IMPORT(*args, **kwargs)
+
+
+def _guarded_stat(path, *args, **kwargs):
+    if getattr(_PATH_STATE, "resolving", False):
+        return _ORIGINAL_STAT(path, *args, **kwargs)
+    _require_allowed_read(path, "os.stat")
+    return _ORIGINAL_STAT(path, *args, **kwargs)
+
+
+def _guarded_lstat(path, *args, **kwargs):
+    if getattr(_PATH_STATE, "resolving", False):
+        return _ORIGINAL_LSTAT(path, *args, **kwargs)
+    _require_allowed_read(path, "os.lstat")
+    return _ORIGINAL_LSTAT(path, *args, **kwargs)
+
+
+def _guarded_access(path, *args, **kwargs):
+    if getattr(_PATH_STATE, "resolving", False):
+        return _ORIGINAL_ACCESS(path, *args, **kwargs)
+    _require_allowed_read(path, "os.access")
+    return _ORIGINAL_ACCESS(path, *args, **kwargs)
+
+
+def _guarded_readlink(path, *args, **kwargs):
+    if getattr(_PATH_STATE, "resolving", False):
+        return _ORIGINAL_READLINK(path, *args, **kwargs)
+    _require_allowed_read(path, "os.readlink")
+    return _ORIGINAL_READLINK(path, *args, **kwargs)
+
+
+def _direct_audit_case_caller():
+    try:
+        return _is_case_frame(sys._getframe(2))
+    except ValueError:
+        return False
+
+
+def _audit(event, args):
+    if event.startswith("socket."):
+        _deny(f"network operation blocked ({event})")
+    if (
+        event == "subprocess.Popen"
+        or event == "os.system"
+        or event.startswith("os.spawn")
+        or event.startswith("os.posix_spawn")
+        or event.startswith("os.exec")
+        or event in {"os.fork", "os.forkpty", "pty.fork", "pty.spawn"}
+        or event.startswith("os.startfile")
+    ):
+        _deny(f"process operation blocked ({event})")
+    if event in {"compile", "exec"} and _direct_audit_case_caller():
+        _deny(f"dynamic code execution blocked ({event})")
+    if (
+        event == "import"
+        and _direct_audit_case_caller()
+        and not _is_import_statement(sys._getframe(1))
+    ):
+        _deny("dynamic import blocked")
+    if event == "open" and args:
+        path = args[0]
+        mode = args[1] if len(args) > 1 else None
+        flags = args[2] if len(args) > 2 else None
+        if _open_is_write(mode, flags):
+            _require_case_write(path, event)
+        else:
+            _require_allowed_read(path, event)
+        return
+    path_indexes = _MUTATING_PATH_ARGUMENTS.get(event)
+    if path_indexes:
+        for index in path_indexes:
+            if index < len(args):
+                _require_case_write(args[index], event)
+        return
+    if event == "os.chdir" and args:
+        _require_case_chdir(args[0], event)
+        return
+    if event in _READ_PATH_EVENTS and args:
+        path = _glob_anchor(args) if event.startswith("glob.") else args[0]
+        _require_allowed_read(path, event)
+
+
+sys.addaudithook(_audit)
+builtins.eval = _guarded_eval
+builtins.exec = _guarded_exec
+builtins.compile = _guarded_compile
+builtins.__import__ = _guarded_import
+os.stat = _guarded_stat
+os.lstat = _guarded_lstat
+os.access = _guarded_access
+os.readlink = _guarded_readlink
+sys.path.insert(0, _WORK_DIR)
+
+import unittest
+
+_START_DIR = _real_path(os.path.join(_WORK_DIR, _CONFIG["start_dir"]))
+if _START_DIR is None or not _inside(_START_DIR, _WORK_DIR):
+    _deny("unittest discovery path escapes the case sandbox")
+_SUITE = unittest.defaultTestLoader.discover(
+    start_dir=_START_DIR,
+    top_level_dir=_WORK_DIR,
+)
+_RESULT = unittest.TextTestRunner(verbosity=2).run(_SUITE)
+raise SystemExit(0 if _RESULT.wasSuccessful() else 1)
+"""
 
 
 def resolve_codex_timeout(timeout: float | None) -> float:
@@ -194,17 +552,46 @@ def run_python_unittest_subprocess(
     start_dir: str = "tests",
     timeout: float = 120.0,
 ) -> dict[str, Any]:
-    """Run generated contract tests through the centralized subprocess boundary."""
+    """Run generated contract tests through an isolated, host-owned Python."""
 
-    env = codex_safe_env()
+    env = build_safe_env()
+    resolved_work_dir = work_dir.resolve()
+    runtime_home = resolved_work_dir / ".runtime_home"
+    runtime_cache = runtime_home / ".cache"
+    runtime_tmp = runtime_home / "tmp"
+    runtime_cache.mkdir(parents=True, exist_ok=True)
+    runtime_tmp.mkdir(parents=True, exist_ok=True)
+    env["HOME"] = str(runtime_home)
+    env["USERPROFILE"] = str(runtime_home)
+    env["XDG_CACHE_HOME"] = str(runtime_cache)
+    env["MPLCONFIGDIR"] = str(runtime_cache / "matplotlib")
+    env["TEMP"] = str(runtime_tmp)
+    env["TMP"] = str(runtime_tmp)
+    env["TMPDIR"] = str(runtime_tmp)
+    for key in ("CUDA_HOME", "CUDA_PATH", "CUDA_VISIBLE_DEVICES", "LD_LIBRARY_PATH"):
+        value = os.environ.get(key)
+        if value:
+            env[key] = value
     python_dir = str(Path(sys.executable).resolve().parent)
     env["PATH"] = os.pathsep.join([python_dir, env.get("PATH", "")])
     if os.name == "nt":
         env["Path"] = env["PATH"]
+    guard_config = _foundation_unittest_guard_config(
+        work_dir=resolved_work_dir,
+        start_dir=start_dir,
+    )
+    command = [
+        sys.executable,
+        "-I",
+        "-B",
+        "-c",
+        _FOUNDATION_UNITTEST_GUARD,
+        json.dumps(guard_config, ensure_ascii=True, separators=(",", ":")),
+    ]
     try:
         completed = subprocess.run(
-            [sys.executable, "-B", "-m", "unittest", "discover", "-s", start_dir, "-v"],
-            cwd=work_dir,
+            command,
+            cwd=resolved_work_dir,
             env=env,
             capture_output=True,
             text=True,
@@ -226,6 +613,69 @@ def run_python_unittest_subprocess(
             "stdout": str(exc.stdout or "")[-20_000:],
             "stderr": str(exc.stderr or "")[-20_000:],
         }
+
+
+def _foundation_unittest_guard_config(*, work_dir: Path, start_dir: str) -> dict[str, Any]:
+    """Build path-only guard input without exposing host environment values."""
+
+    home_candidates: list[Path] = [Path.home()]
+    for name in ("HOME", "USERPROFILE"):
+        value = os.environ.get(name)
+        if value:
+            home_candidates.append(Path(value))
+    sensitive_roots = {
+        str((home / leaf).resolve())
+        for home in home_candidates
+        for leaf in (".ssh", ".codex", ".config")
+    }
+
+    trusted_read_roots = {
+        str(work_dir.resolve()),
+        str(Path(sys.prefix).resolve()),
+        str(Path(sys.base_prefix).resolve()),
+        str(Path(sys.executable).resolve().parent),
+    }
+    try:
+        trusted_read_roots.update(str(Path(path).resolve()) for path in site.getsitepackages())
+    except AttributeError:
+        pass
+    trusted_read_roots.update(
+        str(Path(path).resolve())
+        for path in sysconfig.get_paths().values()
+        if path
+    )
+    if os.name == "nt":
+        system_root = os.environ.get("SystemRoot")
+        if system_root:
+            trusted_read_roots.add(str(Path(system_root).resolve()))
+    else:
+        trusted_read_roots.update(
+            str(path.absolute())
+            for path in (
+                Path("/usr/lib"),
+                Path("/usr/lib64"),
+                Path("/lib"),
+                Path("/lib64"),
+                Path("/usr/share"),
+                Path("/etc/ssl/certs"),
+                Path("/dev/urandom"),
+                Path("/proc/cpuinfo"),
+                Path("/proc/meminfo"),
+                Path("/proc/self/status"),
+                Path("/proc/driver/nvidia"),
+                Path("/sys/bus/pci/devices"),
+                Path("/sys/devices/system/cpu"),
+                Path("/sys/devices/system/node"),
+            )
+            if path.exists()
+        )
+
+    return {
+        "work_dir": str(work_dir.resolve()),
+        "start_dir": str(start_dir),
+        "sensitive_roots": sorted(sensitive_roots),
+        "trusted_read_roots": sorted(trusted_read_roots),
+    }
 
 
 def _ephemeral_capability(

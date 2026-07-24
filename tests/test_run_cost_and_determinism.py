@@ -100,6 +100,7 @@ class RiskDimensionTests(unittest.TestCase):
         )
         self.assertEqual(dims["implementation_fidelity"]["level"], "low")
         self.assertEqual(dims["result_alignment"]["level"], "low")
+        self.assertEqual(dims["security_isolation"]["level"], "low")
 
     def test_dependency_warnings_are_visible_but_not_high_risk(self) -> None:
         dims = build_risk_dimensions(
@@ -117,8 +118,28 @@ class RiskDimensionTests(unittest.TestCase):
         )
 
         self.assertEqual(dims["runtime_reliability"]["level"], "low")
-        self.assertEqual(dims["security_isolation"]["level"], "medium")
-        self.assertIn("requirements_warnings=1", dims["security_isolation"]["evidence"])
+        self.assertEqual(dims["security_isolation"]["level"], "low")
+        self.assertEqual(dims["dependency_portability"]["level"], "medium")
+        self.assertIn("requirements_warnings=1", dims["dependency_portability"]["evidence"])
+
+    def test_inconclusive_terminal_result_is_reportable_not_an_incomplete_review(self) -> None:
+        dims = build_risk_dimensions(
+            missing=[{"name": "undisclosed setting"}],
+            assumptions=[],
+            validation={"required_files_present": True, "python_compiles": True},
+            runtime_result={"enabled": True, "passed": True},
+            scientific_check={},
+            tasks={"repro_tasks": [{"task_id": "task_1"}]},
+            result_review_result={
+                "enabled": True,
+                "passed": False,
+                "all_terminal": True,
+                "tasks": [{"task_id": "task_1", "outcome": "inconclusive_missing_information"}],
+            },
+        )
+
+        self.assertEqual(dims["result_alignment"]["level"], "medium")
+        self.assertEqual(dims["information_completeness"]["level"], "high")
 
 
 class UsageRollupTests(unittest.TestCase):

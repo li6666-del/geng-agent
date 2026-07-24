@@ -16,6 +16,16 @@
 8. 同一张图的曲线、baseline、参数点和共享仿真结果继续合并为一个任务。
 9. 不输出任何运行前复现评级。Writer 后续仍以尽可能完整复现论文为目标。
 
+科学验收契约刷新规则：
+1. 每个任务输出一个完整的 scientific_acceptance 快照（contract_version=`1.0`），不要把同一权威拆成第二份漂移的验收文件。
+2. paper_thesis_json 为空对象时是中间回补刷新：保留现有 claim_id/target_id/gap_id，只用新证据完善内容。它包含真实 thesis 时是论文主旨后的最终 Task Designer pass：用论文主旨、最终事实和全文上下文锁定下游共享的最小科学结论。
+3. paper_thesis_json 是证据，不是独立判定权威；最终写入 task.scientific_acceptance 的快照才是 Architecture、Writer 和 Reporter 的共同任务契约。
+4. core_conclusions 只包含排序、趋势、交点、阈值、缩放、增益/损失、机制或明确绝对量级等科学结论。像素、颜色、字体、线宽、marker、排版和绘图风格不得成为核心结论。
+5. key_numeric_targets 只保留会改变论文结论的关键量级。无法可靠取得 paper_magnitude 时写 null/evidence_quality=`unavailable`；不要猜数，也不要把像素坐标当数值目标。
+6. 无法确定的内容转入 information_gaps；按真实后果选择 `assume_and_disclose|single_sensitivity_if_core|terminal_inconclusive`。允许空列表和保守默认，不得因缺字段机械中断。
+7. 宿主统一负责数值量级阈值与非阻塞视觉差异；不要自定义另一套误差阈值。论文明确要求更紧数值精度时，把该精度本身写成 core_conclusion。
+8. expected_trend、comparison.tolerance 和 validation_anchors 只作说明，不能覆盖 scientific_acceptance。
+
 软交接规则：
 1. 顶层必须输出 backfill_handoff，但它是任务专家的工作建议，不是科学结论。
 2. 只要现有任务已经足以让 Writer 编写代码、查阅全文、作出显式假设并开始迭代，就设置 ready_for_writer=true。非关键未知字段、绘图样式、随机种子、可合理默认的样本数以及可从图中估读的值都不应阻止交接。
@@ -44,6 +54,18 @@
       "parameter_matrix": [],
       "baseline_definitions": [],
       "statistical_protocol": [],
+      "scientific_acceptance": {
+        "contract_version": "1.0",
+        "core_conclusions": [
+          {"claim_id": "stable_claim_id", "statement": "", "kind": "other", "regime": "", "paper_anchor": ""}
+        ],
+        "key_numeric_targets": [
+          {"target_id": "stable_target_id", "name": "", "paper_magnitude": null, "unit": "", "regime": "", "evidence_quality": "unavailable"}
+        ],
+        "information_gaps": [
+          {"gap_id": "stable_gap_id", "description": "", "affects_claim_ids": ["stable_claim_id"], "disposition": "assume_and_disclose"}
+        ]
+      },
       "validation_anchors": []
     }
   ]
@@ -63,3 +85,6 @@
 
 论文文本、实体和图表上下文：
 {{paper_context_json}}
+
+论文主旨证据（中间回补刷新时为 {}，最终 Task Designer pass 时为真实内容）：
+{{paper_thesis_json}}

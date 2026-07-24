@@ -71,7 +71,13 @@ from .stage_cleanup import (
     _clear_stage_audit,
     _clear_stage_outputs,
 )
-from .runtime_status import _load_valid_stage_cache, _paper_cache_matches
+from .runtime_status import (
+    _load_valid_stage_cache,
+    _paper_cache_matches,
+    _sha256_file,
+    build_stage_cache_metadata,
+)
+from .scientific_materiality import SCIENTIFIC_POLICY_ID
 from .risk_report import (
     _build_run_cost,
     _count_missing_baselines,
@@ -101,61 +107,31 @@ TARGETED_BACKFILL_MAX_ROUNDS = 3
 
 
 def _select_workflow_version(output_dir: Path, *, resume: bool) -> str:
-    """Keep legacy cases on v1 while making every new/rebuilt case v2."""
+    """Use the current workflow for every run; old case compatibility is intentionally removed."""
 
-    marker = output_dir / "workflow.json"
-    if resume and marker.is_file():
-        try:
-            version = str(json.loads(marker.read_text(encoding="utf-8-sig")).get("workflow_version") or "")
-        except Exception:
-            version = ""
-        if version in {"1", "2"}:
-            return version
-    legacy_artifacts = any(
-        (output_dir / name).exists()
-        for name in ("engineering_facts.json", "repro_tasks.json", "experiment_index.json", "repro_project")
-    )
-    if resume and legacy_artifacts and not (output_dir / "scientific_architecture.json").is_file():
-        write_json(
-            marker,
-            {
-                "workflow_version": "1",
-                "legacy_detected": True,
-                "note": "resume keeps pre-v2 cases on their original workflow",
-            },
-        )
-        return "1"
+    del resume
     write_json(
-        marker,
+        output_dir / "workflow.json",
         {
             "workflow_version": "2",
-            "architecture_contract": "scientific_architecture/1.1",
+            "architecture_contract": "scientific_architecture/advisory-1.1",
             "foundation_contract": "foundation/1",
+            "scientific_policy_id": SCIENTIFIC_POLICY_ID,
+            "legacy_case_compatibility": False,
         },
     )
     return "2"
+
 
 def _requires_scientific_architecture_v11(
     output_dir: Path,
     *,
     resume: bool,
 ) -> bool:
-    """Require 1.1 for new/rebuilt cases while preserving explicit legacy markers."""
+    """The architecture is useful execution guidance, never a schema-version gate."""
 
-    marker = output_dir / "workflow.json"
-    try:
-        payload = json.loads(marker.read_text(encoding="utf-8-sig")) if marker.is_file() else {}
-    except Exception:
-        payload = {}
-    contract = str(payload.get("architecture_contract") or "")
-    if contract == "scientific_architecture/1.1":
-        return True
-    if contract == "scientific_architecture/1.0":
-        return False
-    # Older v2 cases did not always record the architecture contract. Preserve
-    # them on resume; a deliberate rebuild must use the current contract.
-    return not resume
-
+    del output_dir, resume
+    return False
 
 @dataclass(frozen=True)
 class PipelineResult:
@@ -366,6 +342,7 @@ class ReviewPipeline:
         _mark("mineru_layout")
         paper_context_raw = pretty_json(
             {
+                "paper_source_sha256": paper.get("source_sha256"),
                 "paper_chunks": json.loads(_paper_context_for_prompt(paper["chunks"])),
                 "paper_figure_index": figure_index_prompt_summary(figure_index),
             }
@@ -399,6 +376,11 @@ class ReviewPipeline:
             truncation_recovery=recover_truncated_engineering_facts,
             backend=analysis_backend,
             codex_timeout=codex_analysis_timeout,
+            cache_inputs={
+                "paper_source_sha256": paper.get("source_sha256"),
+                "figure_index": figure_index_prompt_summary(figure_index),
+                "visible_figure_pages": sorted(valid_pages),
+            },
             fallback_factory=(
                 (
                     lambda exc: build_fallback_engineering_facts(
@@ -490,6 +472,11 @@ class ReviewPipeline:
             request_timeout=tasks_timeout,
             backend=analysis_backend,
             codex_timeout=codex_analysis_timeout,
+            cache_inputs={
+                "paper_source_sha256": paper.get("source_sha256"),
+                "facts": initial_facts,
+                "fact_coverage": fact_coverage,
+            },
             fallback_factory=(
                 (
                     lambda exc: build_fallback_repro_tasks(
@@ -515,9 +502,24 @@ class ReviewPipeline:
             "repro_tasks", preliminary_tasks
         )
         if preliminary_structure_issues:
-            raise RuntimeError(
-                "Internal preliminary task merge produced no readable task set: "
-                + format_issues(preliminary_structure_issues)
+            preliminary_tasks = finalize_repro_tasks(preliminary_tasks, initial_facts)
+            remaining_preliminary_issues = validate_stage(
+                "repro_tasks", preliminary_tasks
+            )
+            write_json(
+                audit_dir / "02a_preliminary_task_structure_warning.json",
+                {
+                    "advisory": True,
+                    "recovered_with_minimum_handoff": not remaining_preliminary_issues,
+                    "warnings": [
+                        {"path": issue.path, "message": issue.message}
+                        for issue in preliminary_structure_issues
+                    ],
+                    "remaining_warnings": [
+                        {"path": issue.path, "message": issue.message}
+                        for issue in remaining_preliminary_issues
+                    ],
+                },
             )
         write_analysis_warnings(
             output_dir=output_dir,
@@ -586,6 +588,14 @@ class ReviewPipeline:
                 candidate_normalizer=_normalize_backfill,
                 backend=analysis_backend,
                 codex_timeout=codex_analysis_timeout,
+                cache_inputs={
+                    "paper_source_sha256": paper.get("source_sha256"),
+                    "round_index": round_index,
+                    "requests": requests,
+                    "facts": current_facts,
+                    "tasks": current_tasks,
+                    "search_ledger": search_ledger,
+                },
             )
             write_analysis_warnings(
                 output_dir=output_dir,
@@ -626,6 +636,7 @@ class ReviewPipeline:
                 search_ledger_json=wrap_untrusted(
                     "search_ledger_json", pretty_json(search_ledger)
                 ),
+                paper_thesis_json=wrap_untrusted("paper_thesis_json", "{}"),
                 paper_context_json=paper_context,
             )
 
@@ -650,6 +661,14 @@ class ReviewPipeline:
                 request_timeout=tasks_timeout,
                 backend=analysis_backend,
                 codex_timeout=codex_analysis_timeout,
+                cache_inputs={
+                    "paper_source_sha256": paper.get("source_sha256"),
+                    "round_index": round_index,
+                    "tasks": current_tasks,
+                    "facts": current_facts,
+                    "backfill_resolution": cumulative_resolution,
+                    "search_ledger": search_ledger,
+                },
             )
             write_analysis_warnings(
                 output_dir=output_dir,
@@ -719,11 +738,23 @@ class ReviewPipeline:
 
         task_structure_issues = validate_stage("repro_tasks", tasks)
         if task_structure_issues:
-            raise RuntimeError(
-                "Internal task finalization produced no readable task set: "
-                + format_issues(task_structure_issues)
+            tasks = finalize_repro_tasks(tasks, facts)
+            remaining_task_issues = validate_stage("repro_tasks", tasks)
+            write_json(
+                audit_dir / "02c_final_task_structure_warning.json",
+                {
+                    "advisory": True,
+                    "recovered_with_minimum_handoff": not remaining_task_issues,
+                    "warnings": [
+                        {"path": issue.path, "message": issue.message}
+                        for issue in task_structure_issues
+                    ],
+                    "remaining_warnings": [
+                        {"path": issue.path, "message": issue.message}
+                        for issue in remaining_task_issues
+                    ],
+                },
             )
-
         terminal_gap_issues = validate_terminal_gap_assumptions(
             tasks, resolution
         )
@@ -783,11 +814,84 @@ class ReviewPipeline:
             paper_context=paper_context,
             paper_images=paper_images,
             resume=resume,
+            paper_source_sha256=paper.get("source_sha256"),
             max_attempts=json_repair_attempts + 1,
             analysis_backend=analysis_backend,
             codex_analysis_timeout=codex_analysis_timeout,
         )
         _mark("thesis")
+
+        # The thesis is evidence for one final Task-Designer pass. Failure to improve
+        # the small acceptance hints is advisory; it must not block reproduction.
+        final_task_prompt = self.prompt_book.render(
+            "finalize_repro_tasks.md",
+            round_index="final",
+            current_tasks_json=wrap_untrusted("current_tasks_json", pretty_json(tasks)),
+            final_engineering_facts_json=wrap_untrusted(
+                "final_engineering_facts_json", pretty_json(facts)
+            ),
+            backfill_resolution_json=wrap_untrusted(
+                "backfill_resolution_json", pretty_json(resolution)
+            ),
+            search_ledger_json=wrap_untrusted(
+                "search_ledger_json", pretty_json(backfill_loop["ledger"])
+            ),
+            paper_thesis_json=wrap_untrusted(
+                "paper_thesis_json", pretty_json(paper_thesis or {})
+            ),
+            paper_context_json=paper_context,
+        )
+        previous_tasks = tasks
+        try:
+            tasks = self._load_or_create_analysis_stage_json(
+                output_path=audit_dir / "02d_final_scientific_acceptance.json",
+                output_dir=output_dir,
+                audit_dir=audit_dir,
+                prompt=final_task_prompt,
+                stage_label="02d_finalize_scientific_acceptance",
+                cleanup_stage="tasks_finalize",
+                schema_stage="repro_tasks",
+                max_attempts=json_repair_attempts + 1,
+                resume=resume,
+                candidate_normalizer=lambda parsed: finalize_repro_tasks(parsed, facts),
+                truncation_recovery=recover_truncated_repro_tasks,
+                request_timeout=tasks_timeout,
+                images=paper_images,
+                backend=analysis_backend,
+                codex_timeout=codex_analysis_timeout,
+                cache_inputs={
+                    "paper_source_sha256": paper.get("source_sha256"),
+                    "tasks": previous_tasks,
+                    "facts": facts,
+                    "paper_thesis": paper_thesis or {},
+                    "backfill_resolution": resolution,
+                    "search_ledger": backfill_loop["ledger"],
+                },
+            )
+        except Exception as exc:
+            tasks = finalize_repro_tasks(previous_tasks, facts)
+            write_json(
+                audit_dir / "02d_final_scientific_acceptance_warning.json",
+                {
+                    "advisory": True,
+                    "fallback": "normalized_pre_thesis_tasks",
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
+        tasks_meta = dict(tasks.get("_meta", {})) if isinstance(tasks.get("_meta"), dict) else {}
+        tasks_meta["scientific_acceptance_finalization"] = {
+            "paper_thesis_used": bool(paper_thesis),
+            "policy_id": SCIENTIFIC_POLICY_ID,
+            "structure_is_advisory": True,
+        }
+        tasks["_meta"] = tasks_meta
+        write_json(output_dir / "repro_tasks.json", tasks)
+        write_json(output_dir / "task_conflicts.json", {"conflicts": semantic_conflicts(tasks, "task")})
+        write_json(
+            audit_dir / "02d_final_task_coverage.json",
+            compute_task_coverage(facts, tasks),
+        )
+
         experiment_index = self._load_or_create_experiment_index(
             output_dir=output_dir,
             audit_dir=audit_dir,
@@ -811,6 +915,7 @@ class ReviewPipeline:
                     paper_context=paper_context,
                     paper_images=paper_images,
                     resume=resume,
+                    paper_source_sha256=paper.get("source_sha256"),
                     max_attempts=json_repair_attempts + 1,
                     analysis_backend=analysis_backend,
                     codex_analysis_timeout=codex_analysis_timeout,
@@ -857,7 +962,7 @@ class ReviewPipeline:
         _mark("scientific_architecture")
         repro_project_dir = output_dir / "repro_project"
 
-        analysis_stage_invocations = 3 + (2 * backfill_round_count) + (1 if scientific_architecture is not None else 0)
+        analysis_stage_invocations = 4 + (2 * backfill_round_count) + (1 if scientific_architecture is not None else 0)
         if analysis_only:
             run_cost = _build_run_cost(
                 cost_marks,
@@ -873,7 +978,7 @@ class ReviewPipeline:
                     "analysis_warning_count": int(analysis_warnings.get("warning_count") or 0),
                     "json_format_repair_limit": int(json_repair_attempts),
                     "facts_stop_rule": "single_global_then_selected_blockers_max_3",
-                    "tasks_stop_rule": "preliminary_or_refreshed_handoff_ready",
+                    "tasks_stop_rule": "thesis_informed_core_conclusion_contract",
                     "mineru_layout": {
                         "ok": mineru_result.get("ok"),
                         "cached": mineru_result.get("cached"),
@@ -923,7 +1028,7 @@ class ReviewPipeline:
             task_verifications_document,
         )
         from .agentic_task_writers import apply_verified_result, run_codex_task_writer_workflow
-        from .verification_result import verification_result_issues
+        from .verification_result import normalize_task_verification, verification_result_issues
 
         validation = {
             "required_files_present": True,
@@ -957,12 +1062,7 @@ class ReviewPipeline:
                 resume=resume,
                 round_no=writer_round,
             )
-            verification = result.get("task_verification") if isinstance(result, dict) else None
             reporter_owned_retry = (
-                isinstance(verification, dict)
-                and verification.get("verdict") == "revise"
-                and verification.get("revision_target") == "reporter"
-            ) or (
                 not result.get("ok")
                 and isinstance(result.get("codex_status"), dict)
                 and result["codex_status"].get("ok")
@@ -1009,31 +1109,18 @@ class ReviewPipeline:
                     resume=resume,
                 )
             except Exception as exc:
-                architecture_v11 = (
-                    str(scientific_architecture.get("schema_version") or "") == "1.1"
-                )
                 foundation = None
                 write_json(
                     audit_dir / "03b_foundation_fallback.json",
                     {
                         "policy": "reproduction_first",
-                        "decision": "stop" if architecture_v11 else "fallback",
+                        "decision": "fallback",
                         "stage_usable": False,
-                        "pipeline_can_continue": not architecture_v11,
-                        "fallback": (
-                            None
-                            if architecture_v11
-                            else "isolated_task_writers_without_shared_foundation"
-                        ),
+                        "pipeline_can_continue": True,
+                        "fallback": "isolated_task_writers_without_shared_foundation",
                         "warning": f"{type(exc).__name__}: {exc}",
                     },
                 )
-                if architecture_v11:
-                    raise RuntimeError(
-                        "Foundation generation failed for scientific_architecture/1.1; "
-                        "isolated task writers cannot preserve its shared implementation "
-                        "and execution contract"
-                    ) from exc
             finally:
                 _mark("foundation")
         _begin("generation")
@@ -1094,35 +1181,91 @@ class ReviewPipeline:
         for nd_finding in detect_nondeterminism_findings(repro_project_dir):
             risk_report.setdefault("findings", []).append(nd_finding)
         if not runtime_result.get("passed"):
-            write_json(output_dir / "risk_report.json", risk_report)
-            raise RuntimeError("One or more task Writer-Reporter loops did not complete a valid full delivery.")
+            risk_report.setdefault("findings", []).append(
+                {
+                    "type": "runtime_not_fully_valid",
+                    "severity": "warning",
+                    "message": "One or more tasks did not finish a valid full; the failure remains reportable.",
+                }
+            )
 
-        task_reporter_results = [
-            record.get("task_reporter")
-            for record in task_records
-            if isinstance(record, dict) and isinstance(record.get("task_reporter"), dict)
-        ]
-        reporter_failures = [result for result in task_reporter_results if not result.get("ok")]
-        if reporter_failures or len(task_reporter_results) != len(task_records):
-            reporter_error = "; ".join(
-                str(item.get("error") or item.get("task_id") or "task reporter failed")
-                for item in reporter_failures[:4]
-            ) or "one or more tasks did not reach an isolated task reporter"
-            raise RuntimeError(reporter_error)
+        task_by_id = {
+            str(item.get("task_id") or ""): item
+            for item in tasks.get("repro_tasks", [])
+            if isinstance(item, dict) and str(item.get("task_id") or "")
+        }
+        task_reporter_results: list[dict[str, Any]] = []
+        for record in task_records:
+            task_id = str(record.get("task_id") or "")
+            existing = record.get("task_reporter") if isinstance(record.get("task_reporter"), dict) else {}
+            verification = existing.get("task_verification") if isinstance(existing.get("task_verification"), dict) else None
+            if verification:
+                task_reporter_results.append(existing)
+                continue
+            execution = record.get("execution_summary") if isinstance(record.get("execution_summary"), dict) else {}
+            try:
+                full_run_count = int(execution.get("full_run_count") or 0)
+            except (TypeError, ValueError):
+                full_run_count = 0
+            run_valid_hint = full_run_count >= 1 and execution.get("last_returncode") == 0
+            verification = normalize_task_verification(
+                {},
+                task_id,
+                task=task_by_id.get(task_id),
+                run_valid_hint=run_valid_hint,
+            )
+            verification.setdefault("remaining_uncertainties", []).append(
+                "The isolated Reporter did not produce a usable note; the host retained a conservative terminal outcome."
+            )
+            synthetic = {
+                "ok": True,
+                "synthetic_terminal": True,
+                "task_id": task_id,
+                "task_verification": verification,
+                "scientific_terminal": True,
+                "scientific_successful": verification.get("outcome") in {
+                    "reproduced",
+                    "reproduced_with_assumptions",
+                },
+                "validation_warnings": [str(existing.get("error") or "reporter unavailable")],
+            }
+            record["task_reporter"] = synthetic
+            record["task_verification"] = verification
+            task_reporter_results.append(synthetic)
 
         verification_result = task_verifications_document(task_reporter_results)
-        verification_issues = (
-            validate_stage("verification_result", verification_result)
-            + verification_result_issues(
-                verification_result,
-                [str(record.get("task_id") or "") for record in task_records],
-            )
+        if not verification_result.get("all_terminal"):
+            # A lingering rerun request cannot be executed after the Writer loop ended.
+            # Preserve the scientific failure instead of converting it into a format crash.
+            for result in task_reporter_results:
+                verification = result.get("task_verification") if isinstance(result, dict) else None
+                if not isinstance(verification, dict) or verification.get("host_action") != "rerun_writer":
+                    continue
+                verification["host_action"] = "complete"
+                verification["rerun_reason"] = "none"
+                verification["outcome"] = (
+                    "execution_failed" if verification.get("run_valid") is False else "not_reproduced"
+                )
+                verification.setdefault("remaining_uncertainties", []).append(
+                    "A requested causal rerun could not be completed; recorded as a terminal outcome."
+                )
+            verification_result = task_verifications_document(task_reporter_results)
+
+        schema_issues = validate_stage("verification_result", verification_result)
+        verification_warnings = [
+            f"{issue.path}: {issue.message}" for issue in schema_issues
+        ] + verification_result_issues(
+            verification_result,
+            [str(record.get("task_id") or "") for record in task_records],
         )
-        if verification_issues or not verification_result.get("all_accepted"):
-            raise RuntimeError(
-                "Task Writer-Reporter loops ended without accepted task results: "
-                + format_issues(verification_issues)
-            )
+        write_json(
+            audit_dir / "04_task_verification_warnings.json",
+            {
+                "advisory": True,
+                "warning_count": len(verification_warnings),
+                "warnings": verification_warnings,
+            },
+        )
         write_json(output_dir / "verification_result.json", verification_result)
         runtime_result = apply_verified_result(
             task_records=task_records,
@@ -1131,29 +1274,66 @@ class ReviewPipeline:
             audit_dir=audit_dir,
             repro_project_dir=repro_project_dir,
         )
+        all_successful = bool(verification_result.get("all_successful"))
+        outcome_counts = {
+            str(key): int(value)
+            for key, value in verification_result.get("outcome_counts", {}).items()
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        }
+        successful_tasks = outcome_counts.get("reproduced", 0) + outcome_counts.get(
+            "reproduced_with_assumptions", 0
+        )
+        if all_successful:
+            terminal_alignment = "match"
+            terminal_credibility = "high"
+            terminal_summary = "All tasks reproduced their assigned core conclusions."
+        elif successful_tasks:
+            terminal_alignment = "partial_match"
+            terminal_credibility = "medium"
+            terminal_summary = "Some tasks reproduced their core conclusions and others reached non-positive terminal outcomes."
+        elif outcome_counts.get("not_reproduced", 0) and not (
+            outcome_counts.get("inconclusive_missing_information", 0)
+            or outcome_counts.get("execution_failed", 0)
+        ):
+            terminal_alignment = "mismatch"
+            terminal_credibility = "high"
+            terminal_summary = "No task reproduced its assigned core conclusion."
+        else:
+            terminal_alignment = "inconclusive"
+            terminal_credibility = "low"
+            terminal_summary = "No positive reproduction conclusion is available because task evidence is inconclusive or execution failed."
         if isinstance(agentic_result.get("status"), dict):
             agentic_result["status"].update(
                 {
-                    "stop_class": "verified_matched",
-                    "stopped_reason": "all tasks passed isolated direct paper verification",
-                    "runtime": {"passed": True, "coverage": runtime_result.get("coverage")},
+                    "stop_class": "verified_matched" if all_successful else "verified_terminal",
+                    "stopped_reason": (
+                        "all tasks reproduced their core conclusions"
+                        if all_successful
+                        else "all tasks reached reportable scientific terminal outcomes"
+                    ),
+                    "runtime": {"passed": runtime_result.get("passed"), "coverage": runtime_result.get("coverage")},
                 }
             )
         agentic_result["runtime_result"] = runtime_result
         agentic_result["task_records"] = task_records
         writer_review_document = {
-            "_meta": {"mode": "isolated_task_reporter_verification"},
-            "overall_alignment": "match",
-            "overall_result_credibility": "medium",
-            "overall_summary": "All tasks passed isolated direct paper verification.",
+            "_meta": {"mode": "host_derived_core_conclusion_outcomes"},
+            "passed": True,
+            "overall_alignment": terminal_alignment,
+            "overall_result_credibility": terminal_credibility,
+            "overall_summary": terminal_summary,
             "verification_result": verification_result,
         }
         writer_summary_result = {
             "enabled": True,
             "passed": True,
-            "mode": "isolated_task_reporter_verification",
-            "overall_alignment": "match",
-            "overall_result_credibility": "medium",
+            "scientific_all_successful": all_successful,
+            "all_terminal": bool(verification_result.get("all_terminal")),
+            "outcome_counts": outcome_counts,
+            "mode": "host_derived_core_conclusion_outcomes",
+            "overall_alignment": terminal_alignment,
+            "overall_result_credibility": terminal_credibility,
+            "verification_result": verification_result,
         }
         risk_report = build_risk_report(
             facts,
@@ -1178,31 +1358,29 @@ class ReviewPipeline:
 
         _mark("task_reporters")
         _begin("report_editor")
-        report_editor_result = run_codex_report_editor_workflow(
-            paper=paper,
-            facts=facts,
-            tasks=tasks,
-            paper_thesis=paper_thesis,
-            runtime_result=runtime_result,
-            risk_report=risk_report,
-            task_records=task_records,
-            task_verifications=[
-                item.get("task_verification")
-                for item in task_reporter_results
-                if isinstance(item, dict) and isinstance(item.get("task_verification"), dict)
-            ],
-            output_dir=output_dir,
-            audit_dir=audit_dir,
-            timeout=codex_reporter_timeout,
-            resume=resume,
-        )
-        first_editor_status = report_editor_result.get("codex_status")
-        report_editor_invocations = int(
-            not report_editor_result.get("cached")
-            and isinstance(first_editor_status, dict)
-            and first_editor_status.get("role") == "report_editor"
-        )
-        if not report_editor_result.get("ok") and report_editor_result.get("retryable"):
+
+        def _report_editor_exception_result(exc: Exception) -> dict[str, Any]:
+            reason = f"{type(exc).__name__}: {exc}"
+            return {
+                "ok": False,
+                "retryable": False,
+                "mode": "isolated_report_editor",
+                "cached": False,
+                "completion_mode": "exception_fallback",
+                "degraded_report_generation": True,
+                "codex_status": {
+                    "ok": False,
+                    "error_kind": "report_editor_exception",
+                    "error": reason,
+                },
+                "result_review_result": {
+                    "enabled": True,
+                    "passed": False,
+                    "reason": reason,
+                },
+            }
+
+        try:
             report_editor_result = run_codex_report_editor_workflow(
                 paper=paper,
                 facts=facts,
@@ -1219,27 +1397,62 @@ class ReviewPipeline:
                 output_dir=output_dir,
                 audit_dir=audit_dir,
                 timeout=codex_reporter_timeout,
-                resume=False,
-                attempt_no=2,
-                repair_context=report_editor_result,
-                allow_fallback=True,
+                resume=resume,
             )
+        except Exception as exc:
+            report_editor_result = _report_editor_exception_result(exc)
+        first_editor_status = report_editor_result.get("codex_status")
+        report_editor_invocations = int(
+            not report_editor_result.get("cached")
+            and isinstance(first_editor_status, dict)
+            and first_editor_status.get("role") == "report_editor"
+        )
+        if not report_editor_result.get("ok") and report_editor_result.get("retryable"):
+            try:
+                report_editor_result = run_codex_report_editor_workflow(
+                    paper=paper,
+                    facts=facts,
+                    tasks=tasks,
+                    paper_thesis=paper_thesis,
+                    runtime_result=runtime_result,
+                    risk_report=risk_report,
+                    task_records=task_records,
+                    task_verifications=[
+                        item.get("task_verification")
+                        for item in task_reporter_results
+                        if isinstance(item, dict) and isinstance(item.get("task_verification"), dict)
+                    ],
+                    output_dir=output_dir,
+                    audit_dir=audit_dir,
+                    timeout=codex_reporter_timeout,
+                    resume=False,
+                    attempt_no=2,
+                    repair_context=report_editor_result,
+                    allow_fallback=True,
+                )
+            except Exception as exc:
+                report_editor_result = _report_editor_exception_result(exc)
             second_editor_status = report_editor_result.get("codex_status")
             report_editor_invocations += int(
                 isinstance(second_editor_status, dict)
                 and second_editor_status.get("role") == "report_editor"
             )
-        result_review_result = report_editor_result["result_review_result"]
+        result_review_result = report_editor_result.get("result_review_result")
+        if not isinstance(result_review_result, dict):
+            result_review_result = {
+                "enabled": True,
+                "passed": False,
+                "reason": "report packaging did not return a result-review status",
+            }
         if not report_editor_result.get("ok"):
             risk_report.setdefault("findings", []).append(
                 {
                     "type": "report_editor_failed",
-                    "message": "Codex report editor did not produce the required human-facing reports.",
+                    "message": "Human-facing report packaging degraded; scientific task results were preserved.",
                     "error": result_review_result.get("reason"),
                 }
             )
             write_json(output_dir / "risk_report.json", risk_report)
-            raise RuntimeError(str(result_review_result.get("reason") or "Report editor failed."))
 
         reproducibility_verdict = derive_reproducibility_verdict(
             risk_report=risk_report,
@@ -1248,14 +1461,29 @@ class ReviewPipeline:
         )
         verdict_issues = validate_stage("reproducibility_verdict", reproducibility_verdict)
         if verdict_issues:
-            raise RuntimeError(f"Internal reproducibility verdict failed schema validation: {format_issues(verdict_issues)}")
+            write_json(
+                audit_dir / "04b_reproducibility_verdict_fallback.json",
+                {
+                    "advisory": True,
+                    "errors": [issue.as_dict() for issue in verdict_issues],
+                    "candidate": reproducibility_verdict,
+                },
+            )
+            reproducibility_verdict = {
+                "verdict": "inconclusive",
+                "confidence": "low",
+                "reasons": ["internal verdict formatting failed; task-level scientific evidence remains available"],
+                "recommended_action": "Use task verification and runtime artifacts as the authority; regenerate only the summary verdict.",
+            }
         risk_report["reproducibility_verdict"] = reproducibility_verdict
         risk_report["task_reporters"] = {
             "ok": all(bool(item.get("ok")) for item in task_reporter_results),
             "mode": "isolated_task_reporters",
             "task_count": len(task_reporter_results),
             "verification_rounds": verification_round,
-            "all_accepted": True,
+            "all_terminal": bool(verification_result.get("all_terminal")),
+            "all_successful": bool(verification_result.get("all_successful")),
+            "outcome_counts": verification_result.get("outcome_counts", {}),
         }
         risk_report["report_editor"] = {
             "ok": report_editor_result.get("ok"),
@@ -1346,9 +1574,9 @@ class ReviewPipeline:
                     "analysis_backend": analysis_backend,
                     "analysis_agent_count": 1,
                     "facts_stop_rule": "single_global_then_selected_blockers_max_3",
-                    "tasks_stop_rule": "preliminary_or_refreshed_handoff_ready",
-                    "task_writer_stop_rule": "accepted_by_own_isolated_task_reporter_or_external_blocker",
-                    "verification_stop_rule": "every_task_directly_verified_in_an_isolated_context",
+                    "tasks_stop_rule": "thesis_informed_core_conclusion_contract",
+                    "task_writer_stop_rule": "host_terminal_scientific_outcome_or_external_blocker",
+                    "verification_stop_rule": "all_tasks_reach_reportable_core_conclusion_outcomes",
                     "report_backend": "parallel_task_reporters_plus_final_editor",
                 },
             ),
@@ -1395,9 +1623,15 @@ class ReviewPipeline:
             cached = _read_json_file(cache_path)
             if _paper_cache_matches(cached, paper_path):
                 return cached
-        _clear_stage_outputs(output_dir, "paper")
         paper = load_paper(paper_path, max_pages=max_pages)
+        paper["source_sha256"] = _sha256_file(paper_path)
         write_json(cache_path, paper)
+        _clear_stage_outputs(
+            output_dir,
+            "paper",
+            preserve_audit=True,
+            preserve_paths={"paper_chunks.json"},
+        )
         return paper
 
     def _load_or_create_stage_json(
@@ -1424,7 +1658,27 @@ class ReviewPipeline:
         client: Any = None,
         backend: str = "llm",
         codex_timeout: float | None = None,
+        cache_inputs: Any = None,
     ) -> dict[str, Any]:
+        cache_reuse_enabled = cache_inputs is not None
+        cache_metadata = build_stage_cache_metadata(
+            stage_label=stage_label,
+            schema_stage=schema_stage,
+            prompt=prompt,
+            policy_version=SCIENTIFIC_POLICY_ID,
+            inputs=cache_inputs if cache_inputs is not None else {},
+        )
+
+        def _normalize_and_bind_cache(candidate: dict[str, Any]) -> dict[str, Any]:
+            normalized = (
+                candidate_normalizer(candidate)
+                if candidate_normalizer is not None
+                else candidate
+            )
+            meta = dict(normalized.get("_meta", {})) if isinstance(normalized.get("_meta"), dict) else {}
+            meta["cache"] = cache_metadata
+            normalized["_meta"] = meta
+            return normalized
         cache_validation: Callable[[dict[str, Any]], list[ValidationIssue]] | None = None
         if pre_validation is not None or extra_validation is not None:
             def _combined_validation(parsed: dict[str, Any]) -> list[ValidationIssue]:
@@ -1435,18 +1689,24 @@ class ReviewPipeline:
 
             cache_validation = _combined_validation
 
-        if resume and output_path.exists():
+        if resume and cache_reuse_enabled and output_path.exists():
             cached = _load_valid_stage_cache(
                 path=output_path,
                 audit_dir=audit_dir,
                 stage_label=stage_label,
                 schema_stage=schema_stage,
                 extra_validation=cache_validation,
+                expected_cache_metadata=cache_metadata,
             )
             if cached is not None:
                 return cached
 
-        if resume and salvage_failed_candidates and candidate_normalizer is not None:
+        if (
+            resume
+            and cache_reuse_enabled
+            and salvage_failed_candidates
+            and candidate_normalizer is not None
+        ):
             candidates = sorted(
                 audit_dir.glob(f"normalized_{stage_label}_attempt_*.json"),
                 key=lambda path: path.stat().st_mtime,
@@ -1454,7 +1714,25 @@ class ReviewPipeline:
             )
             for candidate_path in candidates:
                 try:
-                    candidate = candidate_normalizer(_read_json_file(candidate_path))
+                    raw_candidate = _read_json_file(candidate_path)
+                except Exception:
+                    continue
+                raw_meta = raw_candidate.get("_meta") if isinstance(raw_candidate.get("_meta"), dict) else {}
+                raw_cache = raw_meta.get("cache") if isinstance(raw_meta.get("cache"), dict) else {}
+                if raw_cache.get("fingerprint") != cache_metadata.get("fingerprint"):
+                    write_json(
+                        audit_dir / f"resume_rejected_{stage_label}_{candidate_path.stem}.json",
+                        {
+                            "ok": False,
+                            "source": candidate_path.name,
+                            "reason": "candidate cache scientific inputs or policy changed",
+                            "expected_cache": cache_metadata,
+                            "actual_cache": raw_cache,
+                        },
+                    )
+                    continue
+                try:
+                    candidate = _normalize_and_bind_cache(raw_candidate)
                 except Exception:
                     continue
                 candidate_issues = pre_validation(candidate) if pre_validation is not None else []
@@ -1470,15 +1748,25 @@ class ReviewPipeline:
                     "analysis_stage_label": stage_label,
                     "analysis_resume_source": candidate_path.name,
                 })
+                meta["cache"] = cache_metadata
                 candidate["_meta"] = meta
                 write_json(output_path, candidate)
+                try:
+                    preserved_output = output_path.relative_to(output_dir).as_posix()
+                except ValueError:
+                    preserved_output = ""
+                _clear_stage_outputs(
+                    output_dir,
+                    cleanup_stage,
+                    preserve_audit=True,
+                    preserve_paths={preserved_output} if preserved_output else set(),
+                )
                 write_json(
                     audit_dir / f"resume_{stage_label}.json",
                     {"ok": True, "source": candidate_path.name, "mode": "deterministic_normalization"},
                 )
                 return candidate
 
-        _clear_stage_outputs(output_dir, cleanup_stage)
         write_text(audit_dir / f"{stage_label}.md", prompt)
         try:
             if backend == CODEX_ANALYSIS_BACKEND:
@@ -1492,7 +1780,7 @@ class ReviewPipeline:
                     timeout=codex_timeout,
                     pre_validation=pre_validation,
                     extra_validation=extra_validation,
-                    candidate_normalizer=candidate_normalizer,
+                    candidate_normalizer=_normalize_and_bind_cache,
                     repair_preservation_validator=repair_preservation_validator,
                     truncation_recovery=truncation_recovery,
                     images=images,
@@ -1507,7 +1795,7 @@ class ReviewPipeline:
                     pre_validation=pre_validation,
                     extra_validation=extra_validation,
                     request_timeout=request_timeout,
-                    candidate_normalizer=candidate_normalizer,
+                    candidate_normalizer=_normalize_and_bind_cache,
                     truncation_recovery=truncation_recovery,
                     images=images,
                     client=client,
@@ -1534,7 +1822,20 @@ class ReviewPipeline:
                     "fallback": parsed.get("_meta", {}),
                 },
             )
+        meta = dict(parsed.get("_meta", {})) if isinstance(parsed.get("_meta"), dict) else {}
+        meta["cache"] = cache_metadata
+        parsed["_meta"] = meta
         write_json(output_path, parsed)
+        try:
+            preserved_output = output_path.relative_to(output_dir).as_posix()
+        except ValueError:
+            preserved_output = ""
+        _clear_stage_outputs(
+            output_dir,
+            cleanup_stage,
+            preserve_audit=True,
+            preserve_paths={preserved_output} if preserved_output else set(),
+        )
         return parsed
 
     def _load_or_create_analysis_stage_json(
@@ -1561,6 +1862,7 @@ class ReviewPipeline:
         client: Any = None,
         backend: str = "llm",
         codex_timeout: float | None = None,
+        cache_inputs: Any = None,
     ) -> dict[str, Any]:
         """Run exactly one analysis specialist for facts or task design."""
         return self._load_or_create_stage_json(
@@ -1585,6 +1887,7 @@ class ReviewPipeline:
             client=client,
             backend=backend,
             codex_timeout=codex_timeout,
+            cache_inputs=cache_inputs,
         )
 
     def _load_or_create_paper_thesis(
@@ -1599,6 +1902,7 @@ class ReviewPipeline:
         max_attempts: int,
         analysis_backend: str = "llm",
         codex_analysis_timeout: float | None = None,
+        paper_source_sha256: str | None = None,
     ) -> dict[str, Any] | None:
         """Distill the paper's central thesis: claim + mechanism + the head-to-head method
         orderings it asserts. Multimodal (the main result figure carries the headline shape).
@@ -1623,6 +1927,10 @@ class ReviewPipeline:
                 images=paper_images,
                 backend=analysis_backend,
                 codex_timeout=codex_analysis_timeout,
+                cache_inputs={
+                    "paper_source_sha256": paper_source_sha256,
+                    "facts": facts,
+                },
                 fallback_factory=None,
             )
         except Exception as exc:
@@ -1645,12 +1953,25 @@ class ReviewPipeline:
     ) -> dict[str, Any]:
         output_path = output_dir / "experiment_index.json"
         stage_label = "02e_build_experiment_index"
+        cache_metadata = build_stage_cache_metadata(
+            stage_label=stage_label,
+            schema_stage="experiment_index",
+            prompt="local deterministic experiment index",
+            policy_version=SCIENTIFIC_POLICY_ID,
+            inputs={
+                "facts": facts,
+                "tasks": tasks,
+                "paper_source_sha256": paper.get("source_sha256"),
+                "figure_index": figure_index or {},
+            },
+        )
         if resume and output_path.exists():
             cached = _load_valid_stage_cache(
                 path=output_path,
                 audit_dir=audit_dir,
                 stage_label=stage_label,
                 schema_stage="experiment_index",
+                expected_cache_metadata=cache_metadata,
             )
             if cached is not None:
                 return cached
@@ -1664,7 +1985,16 @@ class ReviewPipeline:
         issues = validate_stage("experiment_index", experiment_index)
         if issues:
             raise RuntimeError(f"{stage_label} failed local validation: {format_issues(issues)}")
+        meta = dict(experiment_index.get("_meta", {})) if isinstance(experiment_index.get("_meta"), dict) else {}
+        meta["cache"] = cache_metadata
+        experiment_index["_meta"] = meta
         write_json(output_path, experiment_index)
+        _clear_stage_outputs(
+            output_dir,
+            "experiment_index",
+            preserve_audit=True,
+            preserve_paths={"experiment_index.json"},
+        )
         write_json(
             audit_dir / "local_02e_build_experiment_index.json",
             {
@@ -1690,6 +2020,7 @@ class ReviewPipeline:
         max_attempts: int,
         analysis_backend: str,
         codex_analysis_timeout: float | None,
+        paper_source_sha256: str | None = None,
     ) -> dict[str, Any]:
         from .preflight import (
             architecture_capability_inventory,
@@ -1766,6 +2097,14 @@ class ReviewPipeline:
             images=paper_images,
             backend=analysis_backend,
             codex_timeout=codex_analysis_timeout,
+            cache_inputs={
+                "paper_source_sha256": paper_source_sha256,
+                "facts": facts,
+                "tasks": tasks,
+                "paper_thesis": paper_thesis or {},
+                "experiment_index": experiment_index,
+                "host_capabilities": host_capabilities,
+            },
             fallback_factory=None,
         )
         reused_cached_architecture = False

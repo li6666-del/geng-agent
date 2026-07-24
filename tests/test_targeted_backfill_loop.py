@@ -292,6 +292,69 @@ class TargetedBackfillLoopTests(unittest.TestCase):
         self.assertEqual(result["stop_reason"], "selected_requests_exhausted")
         self.assertEqual(result["resolution"]["terminal_unresolved_count"], 1)
 
+    def test_backfill_error_degrades_to_writer_with_existing_state(self) -> None:
+        initial = _tasks()
+        _set_handoff(
+            initial,
+            ready=False,
+            blocking_request_ids=["task_request"],
+            reason="worth searching but not worth stopping the workflow",
+        )
+
+        def fail_backfill(*args):
+            raise RuntimeError("temporary model failure")
+
+        result = run_targeted_backfill_loop(
+            initial_facts=_facts(),
+            preliminary_tasks=initial,
+            run_backfill=fail_backfill,
+            refresh_tasks=lambda *args: self.fail("refresh should not run"),
+            normalize_tasks=lambda tasks, facts: tasks,
+        )
+
+        self.assertEqual(result["stop_reason"], "backfill_error")
+        self.assertEqual(result["round_count"], 1)
+        self.assertTrue(result["round_summaries"][0]["degraded_to_writer"])
+        self.assertEqual(result["tasks"], initial)
+        self.assertEqual(result["resolution"]["open_count"], 1)
+
+    def test_refresh_error_keeps_new_facts_and_existing_tasks(self) -> None:
+        initial = _tasks()
+        _set_handoff(
+            initial,
+            ready=False,
+            blocking_request_ids=["task_request"],
+            reason="normalization affects implementation",
+        )
+
+        def run_backfill(round_index, requests, facts, tasks, ledger):
+            request = requests[0]
+            return _resolved_result(
+                request,
+                request["required_fields"][0],
+                "recovered normalization",
+            )
+
+        def fail_refresh(*args):
+            raise ValueError("malformed refresh response")
+
+        result = run_targeted_backfill_loop(
+            initial_facts=_facts(),
+            preliminary_tasks=initial,
+            run_backfill=run_backfill,
+            refresh_tasks=fail_refresh,
+            normalize_tasks=lambda tasks, facts: tasks,
+        )
+
+        self.assertEqual(result["stop_reason"], "task_refresh_error")
+        self.assertEqual(result["round_count"], 1)
+        self.assertTrue(result["round_summaries"][0]["new_facts_retained"])
+        self.assertEqual(result["tasks"], initial)
+        self.assertEqual(
+            result["facts"]["engineering_facts"][0]["name"],
+            "recovered normalization",
+        )
+
     def test_three_round_safety_limit_preserves_new_open_field(self) -> None:
         initial = _tasks()
         _set_handoff(

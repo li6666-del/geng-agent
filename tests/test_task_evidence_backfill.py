@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import copy
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -363,7 +364,7 @@ class TaskEvidenceBackfillTests(unittest.TestCase):
         candidate = {
             "repro_tasks": [
                 {**_task("task_a", []), "target": "refined target"},
-                _task("invented_task", []),
+                {"task_id": "invented_task"},
             ]
         }
         resolution = {
@@ -381,6 +382,56 @@ class TaskEvidenceBackfillTests(unittest.TestCase):
             ["invented_task"],
         )
 
+    def test_final_reconciliation_accepts_new_task_with_material_paper_anchor(self) -> None:
+        draft = {"repro_tasks": [_task("task_a", [])]}
+        new_task = _task("new_fig_task", [])
+        new_task["figure_or_claim"] = "Fig. 8"
+        new_task["target"] = "Reproduce the additional Fig. 8 rate comparison"
+        candidate = {
+            "repro_tasks": [copy.deepcopy(draft["repro_tasks"][0]), new_task]
+        }
+
+        reconciled = reconcile_final_tasks(
+            draft,
+            candidate,
+            {"resolved": [], "unresolved": []},
+        )
+
+        self.assertEqual(
+            [item["task_id"] for item in reconciled["repro_tasks"]],
+            ["task_a", "new_fig_task"],
+        )
+        metadata = reconciled["_meta"]["task_set_reconciliation"]
+        self.assertEqual(metadata["added_candidate_task_ids"], ["new_fig_task"])
+        self.assertEqual(metadata["discarded_candidate_task_ids"], [])
+
+    def test_reconciliation_preserves_one_acceptance_snapshot_when_refresh_omits_it(self) -> None:
+        contract = {
+            "contract_version": "1.0",
+            "core_conclusions": [
+                {
+                    "claim_id": "fig4_rate_trend",
+                    "statement": "Rate increases with SNR.",
+                    "kind": "trend",
+                    "regime": "paper regime",
+                    "paper_anchor": "Fig. 4",
+                }
+            ],
+            "key_numeric_targets": [],
+            "information_gaps": [],
+        }
+        draft_task = {**_task("task_a", []), "scientific_acceptance": contract}
+        candidate_task = {**_task("task_a", []), "target": "refined target"}
+
+        reconciled = reconcile_final_tasks(
+            {"repro_tasks": [draft_task]},
+            {"repro_tasks": [candidate_task]},
+            {"resolved": [], "unresolved": []},
+        )
+
+        self.assertEqual(
+            reconciled["repro_tasks"][0]["scientific_acceptance"], contract
+        )
     def test_resolved_request_becomes_required_fact_and_is_removed(self) -> None:
         draft = {"repro_tasks": [_task("task_a", [_request("a")])]}
         requests = collect_missing_fact_requests(draft)

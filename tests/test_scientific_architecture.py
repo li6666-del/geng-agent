@@ -43,6 +43,47 @@ def _declare_ber_consistency_group(architecture: dict) -> None:
     ]
 
 
+def _scientific_acceptance(task_id: str) -> dict:
+    return {
+        "contract_version": "1.0",
+        "core_conclusions": [
+            {
+                "claim_id": f"{task_id}.ber_decreases",
+                "statement": "BER decreases as SNR increases.",
+                "kind": "trend",
+                "regime": "the declared SNR sweep",
+                "paper_anchor": "Fig. 1",
+            }
+        ],
+        "key_numeric_targets": [
+            {
+                "target_id": f"{task_id}.ber_at_10db",
+                "name": "BER at 10 dB",
+                "paper_magnitude": 0.01,
+                "unit": "1",
+                "regime": "SNR = 10 dB",
+                "evidence_quality": "visual_estimate",
+            }
+        ],
+        "information_gaps": [],
+    }
+
+
+def _acceptance_bindings(task_id: str) -> list[dict]:
+    return [
+        {
+            "criterion_id": f"{task_id}.ber_decreases",
+            "criterion_kind": "core_conclusion",
+            "output_quantity_ids": ["ber"],
+        },
+        {
+            "criterion_id": f"{task_id}.ber_at_10db",
+            "criterion_kind": "key_numeric_target",
+            "output_quantity_ids": ["ber"],
+        },
+    ]
+
+
 def _inputs() -> tuple[dict, dict, dict, dict]:
     facts = {
         "engineering_facts": [
@@ -52,8 +93,8 @@ def _inputs() -> tuple[dict, dict, dict, dict]:
     }
     tasks = {
         "repro_tasks": [
-            {"task_id": "fig_1", "assumptions": [{"name": "sample_count"}]},
-            {"task_id": "fig_2", "assumptions": [{"name": "sample_count"}]},
+            {"task_id": "fig_1", "assumptions": [{"name": "sample_count"}], "scientific_acceptance": _scientific_acceptance("fig_1")},
+            {"task_id": "fig_2", "assumptions": [{"name": "sample_count"}], "scientific_acceptance": _scientific_acceptance("fig_2")},
         ]
     }
     experiments = {
@@ -96,8 +137,8 @@ def _inputs() -> tuple[dict, dict, dict, dict]:
             },
         ],
         "bindings": [
-            {"task_id": "fig_1", "experiment_id": "exp_1", "consistency_group": "ber", "components": ["channel", "metric"], "overrides": {}, "outputs": ["ber"]},
-            {"task_id": "fig_2", "experiment_id": "exp_2", "consistency_group": "ber", "components": ["channel", "metric"], "overrides": {}, "outputs": ["ber"]},
+            {"task_id": "fig_1", "experiment_id": "exp_1", "consistency_group": "ber", "components": ["channel", "metric"], "overrides": {}, "outputs": ["ber"], "acceptance_bindings": _acceptance_bindings("fig_1")},
+            {"task_id": "fig_2", "experiment_id": "exp_2", "consistency_group": "ber", "components": ["channel", "metric"], "overrides": {}, "outputs": ["ber"], "acceptance_bindings": _acceptance_bindings("fig_2")},
         ],
         "invariants": [
             {"id": "same_snr", "kind": "consistency", "subjects": ["snr_db"], "task_ids": ["fig_1", "fig_2"], "severity": "error", "basis": basis}
@@ -116,6 +157,118 @@ class ScientificArchitectureTests(unittest.TestCase):
         )
         self.assertEqual(foundation_module_paths(architecture), {"src/channel.py", "src/metrics.py"})
 
+    def test_same_criterion_id_in_different_acceptance_kinds_is_not_conflated(self) -> None:
+        facts, tasks, experiments, architecture = _inputs()
+        acceptance = tasks["repro_tasks"][0]["scientific_acceptance"]
+        shared_id = acceptance["core_conclusions"][0]["claim_id"]
+        acceptance["key_numeric_targets"][0]["target_id"] = shared_id
+        architecture["bindings"][0]["acceptance_bindings"][1]["criterion_id"] = shared_id
+
+        self.assertEqual(
+            validate_scientific_architecture(
+                architecture,
+                facts=facts,
+                tasks=tasks,
+                experiment_index=experiments,
+            ),
+            [],
+        )
+
+
+    def test_private_style_module_names_are_allowed_under_src(self) -> None:
+        facts, tasks, experiments, architecture = _inputs()
+        architecture["components"][0]["module"] = "src/_io.py"
+
+        self.assertFalse(
+            any(
+                issue.path == "$.components[0].module"
+                for issue in validate_scientific_architecture(
+                    architecture, facts=facts, tasks=tasks, experiment_index=experiments
+                )
+            )
+        )
+        self.assertIn("src/_io.py", foundation_module_paths(architecture))
+
+
+    def test_acceptance_mapping_shape_debt_is_advisory(self) -> None:
+        facts, tasks, experiments, architecture = _inputs()
+        binding = architecture["bindings"][0]
+        mapped_claim = copy.deepcopy(binding["acceptance_bindings"][0])
+        mapped_claim["criterion_kind"] = "key_numeric_target"
+        binding["acceptance_bindings"] = [
+            mapped_claim,
+            copy.deepcopy(mapped_claim),
+            {
+                "criterion_id": "fig_1.unknown",
+                "criterion_kind": "core_conclusion",
+                "output_quantity_ids": ["ghost_quantity"],
+            },
+        ]
+
+        blockers, warnings = partition_scientific_architecture_issues(
+            architecture,
+            facts=facts,
+            tasks=tasks,
+            experiment_index=experiments,
+        )
+
+        self.assertEqual(blockers, [])
+        warning_paths = {issue.path for issue in warnings}
+        self.assertIn("$.bindings[0].acceptance_bindings[0].criterion_kind", warning_paths)
+        self.assertIn("$.bindings[0].acceptance_bindings[1].criterion_id", warning_paths)
+        self.assertIn("$.bindings[0].acceptance_bindings[2].criterion_id", warning_paths)
+        self.assertIn("$.bindings[0].acceptance_bindings", warning_paths)
+
+    def test_unresolved_acceptance_outputs_are_advisory(self) -> None:
+        facts, tasks, experiments, architecture = _inputs()
+        architecture["bindings"][0]["acceptance_bindings"][0]["output_quantity_ids"] = [
+            "ghost_quantity",
+            "snr_db",
+        ]
+
+        blockers, warnings = partition_scientific_architecture_issues(
+            architecture,
+            facts=facts,
+            tasks=tasks,
+            experiment_index=experiments,
+        )
+
+        self.assertEqual(blockers, [])
+        warning_paths = {issue.path for issue in warnings}
+        self.assertIn(
+            "$.bindings[0].acceptance_bindings[0].output_quantity_ids[0]",
+            warning_paths,
+        )
+        self.assertIn(
+            "$.bindings[0].acceptance_bindings[0].output_quantity_ids[1]",
+            warning_paths,
+        )
+
+    def test_acceptance_mapping_format_noise_is_normalized_without_blocking(self) -> None:
+        facts, tasks, experiments, architecture = _inputs()
+        architecture["bindings"][0]["acceptance_bindings"][0] = {
+            "criterion_id": 123,
+            "criterion_kind": "narrative",
+            "output_quantity_ids": ["ber", None],
+            "comment": "advisory metadata",
+        }
+
+        normalized = finalize_scientific_architecture(architecture)
+        blockers, warnings = partition_scientific_architecture_issues(
+            normalized,
+            facts=facts,
+            tasks=tasks,
+            experiment_index=experiments,
+        )
+
+        self.assertEqual(validate_stage("scientific_architecture", normalized), [])
+        self.assertEqual(blockers, [])
+        normalized_mapping = normalized["bindings"][0]["acceptance_bindings"][0]
+        self.assertEqual(normalized_mapping["criterion_id"], "123")
+        self.assertEqual(normalized_mapping["criterion_kind"], "core_conclusion")
+        self.assertEqual(normalized_mapping["output_quantity_ids"], ["ber"])
+        self.assertNotIn("comment", normalized_mapping)
+        self.assertTrue(any("mapping is ignored" in issue.message for issue in warnings))
     def test_schema_version_must_be_explicit(self) -> None:
         _facts, _tasks, _experiments, architecture = _inputs()
         architecture.pop("schema_version")
@@ -151,7 +304,7 @@ class ScientificArchitectureTests(unittest.TestCase):
             [],
         )
 
-    def test_v11_requires_execution_callable_and_shared_implementation(self) -> None:
+    def test_v11_requires_execution_callable_but_normalizes_shared_bookkeeping(self) -> None:
         facts, tasks, experiments, architecture = _inputs()
         architecture["schema_version"] = "1.1"
         _declare_ber_consistency_group(architecture)
@@ -164,7 +317,7 @@ class ScientificArchitectureTests(unittest.TestCase):
             for issue in validate_stage("scientific_architecture", architecture)
         ]
         self.assertTrue(any("non-empty callable" in message for message in schema_messages))
-        self.assertTrue(any("shared_implementation=true" in message for message in schema_messages))
+        self.assertFalse(any("shared_implementation=true" in message for message in schema_messages))
 
         cross_issues = validate_scientific_architecture(
             architecture,
@@ -181,6 +334,25 @@ class ScientificArchitectureTests(unittest.TestCase):
                 for issue in cross_issues
             )
         )
+        blockers, warnings = partition_scientific_architecture_issues(
+            architecture,
+            facts=facts,
+            tasks=tasks,
+            experiment_index=experiments,
+        )
+        self.assertNotIn(
+            "$.components[0].execution.shared_implementation",
+            {issue.path for issue in blockers},
+        )
+        self.assertIn(
+            "$.components[0].execution.shared_implementation",
+            {issue.path for issue in warnings},
+        )
+        normalized = finalize_scientific_architecture(architecture)
+        self.assertTrue(
+            normalized["components"][0]["execution"]["shared_implementation"]
+        )
+
 
         del architecture["components"][1]["execution"]
         self.assertTrue(
@@ -195,39 +367,40 @@ class ScientificArchitectureTests(unittest.TestCase):
             )
         )
 
-    def test_v11_requires_declared_unique_consistency_groups(self) -> None:
+    def test_v11_normalizes_consistency_group_bookkeeping(self) -> None:
         facts, tasks, experiments, architecture = _inputs()
         architecture["schema_version"] = "1.1"
         for component in architecture["components"]:
             component["execution"] = _execution(shared=True)
 
-        schema_messages = [
-            issue.message for issue in validate_stage("scientific_architecture", architecture)
-        ]
-        self.assertTrue(any("undeclared consistency group" in message for message in schema_messages))
-        blockers, _warnings = partition_scientific_architecture_issues(
+        self.assertEqual(validate_stage("scientific_architecture", architecture), [])
+        blockers, warnings = partition_scientific_architecture_issues(
             architecture,
             facts=facts,
             tasks=tasks,
             experiment_index=experiments,
         )
-        self.assertIn("$.bindings[0].consistency_group", {issue.path for issue in blockers})
+        self.assertEqual(blockers, [])
+        self.assertIn(
+            "$.bindings[0].consistency_group", {issue.path for issue in warnings}
+        )
+
+        normalized = finalize_scientific_architecture(architecture)
+        self.assertEqual(validate_stage("scientific_architecture", normalized), [])
+        self.assertEqual(normalized["consistency_groups"][0]["id"], "ber")
+        self.assertEqual(
+            normalized["consistency_groups"][0]["task_ids"], ["fig_1", "fig_2"]
+        )
 
         _declare_ber_consistency_group(architecture)
         architecture["consistency_groups"].append(
             copy.deepcopy(architecture["consistency_groups"][0])
         )
-        duplicate_schema_messages = [
-            issue.message for issue in validate_stage("scientific_architecture", architecture)
-        ]
-        self.assertTrue(any("declared more than once" in message for message in duplicate_schema_messages))
-        duplicate_blockers, _warnings = partition_scientific_architecture_issues(
-            architecture,
-            facts=facts,
-            tasks=tasks,
-            experiment_index=experiments,
+        normalized_duplicate = finalize_scientific_architecture(architecture)
+        self.assertEqual(
+            [group["id"] for group in normalized_duplicate["consistency_groups"]],
+            ["ber"],
         )
-        self.assertIn("$.consistency_groups[1].id", {issue.path for issue in duplicate_blockers})
 
     def test_missing_binding_unsafe_module_and_global_override_are_rejected(self) -> None:
         facts, tasks, experiments, architecture = _inputs()
@@ -257,6 +430,23 @@ class ScientificArchitectureTests(unittest.TestCase):
             no_whitelist, facts=facts, tasks=tasks, experiment_index=experiments
         )
         self.assertTrue(any("not listed in allowed_overrides" in issue.message for issue in no_whitelist_issues))
+        whitelist_blockers, whitelist_warnings = partition_scientific_architecture_issues(
+            no_whitelist,
+            facts=facts,
+            tasks=tasks,
+            experiment_index=experiments,
+        )
+        self.assertNotIn(
+            "$.bindings[0].overrides.ber",
+            {issue.path for issue in whitelist_blockers},
+        )
+        self.assertIn(
+            "$.bindings[0].overrides.ber",
+            {issue.path for issue in whitelist_warnings},
+        )
+        normalized_whitelist = finalize_scientific_architecture(no_whitelist)
+        self.assertEqual(normalized_whitelist["bindings"][0]["allowed_overrides"], ["ber"])
+
 
     def test_partition_blocks_only_contract_defects_needed_for_execution(self) -> None:
         facts, tasks, experiments, architecture = _inputs()
@@ -373,6 +563,14 @@ class ScientificArchitectureTests(unittest.TestCase):
             binding["component_ids"] = binding.pop("components")
             binding["output_quantity_ids"] = binding.pop("outputs")
             binding["allowed_overrides"] = ["ber"]
+            for acceptance in binding["acceptance_bindings"]:
+                criterion_kind = acceptance.pop("criterion_kind")
+                criterion_id = acceptance.pop("criterion_id")
+                if criterion_kind == "core_conclusion":
+                    acceptance["claim_id"] = criterion_id
+                else:
+                    acceptance["target_id"] = criterion_id
+                acceptance["outputs"] = acceptance.pop("output_quantity_ids")
         for invariant in dialect["invariants"]:
             invariant.pop("kind")
             invariant.pop("subjects")
@@ -389,6 +587,12 @@ class ScientificArchitectureTests(unittest.TestCase):
         self.assertEqual(normalized["quantities"][0]["shape"], ["B×L×E"])
         self.assertEqual(normalized["components"][0]["callable"], "")
         self.assertEqual(normalized["bindings"][0]["allowed_overrides"], ["ber"])
+        normalized_acceptance = normalized["bindings"][0]["acceptance_bindings"]
+        self.assertEqual(normalized_acceptance[0]["criterion_id"], "fig_1.ber_decreases")
+        self.assertEqual(normalized_acceptance[0]["criterion_kind"], "core_conclusion")
+        self.assertEqual(normalized_acceptance[0]["output_quantity_ids"], ["ber"])
+        self.assertEqual(normalized_acceptance[1]["criterion_id"], "fig_1.ber_at_10db")
+        self.assertEqual(normalized_acceptance[1]["criterion_kind"], "key_numeric_target")
         self.assertEqual(validate_stage("scientific_architecture", normalized), [])
         self.assertEqual(
             validate_scientific_architecture(normalized, facts=facts, tasks=tasks, experiment_index=experiments),
@@ -397,7 +601,7 @@ class ScientificArchitectureTests(unittest.TestCase):
         self.assertGreater(len(scientific_architecture_normalization_warnings(normalized)), 0)
         self.assertEqual(scientific_architecture_normalization_errors(normalized), [])
 
-    def test_alias_conflicts_keep_canonical_value_as_warning_but_scientific_repair_still_fails(self) -> None:
+    def test_alias_conflicts_warn_and_repair_still_protects_existing_science(self) -> None:
         _, _, _, architecture = _inputs()
         conflicting = copy.deepcopy(architecture)
         conflicting["task_bindings"] = [{"task_id": "different"}]
@@ -408,9 +612,43 @@ class ScientificArchitectureTests(unittest.TestCase):
         repaired = copy.deepcopy(architecture)
         repaired["quantities"][0]["default"] = [1, 2, 3]
         issues = validate_scientific_architecture_repair_preservation(architecture, repaired)
-        self.assertTrue(any(issue.path == "$.quantities" for issue in issues))
+        self.assertTrue(any(issue.path == "$.quantities[0].default" for issue in issues))
 
-    def test_normalization_and_repair_projection_preserve_execution_contract(self) -> None:
+    def test_repair_may_add_fields_and_fix_references(self) -> None:
+        _, _, _, architecture = _inputs()
+        repaired = copy.deepcopy(architecture)
+        repaired["components"][0]["execution"] = _execution(shared=True)
+        repaired["components"][0]["inputs"] = ["snr_db", "ber"]
+        repaired["bindings"][0]["consistency_group"] = "repaired_group"
+        repaired["quantities"].append(
+            {
+                **copy.deepcopy(repaired["quantities"][1]),
+                "id": "new_diagnostic_quantity",
+            }
+        )
+
+        self.assertEqual(
+            validate_scientific_architecture_repair_preservation(
+                architecture, repaired
+            ),
+            [],
+        )
+
+    def test_normalization_maps_python_runtime_labels_to_standard_library(self) -> None:
+        _, _, _, architecture = _inputs()
+        architecture["schema_version"] = "1.1"
+        for component in architecture["components"]:
+            component["execution"] = _execution(shared=True)
+            component["execution"]["primary_framework"] = "python_3.11"
+
+        normalized = finalize_scientific_architecture(architecture)
+
+        self.assertTrue(all(
+            component["execution"]["primary_framework"] == "standard_library"
+            for component in normalized["components"]
+        ))
+
+    def test_normalization_and_repair_preserve_existing_execution_contract(self) -> None:
         _, _, _, architecture = _inputs()
         architecture["schema_version"] = "1.1"
         for component in architecture["components"]:
@@ -426,7 +664,12 @@ class ScientificArchitectureTests(unittest.TestCase):
         changed = copy.deepcopy(normalized)
         changed["components"][0]["execution"]["primary_framework"] = "jax"
         issues = validate_scientific_architecture_repair_preservation(normalized, changed)
-        self.assertTrue(any(issue.path == "$.components" for issue in issues))
+        self.assertTrue(
+            any(
+                issue.path == "$.components[0].execution.primary_framework"
+                for issue in issues
+            )
+        )
 
     def test_partition_keeps_evidence_and_invariant_completeness_advisory(self) -> None:
         facts, tasks, experiments, architecture = _inputs()
@@ -453,7 +696,7 @@ class ScientificArchitectureTests(unittest.TestCase):
         self.assertIn("$.invariants[0].subjects[0]", warning_paths)
         self.assertIn("$.invariants[0].task_ids[0]", warning_paths)
 
-    def test_conflicting_overrides_are_execution_blockers(self) -> None:
+    def test_non_shared_overrides_may_differ_inside_consistency_group(self) -> None:
         facts, tasks, experiments, architecture = _inputs()
         for index, binding in enumerate(architecture["bindings"]):
             binding["allowed_overrides"] = ["ber"]
@@ -466,9 +709,48 @@ class ScientificArchitectureTests(unittest.TestCase):
             experiment_index=experiments,
         )
 
+        self.assertFalse(any("conflicts" in issue.message for issue in blockers))
+
+    def test_numerically_equivalent_shared_overrides_do_not_conflict(self) -> None:
+        facts, tasks, experiments, architecture = _inputs()
+        _declare_ber_consistency_group(architecture)
+        architecture["quantities"][0]["scope"] = "consistency_group"
+        architecture["bindings"][0]["allowed_overrides"] = ["snr_db"]
+        architecture["bindings"][0]["overrides"] = {"snr_db": [0, 5, 10]}
+        architecture["bindings"][1]["allowed_overrides"] = ["snr_db"]
+        architecture["bindings"][1]["overrides"] = {
+            "snr_db": [0.0, 5.0, 10.0]
+        }
+
+        blockers, _warnings = partition_scientific_architecture_issues(
+            architecture,
+            facts=facts,
+            tasks=tasks,
+            experiment_index=experiments,
+        )
+
+        self.assertFalse(
+            any("conflicts inside one consistency_group" in issue.message for issue in blockers)
+        )
+
+    def test_conflicting_shared_overrides_are_execution_blockers(self) -> None:
+        facts, tasks, experiments, architecture = _inputs()
+        _declare_ber_consistency_group(architecture)
+        architecture["quantities"][0]["scope"] = "consistency_group"
+        for index, binding in enumerate(architecture["bindings"]):
+            binding["allowed_overrides"] = ["snr_db"]
+            binding["overrides"] = {"snr_db": [0, 5 + index, 10]}
+
+        blockers, _warnings = partition_scientific_architecture_issues(
+            architecture,
+            facts=facts,
+            tasks=tasks,
+            experiment_index=experiments,
+        )
+
         self.assertTrue(
             any(
-                issue.path == "$.bindings[1].overrides.ber"
+                issue.path == "$.bindings[1].overrides.snr_db"
                 and "conflicts" in issue.message
                 for issue in blockers
             )

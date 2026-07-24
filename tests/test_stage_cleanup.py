@@ -53,6 +53,24 @@ class StageCleanupV2Tests(unittest.TestCase):
             for stale in paths:
                 self.assertFalse(stale.exists(), stale)
 
+    def test_transactional_cleanup_preserves_committed_stage_and_audit(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            architecture = _write(root / "scientific_architecture.json", "new")
+            foundation = _write(root / "foundation_manifest.json", "old")
+            audit = _write(root / "audit" / "02f_design_scientific_architecture.json", "new audit")
+
+            _clear_stage_outputs(
+                root,
+                "scientific_architecture",
+                preserve_audit=True,
+                preserve_paths={"scientific_architecture.json"},
+            )
+
+            self.assertEqual(architecture.read_text(encoding="utf-8"), "new")
+            self.assertTrue(audit.exists())
+            self.assertFalse(foundation.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

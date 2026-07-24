@@ -68,10 +68,10 @@ def build_automation_provenance(
                     "task_id": item.get("task_id"),
                     "status": item.get("task_writer_status"),
                     "passed": item.get("passed"),
-                    "task_reporter_verdict": item.get("task_reporter_verdict"),
-                    "task_reporter_revision_target": item.get("task_reporter_revision_target"),
+                    "task_reporter_outcome": item.get("task_reporter_outcome"),
+                    "task_reporter_host_action": item.get("task_reporter_host_action"),
+                    "task_reporter_rerun_reason": item.get("task_reporter_rerun_reason"),
                     "execution_summary": item.get("execution_summary"),
-                    "revision_request": item.get("revision_request"),
                 }
                 for item in runtime_result.get("per_task", [])
                 if isinstance(item, dict)

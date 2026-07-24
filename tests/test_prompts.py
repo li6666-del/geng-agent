@@ -49,6 +49,7 @@ class PromptTests(unittest.TestCase):
                 backfill_resolution_json="{}",
                 search_ledger_json="{}",
                 paper_context_json="[]",
+                paper_thesis_json="{}",
             ),
             "architecture": book.render(
                 "design_scientific_architecture.md",
@@ -71,6 +72,7 @@ class PromptTests(unittest.TestCase):
         self.assertIn("missing_fact_requests", rendered["tasks"])
         self.assertIn("backfill_handoff", rendered["tasks"])
         self.assertIn("ready_for_writer", rendered["tasks"])
+        self.assertIn("scientific_acceptance", rendered["tasks"])
         self.assertIn("只进行这一轮全局扫描", rendered["facts"])
         self.assertIn("允许只交付", rendered["backfill"])
         self.assertNotIn("都必须输出且只输出", rendered["backfill"])
@@ -79,6 +81,7 @@ class PromptTests(unittest.TestCase):
         self.assertIn("required_fields", rendered["finalize_tasks"])
         self.assertIn("backfill_handoff", rendered["finalize_tasks"])
         self.assertIn("ready_for_writer", rendered["finalize_tasks"])
+        self.assertIn("paper_thesis_json", rendered["finalize_tasks"])
         self.assertNotIn("不能用空数组掩盖未知", rendered["finalize_tasks"])
         self.assertIn("schema_version: \"1.1\"", rendered["architecture"])
         self.assertIn("Host capability inventory", rendered["architecture"])

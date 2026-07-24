@@ -290,6 +290,9 @@
           "title": "Formula Chain",
           "type": "array"
         },
+        "scientific_acceptance": {
+          "$ref": "#/$defs/ScientificAcceptance"
+        },
         "parameter_matrix": {
           "items": {
             "$ref": "#/$defs/TaskSpecificationItem"
@@ -397,6 +400,168 @@
         "name"
       ],
       "title": "RequiredFactRef",
+      "type": "object"
+    },
+    "ScientificAcceptance": {
+      "additionalProperties": false,
+      "description": "Small shared vocabulary, not a completeness gate.",
+      "properties": {
+        "contract_version": {
+          "const": "1.0",
+          "default": "1.0",
+          "title": "Contract Version",
+          "type": "string"
+        },
+        "core_conclusions": {
+          "items": {
+            "$ref": "#/$defs/ScientificCoreConclusion"
+          },
+          "title": "Core Conclusions",
+          "type": "array"
+        },
+        "key_numeric_targets": {
+          "items": {
+            "$ref": "#/$defs/ScientificNumericTarget"
+          },
+          "title": "Key Numeric Targets",
+          "type": "array"
+        },
+        "information_gaps": {
+          "items": {
+            "$ref": "#/$defs/ScientificInformationGap"
+          },
+          "title": "Information Gaps",
+          "type": "array"
+        }
+      },
+      "title": "ScientificAcceptance",
+      "type": "object"
+    },
+    "ScientificCoreConclusion": {
+      "additionalProperties": false,
+      "properties": {
+        "claim_id": {
+          "default": "",
+          "title": "Claim Id",
+          "type": "string"
+        },
+        "statement": {
+          "default": "",
+          "title": "Statement",
+          "type": "string"
+        },
+        "kind": {
+          "default": "other",
+          "enum": [
+            "ordering",
+            "trend",
+            "crossing",
+            "threshold",
+            "scaling",
+            "gain_loss",
+            "mechanism",
+            "absolute_level",
+            "other"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "regime": {
+          "default": "",
+          "title": "Regime",
+          "type": "string"
+        },
+        "paper_anchor": {
+          "default": "",
+          "title": "Paper Anchor",
+          "type": "string"
+        }
+      },
+      "title": "ScientificCoreConclusion",
+      "type": "object"
+    },
+    "ScientificInformationGap": {
+      "additionalProperties": false,
+      "properties": {
+        "gap_id": {
+          "default": "",
+          "title": "Gap Id",
+          "type": "string"
+        },
+        "description": {
+          "default": "",
+          "title": "Description",
+          "type": "string"
+        },
+        "affects_claim_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Affects Claim Ids",
+          "type": "array"
+        },
+        "disposition": {
+          "default": "assume_and_disclose",
+          "enum": [
+            "assume_and_disclose",
+            "single_sensitivity_if_core",
+            "terminal_inconclusive"
+          ],
+          "title": "Disposition",
+          "type": "string"
+        }
+      },
+      "title": "ScientificInformationGap",
+      "type": "object"
+    },
+    "ScientificNumericTarget": {
+      "additionalProperties": false,
+      "properties": {
+        "target_id": {
+          "default": "",
+          "title": "Target Id",
+          "type": "string"
+        },
+        "name": {
+          "default": "",
+          "title": "Name",
+          "type": "string"
+        },
+        "paper_magnitude": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Paper Magnitude"
+        },
+        "unit": {
+          "default": "",
+          "title": "Unit",
+          "type": "string"
+        },
+        "regime": {
+          "default": "",
+          "title": "Regime",
+          "type": "string"
+        },
+        "evidence_quality": {
+          "default": "unavailable",
+          "enum": [
+            "paper_explicit",
+            "paper_derived",
+            "visual_estimate",
+            "unavailable"
+          ],
+          "title": "Evidence Quality",
+          "type": "string"
+        }
+      },
+      "title": "ScientificNumericTarget",
       "type": "object"
     },
     "TaskSpecificationItem": {

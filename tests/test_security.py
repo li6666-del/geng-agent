@@ -5,10 +5,12 @@ import os
 import unittest
 
 from geng_agent.security import (
+    FOUNDATION_STATIC_SECURITY_ADVISORY_CATEGORIES,
     FORBIDDEN_BUILTINS,
     codex_safe_env,
     reconcile_whitelisted_requirements,
     requirement_name_for_import,
+    split_static_security_issues,
     split_requirement_issues,
     static_scan_repro_project,
     validate_requirements,
@@ -48,6 +50,198 @@ class StaticScanDynamicBuiltinTests(unittest.TestCase):
     def test_flags_importlib_import(self) -> None:
         issues = scan_source("import importlib\nimportlib.import_module('socket')\n")
         self.assertIn("forbidden import: importlib", messages(issues))
+
+    def test_importlib_import_module_honors_keywords_and_relative_packages(self) -> None:
+        safe_sources = (
+            "import importlib\nimportlib.import_module(name='numpy')\n",
+            "import importlib\nimportlib.import_module('num' + 'py')\n",
+            "import importlib\nimportlib.import_module('.layers', package='src.models')\n",
+            "import importlib\nimportlib.import_module(name='.layers', package='src.models')\n",
+        )
+        for source in safe_sources:
+            with self.subTest(source=source):
+                self.assertFalse(
+                    any(
+                        item.startswith("dangerous dynamic import:")
+                        for item in messages(scan_source(source))
+                    )
+                )
+
+        hard_sources = (
+            "import importlib\nname = 'numpy'\nimportlib.import_module(name)\n",
+            "import importlib\nimportlib.import_module(name='socket')\n",
+            "import importlib\nimportlib.import_module('.layers')\n",
+            (
+                "import importlib\npackage = 'src.models'\n"
+                "importlib.import_module('.layers', package=package)\n"
+            ),
+            "import importlib\nimportlib.import_module('.path', package='os')\n",
+        )
+        for source in hard_sources:
+            with self.subTest(source=source):
+                self.assertTrue(
+                    any(
+                        item.startswith("dangerous dynamic import:")
+                        for item in messages(scan_source(source))
+                    )
+                )
+
+    def test_assignment_aliases_preserve_module_security_identity(self) -> None:
+        import_issues = scan_source(
+            "import importlib\n"
+            "lib = importlib\n"
+            "lib.import_module(name='socket')\n"
+        )
+        self.assertIn(
+            "dangerous dynamic import: forbidden module target 'socket'",
+            messages(import_issues),
+        )
+
+        process_issues = scan_source(
+            "import os\n"
+            "op = os\n"
+            "op.system('echo blocked')\n"
+        )
+        self.assertIn("forbidden call: os.system", messages(process_issues))
+
+        loader_issues = scan_source(
+            "import importlib\n"
+            "machinery = importlib.machinery\n"
+            "machinery.SourceFileLoader('x', '/outside/module.py')\n"
+        )
+        self.assertTrue(
+            any(
+                item.startswith("dangerous dynamic import: loader construction")
+                for item in messages(loader_issues)
+            ),
+            loader_issues,
+        )
+
+    def test_dunder_builtins_is_normalized_for_direct_and_reflected_access(self) -> None:
+        for capability in ("eval", "exec", "compile", "__import__"):
+            with self.subTest(capability=capability, access="direct"):
+                issues = scan_source(f"__builtins__.{capability}()\n")
+                self.assertIn(
+                    f"forbidden dynamic builtin: {capability}",
+                    messages(issues),
+                )
+            with self.subTest(capability=capability, access="getattr"):
+                issues = scan_source(
+                    f"getattr(__builtins__, {capability!r})()\n"
+                )
+                self.assertTrue(
+                    any(
+                        item.startswith("dangerous reflection:")
+                        for item in messages(issues)
+                    ),
+                    issues,
+                )
+            with self.subTest(capability=capability, access="vars"):
+                issues = scan_source(f"vars(__builtins__)[{capability!r}]()\n")
+                self.assertTrue(
+                    any(
+                        item.startswith("dangerous reflection:")
+                        for item in messages(issues)
+                    ),
+                    issues,
+                )
+
+    def test_dangerous_getattr_requires_a_foldable_dangerous_attribute(self) -> None:
+        for expression in ("'sys' + 'tem'", "f'system'"):
+            with self.subTest(expression=expression):
+                issues = scan_source(f"import os\ngetattr(os, {expression})\n")
+                self.assertIn(
+                    "dangerous reflection: sensitive module os attribute 'system'",
+                    messages(issues),
+                )
+
+        for expression in ("attribute", "f'{attribute}'"):
+            with self.subTest(expression=expression):
+                issues = scan_source(
+                    "import os\nattribute = 'system'\n"
+                    f"getattr(os, {expression})\n"
+                )
+                self.assertFalse(
+                    any(
+                        item.startswith("dangerous reflection:")
+                        for item in messages(issues)
+                    )
+                )
+                self.assertIn("forbidden dynamic builtin: getattr", messages(issues))
+
+    def test_literal_mapping_and_loader_reflection_capabilities_are_blocking(self) -> None:
+        hard_sources = {
+            "direct builtins": "__builtins__['eval']('1')\n",
+            "vars builtins": (
+                "import builtins\nvars(builtins)['eval']('1')\n"
+            ),
+            "globals builtins": (
+                "globals()['__builtins__']['__import__']('socket')\n"
+            ),
+            "importlib dict": (
+                "import importlib\n"
+                "importlib.__dict__['import_module']('socket')\n"
+            ),
+            "vars os": "import os\nvars(os)['system']('echo blocked')\n",
+            "getattr importlib util": (
+                "import importlib\n"
+                "getattr(importlib.util, 'spec_from_file_location')"
+                "('x', '/outside/module.py')\n"
+            ),
+            "getattr machinery loader": (
+                "import importlib\n"
+                "getattr(importlib.machinery, 'SourceFileLoader')"
+                "('x', '/outside/module.py')\n"
+            ),
+            "vars loader exec": (
+                "spec = object()\nvars(spec.loader)['exec_module'](None)\n"
+            ),
+            "loader dict load": (
+                "spec = object()\n"
+                "spec.loader.__dict__['load_module']('x')\n"
+            ),
+            "getattr loader exec": (
+                "spec = object()\ngetattr(spec.loader, 'exec_module')(None)\n"
+            ),
+            "getattr loader load": (
+                "spec = object()\ngetattr(spec.loader, 'load_module')('x')\n"
+            ),
+        }
+        for label, source in hard_sources.items():
+            with self.subTest(label=label):
+                self.assertTrue(
+                    any(
+                        item.startswith("dangerous reflection:")
+                        for item in messages(scan_source(source))
+                    )
+                )
+
+    def test_dynamic_mapping_and_loader_reflection_keys_remain_advisory(self) -> None:
+        issues = scan_source(
+            "import builtins\n"
+            "import importlib\n"
+            "import os\n"
+            "key = '__import__'\n"
+            "getattr(__builtins__, key)\n"
+            "vars(__builtins__)[key]\n"
+            "__builtins__[key]\n"
+            "vars(builtins)[key]\n"
+            "globals()['__builtins__'][key]\n"
+            "importlib.__dict__[key]\n"
+            "vars(os)[key]\n"
+            "spec = object()\n"
+            "getattr(importlib.machinery, key)\n"
+            "vars(spec.loader)[key]\n"
+            "spec.loader.__dict__[key]\n"
+            "getattr(spec.loader, key)\n"
+        )
+        self.assertFalse(
+            any(item.startswith("dangerous reflection:") for item in messages(issues)),
+            issues,
+        )
+        self.assertIn("forbidden dynamic builtin: vars", messages(issues))
+        self.assertIn("forbidden dynamic builtin: globals", messages(issues))
+        self.assertIn("forbidden dynamic builtin: getattr", messages(issues))
 
     def test_flags_getattribute_reflection_bypass(self) -> None:
         # getattr is blocked, but __getattribute__ fetches os.system just the same.
@@ -90,6 +284,36 @@ class StaticScanDynamicBuiltinTests(unittest.TestCase):
         self.assertEqual(len(flagged), 1)
         self.assertEqual(flagged[0]["file"], "run_experiment.py")
         self.assertEqual(flagged[0]["line"], "2")
+
+    def test_environment_findings_are_foundation_advisories_but_strict_by_default(self) -> None:
+        issues = scan_source(
+            "import os\n"
+            "key = 'OPENAI_' + 'API_KEY'\n"
+            "secret = os.getenv('OPENAI_API_KEY')\n"
+            "dynamic = os.environ[key]\n"
+            "bulk = dict(os.environ)\n"
+            "os.environ.update({'MODEL_SIZE': 'small'})\n"
+        )
+
+        strict_blocking, strict_warnings = split_static_security_issues(issues)
+        self.assertEqual(strict_warnings, [])
+        self.assertTrue(strict_blocking)
+        self.assertTrue(all(item["severity"] == "error" for item in strict_blocking))
+
+        foundation_blocking, foundation_warnings = split_static_security_issues(
+            issues,
+            advisory_categories=FOUNDATION_STATIC_SECURITY_ADVISORY_CATEGORIES,
+        )
+        self.assertEqual(foundation_blocking, [])
+        self.assertTrue(foundation_warnings)
+        self.assertTrue(
+            all(
+                item["category"] == "environment_access"
+                and item["severity"] == "warning"
+                for item in foundation_warnings
+            ),
+            foundation_warnings,
+        )
 
     def test_does_not_flag_dotted_or_legitimate_calls(self) -> None:
         # re.compile is an attribute call, not the bare compile builtin; numerical

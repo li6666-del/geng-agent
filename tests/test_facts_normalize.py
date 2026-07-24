@@ -103,7 +103,7 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual(out["engineering_facts"][0]["source"]["page"], 12)
         self.assertEqual(out["engineering_facts"][0]["confidence"], "medium")
 
-    def test_strips_unknown_keys_on_fact_and_source(self) -> None:
+    def test_preserves_unknown_fact_and_source_fields_inside_value(self) -> None:
         fact = good_fact(explanation="prose the model added")
         fact["source"]["confidence_note"] = "extra"
         out, coercions = normalize_engineering_facts_candidate(
@@ -111,6 +111,14 @@ class NormalizeTests(unittest.TestCase):
         )
         self.assertNotIn("explanation", out["engineering_facts"][0])
         self.assertNotIn("confidence_note", out["engineering_facts"][0]["source"])
+        self.assertEqual(
+            out["engineering_facts"][0]["value"]["_extensions"]["explanation"],
+            "prose the model added",
+        )
+        self.assertEqual(
+            out["engineering_facts"][0]["value"]["_source_extensions"]["confidence_note"],
+            "extra",
+        )
         self.assertTrue(any("unknown keys" in c for c in coercions))
 
     def test_drops_malformed_missing_information(self) -> None:
@@ -130,7 +138,7 @@ class NormalizeTests(unittest.TestCase):
 
 
 class PartialAcceptanceTests(unittest.TestCase):
-    def test_drops_only_invalid_facts(self) -> None:
+    def test_keeps_source_mismatch_as_unverified_and_drops_only_structural_invalidity(self) -> None:
         data = {
             "engineering_facts": [
                 good_fact(name="AWGN"),
@@ -139,10 +147,11 @@ class PartialAcceptanceTests(unittest.TestCase):
             ]
         }
         kept, dropped = select_valid_engineering_facts(data, CHUNK_IDS)
-        self.assertEqual([f["name"] for f in kept], ["AWGN"])
+        self.assertEqual([f["name"] for f in kept], ["AWGN", "ghost"])
+        self.assertFalse(kept[1]["value"]["_provenance"]["verified"])
         reasons = {d["name"]: d["reason"] for d in dropped}
-        self.assertIn("chunk_id", reasons["ghost"])
-        self.assertEqual(len(dropped), 2)
+        self.assertIn("quote", reasons["noquote"])
+        self.assertEqual(len(dropped), 1)
 
     def test_finalize_produces_schema_clean_document(self) -> None:
         messy = {
@@ -155,11 +164,12 @@ class PartialAcceptanceTests(unittest.TestCase):
         }
         doc = finalize_engineering_facts(messy, CHUNK_IDS)
         self.assertEqual(validate_stage("engineering_facts", doc), [])
-        self.assertEqual(len(doc["engineering_facts"]), 1)
+        self.assertEqual(len(doc["engineering_facts"]), 2)
         self.assertEqual(doc["paper_repro_type"], "signal_chain")
         self.assertTrue(doc["_meta"]["normalization_used"])
-        self.assertTrue(doc["_meta"]["partial_acceptance_used"])
-        self.assertEqual(doc["_meta"]["dropped_fact_count"], 1)
+        self.assertNotIn("partial_acceptance_used", doc["_meta"])
+        self.assertEqual(doc["_meta"]["unverified_fact_count"], 1)
+        self.assertFalse(doc["engineering_facts"][1]["value"]["_provenance"]["verified"])
 
     def test_clean_input_is_left_untouched_without_meta(self) -> None:
         clean = {
@@ -226,11 +236,13 @@ class FigureSourceTests(unittest.TestCase):
         self.assertEqual([f["name"] for f in kept], ["fig7_curves"])
         self.assertEqual(dropped, [])
 
-    def test_figure_fact_dropped_when_page_not_seen(self) -> None:
+    def test_figure_fact_kept_unverified_when_page_not_seen(self) -> None:
         data = {"engineering_facts": [figure_fact()]}
         kept, dropped = select_valid_engineering_facts(data, CHUNK_IDS, {3})
-        self.assertEqual(kept, [])
-        self.assertIn("page", dropped[0]["reason"])
+        self.assertEqual([fact["name"] for fact in kept], ["fig7_curves"])
+        self.assertEqual(dropped, [])
+        self.assertFalse(kept[0]["value"]["_provenance"]["verified"])
+        self.assertTrue(any("page" in reason for reason in kept[0]["value"]["_provenance"]["reasons"]))
 
     def test_finalize_keeps_figure_fact_for_rendered_page(self) -> None:
         messy = {

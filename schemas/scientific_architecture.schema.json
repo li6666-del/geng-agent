@@ -1,5 +1,33 @@
 {
   "$defs": {
+    "ArchitectureAcceptanceBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "criterion_id": {
+          "default": "",
+          "title": "Criterion Id",
+          "type": "string"
+        },
+        "criterion_kind": {
+          "default": "core_conclusion",
+          "enum": [
+            "core_conclusion",
+            "key_numeric_target"
+          ],
+          "title": "Criterion Kind",
+          "type": "string"
+        },
+        "output_quantity_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Output Quantity Ids",
+          "type": "array"
+        }
+      },
+      "title": "ArchitectureAcceptanceBinding",
+      "type": "object"
+    },
     "ArchitectureBasis": {
       "additionalProperties": false,
       "properties": {
@@ -66,6 +94,14 @@
           "title": "Components",
           "type": "array"
         },
+        "allowed_overrides": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Allowed Overrides",
+          "type": "array"
+        },
         "overrides": {
           "additionalProperties": true,
           "title": "Overrides",
@@ -79,12 +115,11 @@
           "title": "Outputs",
           "type": "array"
         },
-        "allowed_overrides": {
+        "acceptance_bindings": {
           "items": {
-            "minLength": 1,
-            "type": "string"
+            "$ref": "#/$defs/ArchitectureAcceptanceBinding"
           },
-          "title": "Allowed Overrides",
+          "title": "Acceptance Bindings",
           "type": "array"
         }
       },
@@ -106,9 +141,9 @@
           "type": "string"
         },
         "kind": {
+          "minLength": 1,
           "title": "Kind",
-          "type": "string",
-          "minLength": 1
+          "type": "string"
         },
         "module": {
           "minLength": 1,
@@ -116,9 +151,9 @@
           "type": "string"
         },
         "callable": {
+          "default": "",
           "title": "Callable",
-          "type": "string",
-          "default": ""
+          "type": "string"
         },
         "execution": {
           "anyOf": [
@@ -174,6 +209,37 @@
         "basis"
       ],
       "title": "ArchitectureComponent",
+      "type": "object"
+    },
+    "ArchitectureConsistencyGroup": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "task_ids": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Task Ids",
+          "type": "array"
+        },
+        "shared_quantity_ids": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Shared Quantity Ids",
+          "type": "array"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "ArchitectureConsistencyGroup",
       "type": "object"
     },
     "ArchitectureExecutionContract": {
@@ -277,6 +343,7 @@
           "type": "string"
         },
         "kind": {
+          "default": "other",
           "enum": [
             "reference",
             "shape",
@@ -288,8 +355,7 @@
             "other"
           ],
           "title": "Kind",
-          "type": "string",
-          "default": "other"
+          "type": "string"
         },
         "subjects": {
           "items": {
@@ -315,9 +381,6 @@
           "title": "Severity",
           "type": "string"
         },
-        "basis": {
-          "$ref": "#/$defs/ArchitectureBasis"
-        },
         "description": {
           "default": "",
           "title": "Description",
@@ -327,6 +390,9 @@
           "default": "",
           "title": "Expression",
           "type": "string"
+        },
+        "basis": {
+          "$ref": "#/$defs/ArchitectureBasis"
         }
       },
       "required": [
@@ -437,39 +503,9 @@
       ],
       "title": "RequiredFactRef",
       "type": "object"
-    },
-    "ArchitectureConsistencyGroup": {
-      "additionalProperties": false,
-      "properties": {
-        "id": {
-          "minLength": 1,
-          "title": "Id",
-          "type": "string"
-        },
-        "task_ids": {
-          "items": {
-            "minLength": 1,
-            "type": "string"
-          },
-          "title": "Task Ids",
-          "type": "array"
-        },
-        "shared_quantity_ids": {
-          "items": {
-            "minLength": 1,
-            "type": "string"
-          },
-          "title": "Shared Quantity Ids",
-          "type": "array"
-        }
-      },
-      "required": [
-        "id"
-      ],
-      "title": "ArchitectureConsistencyGroup",
-      "type": "object"
     }
   },
+  "additionalProperties": false,
   "allOf": [
     {
       "if": {
@@ -486,27 +522,28 @@
         "properties": {
           "components": {
             "items": {
+              "properties": {
+                "callable": {
+                  "minLength": 1,
+                  "pattern": "\\S",
+                  "type": "string"
+                },
+                "execution": {
+                  "not": {
+                    "type": "null"
+                  }
+                }
+              },
               "required": [
                 "callable",
                 "execution"
-              ],
-              "properties": {
-                "callable": {
-                  "type": "string",
-                  "minLength": 1,
-                  "pattern": "\\S"
-                },
-                "execution": {
-                  "$ref": "#/$defs/ArchitectureExecutionContract"
-                }
-              }
+              ]
             }
           }
         }
       }
     }
   ],
-  "additionalProperties": false,
   "properties": {
     "schema_version": {
       "enum": [
@@ -537,6 +574,13 @@
       "title": "Components",
       "type": "array"
     },
+    "consistency_groups": {
+      "items": {
+        "$ref": "#/$defs/ArchitectureConsistencyGroup"
+      },
+      "title": "Consistency Groups",
+      "type": "array"
+    },
     "bindings": {
       "items": {
         "$ref": "#/$defs/ArchitectureBinding"
@@ -550,13 +594,6 @@
         "$ref": "#/$defs/ArchitectureInvariant"
       },
       "title": "Invariants",
-      "type": "array"
-    },
-    "consistency_groups": {
-      "items": {
-        "$ref": "#/$defs/ArchitectureConsistencyGroup"
-      },
-      "title": "Consistency Groups",
       "type": "array"
     }
   },

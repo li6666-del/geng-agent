@@ -141,9 +141,46 @@ class SchemaTests(unittest.TestCase):
         self.assertEqual(component_rule["properties"]["callable"]["minLength"], 1)
         self.assertEqual(component_rule["properties"]["callable"]["pattern"], r"\S")
         self.assertEqual(
-            component_rule["properties"]["execution"]["$ref"],
-            "#/$defs/ArchitectureExecutionContract",
+            component_rule["properties"]["execution"],
+            {"not": {"type": "null"}},
         )
+
+    def test_task_verification_schemas_expose_structured_rerun_contract(self) -> None:
+        isolated = SCHEMA_MODELS["task_verification_result"].model_json_schema()
+        aggregate = SCHEMA_MODELS["verification_result"].model_json_schema()
+        schema_nodes = [
+            isolated,
+            aggregate["$defs"]["TaskVerificationResult"],
+        ]
+
+        for schema in schema_nodes:
+            properties = schema["properties"]
+            required = set(schema.get("required", []))
+            with self.subTest(title=properties["rerun_reason"]["title"]):
+                self.assertEqual(
+                    properties["rerun_reason"]["enum"],
+                    [
+                        "none",
+                        "core_conclusion_failed",
+                        "key_numeric_ratio_ge_10",
+                        "invalid_run",
+                    ],
+                )
+                self.assertEqual(properties["rerun_reason"]["default"], "none")
+                self.assertIsNone(properties["run_valid"]["default"])
+                self.assertTrue(
+                    {
+                        "rerun_reason", "run_valid", "core_conclusions",
+                        "key_numeric_comparisons", "max_key_numeric_ratio",
+                    }.isdisjoint(required)
+                )
+                self.assertNotIn("default", properties["core_conclusions"])
+                self.assertIn("$ref", properties["core_conclusions"]["items"])
+                self.assertIn("$ref", properties["key_numeric_comparisons"]["items"])
+                self.assertEqual(
+                    properties["max_key_numeric_ratio"]["anyOf"][0]["minimum"],
+                    1,
+                )
 
     def test_response_format_uses_json_schema(self) -> None:
         response_format = response_format_for_stage("repro_tasks")

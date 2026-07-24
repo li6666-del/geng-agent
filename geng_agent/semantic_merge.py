@@ -117,7 +117,7 @@ def semantic_merge_repro_tasks(base: dict[str, Any], addition: dict[str, Any]) -
     merged["repro_tasks"] = tasks
     semantic_meta.update(
         {
-            "merge_version": 2,
+            "merge_version": 3,
             "last_added": added,
             "last_enriched": enriched,
             "last_new_conflicts": new_conflicts,
@@ -199,21 +199,33 @@ def _merge_fact_fields(current: dict[str, Any], candidate: dict[str, Any], key: 
             conflicts.append(_conflict("fact", key, f"value.{field}", merged_value[field], value, current, candidate))
     if changed:
         current["value"] = merged_value
-    if _confidence_rank(candidate.get("confidence")) > _confidence_rank(current.get("confidence")):
-        current["confidence"] = candidate.get("confidence")
-        changed = True
-    if _evidence_rank(candidate.get("evidence_kind")) > _evidence_rank(current.get("evidence_kind")):
-        current["evidence_kind"] = candidate.get("evidence_kind")
-        changed = True
-    if not current.get("derivation") and candidate.get("derivation"):
-        current["derivation"] = candidate.get("derivation")
-        changed = True
+    # Evidence labels describe a particular value. If the candidate disputes
+    # any existing value, retain its source/quality in the conflict record
+    # instead of attaching those labels to the older canonical value.
+    if not conflicts:
+        if _confidence_rank(candidate.get("confidence")) > _confidence_rank(current.get("confidence")):
+            current["confidence"] = candidate.get("confidence")
+            changed = True
+        if _evidence_rank(candidate.get("evidence_kind")) > _evidence_rank(current.get("evidence_kind")):
+            current["evidence_kind"] = candidate.get("evidence_kind")
+            changed = True
+        if not current.get("derivation") and candidate.get("derivation"):
+            current["derivation"] = candidate.get("derivation")
+            changed = True
     return changed, conflicts
 
 
 def _merge_task_fields(current: dict[str, Any], candidate: dict[str, Any], key: tuple[str, ...]) -> tuple[bool, list[dict[str, Any]]]:
     changed = False
     conflicts: list[dict[str, Any]] = []
+    # scientific_acceptance is one coherent authority snapshot. Combining its
+    # nested arrays across rounds would let stale and refined criteria drift apart.
+    candidate_acceptance = candidate.get("scientific_acceptance")
+    if isinstance(candidate_acceptance, dict) and candidate_acceptance != current.get(
+        "scientific_acceptance"
+    ):
+        current["scientific_acceptance"] = copy.deepcopy(candidate_acceptance)
+        changed = True
     for field in (
         "expected_artifacts",
         "output_columns",

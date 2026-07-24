@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import PurePosixPath
 from typing import Any
 
@@ -41,9 +40,15 @@ def validate_scientific_architecture(
     }
     component_task_ids: dict[str, set[str]] = {}
 
+    task_items = _dict_items(tasks.get("repro_tasks"))
     task_ids = {
         str(item.get("task_id"))
-        for item in _dict_items(tasks.get("repro_tasks"))
+        for item in task_items
+        if item.get("task_id")
+    }
+    task_acceptance_criteria = {
+        str(item.get("task_id")): _task_acceptance_criteria(item)
+        for item in task_items
         if item.get("task_id")
     }
     experiment_pairs = {
@@ -106,7 +111,7 @@ def validate_scientific_architecture(
         issues.extend(_basis_issues(component.get("basis"), f"{base}.basis", fact_keys, assumption_names))
 
     bound_task_ids: set[str] = set()
-    group_overrides: dict[tuple[str, str], str] = {}
+    group_overrides: dict[tuple[str, str], Any] = {}
     for index, binding in enumerate(bindings):
         base = f"$.bindings[{index}]"
         task_id = str(binding.get("task_id") or "")
@@ -132,9 +137,108 @@ def validate_scientific_architecture(
                 issues.append(ValidationIssue(f"{base}.components[{ref_index}]", "must refer to a declared component"))
             elif task_id in task_ids:
                 component_task_ids.setdefault(str(ref), set()).add(task_id)
+        binding_outputs = {
+            str(ref)
+            for ref in binding.get("outputs", [])
+        } if isinstance(binding.get("outputs"), list) else set()
         for ref_index, ref in enumerate(binding.get("outputs", []) if isinstance(binding.get("outputs"), list) else []):
             if str(ref) not in quantity_ids:
                 issues.append(ValidationIssue(f"{base}.outputs[{ref_index}]", "must refer to a declared quantity"))
+        acceptance_items = _dict_items(binding.get("acceptance_bindings"))
+        expected_acceptance = task_acceptance_criteria.get(task_id, set())
+        mapped_acceptance: set[tuple[str, str]] = set()
+        seen_acceptance: set[tuple[str, str]] = set()
+        if "acceptance_bindings" in binding and not isinstance(binding.get("acceptance_bindings"), list):
+            issues.append(
+                ValidationIssue(
+                    f"{base}.acceptance_bindings",
+                    "optional acceptance output mappings should be an array; malformed mappings are ignored",
+                )
+            )
+        for acceptance_index, acceptance_binding in enumerate(acceptance_items):
+            acceptance_base = f"{base}.acceptance_bindings[{acceptance_index}]"
+            criterion_id = str(acceptance_binding.get("criterion_id") or "")
+            criterion_kind = str(acceptance_binding.get("criterion_kind") or "")
+            criterion_key = (criterion_id, criterion_kind)
+            expected_kinds = {kind for expected_id, kind in expected_acceptance if expected_id == criterion_id}
+            expected_kind = next(iter(expected_kinds)) if len(expected_kinds) == 1 else None
+            mapping_is_active = False
+            if not criterion_id:
+                issues.append(
+                    ValidationIssue(
+                        f"{acceptance_base}.criterion_id",
+                        "empty optional criterion mapping is ignored",
+                    )
+                )
+            elif criterion_key in seen_acceptance:
+                issues.append(
+                    ValidationIssue(
+                        f"{acceptance_base}.criterion_id",
+                        "duplicate optional criterion mapping is ignored after the first occurrence",
+                    )
+                )
+            else:
+                seen_acceptance.add(criterion_key)
+                if not expected_kinds:
+                    issues.append(
+                        ValidationIssue(
+                            f"{acceptance_base}.criterion_id",
+                            "does not match this task's scientific_acceptance contract; mapping is ignored",
+                        )
+                    )
+                elif criterion_kind in expected_kinds:
+                    mapping_is_active = True
+                    mapped_acceptance.add(criterion_key)
+                elif expected_kind is not None:
+                    mapping_is_active = True
+                    mapped_acceptance.add((criterion_id, expected_kind))
+                    issues.append(
+                        ValidationIssue(
+                            f"{acceptance_base}.criterion_kind",
+                            f"expected {expected_kind!r} for {criterion_id!r}; output mapping remains advisory",
+                        )
+                    )
+                else:
+                    issues.append(
+                        ValidationIssue(
+                            f"{acceptance_base}.criterion_kind",
+                            f"{criterion_id!r} is used by multiple criterion kinds; this ambiguous mapping is ignored",
+                        )
+                    )
+            if mapping_is_active:
+                raw_output_ids = acceptance_binding.get("output_quantity_ids")
+                output_ids = raw_output_ids if isinstance(raw_output_ids, list) else []
+                if not output_ids:
+                    issues.append(
+                        ValidationIssue(
+                            f"{acceptance_base}.output_quantity_ids",
+                            "optional criterion mapping has no measurable output quantities",
+                        )
+                    )
+                for output_index, output_id in enumerate(output_ids):
+                    output_id = str(output_id)
+                    output_path = f"{acceptance_base}.output_quantity_ids[{output_index}]"
+                    if output_id not in quantity_ids:
+                        issues.append(
+                            ValidationIssue(
+                                output_path,
+                                "must refer to a declared quantity so the Foundation can implement the interface",
+                            )
+                        )
+                    elif output_id not in binding_outputs:
+                        issues.append(
+                            ValidationIssue(
+                                output_path,
+                                "must also be listed in this task binding's outputs",
+                            )
+                        )
+        for criterion_id, criterion_kind in sorted(expected_acceptance - mapped_acceptance):
+            issues.append(
+                ValidationIssue(
+                    f"{base}.acceptance_bindings",
+                    f"no measurable output mapping was supplied for {criterion_kind} {criterion_id!r}; mapping is optional and execution may continue",
+                )
+            )
         allowed_raw = binding.get("allowed_overrides")
         allowed_overrides = {
             str(quantity_id)
@@ -153,13 +257,17 @@ def validate_scientific_architecture(
             if quantity_id in global_quantities:
                 issues.append(ValidationIssue(f"{base}.overrides.{quantity_id}", "global quantities cannot be overridden per task"))
             group = str(binding.get("consistency_group") or "")
-            if group:
+            group_definition = groups_by_id.get(group, {})
+            shared_quantity_ids = {
+                str(item)
+                for item in group_definition.get("shared_quantity_ids", [])
+            } if isinstance(group_definition.get("shared_quantity_ids"), list) else set()
+            if group and quantity_id in shared_quantity_ids:
                 key = (group, str(quantity_id))
-                encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
                 previous = group_overrides.get(key)
-                if previous is not None and previous != encoded:
+                if previous is not None and not _scientifically_equivalent(previous, value):
                     issues.append(ValidationIssue(f"{base}.overrides.{quantity_id}", "override conflicts inside one consistency_group"))
-                group_overrides[key] = encoded
+                group_overrides[key] = value
 
     if schema_version == "1.1":
         for component_id, bound_tasks in component_task_ids.items():
@@ -265,27 +373,42 @@ def _is_execution_blocker(
     *,
     schema_version: str,
 ) -> bool:
+    del schema_version  # classification is based on material execution impact.
     path = issue.path
     if ".basis" in path or path.startswith("$.invariants["):
         return False
-    if path == "$.bindings" or path.startswith("$.bindings["):
+    if path.startswith("$.consistency_groups["):
+        return False
+    if any(
+        marker in path
+        for marker in (
+            ".acceptance_bindings",
+            ".allowed_overrides",
+            ".execution.shared_implementation",
+        )
+    ):
+        return False
+    if path == "$.bindings":
         return True
+    if path.startswith("$.bindings["):
+        if ".consistency_group" in path:
+            return False
+        if ".overrides." in path:
+            # Unknown/global/shared-conflicting values change executable
+            # science. A missing whitelist entry is only bookkeeping debt.
+            return "not listed in allowed_overrides" not in issue.message
+        return any(
+            marker in path
+            for marker in (".task_id", ".experiment_id", ".components[", ".outputs[")
+        )
     if path.startswith("$.quantities["):
-        return path.endswith(".id")
-    if schema_version == "1.1" and path.startswith("$.consistency_groups["):
         return path.endswith(".id")
     if path.startswith("$.components["):
         return any(
             marker in path
             for marker in (
-                ".id",
-                ".module",
-                ".callable",
-                ".execution",
-                ".inputs[",
-                ".outputs[",
-                ".parameters[",
-                ".depends_on[",
+                ".id", ".module", ".callable", ".execution",
+                ".inputs[", ".outputs[", ".parameters[", ".depends_on[",
             )
         )
     return False
@@ -322,8 +445,24 @@ def _safe_foundation_module(value: str) -> bool:
         and path.parts[0] == "src"
         and path.suffix == ".py"
         and all(part not in {"", "."} for part in path.parts)
-        and path.name not in {"_io.py", "_backend.py"}
     )
+
+
+def _scientifically_equivalent(left: Any, right: Any) -> bool:
+    if isinstance(left, bool) or isinstance(right, bool):
+        return left is right
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return float(left) == float(right)
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(
+            _scientifically_equivalent(left_item, right_item)
+            for left_item, right_item in zip(left, right)
+        )
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(
+            _scientifically_equivalent(left[key], right[key]) for key in left
+        )
+    return left == right
 
 
 def _unique_ids(
@@ -348,6 +487,29 @@ def _unique_ids(
 
 def _dict_items(value: Any) -> list[dict[str, Any]]:
     return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+def _task_acceptance_criteria(task: dict[str, Any]) -> set[tuple[str, str]]:
+    """Return criterion IDs that may be mapped to measurable outputs.
+
+    The task contract remains the scientific authority. Architecture mappings are
+    only implementation hints, so malformed task entries stay the task validator's
+    responsibility and never become a second acceptance authority here.
+    """
+
+    acceptance = task.get("scientific_acceptance")
+    if not isinstance(acceptance, dict):
+        return set()
+    result: set[tuple[str, str]] = set()
+    for item in _dict_items(acceptance.get("core_conclusions")):
+        criterion_id = str(item.get("claim_id") or "")
+        if criterion_id:
+            result.add((criterion_id, "core_conclusion"))
+    for item in _dict_items(acceptance.get("key_numeric_targets")):
+        criterion_id = str(item.get("target_id") or "")
+        if criterion_id:
+            result.add((criterion_id, "key_numeric_target"))
+    return result
 
 
 def _dedupe(issues: list[ValidationIssue]) -> list[ValidationIssue]:

@@ -1,10 +1,12 @@
 import base64
+import json
 import os
 import sys
 import textwrap
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from geng_agent.agentic_report_editor import run_codex_report_editor_workflow
 
@@ -59,7 +61,7 @@ def _workflow_inputs(output: Path) -> dict:
         "risk_report": {},
         "task_records": [{"task_id": "task_1", "result_json": {"summary": "done", "execution_summary": {}}}],
         "task_verifications": [{
-            "task_id": "task_1", "verdict": "accepted", "revision_target": "none",
+            "task_id": "task_1", "outcome": "reproduced", "host_action": "complete",
             "comparison_summary": "match", "differences": [], "non_material_differences": [],
             "evidence_files": ["paper.png"], "feedback": [], "confidence": "high",
             "local_assets": ["report_assets/task_1/local_result.png"],
@@ -85,7 +87,7 @@ def _run_with_command(command: str, **kwargs) -> dict:
 
 
 class FinalReportEditorTests(unittest.TestCase):
-    def test_editor_receives_accepted_packets_and_writes_reports(self) -> None:
+    def test_editor_receives_terminal_packets_and_writes_reports(self) -> None:
         with TemporaryDirectory() as temp:
             root = Path(temp)
             output = root / "case"
@@ -105,7 +107,7 @@ class FinalReportEditorTests(unittest.TestCase):
                     paper_thesis={}, runtime_result={"passed": True}, risk_report={},
                     task_records=[{"task_id": "task_1", "result_json": {"summary": "done", "execution_summary": {}}}],
                     task_verifications=[{
-                        "task_id": "task_1", "verdict": "accepted", "revision_target": "none",
+                        "task_id": "task_1", "outcome": "reproduced", "host_action": "complete",
                         "comparison_summary": "match", "differences": [], "non_material_differences": [],
                         "evidence_files": ["paper.png"], "feedback": [], "confidence": "high",
                         "local_assets": ["report_assets/task_1/local_result.png"],
@@ -140,6 +142,76 @@ class FinalReportEditorTests(unittest.TestCase):
             self.assertEqual(result["coverage_issues"], [])
             self.assertEqual(result["completion_mode"], "passed_after_normalization")
 
+    def test_terminal_not_reproduced_task_without_images_is_reportable(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / "case"
+            inputs = _workflow_inputs(output)
+            for path in (output / "report_assets").rglob("*"):
+                if path.is_file():
+                    path.unlink()
+            inputs["task_verifications"] = [{
+                "task_id": "task_1",
+                "terminal_outcome": "not_reproduced",
+                "comparison_summary": "valid run did not support the core conclusion",
+                "evidence_files": ["outputs/task_1/results.csv"],
+                "local_assets": [],
+                "paper_assets": [],
+            }]
+            command = _fake_editor(root)
+
+            result = _run_with_command(command, **inputs)
+
+            self.assertTrue(result["ok"], result)
+            report_input = json.loads(
+                (Path(result["workspace"]) / "inputs" / "report_editor_input.json").read_text(encoding="utf-8")
+            )
+            packet = report_input["task_packets"][0]
+            self.assertEqual(packet["terminal_outcome"], "not_reproduced")
+            self.assertEqual(packet["local_assets"], [])
+            self.assertEqual(packet["paper_assets"], [])
+
+    def test_missing_declared_crop_becomes_warning_not_failure(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / "case"
+            inputs = _workflow_inputs(output)
+            missing = output / "report_assets" / "task_1" / "paper_target.png"
+            missing.unlink()
+            command = _fake_editor(root)
+
+            result = _run_with_command(command, **inputs)
+
+            self.assertTrue(result["ok"], result)
+            self.assertTrue(any("paper_asset" in item for item in result["asset_warnings"]))
+
+    def test_asset_content_change_invalidates_editor_cache_even_with_same_metadata(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / "case"
+            command = _fake_editor(root)
+            inputs = _workflow_inputs(output)
+            first = _run_with_command(command, **inputs)
+            self.assertTrue(first["ok"], first)
+
+            cached_inputs = _workflow_inputs(output)
+            cached_inputs["resume"] = True
+            cached = _run_with_command(command, **cached_inputs)
+            self.assertTrue(cached["cached"], cached)
+
+            asset = output / "report_assets" / "task_1" / "local_result.png"
+            stat = asset.stat()
+            payload = bytearray(asset.read_bytes())
+            payload[-1] ^= 1
+            asset.write_bytes(bytes(payload))
+            os.utime(asset, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+
+            refreshed_inputs = dict(cached_inputs)
+            refreshed = _run_with_command(command, **refreshed_inputs)
+            self.assertTrue(refreshed["ok"], refreshed)
+            self.assertFalse(refreshed["cached"], refreshed)
+            self.assertNotEqual(first["input_hash"], refreshed["input_hash"])
+
     def test_common_markdown_delivery_errors_are_normalized_without_retry(self) -> None:
         with TemporaryDirectory() as temp:
             root = Path(temp)
@@ -165,62 +237,39 @@ class FinalReportEditorTests(unittest.TestCase):
             comparison = (output / "result_review.md").read_text(encoding="utf-8")
             self.assertIn("report_assets/task_1/local_result.png", comparison)
 
-    def test_second_attempt_repairs_only_missing_report_and_preserves_drafts(self) -> None:
+    def test_missing_report_gets_deterministic_fallback_without_retry(self) -> None:
         with TemporaryDirectory() as temp:
             root = Path(temp)
             output = root / "case"
-            first_command = _editor_command(root, "partial.py", """
+            command = _editor_command(root, "partial.py", """
                 (root / "review.md").write_text("# 原始总览", encoding="utf-8")
                 (root / "result_review.md").write_text("## 原始对比", encoding="utf-8")
             """)
-            first = _run_with_command(first_command, **_workflow_inputs(output))
-            self.assertFalse(first["ok"])
-            self.assertTrue(first["retryable"])
-            self.assertEqual(first["missing_outputs"], ["reproduction_report.md"])
-            first_workspace = Path(first["workspace"])
-            original_review = (first_workspace / "review.md").read_bytes()
-            original_comparison = (first_workspace / "result_review.md").read_bytes()
+            result = _run_with_command(command, **_workflow_inputs(output))
 
-            repair_command = _editor_command(root, "repair.py", """
-                (root / "review.md").write_text("# 不应保留的重写", encoding="utf-8")
-                (root / "result_review.md").write_text("## 不应保留的重写", encoding="utf-8")
-                (root / "reproduction_report.md").write_text("## 任务 1\\n补齐参数。", encoding="utf-8")
-            """)
-            second = _run_with_command(
-                repair_command,
-                **_workflow_inputs(output),
-                attempt_no=2,
-                repair_context=first,
-                allow_fallback=True,
-            )
+            self.assertTrue(result["ok"], result)
+            self.assertFalse(result["retryable"])
+            self.assertEqual(result["completion_mode"], "degraded_fallback")
+            self.assertEqual(result["missing_outputs"], [])
+            self.assertEqual(result["fallback_files"], ["reproduction_report.md"])
+            self.assertEqual((output / "review.md").read_text(encoding="utf-8"), "# 原始总览")
+            self.assertTrue((output / "reproduction_report.md").is_file())
 
-            self.assertTrue(second["ok"], second)
-            self.assertEqual(second["completion_mode"], "passed_after_targeted_repair")
-            self.assertEqual(second["repair_targets"], ["reproduction_report.md"])
-            self.assertCountEqual(second["restored_files"], ["review.md", "result_review.md"])
-            self.assertEqual((output / "review.md").read_bytes(), original_review)
-            self.assertEqual((output / "result_review.md").read_bytes(), original_comparison)
-
-    def test_second_attempt_uses_deterministic_fallback_when_codex_still_omits_files(self) -> None:
+    def test_empty_editor_output_gets_all_deterministic_reports(self) -> None:
         with TemporaryDirectory() as temp:
             root = Path(temp)
             output = root / "case"
             empty_command = _editor_command(root, "empty.py", "pass\n")
-            first = _run_with_command(empty_command, **_workflow_inputs(output))
-            self.assertFalse(first["ok"])
+            result = _run_with_command(empty_command, **_workflow_inputs(output))
 
-            second = _run_with_command(
-                empty_command,
-                **_workflow_inputs(output),
-                attempt_no=2,
-                repair_context=first,
-                allow_fallback=True,
+            self.assertTrue(result["ok"], result)
+            self.assertFalse(result["retryable"])
+            self.assertEqual(result["completion_mode"], "degraded_fallback")
+            self.assertTrue(result["degraded_report_generation"])
+            self.assertCountEqual(
+                result["fallback_files"],
+                ["review.md", "reproduction_report.md", "result_review.md"],
             )
-
-            self.assertTrue(second["ok"], second)
-            self.assertEqual(second["completion_mode"], "degraded_fallback")
-            self.assertTrue(second["degraded_report_generation"])
-            self.assertCountEqual(second["fallback_files"], list(("review.md", "reproduction_report.md", "result_review.md")))
             for name in ("review.md", "reproduction_report.md", "result_review.md"):
                 self.assertTrue((output / name).is_file())
 
@@ -240,7 +289,44 @@ class FinalReportEditorTests(unittest.TestCase):
             self.assertEqual(result["completion_mode"], "passed_with_process_warning")
             self.assertIsNotNone(result["process_warning"])
 
-    def test_unsafe_report_shape_remains_a_hard_failure(self) -> None:
+    def test_reports_larger_than_two_megabytes_remain_deliverable(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / "case"
+            command = _editor_command(root, "large.py", """
+                (root / "review.md").write_text("# 大报告\\n" + "x" * (2 * 1024 * 1024 + 1), encoding="utf-8")
+                for name in ("reproduction_report.md", "result_review.md"):
+                    (root / name).write_text("## 报告", encoding="utf-8")
+            """)
+
+            result = _run_with_command(command, **_workflow_inputs(output))
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["fallback_files"], [])
+            self.assertGreater((output / "review.md").stat().st_size, 2 * 1024 * 1024)
+
+    def test_oversized_report_is_quarantined_and_replaced_with_fallback(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / "case"
+            command = _editor_command(root, "oversized.py", """
+                (root / "review.md").write_text("# oversized\\n" + "x" * (128 * 1024), encoding="utf-8")
+                for name in ("reproduction_report.md", "result_review.md"):
+                    (root / name).write_text("## ??", encoding="utf-8")
+            """)
+
+            with patch("geng_agent.agentic_report_editor.REPORT_MARKDOWN_MAX_BYTES", 64 * 1024):
+                result = _run_with_command(command, **_workflow_inputs(output))
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["completion_mode"], "degraded_fallback")
+            self.assertEqual(result["fallback_files"], ["review.md"])
+            self.assertTrue(any("resource limit" in issue for issue in result["recovered_packaging_issues"]))
+            discarded = Path(result["workspace"]) / "discarded_report_outputs" / "review.md"
+            self.assertGreater(discarded.stat().st_size, 64 * 1024)
+            self.assertLess((output / "review.md").stat().st_size, 64 * 1024)
+
+    def test_unsafe_report_shape_is_quarantined_and_replaced(self) -> None:
         with TemporaryDirectory() as temp:
             root = Path(temp)
             output = root / "case"
@@ -252,10 +338,15 @@ class FinalReportEditorTests(unittest.TestCase):
 
             result = _run_with_command(command, **_workflow_inputs(output))
 
-            self.assertFalse(result["ok"])
+            self.assertTrue(result["ok"], result)
             self.assertFalse(result["retryable"])
-            self.assertEqual(result["completion_mode"], "hard_failure")
-            self.assertTrue(any("regular file" in issue for issue in result["hard_issues"]))
+            self.assertEqual(result["completion_mode"], "degraded_fallback")
+            self.assertEqual(result["hard_issues"], [])
+            self.assertEqual(result["fallback_files"], ["review.md"])
+            self.assertTrue(any("regular file" in issue for issue in result["recovered_packaging_issues"]))
+            self.assertTrue((output / "review.md").is_file())
+            discarded = Path(result["workspace"]) / "discarded_report_outputs" / "review.md"
+            self.assertTrue(discarded.is_dir())
 
 
 if __name__ == "__main__":

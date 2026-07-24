@@ -1,18 +1,28 @@
 import ast
+import json
+import importlib.util
+import os
+import site
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from tempfile import TemporaryDirectory
 import subprocess
+import sys
 import threading
 import time
+import textwrap
 import unittest
 from unittest.mock import patch
 
 from geng_agent.codex_runner import (
     DEFAULT_CODEX_TIMEOUT_SECONDS,
     DEFAULT_GENG_CODEX_MODEL,
+    _FOUNDATION_UNITTEST_GUARD,
     _clear_ephemeral_capability_cache,
+    _foundation_unittest_guard_config,
     resolve_codex_timeout,
     run_codex_subprocess,
+    run_python_unittest_subprocess,
 )
 
 
@@ -248,6 +258,219 @@ class CodexRunnerEphemeralTests(unittest.TestCase):
         self.assertEqual(help_calls, 1)
         self.assertGreaterEqual(peak_workers, 2)
         self.assertTrue(all(status["ok"] for status in statuses))
+
+    def test_generated_unittest_uses_isolated_guarded_case_environment(self) -> None:
+        captured: dict = {}
+
+        def fake_run(command, **kwargs):
+            captured["command"] = list(command)
+            captured.update(kwargs)
+            return _completed(list(command))
+
+        with TemporaryDirectory() as temp, patch(
+            "geng_agent.codex_runner.build_safe_env",
+            return_value={"PATH": "safe-path", "PYTHONIOENCODING": "utf-8"},
+        ), patch("geng_agent.codex_runner.subprocess.run", side_effect=fake_run):
+            work_dir = Path(temp)
+            result = run_python_unittest_subprocess(work_dir=work_dir)
+
+        env = captured["env"]
+        command = captured["command"]
+        guard_config = json.loads(command[-1])
+        self.assertTrue(result["passed"])
+        self.assertEqual(command[:4], [sys.executable, "-I", "-B", "-c"])
+        self.assertEqual(command[4], _FOUNDATION_UNITTEST_GUARD)
+        self.assertIn("sys.addaudithook(_audit)", command[4])
+        self.assertIn('event.startswith("socket.")', command[4])
+        self.assertIn('event == "subprocess.Popen"', command[4])
+        self.assertIn("def _require_allowed_read", command[4])
+        self.assertIn("follows a case symlink outside the sandbox", command[4])
+        self.assertIn('event == "os.chdir"', command[4])
+        self.assertIn("def _guarded_stat", command[4])
+        self.assertIn("builtins.eval = _guarded_eval", command[4])
+        self.assertIn("builtins.exec = _guarded_exec", command[4])
+        self.assertIn("builtins.compile = _guarded_compile", command[4])
+        self.assertIn("builtins.__import__ = _guarded_import", command[4])
+        self.assertIn("os.stat = _guarded_stat", command[4])
+        self.assertIn("not _is_import_statement(caller)", command[4])
+        self.assertIn('event in {"compile", "exec"}', command[4])
+        self.assertIn('code_filename.startswith("<")', command[4])
+        self.assertNotIn("OPENAI_API_KEY", env)
+        self.assertNotIn("GENG_LLM_API_KEY", env)
+        self.assertTrue(Path(env["HOME"]).is_relative_to(work_dir))
+        self.assertTrue(Path(env["XDG_CACHE_HOME"]).is_relative_to(work_dir))
+        self.assertTrue(Path(env["TMPDIR"]).is_relative_to(work_dir))
+        self.assertEqual(Path(guard_config["work_dir"]), work_dir.resolve())
+        self.assertEqual(guard_config["start_dir"], "tests")
+        self.assertTrue(all(Path(path).is_absolute() for path in guard_config["sensitive_roots"]))
+        self.assertIn(str(work_dir.resolve()), guard_config["trusted_read_roots"])
+        self.assertEqual(captured["cwd"], work_dir.resolve())
+
+    def test_runtime_guard_allows_authorized_features_and_blocks_boundaries(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            work_dir = root / "case"
+            tests_dir = work_dir / "tests"
+            tests_dir.mkdir(parents=True)
+            outside = root / "outside.txt"
+            outside.write_text("host-secret", encoding="utf-8")
+            scientific_modules = tuple(
+                name for name in ("numpy", "matplotlib", "torch")
+                if importlib.util.find_spec(name) is not None
+            )
+            source = textwrap.dedent(
+                f"""\
+                import glob
+                import importlib
+                import json
+                import math
+                import os
+                import unittest
+
+                OUTSIDE = {str(outside)!r}
+                OUTSIDE_PARENT = {str(root)!r}
+                SCIENTIFIC_MODULES = {scientific_modules!r}
+
+
+                class GuardBehaviorTest(unittest.TestCase):
+                    def test_authorized_foundation_features(self):
+                        loaded = importlib.import_module("fractions")
+                        self.assertEqual(loaded.Fraction(1, 2), loaded.Fraction(2, 4))
+                        self.assertEqual(json.loads("1"), 1)
+                        self.assertEqual(math.floor(1.5), 1)
+                        os.environ["FOUNDATION_TEST_FLAG"] = "yes"
+                        self.assertEqual(os.environ.get("FOUNDATION_TEST_FLAG"), "yes")
+                        self.assertEqual(os.getenv("FOUNDATION_TEST_FLAG"), "yes")
+
+                        class Box:
+                            pass
+
+                        box = Box()
+                        setattr(box, "value", 3)
+                        self.assertEqual(getattr(box, "value"), 3)
+                        self.assertEqual(vars(box)["value"], 3)
+                        self.assertIn("GuardBehaviorTest", globals())
+                        delattr(box, "value")
+                        self.assertFalse(hasattr(box, "value"))
+
+                    def test_installed_scientific_dependencies_import(self):
+                        imported = []
+                        for module_name in SCIENTIFIC_MODULES:
+                            with self.subTest(module=module_name):
+                                module = importlib.import_module(module_name)
+                                imported.append(module.__name__)
+                        self.assertEqual(imported, list(SCIENTIFIC_MODULES))
+
+                    def test_external_file_and_directory_access_is_blocked(self):
+                        actions = (
+                            lambda: open(OUTSIDE, encoding="utf-8").read(),
+                            lambda: os.listdir(OUTSIDE_PARENT),
+                            lambda: list(os.scandir(OUTSIDE_PARENT)),
+                            lambda: glob.glob(os.path.join(OUTSIDE_PARENT, "*")),
+                            lambda: os.stat(OUTSIDE),
+                            lambda: os.chdir(OUTSIDE_PARENT),
+                        )
+                        for action in actions:
+                            with self.subTest(action=action):
+                                with self.assertRaises(PermissionError):
+                                    action()
+
+                    def test_dynamic_execution_direct_and_alias_calls_are_blocked(self):
+                        eval_alias = eval
+                        exec_alias = exec
+                        compile_alias = compile
+                        import_alias = __import__
+                        actions = (
+                            lambda: eval("1 + 1"),
+                            lambda: eval_alias("1 + 1"),
+                            lambda: exec("value = 1"),
+                            lambda: exec_alias("value = 1"),
+                            lambda: compile("1 + 1", "<case>", "eval"),
+                            lambda: compile_alias("1 + 1", "<case>", "eval"),
+                            lambda: __import__("decimal"),
+                            lambda: import_alias("decimal"),
+                        )
+                        for action in actions:
+                            with self.subTest(action=action):
+                                with self.assertRaises(PermissionError):
+                                    action()
+                """
+            )
+            (tests_dir / "test_guard_behavior.py").write_text(source, encoding="utf-8")
+
+            result = run_python_unittest_subprocess(work_dir=work_dir, timeout=30)
+
+        self.assertTrue(
+            result["passed"],
+            msg=f"guard behavior suite failed:\n{result.get('stdout')}\n{result.get('stderr')}",
+        )
+
+    def test_runtime_guard_blocks_case_symlink_escape(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            work_dir = root / "case"
+            tests_dir = work_dir / "tests"
+            tests_dir.mkdir(parents=True)
+            outside = root / "outside.txt"
+            outside.write_text("host-secret", encoding="utf-8")
+            escape = work_dir / "escape.txt"
+            try:
+                escape.symlink_to(outside)
+            except (NotImplementedError, OSError) as exc:
+                self.skipTest(f"symlink creation is unavailable: {exc}")
+            source = textwrap.dedent(
+                f"""\
+                import unittest
+
+                ESCAPE = {str(escape)!r}
+
+
+
+                class SymlinkEscapeTest(unittest.TestCase):
+                    def test_symlink_read_is_blocked(self):
+                        with self.assertRaises(PermissionError):
+                            open(ESCAPE, encoding="utf-8").read()
+                """
+            )
+            (tests_dir / "test_symlink_escape.py").write_text(source, encoding="utf-8")
+
+            result = run_python_unittest_subprocess(work_dir=work_dir, timeout=30)
+
+        self.assertTrue(
+            result["passed"],
+            msg=f"symlink guard suite failed:\n{result.get('stdout')}\n{result.get('stderr')}",
+        )
+
+    def test_guard_config_contains_only_paths_and_discovery_name(self) -> None:
+        with TemporaryDirectory() as temp:
+            work_dir = Path(temp)
+            config = _foundation_unittest_guard_config(work_dir=work_dir, start_dir="tests")
+
+        self.assertEqual(
+            set(config),
+            {"work_dir", "start_dir", "sensitive_roots", "trusted_read_roots"},
+        )
+        self.assertEqual(config["work_dir"], str(work_dir.resolve()))
+        self.assertEqual(config["start_dir"], "tests")
+        self.assertTrue(config["sensitive_roots"])
+        self.assertTrue(
+            all(
+                isinstance(path, str) and Path(path).is_absolute()
+                for key in ("sensitive_roots", "trusted_read_roots")
+                for path in config[key]
+            )
+        )
+        self.assertIn(str(Path(sys.prefix).resolve()), config["trusted_read_roots"])
+        self.assertIn(str(Path(sys.base_prefix).resolve()), config["trusted_read_roots"])
+        for package_root in site.getsitepackages():
+            self.assertIn(str(Path(package_root).resolve()), config["trusted_read_roots"])
+        if os.name == "nt" and os.environ.get("SystemRoot"):
+            self.assertIn(
+                str(Path(os.environ["SystemRoot"]).resolve()),
+                config["trusted_read_roots"],
+            )
+        elif Path("/usr/lib").exists():
+            self.assertIn(str(Path("/usr/lib").absolute()), config["trusted_read_roots"])
 
 
 class CodexRunnerBoundaryTests(unittest.TestCase):

@@ -9,32 +9,40 @@ checks on the task list, nondeterminism detection, and per-stage run-cost ledger
 
 
 def build_scientific_check(tasks: dict[str, Any]) -> dict[str, Any]:
-    issues: list[dict[str, str]] = []
+    warnings: list[dict[str, str]] = []
     repro_tasks = tasks.get("repro_tasks", [])
     if not isinstance(repro_tasks, list):
-        return {"ok": False, "issues": [{"path": "$.repro_tasks", "message": "repro_tasks is not a list"}]}
+        return {
+            "ok": True,
+            "issues": [],
+            "warnings": [{"path": "$.repro_tasks", "message": "repro_tasks is unavailable for advisory risk review"}],
+            "policy": "advisory_only",
+        }
 
     for index, task in enumerate(repro_tasks):
         if not isinstance(task, dict):
             continue
         base = f"$.repro_tasks[{index}]"
-        comparison = task.get("comparison")
-        if isinstance(comparison, dict):
-            baselines = comparison.get("baselines")
-            if baselines in (None, [], ""):
-                issues.append({"path": f"{base}.comparison.baselines", "message": "baseline is missing or empty"})
-        expected_trend = task.get("expected_trend")
-        if isinstance(expected_trend, dict) and not expected_trend:
-            issues.append({"path": f"{base}.expected_trend", "message": "expected trend is empty"})
-        output_columns = task.get("output_columns")
-        if isinstance(output_columns, list) and "metric_value" in output_columns:
-            issues.append({"path": f"{base}.output_columns", "message": "generic metric_value should be replaced by concrete CSV columns"})
-        metric = str(task.get("metric", "")).lower()
-        formula = str(task.get("metric_formula", "")).lower()
-        if metric and metric not in formula and metric not in {"other"}:
-            issues.append({"path": f"{base}.metric_formula", "message": "metric formula should explicitly name the metric"})
+        acceptance = task.get("scientific_acceptance")
+        if not isinstance(acceptance, dict):
+            warnings.append(
+                {
+                    "path": f"{base}.scientific_acceptance",
+                    "message": "conclusion-level acceptance contract is unavailable; report this as an audit limitation",
+                }
+            )
+            continue
+        conclusions = acceptance.get("core_conclusions")
+        numeric_targets = acceptance.get("key_numeric_targets")
+        if not conclusions and not numeric_targets:
+            warnings.append(
+                {
+                    "path": f"{base}.scientific_acceptance",
+                    "message": "no conclusion or key numeric target is available for criterion-level reporting",
+                }
+            )
 
-    return {"ok": not issues, "issues": issues}
+    return {"ok": True, "issues": [], "warnings": warnings, "policy": "advisory_only"}
 
 
 _RANDOM_USE = re.compile(
@@ -133,6 +141,11 @@ def build_risk_report(
             for request in task["missing_fact_requests"]:
                 if isinstance(request, dict):
                     task_evidence_gaps.append({**request, "task_id": task.get("task_id")})
+        acceptance = task.get("scientific_acceptance") if isinstance(task, dict) else None
+        information_gaps = acceptance.get("information_gaps") if isinstance(acceptance, dict) else None
+        for gap in information_gaps if isinstance(information_gaps, list) else []:
+            if isinstance(gap, dict):
+                task_evidence_gaps.append({**gap, "task_id": task.get("task_id")})
 
     findings: list[dict[str, Any]] = []
 
@@ -141,9 +154,9 @@ def build_risk_report(
     if paper_format == "pdf":
         findings.append({
             "type": "pdf_images_lost",
-            "message": "PDF 转 text chunks 时，嵌入的图片、图表、坐标轴、星座图等视觉信息会丢失。source_kind=figure 的事实通过多模态页面 PNG 和任务级论文证据包补偿，仍建议人工核对关键图结论。",
-            "severity": "high",
-            "mitigation": "多模态模型在支持阶段会收到页面渲染 PNG；非 PDF 或无图论文不受此影响。",
+            "message": "PDF 文本抽取可能省略图表视觉信息；系统会优先使用页面渲染、结构化数值与任务证据补偿。缺少裁图只作为证据包装限制记录。",
+            "severity": "advisory",
+            "mitigation": "结论级验收可使用可读结果图或等价 CSV、表格、summary 与文本证据，不要求像素级或裁图级一致。",
             "always_injected_for_pdfs": True,
         })
 
@@ -229,10 +242,37 @@ def build_risk_report(
                     "coercion_count": facts_meta.get("coercion_count"),
                 }
             )
-    if scientific_check and scientific_check.get("issues"):
-        findings.append({"type": "scientific_check_issues", "message": "复现任务缺少部分通信实验语义约束。", "count": len(scientific_check["issues"])})
-    if result_review_result and result_review_result.get("enabled") and not result_review_result.get("passed"):
-        findings.append({"type": "writer_results_incomplete", "message": "至少一个任务 writer 未完成最终科学结论。", "error": result_review_result.get("error")})
+    if scientific_check and scientific_check.get("warnings"):
+        findings.append(
+            {
+                "type": "scientific_check_warnings",
+                "message": "部分任务的结论级验收信息不完整；该项只作为报告审计提示，不阻断流程。",
+                "count": len(scientific_check["warnings"]),
+            }
+        )
+    outcome_counts = _terminal_outcome_counts(result_review_result or {})
+    terminal_count = sum(outcome_counts.values())
+    all_terminal = bool((result_review_result or {}).get("all_terminal")) or (
+        bool(repro_tasks) and terminal_count >= len(repro_tasks)
+    )
+    if outcome_counts.get("inconclusive_missing_information"):
+        findings.append(
+            {
+                "type": "inconclusive_missing_information",
+                "message": "部分任务因论文缺少影响核心结论的信息而进入可报告的不确定终态。",
+                "count": outcome_counts["inconclusive_missing_information"],
+            }
+        )
+    if outcome_counts.get("not_reproduced"):
+        findings.append(
+            {
+                "type": "not_reproduced",
+                "message": "部分任务已完成有效且忠实的运行，但核心结论未得到支持；这是科学结果而不是流水线错误。",
+                "count": outcome_counts["not_reproduced"],
+            }
+        )
+    if result_review_result and result_review_result.get("enabled") and not result_review_result.get("passed") and not all_terminal:
+        findings.append({"type": "writer_results_incomplete", "message": "至少一个任务尚未进入可报告终态。", "error": result_review_result.get("error")})
 
     combined_missing = list(missing) if isinstance(missing, list) else []
     known_missing_names = {
@@ -255,9 +295,16 @@ def build_risk_report(
         result_review_result=result_review_result or {},
         stage_fallback_used=bool(stage_fallbacks),
     )
+    engineering_risk_level = combine_risk_dimensions(dimensions)
+    scientific_risk_level = _scientific_risk_level(
+        dimensions,
+        result_review_result or {},
+    )
     return {
-        "risk_level": combine_risk_dimensions(dimensions),
-        "judgement_style": "reproducibility_risk_only",
+        "risk_level": engineering_risk_level,
+        "engineering_risk_level": engineering_risk_level,
+        "scientific_risk_level": scientific_risk_level,
+        "judgement_style": "separated_scientific_and_engineering_risk",
         "risk_dimensions": dimensions,
         "missing_information_count": len(missing) if isinstance(missing, list) else 0,
         "task_evidence_gap_count": len(task_evidence_gaps),
@@ -267,6 +314,45 @@ def build_risk_report(
         "result_review": result_review_result or {},
         "note": "风险等级只表示工程复现风险，不等同于造假结论；smoke 通过也不等于论文完全复现成功。",
     }
+
+
+def _terminal_outcome_counts(result_review_result: dict[str, Any]) -> dict[str, int]:
+    counts = {outcome: 0 for outcome in (
+        "reproduced",
+        "reproduced_with_assumptions",
+        "inconclusive_missing_information",
+        "not_reproduced",
+        "execution_failed",
+    )}
+    nested = result_review_result.get("verification_result")
+    source = nested if isinstance(nested, dict) else result_review_result
+    declared_counts = source.get("outcome_counts")
+    if isinstance(declared_counts, dict):
+        for outcome in counts:
+            value = declared_counts.get(outcome)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                counts[outcome] = value
+    task_items: list[Any] = []
+    for key in ("tasks", "task_verifications", "per_task"):
+        values = source.get(key)
+        if isinstance(values, list):
+            task_items = values
+            break
+    if any(counts.values()) and not task_items:
+        return counts
+    counts = {outcome: 0 for outcome in counts}
+    for item in task_items:
+        if not isinstance(item, dict):
+            continue
+        outcome = ""
+        for key in ("terminal_outcome", "outcome", "scientific_outcome"):
+            value = str(item.get(key) or "").strip()
+            if value:
+                outcome = value
+                break
+        if outcome in counts:
+            counts[outcome] += 1
+    return counts
 
 
 def build_risk_dimensions(
@@ -287,10 +373,28 @@ def build_risk_dimensions(
     requirement_warnings = runtime_result.get("requirements_warnings", []) if isinstance(runtime_result, dict) else []
     result_review_enabled = bool(result_review_result.get("enabled"))
     result_review_passed = result_review_result.get("passed")
+    outcome_counts = _terminal_outcome_counts(result_review_result)
+    material_missing = _high_impact_count(missing, field="impact")
+    material_assumptions = _high_impact_count(assumptions, field="risk")
+    all_terminal = bool(result_review_result.get("all_terminal")) or (
+        bool(repro_tasks := tasks.get("repro_tasks"))
+        and sum(outcome_counts.values()) >= len(repro_tasks)
+    )
     return {
         "information_completeness": _dimension(
-            "high" if stage_fallback_used or len(missing) >= 5 else "medium" if missing or assumptions else "low",
-            [f"missing_information={len(missing)}", f"assumptions={len(assumptions)}", f"stage_fallback_used={stage_fallback_used}"],
+            "high"
+            if outcome_counts["inconclusive_missing_information"]
+            else "medium"
+            if stage_fallback_used or material_missing or material_assumptions
+            else "low",
+            [
+                f"material_missing_information={material_missing}",
+                f"material_assumptions={material_assumptions}",
+                f"missing_information={len(missing)}",
+                f"assumptions={len(assumptions)}",
+                f"stage_fallback_used={stage_fallback_used}",
+                f"inconclusive_tasks={outcome_counts['inconclusive_missing_information']}",
+            ],
         ),
         "implementation_fidelity": _dimension(
             "high"
@@ -319,21 +423,34 @@ def build_risk_dimensions(
                 result_review_enabled,
                 result_review_passed,
                 scientific_issues,
+                outcome_counts,
+                all_terminal,
             ),
             [
                 f"result_review_enabled={result_review_enabled}",
                 f"result_review_passed={result_review_passed}",
                 f"scientific_issues={len(scientific_issues)}",
+                f"terminal_outcomes={outcome_counts}",
             ],
         ),
-        "baseline_fairness": _dimension("high" if _count_missing_baselines(tasks) else "low", [f"tasks_without_baseline={_count_missing_baselines(tasks)}"]),
+        "baseline_fairness": _dimension(
+            "medium" if _count_missing_baselines(tasks) else "low",
+            [f"declared_comparisons_without_baseline={_count_missing_baselines(tasks)}"],
+        ),
         "security_isolation": _dimension(
-            "high" if security_issues or requirement_issues else "medium" if runtime_enabled or requirement_warnings else "low",
+            "high" if security_issues else "low",
             [
                 f"security_issues={len(security_issues)}",
                 f"requirements_issues={len(requirement_issues)}",
                 f"requirements_warnings={len(requirement_warnings)}",
                 f"host_execution_requested={runtime_enabled}",
+            ],
+        ),
+        "dependency_portability": _dimension(
+            "high" if requirement_issues else "medium" if requirement_warnings else "low",
+            [
+                f"requirements_issues={len(requirement_issues)}",
+                f"requirements_warnings={len(requirement_warnings)}",
             ],
         ),
     }
@@ -360,12 +477,19 @@ def _result_alignment_level(
     result_review_enabled: bool,
     result_review_passed: Any,
     scientific_issues: list[Any],
+    outcome_counts: dict[str, int] | None = None,
+    all_terminal: bool = False,
 ) -> str:
+    outcome_counts = outcome_counts or {}
     if not runtime_enabled:
         return "medium"
     if runtime_enabled and not runtime_passed:
         return "high"
-    if result_review_enabled and not result_review_passed:
+    if outcome_counts.get("not_reproduced"):
+        return "high"
+    if outcome_counts.get("inconclusive_missing_information"):
+        return "medium"
+    if result_review_enabled and not result_review_passed and not all_terminal:
         return "high"
     if scientific_issues:
         return "medium"
@@ -384,6 +508,36 @@ def combine_risk_dimensions(dimensions: dict[str, dict[str, Any]]) -> str:
         return "medium"
     return "low"
 
+def _high_impact_count(items: list[Any], *, field: str) -> int:
+    return sum(
+        1
+        for item in items
+        if isinstance(item, dict)
+        and (
+            str(item.get(field) or "").strip().lower()
+            in {"high", "critical", "severe"}
+            or bool(item.get("affects_claim_ids"))
+        )
+    )
+
+
+def _scientific_risk_level(
+    dimensions: dict[str, dict[str, Any]],
+    result_review_result: dict[str, Any],
+) -> str:
+    outcomes = _terminal_outcome_counts(result_review_result)
+    if outcomes["not_reproduced"] or outcomes["execution_failed"]:
+        return "high"
+    if outcomes["inconclusive_missing_information"] or outcomes["reproduced_with_assumptions"]:
+        return "medium"
+    if sum(outcomes.values()):
+        return "low"
+    alignment = dimensions.get("result_alignment")
+    level = str(alignment.get("level") or "") if isinstance(alignment, dict) else ""
+    return level if level in {"low", "medium", "high"} else "medium"
+
+
+
 
 def _count_missing_baselines(tasks: dict[str, Any]) -> int:
     count = 0
@@ -394,6 +548,8 @@ def _count_missing_baselines(tasks: dict[str, Any]) -> int:
         if not isinstance(task, dict):
             continue
         comparison = task.get("comparison")
-        if not isinstance(comparison, dict) or comparison.get("baselines") in (None, [], ""):
+        if not isinstance(comparison, dict) or "baselines" not in comparison:
+            continue
+        if comparison.get("baselines") in (None, [], ""):
             count += 1
     return count

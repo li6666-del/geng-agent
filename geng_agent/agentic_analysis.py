@@ -39,9 +39,10 @@ def run_codex_json_stage(
 ) -> dict[str, Any]:
     """Run one structured analysis stage through Codex CLI.
 
-    Codex is the reasoning worker; the harness only enforces JSON parsing,
-    structural schema validation, and deterministic normalization. Scientific
-    diagnostics are recorded by the pipeline without forcing regeneration.
+    Codex is the reasoning worker; the harness enforces JSON parsing,
+    deterministic normalization, structural validation, and the stage's
+    execution-critical scientific checks. Repairable findings are returned to
+    the same worker as one aggregated repair request.
     """
 
     attempts = max(1, int(max_attempts or 1))
@@ -86,8 +87,9 @@ def run_codex_json_stage(
                 audit_dir / f"agentic_analysis_error_{stage_label}_attempt_{attempt}.json",
                 {"stage": stage_label, "attempt": attempt, "error": last_errors, "status": status},
             )
-            current_prompt = prompt
-            repair_mode = False
+            if repair_baseline is None:
+                current_prompt = prompt
+                repair_mode = False
             continue
 
         try:
@@ -132,11 +134,21 @@ def run_codex_json_stage(
         schema_issues = validate_stage(schema_stage, parsed)
         preservation_issues: list[ValidationIssue] = []
         scientific_issues: list[ValidationIssue] = []
-        if not normalization_issues and not schema_issues and repair_mode and repair_preservation_validator is not None:
+        # Cross-document validators assume the candidate has its declared
+        # shape. Normalization and schema findings are still reported together;
+        # once the shape is usable we additionally collect every applicable
+        # preservation/scientific finding instead of stopping at the first
+        # non-empty category.
+        if not schema_issues and repair_baseline is not None and repair_preservation_validator is not None:
             preservation_issues = repair_preservation_validator(repair_baseline, parsed)
-        if not normalization_issues and not schema_issues and not preservation_issues and extra_validation is not None:
+        if not schema_issues and extra_validation is not None:
             scientific_issues = extra_validation(parsed)
-        issues = normalization_issues or schema_issues or preservation_issues or scientific_issues
+        issues = [
+            *normalization_issues,
+            *schema_issues,
+            *preservation_issues,
+            *scientific_issues,
+        ]
         if not issues:
             meta = dict(parsed.get("_meta", {})) if isinstance(parsed.get("_meta"), dict) else {}
             meta.update(
@@ -156,7 +168,16 @@ def run_codex_json_stage(
         last_errors = format_issues(issues)
         write_json(
             audit_dir / f"validation_{stage_label}_attempt_{attempt}.json",
-            {"ok": False, "errors": [issue.as_dict() for issue in issues]},
+            {
+                "ok": False,
+                "errors": [issue.as_dict() for issue in issues],
+                "categories": {
+                    "normalization": [issue.as_dict() for issue in normalization_issues],
+                    "schema": [issue.as_dict() for issue in schema_issues],
+                    "preservation": [issue.as_dict() for issue in preservation_issues],
+                    "scientific": [issue.as_dict() for issue in scientific_issues],
+                },
+            },
         )
         normalized_path = (
             audit_dir / f"normalized_{stage_label}_attempt_{attempt}.json"
@@ -165,9 +186,12 @@ def run_codex_json_stage(
         if normalization_issues or preservation_issues or scientific_issues:
             write_json(
                 audit_dir / f"scientific_validation_{stage_label}_attempt_{attempt}.json",
-                {"ok": False, "errors": [issue.as_dict() for issue in issues]},
+                {
+                    "ok": False,
+                    "errors": [issue.as_dict() for issue in issues],
+                    "repair_will_retry": attempt < attempts,
+                },
             )
-            break
         current_prompt = build_json_inline_retry_prompt(
             candidate_text=json.dumps(parsed, ensure_ascii=False, indent=2),
             schema_text=schema_text,
