@@ -199,6 +199,53 @@ class DocxWriterTests(unittest.TestCase):
             self.assertEqual(len(document.tables), 1)
             self.assertEqual(len(document.inline_shapes), 2)
 
+    def test_image_tables_are_detected_from_cells_not_specialized_headers(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            path = root / "result_review.docx"
+            images = [root / f"figure_{index}.png" for index in range(6)]
+            for image_path in images:
+                image_path.write_bytes(TINY_PNG)
+
+            write_result_review_markdown_docx(
+                path,
+                markdown_text=(
+                    "## 任务 1：图 1\n\n"
+                    "| 本地最终结果 | 论文图 |\n"
+                    "|---|---|\n"
+                    f"| ![本地图1]({images[0]}) | ![论文图1]({images[1]}) |\n\n"
+                    "| 验收判据 | 证据结论 |\n"
+                    "|---|---|\n"
+                    "| 趋势一致 | **支持** |\n\n"
+                    "## 任务 2：图 2(a)\n\n"
+                    "| 本地最终结果 | 论文页面中的图 2(a) |\n"
+                    "|---|---|\n"
+                    f"| ![本地图2a]({images[2]}) | ![论文图2a]({images[3]}) |\n\n"
+                    "## 补充三栏图片表\n\n"
+                    "| 本地最终结果 | 论文图 | 补充视图 |\n"
+                    "|---|---|---|\n"
+                    f"| ![本地图3]({images[4]}) | ![论文图3]({images[5]}) | 仅文字说明 |\n"
+                ),
+                status={"passed": True},
+            )
+
+            document = Document(path)
+            table_text = "\n".join(
+                paragraph.text
+                for table in document.tables
+                for row in table.rows
+                for cell in row.cells
+                for paragraph in cell.paragraphs
+            )
+
+            self.assertEqual(len(document.tables), 4)
+            self.assertEqual(len(document.tables[-1].columns), 3)
+            self.assertEqual(len(document.inline_shapes), 6)
+            self.assertIn("论文页面中的图 2(a)", table_text)
+            self.assertIn("仅文字说明", table_text)
+            self.assertIn("支持", table_text)
+            self.assertNotIn("![", table_text)
+
     def test_generic_report_docx_resolves_relative_report_assets(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -218,6 +265,56 @@ class DocxWriterTests(unittest.TestCase):
             document = Document(path)
             self.assertEqual(len(document.inline_shapes), 1)
             self.assertIn("本地复现报告", "\n".join(paragraph.text for paragraph in document.paragraphs))
+
+    def test_generic_markdown_tables_and_inline_bold_render_as_word_structure(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            path = root / "review.docx"
+
+            write_markdown_report_docx(
+                path,
+                markdown_text=(
+                    "## 任务结果\n\n"
+                    "整体风险为**高**，但__关键结论__仍可核验。\n\n"
+                    "- **主要差异：**仅缺少精确参数。\n\n"
+                    "| 方法 | 终局结果 | 备注 |\n"
+                    "|---|:---:|---|\n"
+                    "| Alpha \\| Beta | **带假设复现** | `a|b` |\n"
+                ),
+                title="复现审查报告",
+                subtitle="Markdown 结构回归",
+                base_dir=root,
+            )
+
+            document = Document(path)
+            paragraphs = list(document.paragraphs) + [
+                paragraph
+                for table in document.tables
+                for row in table.rows
+                for cell in row.cells
+                for paragraph in cell.paragraphs
+            ]
+            rendered_text = "\n".join(paragraph.text for paragraph in paragraphs)
+            bold_text = {
+                run.text
+                for paragraph in paragraphs
+                for run in paragraph.runs
+                if run.bold
+            }
+
+            self.assertEqual(len(document.tables), 1)
+            self.assertEqual(len(document.tables[0].columns), 3)
+            for cell in document.tables[0].rows[0].cells:
+                self.assertTrue(cell.paragraphs[0].paragraph_format.keep_with_next)
+            self.assertIn("Alpha | Beta", rendered_text)
+            self.assertIn("a|b", rendered_text)
+            self.assertNotIn("|---|", rendered_text)
+            self.assertNotIn("**", rendered_text)
+            self.assertNotIn("__", rendered_text)
+            self.assertIn("高", bold_text)
+            self.assertIn("关键结论", bold_text)
+            self.assertIn("主要差异：", bold_text)
+            self.assertIn("带假设复现", bold_text)
 
     def test_write_result_review_markdown_docx_records_missing_images(self) -> None:
         with TemporaryDirectory() as temp_dir:

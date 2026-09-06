@@ -43,6 +43,7 @@ def _clear_stage_outputs(
             "repro_tasks_preliminary.json",
             "repro_tasks.json",
             "experiment_index.json",
+            "execution_plan.json",
             "repro_project_manifest.json",
             "repro_project",
             "runtime_result.json",
@@ -67,6 +68,7 @@ def _clear_stage_outputs(
             "repro_tasks_preliminary.json",
             "repro_tasks.json",
             "experiment_index.json",
+            "execution_plan.json",
             "repro_project_manifest.json",
             "repro_project",
             "runtime_result.json",
@@ -83,6 +85,7 @@ def _clear_stage_outputs(
         ],
         "paper_thesis": [
             "paper_thesis.json",
+            "execution_plan.json",
             "repro_project_manifest.json",
             "repro_project",
             "runtime_result.json",
@@ -106,6 +109,7 @@ def _clear_stage_outputs(
             "repro_tasks_preliminary.json",
             "repro_tasks.json",
             "experiment_index.json",
+            "execution_plan.json",
             "repro_project_manifest.json",
             "repro_project",
             "runtime_result.json",
@@ -198,6 +202,12 @@ def _clear_stage_outputs(
     }
     v2_downstream = [
         "scientific_architecture.json",
+        "03a_environment_request.json",
+        "03a_environment.lock.json",
+        "03a_environment_report.json",
+        "03a_pip_resolution_report.json",
+        "03a_pip_install_report.json",
+        "audit/03a_case_environment",
         "foundation_manifest.json",
         "repro_project_manifest.json",
         "repro_project",
@@ -210,6 +220,27 @@ def _clear_stage_outputs(
         stage_outputs[upstream].extend(v2_downstream)
     stage_outputs["scientific_architecture"] = [
         "scientific_architecture.json",
+        "03a_environment_request.json",
+        "03a_environment.lock.json",
+        "03a_environment_report.json",
+        "03a_pip_resolution_report.json",
+        "03a_pip_install_report.json",
+        "audit/03a_case_environment",
+        "foundation_manifest.json",
+        "repro_project_manifest.json",
+        "repro_project",
+        "runtime_result.json",
+        "risk_report.json",
+        "generated_files.json",
+        "automation_provenance.json",
+    ]
+    stage_outputs["environment"] = [
+        "03a_environment_request.json",
+        "03a_environment.lock.json",
+        "03a_environment_report.json",
+        "03a_pip_resolution_report.json",
+        "03a_pip_install_report.json",
+        "audit/03a_case_environment",
         "foundation_manifest.json",
         "repro_project_manifest.json",
         "repro_project",
@@ -252,6 +283,7 @@ def _clear_stage_audit(output_dir: Path, stage: str) -> None:
         "tasks": ["02", "03", "04"],
         "experiment_index": ["02", "03", "04"],
         "scientific_architecture": ["02f", "03", "04"],
+        "environment": ["03a", "03b", "03c", "04"],
         # Rebuilding task-writer outputs must preserve the already validated
         # Foundation snapshot from stage 03b. A broad ``03*`` cleanup deletes
         # the canonical snapshot before stage 03c can install it into task

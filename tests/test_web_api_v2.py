@@ -65,6 +65,10 @@ class WebApiV2Tests(unittest.TestCase):
         paper_dir = case_dir / "paper"
         paper_dir.mkdir(parents=True)
         (paper_dir / "paper.pdf").write_bytes(b"%PDF-1.4\nminimal")
+        (case_dir / "workflow.json").write_text(
+            json.dumps({"workflow_version": "2"}),
+            encoding="utf-8",
+        )
         (case_dir / "paper_chunks.json").write_text(
             json.dumps({"chunks": [{"chunk_id": "p1", "text": "paper"}]}),
             encoding="utf-8",

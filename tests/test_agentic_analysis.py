@@ -8,10 +8,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from geng_agent.agentic_analysis import (
-    DEFAULT_CODEX_ANALYSIS_TIMEOUT,
-    run_codex_json_stage,
-)
+from geng_agent.agentic_analysis import run_codex_json_stage
 from geng_agent.llm import LLMImage
 from geng_agent.pipeline_helpers import _aggregate_validation_issues
 from geng_agent.schemas import ValidationIssue
@@ -35,9 +32,6 @@ def _write_analysis_script(temp: Path, body: str) -> str:
 
 
 class CodexAnalysisStageTests(unittest.TestCase):
-    def test_default_codex_analysis_timeout_is_1800_seconds(self) -> None:
-        self.assertEqual(DEFAULT_CODEX_ANALYSIS_TIMEOUT, 1800.0)
-
     def test_validation_errors_are_grouped_without_dropping_late_categories(self) -> None:
         issues = [
             ValidationIssue(f"$.quantities[{index}].shape", "must be an array")
@@ -102,7 +96,6 @@ class CodexAnalysisStageTests(unittest.TestCase):
                     output_dir=out_dir,
                     audit_dir=audit_dir,
                     max_attempts=1,
-                    timeout=30,
                 )
             finally:
                 if old_cmd is None:
@@ -187,7 +180,6 @@ class CodexAnalysisStageTests(unittest.TestCase):
                     output_dir=out_dir,
                     audit_dir=audit_dir,
                     max_attempts=2,
-                    timeout=30,
                     candidate_normalizer=lambda candidate: finalize_repro_tasks(
                         candidate, {"engineering_facts": []}
                     ),
@@ -198,7 +190,7 @@ class CodexAnalysisStageTests(unittest.TestCase):
                 else:
                     os.environ["GENG_CODEX_ANALYSIS_CMD"] = old_cmd
 
-            handoff = parsed["_meta"]["backfill_handoff"]
+            handoff = parsed["backfill_handoff"]
             self.assertFalse(handoff["ready_for_writer"])
             self.assertEqual(
                 handoff["blocking_request_ids"], ["reproduce_fig_1:decoder"]
@@ -243,7 +235,6 @@ class CodexAnalysisStageTests(unittest.TestCase):
                         output_dir=out_dir,
                         audit_dir=audit_dir,
                         max_attempts=2,
-                        timeout=30,
                         extra_validation=lambda _: [ValidationIssue("$.engineering_facts", "scientific conflict")],
                     )
             finally:
@@ -330,7 +321,6 @@ class CodexAnalysisStageTests(unittest.TestCase):
                     output_dir=out_dir,
                     audit_dir=audit_dir,
                     max_attempts=2,
-                    timeout=30,
                     images=[
                         LLMImage(
                             label="paper_page:1",

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import site
 import shlex
@@ -12,7 +11,7 @@ import sysconfig
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from .config import get_config_value
 from .outputs import write_json, write_text
@@ -20,8 +19,7 @@ from .security import build_safe_env, codex_safe_env, redact_text
 
 
 MAX_TRANSCRIPT_CHARS = 200_000
-CODEX_CAPABILITY_TIMEOUT_SECONDS = 5.0
-DEFAULT_CODEX_TIMEOUT_SECONDS = 1800.0
+CODEX_CLI_HELP_PROBE_TIMEOUT_SECONDS = 5.0
 DEFAULT_GENG_CODEX_MODEL = "gpt-5.6-sol"
 DEFAULT_GENG_CODEX_REASONING_EFFORT = {
     "analysis": "xhigh",
@@ -98,6 +96,11 @@ _TRUSTED_READ_ROOTS = tuple(
     for path in (_real_path(item) for item in _CONFIG["trusted_read_roots"])
     if path is not None
 )
+_WRITE_ROOTS = tuple(
+    path
+    for path in (_real_path(item) for item in _CONFIG["write_roots"])
+    if path is not None
+)
 
 
 def _deny(message):
@@ -137,9 +140,15 @@ def _require_case_write(path, event):
         if path not in (0, 1, 2):
             _deny(f"{event} via an external file descriptor")
         return
+    lexical = _lexical_path(path)
     resolved = _real_path(path)
-    if resolved is None or not _inside(resolved, _WORK_DIR):
-        _deny(f"{event} outside the case sandbox: {path!r}")
+    if lexical is None or resolved is None:
+        _deny(f"{event} with an unresolved path: {path!r}")
+    if not any(
+        _inside(lexical, root) and _inside(resolved, root)
+        for root in _WRITE_ROOTS
+    ):
+        _deny(f"{event} outside Foundation runtime output roots: {path!r}")
 
 
 def _require_case_chdir(path, event):
@@ -185,6 +194,19 @@ _MUTATING_PATH_ARGUMENTS = {
     "shutil.copytree": (1,),
     "shutil.move": (0, 1),
     "shutil.rmtree": (0,),
+}
+
+_DIR_FD_AUDIT_ARGUMENTS = {
+    "os.chmod": (2,),
+    "os.chown": (3,),
+    "os.link": (2, 3),
+    "os.mkdir": (2,),
+    "os.remove": (1,),
+    "os.rename": (2, 3),
+    "os.replace": (2, 3),
+    "os.rmdir": (1,),
+    "os.symlink": (2,),
+    "os.utime": (3,),
 }
 
 _READ_PATH_EVENTS = {
@@ -250,68 +272,184 @@ def _is_import_statement(frame):
     return _caller_opcode(frame).endswith("IMPORT_NAME")
 
 
-
-_ORIGINAL_EVAL = builtins.eval
-_ORIGINAL_EXEC = builtins.exec
-_ORIGINAL_COMPILE = builtins.compile
-_ORIGINAL_IMPORT = builtins.__import__
-_ORIGINAL_STAT = os.stat
-_ORIGINAL_LSTAT = os.lstat
-_ORIGINAL_ACCESS = os.access
-_ORIGINAL_READLINK = os.readlink
-
-
-def _guarded_eval(*args, **kwargs):
-    if _is_case_frame(sys._getframe(1)):
-        _deny("eval called directly by case code")
-    return _ORIGINAL_EVAL(*args, **kwargs)
+def _loaded_name_value(frame, name):
+    if name in frame.f_locals:
+        return frame.f_locals[name]
+    if name in frame.f_globals:
+        return frame.f_globals[name]
+    builtins_scope = frame.f_builtins
+    if isinstance(builtins_scope, dict):
+        return builtins_scope.get(name)
+    return getattr(builtins_scope, name, None)
 
 
-def _guarded_exec(*args, **kwargs):
-    if _is_case_frame(sys._getframe(1)):
-        _deny("exec called directly by case code")
-    return _ORIGINAL_EXEC(*args, **kwargs)
+def _direct_builtin_call(frame, guarded_callable, builtin_name):
+    # Recognize a case call to a guarded builtin without blaming C lazy imports.
+    if frame is None:
+        return False
+    try:
+        instructions = list(dis.get_instructions(frame.f_code))
+    except (TypeError, ValueError):
+        return False
+    current_index = -1
+    for index, instruction in enumerate(instructions):
+        if instruction.offset > frame.f_lasti:
+            break
+        current_index = index
+    if current_index < 0:
+        return False
+    for instruction in reversed(instructions[max(0, current_index - 24):current_index]):
+        opname = instruction.opname
+        if opname in {"RETURN_VALUE", "YIELD_VALUE", "POP_TOP"} or opname.startswith("STORE_"):
+            break
+        if opname == "CALL":
+            break
+        if opname in {"LOAD_GLOBAL", "LOAD_NAME", "LOAD_FAST", "LOAD_DEREF"}:
+            if _loaded_name_value(frame, str(instruction.argval)) is guarded_callable:
+                return True
+        if opname in {"LOAD_ATTR", "LOAD_METHOD"} and instruction.argval == builtin_name:
+            return True
+    return False
 
 
-def _guarded_compile(*args, **kwargs):
-    if _is_case_frame(sys._getframe(1)):
-        _deny("compile called directly by case code")
-    return _ORIGINAL_COMPILE(*args, **kwargs)
+def _call_with_caller_scope(original, args, kwargs, caller):
+    # eval()/exec() with no explicit namespaces inherit their caller's scope.
+    # Calling them through this guard must preserve that Python behavior for
+    # trusted runtime libraries such as NumPy and SciPy.
+    if len(args) == 1 and "globals" not in kwargs and "locals" not in kwargs:
+        return original(args[0], caller.f_globals, caller.f_locals, **kwargs)
+    if len(args) >= 2 and args[1] is None:
+        caller_locals = caller.f_locals if len(args) < 3 or args[2] is None else args[2]
+        return original(
+            args[0],
+            caller.f_globals,
+            caller_locals,
+            *args[3:],
+            **kwargs,
+        )
+    return original(*args, **kwargs)
 
 
-def _guarded_import(*args, **kwargs):
-    caller = sys._getframe(1)
-    if _is_case_frame(caller) and not _is_import_statement(caller):
-        _deny("__import__ called directly by case code")
-    return _ORIGINAL_IMPORT(*args, **kwargs)
+
+_OS_BACKEND = sys.modules.get(os.name)
 
 
-def _guarded_stat(path, *args, **kwargs):
-    if getattr(_PATH_STATE, "resolving", False):
-        return _ORIGINAL_STAT(path, *args, **kwargs)
-    _require_allowed_read(path, "os.stat")
-    return _ORIGINAL_STAT(path, *args, **kwargs)
+def _reject_case_dir_fds(event, kwargs):
+    if (
+        any(key.endswith("dir_fd") and value is not None for key, value in kwargs.items())
+        and _is_case_frame(sys._getframe(2))
+    ):
+        _deny(f"{event} with dir_fd from case code")
 
 
-def _guarded_lstat(path, *args, **kwargs):
-    if getattr(_PATH_STATE, "resolving", False):
-        return _ORIGINAL_LSTAT(path, *args, **kwargs)
-    _require_allowed_read(path, "os.lstat")
-    return _ORIGINAL_LSTAT(path, *args, **kwargs)
+def _make_guarded_builtins(original_eval, original_exec, original_compile, original_import):
+    def guarded_eval(*args, **kwargs):
+        caller = sys._getframe(1)
+        if _is_case_frame(caller):
+            _deny("eval called directly by case code")
+        return _call_with_caller_scope(original_eval, args, kwargs, caller)
+
+    def guarded_exec(*args, **kwargs):
+        caller = sys._getframe(1)
+        if _is_case_frame(caller):
+            _deny("exec called directly by case code")
+        return _call_with_caller_scope(original_exec, args, kwargs, caller)
+
+    def guarded_compile(*args, **kwargs):
+        if _is_case_frame(sys._getframe(1)):
+            _deny("compile called directly by case code")
+        return original_compile(*args, **kwargs)
+
+    def guarded_import(*args, **kwargs):
+        caller = sys._getframe(1)
+        if (
+            _is_case_frame(caller)
+            and not _is_import_statement(caller)
+            and _direct_builtin_call(caller, guarded_import, "__import__")
+        ):
+            _deny("__import__ called directly by case code")
+        return original_import(*args, **kwargs)
+
+    return guarded_eval, guarded_exec, guarded_compile, guarded_import
 
 
-def _guarded_access(path, *args, **kwargs):
-    if getattr(_PATH_STATE, "resolving", False):
-        return _ORIGINAL_ACCESS(path, *args, **kwargs)
-    _require_allowed_read(path, "os.access")
-    return _ORIGINAL_ACCESS(path, *args, **kwargs)
+def _make_guarded_path_functions(
+    original_stat,
+    original_lstat,
+    original_access,
+    original_readlink,
+):
+    def guarded_stat(path, *args, **kwargs):
+        if getattr(_PATH_STATE, "resolving", False):
+            return original_stat(path, *args, **kwargs)
+        _reject_case_dir_fds("os.stat", kwargs)
+        _require_allowed_read(path, "os.stat")
+        return original_stat(path, *args, **kwargs)
+
+    def guarded_lstat(path, *args, **kwargs):
+        if getattr(_PATH_STATE, "resolving", False):
+            return original_lstat(path, *args, **kwargs)
+        _reject_case_dir_fds("os.lstat", kwargs)
+        _require_allowed_read(path, "os.lstat")
+        return original_lstat(path, *args, **kwargs)
+
+    def guarded_access(path, *args, **kwargs):
+        if getattr(_PATH_STATE, "resolving", False):
+            return original_access(path, *args, **kwargs)
+        _reject_case_dir_fds("os.access", kwargs)
+        _require_allowed_read(path, "os.access")
+        return original_access(path, *args, **kwargs)
+
+    def guarded_readlink(path, *args, **kwargs):
+        if getattr(_PATH_STATE, "resolving", False):
+            return original_readlink(path, *args, **kwargs)
+        _reject_case_dir_fds("os.readlink", kwargs)
+        _require_allowed_read(path, "os.readlink")
+        return original_readlink(path, *args, **kwargs)
+
+    for original, guarded in (
+        (original_stat, guarded_stat),
+        (original_lstat, guarded_lstat),
+        (original_access, guarded_access),
+        (original_readlink, guarded_readlink),
+    ):
+        for name in (
+            "supports_dir_fd",
+            "supports_fd",
+            "supports_follow_symlinks",
+            "supports_effective_ids",
+        ):
+            supported = getattr(os, name, None)
+            if isinstance(supported, set) and original in supported:
+                supported.add(guarded)
+
+    return guarded_stat, guarded_lstat, guarded_access, guarded_readlink
 
 
-def _guarded_readlink(path, *args, **kwargs):
-    if getattr(_PATH_STATE, "resolving", False):
-        return _ORIGINAL_READLINK(path, *args, **kwargs)
-    _require_allowed_read(path, "os.readlink")
-    return _ORIGINAL_READLINK(path, *args, **kwargs)
+(
+    _guarded_eval,
+    _guarded_exec,
+    _guarded_compile,
+    _guarded_import,
+) = _make_guarded_builtins(
+    builtins.eval,
+    builtins.exec,
+    builtins.compile,
+    builtins.__import__,
+)
+(
+    _guarded_stat,
+    _guarded_lstat,
+    _guarded_access,
+    _guarded_readlink,
+) = _make_guarded_path_functions(
+    os.stat,
+    os.lstat,
+    os.access,
+    os.readlink,
+)
+del _make_guarded_builtins
+del _make_guarded_path_functions
 
 
 def _direct_audit_case_caller():
@@ -342,10 +480,22 @@ def _audit(event, args):
         and not _is_import_statement(sys._getframe(1))
     ):
         _deny("dynamic import blocked")
+    dir_fd_indexes = _DIR_FD_AUDIT_ARGUMENTS.get(event)
+    if dir_fd_indexes and _direct_audit_case_caller():
+        for index in dir_fd_indexes:
+            if index < len(args) and args[index] not in (None, -1):
+                _deny(f"{event} with dir_fd from case code")
     if event == "open" and args:
         path = args[0]
         mode = args[1] if len(args) > 1 else None
         flags = args[2] if len(args) > 2 else None
+        if mode is None and _direct_audit_case_caller():
+            try:
+                low_level_path = os.fspath(path)
+            except TypeError:
+                low_level_path = None
+            if low_level_path is None or not os.path.isabs(low_level_path):
+                _deny("relative low-level os.open called directly by case code")
         if _open_is_write(mode, flags):
             _require_case_write(path, event)
         else:
@@ -374,6 +524,15 @@ os.stat = _guarded_stat
 os.lstat = _guarded_lstat
 os.access = _guarded_access
 os.readlink = _guarded_readlink
+if _OS_BACKEND is not None:
+    for _name, _guarded in (
+        ("stat", _guarded_stat),
+        ("lstat", _guarded_lstat),
+        ("access", _guarded_access),
+        ("readlink", _guarded_readlink),
+    ):
+        if hasattr(_OS_BACKEND, _name):
+            setattr(_OS_BACKEND, _name, _guarded)
 sys.path.insert(0, _WORK_DIR)
 
 import unittest
@@ -383,20 +542,10 @@ if _START_DIR is None or not _inside(_START_DIR, _WORK_DIR):
     _deny("unittest discovery path escapes the case sandbox")
 _SUITE = unittest.defaultTestLoader.discover(
     start_dir=_START_DIR,
-    top_level_dir=_WORK_DIR,
 )
 _RESULT = unittest.TextTestRunner(verbosity=2).run(_SUITE)
 raise SystemExit(0 if _RESULT.wasSuccessful() else 1)
 """
-
-
-def resolve_codex_timeout(timeout: float | None) -> float:
-    """Resolve every inference Worker to a finite per-session wall-clock limit."""
-
-    value = float(timeout or DEFAULT_CODEX_TIMEOUT_SECONDS)
-    if not math.isfinite(value):
-        raise ValueError("Codex session timeout must be finite")
-    return max(1.0, value)
 
 
 def run_codex_subprocess(
@@ -407,7 +556,6 @@ def run_codex_subprocess(
     audit_dir: Path,
     label: str,
     sandbox: str,
-    timeout: float | None,
     command_override: str | None = None,
     output_schema: Path | None = None,
     image_paths: list[Path] | None = None,
@@ -415,7 +563,6 @@ def run_codex_subprocess(
     path_prepend: list[Path | str] | None = None,
     reasoning_effort: str | None = None,
 ) -> dict[str, Any]:
-    effective_timeout = resolve_codex_timeout(timeout)
     raw_cmd = command_override or get_config_value("GENG_CODEX_CMD") or "codex"
     model = get_config_value("GENG_CODEX_MODEL") or DEFAULT_GENG_CODEX_MODEL
     resolved_reasoning_effort = _resolve_reasoning_effort(role, reasoning_effort)
@@ -426,21 +573,18 @@ def run_codex_subprocess(
         "role": role,
         "backend": "codex",
         "session_persistence": "ephemeral",
+        "execution_policy": "unbounded_until_exit_or_user_stop",
         "ephemeral_capability": None,
         "model": model,
         "reasoning_effort": resolved_reasoning_effort,
-        "timeout_s": effective_timeout,
         "command": None,
         "returncode": None,
-        "timed_out": False,
         "error_kind": None,
         "blocked_reason": None,
         "error": None,
         "last_message_path": None,
         "transcript": None,
         "duration_s": None,
-        "active_duration_s": None,
-        "excluded_duration_s": None,
     }
     if not argv or resolved is None:
         status["error_kind"] = "missing_cli"
@@ -479,6 +623,7 @@ def run_codex_subprocess(
         *command_prefix,
         "exec",
         "--ephemeral",
+        "--json",
         "--skip-git-repo-check",
         "--sandbox",
         sandbox,
@@ -500,6 +645,7 @@ def run_codex_subprocess(
     status["last_message_path"] = str(last_message_path)
 
     started = time.monotonic()
+    invocation_started_at = time.time()
     try:
         completed = subprocess.run(
             command,
@@ -509,36 +655,27 @@ def run_codex_subprocess(
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=effective_timeout,
             check=False,
             input=prompt,
         )
-        status["active_duration_s"] = round(time.monotonic() - started, 1)
-        status["excluded_duration_s"] = 0.0
         status["returncode"] = completed.returncode
         status["ok"] = completed.returncode == 0
         transcript = (completed.stdout or "") + ("\n--- stderr ---\n" + completed.stderr if completed.stderr else "")
         if completed.returncode != 0:
             _annotate_codex_failure(status, transcript)
             status["error"] = f"codex exited with status {completed.returncode}"
-    except subprocess.TimeoutExpired as exc:
-        status["timed_out"] = True
-        status["error_kind"] = "timeout"
-        timeout_label = f"{effective_timeout:.0f}s"
-        status["blocked_reason"] = f"agent session timed out after {timeout_label}"
-        status["error"] = f"agent session timed out after {timeout_label}"
-        out = exc.stdout or b""
-        err = exc.stderr or b""
-        transcript = (out.decode("utf-8", "replace") if isinstance(out, bytes) else str(out)) + (
-            "\n--- stderr ---\n" + (err.decode("utf-8", "replace") if isinstance(err, bytes) else str(err))
-        )
-        status["active_duration_s"] = round(float(getattr(exc, "active_elapsed", effective_timeout)), 1)
-        status["excluded_duration_s"] = round(float(getattr(exc, "excluded_elapsed", 0.0)), 1)
     except Exception as exc:
         status["error_kind"] = "subprocess_error"
         status["error"] = f"{type(exc).__name__}: {exc}"
         transcript = ""
     status["duration_s"] = round(time.monotonic() - started, 1)
+    from .codex_cost import record_codex_invocation
+    try:
+        status["cost_event"] = record_codex_invocation(
+            audit_dir, status, transcript, started_at=invocation_started_at,
+        )
+    except OSError as exc:
+        status["cost_warning"] = f"Invocation accounting unavailable: {type(exc).__name__}"
     transcript_path = audit_dir / f"{label}_transcript.txt"
     write_text(transcript_path, redact_text(transcript)[-MAX_TRANSCRIPT_CHARS:])
     status["transcript"] = str(transcript_path)
@@ -551,6 +688,9 @@ def run_python_unittest_subprocess(
     work_dir: Path,
     start_dir: str = "tests",
     timeout: float = 120.0,
+    python_executable: str | Path | None = None,
+    venv_dir: str | Path | None = None,
+    trusted_runtime_roots: Iterable[str | Path] | None = None,
 ) -> dict[str, Any]:
     """Run generated contract tests through an isolated, host-owned Python."""
 
@@ -559,8 +699,12 @@ def run_python_unittest_subprocess(
     runtime_home = resolved_work_dir / ".runtime_home"
     runtime_cache = runtime_home / ".cache"
     runtime_tmp = runtime_home / "tmp"
+    runtime_artifacts = resolved_work_dir / "tests" / "runtime_artifacts"
+    if runtime_home.exists() or runtime_home.is_symlink():
+        shutil.rmtree(runtime_home)
     runtime_cache.mkdir(parents=True, exist_ok=True)
     runtime_tmp.mkdir(parents=True, exist_ok=True)
+    runtime_artifacts.mkdir(parents=True, exist_ok=True)
     env["HOME"] = str(runtime_home)
     env["USERPROFILE"] = str(runtime_home)
     env["XDG_CACHE_HOME"] = str(runtime_cache)
@@ -568,54 +712,100 @@ def run_python_unittest_subprocess(
     env["TEMP"] = str(runtime_tmp)
     env["TMP"] = str(runtime_tmp)
     env["TMPDIR"] = str(runtime_tmp)
+    env["USER"] = "geng-case-runtime"
+    env["LOGNAME"] = "geng-case-runtime"
+    env["LNAME"] = "geng-case-runtime"
+    env["USERNAME"] = "geng-case-runtime"
+    env["TORCH_HOME"] = str(runtime_cache / "torch")
+    env["TORCHINDUCTOR_CACHE_DIR"] = str(runtime_cache / "torchinductor")
     for key in ("CUDA_HOME", "CUDA_PATH", "CUDA_VISIBLE_DEVICES", "LD_LIBRARY_PATH"):
         value = os.environ.get(key)
         if value:
             env[key] = value
-    python_dir = str(Path(sys.executable).resolve().parent)
+    selected_python = Path(python_executable or sys.executable).absolute()
+    python_dir = str(selected_python.parent)
     env["PATH"] = os.pathsep.join([python_dir, env.get("PATH", "")])
     if os.name == "nt":
         env["Path"] = env["PATH"]
+    for key in ("PYTHONHOME", "PYTHONPATH", "CONDA_PREFIX", "CONDA_DEFAULT_ENV"):
+        env.pop(key, None)
+    if venv_dir is not None:
+        env["VIRTUAL_ENV"] = str(Path(venv_dir).resolve())
+    env["GENG_PYTHON"] = str(selected_python)
+    env["GENG_PYTHON_EXECUTABLE"] = str(selected_python)
     guard_config = _foundation_unittest_guard_config(
         work_dir=resolved_work_dir,
         start_dir=start_dir,
+        python_executable=selected_python,
+        trusted_runtime_roots=trusted_runtime_roots,
+        write_roots=(runtime_home, runtime_artifacts),
     )
     command = [
-        sys.executable,
+        str(selected_python),
         "-I",
         "-B",
         "-c",
         _FOUNDATION_UNITTEST_GUARD,
         json.dumps(guard_config, ensure_ascii=True, separators=(",", ":")),
     ]
+    result: dict[str, Any] | None = None
+    cleanup_error: OSError | None = None
     try:
-        completed = subprocess.run(
-            command,
-            cwd=resolved_work_dir,
-            env=env,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            check=False,
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=resolved_work_dir,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+                check=False,
+            )
+            result = {
+                "passed": completed.returncode == 0,
+                "returncode": completed.returncode,
+                "stdout": completed.stdout[-20_000:],
+                "stderr": completed.stderr[-20_000:],
+            }
+        except subprocess.TimeoutExpired as exc:
+            result = {
+                "passed": False,
+                "timed_out": True,
+                "stdout": str(exc.stdout or "")[-20_000:],
+                "stderr": str(exc.stderr or "")[-20_000:],
+            }
+    finally:
+        try:
+            shutil.rmtree(runtime_home)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            cleanup_error = exc
+    if cleanup_error is not None:
+        assert result is not None
+        result["passed"] = False
+        result["runtime_cleanup_error"] = (
+            f"{type(cleanup_error).__name__}: {cleanup_error}"
         )
-        return {
-            "passed": completed.returncode == 0,
-            "returncode": completed.returncode,
-            "stdout": completed.stdout[-20_000:],
-            "stderr": completed.stderr[-20_000:],
-        }
-    except subprocess.TimeoutExpired as exc:
-        return {
-            "passed": False,
-            "timed_out": True,
-            "stdout": str(exc.stdout or "")[-20_000:],
-            "stderr": str(exc.stderr or "")[-20_000:],
-        }
+        result["stderr"] = (
+            str(result.get("stderr") or "")
+            + "\nFoundation runtime cleanup failed: "
+            + result["runtime_cleanup_error"]
+        )[-20_000:]
+    assert result is not None
+    return result
 
 
-def _foundation_unittest_guard_config(*, work_dir: Path, start_dir: str) -> dict[str, Any]:
+def _foundation_unittest_guard_config(
+    *,
+    work_dir: Path,
+    start_dir: str,
+    python_executable: str | Path | None = None,
+    trusted_runtime_roots: Iterable[str | Path] | None = None,
+    write_roots: Iterable[str | Path] | None = None,
+) -> dict[str, Any]:
     """Build path-only guard input without exposing host environment values."""
 
     home_candidates: list[Path] = [Path.home()]
@@ -629,21 +819,27 @@ def _foundation_unittest_guard_config(*, work_dir: Path, start_dir: str) -> dict
         for leaf in (".ssh", ".codex", ".config")
     }
 
-    trusted_read_roots = {
-        str(work_dir.resolve()),
-        str(Path(sys.prefix).resolve()),
-        str(Path(sys.base_prefix).resolve()),
-        str(Path(sys.executable).resolve().parent),
-    }
-    try:
-        trusted_read_roots.update(str(Path(path).resolve()) for path in site.getsitepackages())
-    except AttributeError:
-        pass
-    trusted_read_roots.update(
-        str(Path(path).resolve())
-        for path in sysconfig.get_paths().values()
-        if path
-    )
+    selected_python = Path(python_executable or sys.executable).absolute()
+    trusted_read_roots = {str(work_dir.resolve()), str(selected_python.parent)}
+    supplied_roots = tuple(trusted_runtime_roots or ())
+    if supplied_roots:
+        trusted_read_roots.update(str(Path(path).resolve()) for path in supplied_roots)
+    else:
+        trusted_read_roots.update(
+            {
+                str(Path(sys.prefix).resolve()),
+                str(Path(sys.base_prefix).resolve()),
+            }
+        )
+        try:
+            trusted_read_roots.update(str(Path(path).resolve()) for path in site.getsitepackages())
+        except AttributeError:
+            pass
+        trusted_read_roots.update(
+            str(Path(path).resolve())
+            for path in sysconfig.get_paths().values()
+            if path
+        )
     if os.name == "nt":
         system_root = os.environ.get("SystemRoot")
         if system_root:
@@ -675,6 +871,17 @@ def _foundation_unittest_guard_config(*, work_dir: Path, start_dir: str) -> dict
         "start_dir": str(start_dir),
         "sensitive_roots": sorted(sensitive_roots),
         "trusted_read_roots": sorted(trusted_read_roots),
+        "write_roots": sorted(
+            str(Path(path).resolve())
+            for path in (
+                tuple(write_roots)
+                if write_roots is not None
+                else (
+                    work_dir / ".runtime_home",
+                    work_dir / "tests" / "runtime_artifacts",
+                )
+            )
+        ),
     }
 
 
@@ -709,7 +916,7 @@ def _probe_ephemeral_capability(
         "cached": False,
         "command": command,
         "returncode": None,
-        "timeout_s": CODEX_CAPABILITY_TIMEOUT_SECONDS,
+        "probe_timeout_s": CODEX_CLI_HELP_PROBE_TIMEOUT_SECONDS,
         "error": None,
     }
     try:
@@ -721,7 +928,7 @@ def _probe_ephemeral_capability(
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=CODEX_CAPABILITY_TIMEOUT_SECONDS,
+            timeout=CODEX_CLI_HELP_PROBE_TIMEOUT_SECONDS,
             check=False,
         )
     except subprocess.TimeoutExpired:

@@ -2,28 +2,39 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 import re
 import shutil
-from pathlib import Path
 from typing import Any
 
-from .codex_runner import DEFAULT_CODEX_TIMEOUT_SECONDS, run_codex_subprocess
+from .codex_runner import run_codex_subprocess
 from .config import get_config_value
 from .outputs import write_json, write_text
 from .paper_evidence import facts_for_task, safe_label
 from .security import redact_text
 from .scientific_materiality import SCIENTIFIC_POLICY_ID
+from .report_editor_assets import (
+    _accepted_asset_inventory, _accepted_asset_sources, _build_task_packets,
+    _copy_assets_for_editor, _editor_asset_paths, _resolve_report_asset,
+    _sanitize_task_packet_assets, _sha256_file, _task_terminal_outcome,
+)
+from .report_editor_workspace import (
+    REPORT_ASSETS_DIR, REPORT_FILE_ALIASES, REPORT_MARKDOWN_FILES,
+    REPORT_MARKDOWN_MAX_BYTES, _clear_editor_outputs, _inspect_report_editor_outputs,
+    _nonempty_file, _normalize_report_editor_outputs, _recover_unsafe_report_outputs,
+    _repair_issues, _repair_targets, _report_outputs_fingerprint,
+    _restore_protected_reports, _seed_repair_drafts,
+)
+from .report_editor_fallback import (
+    _codex_process_warning, _compact_value, _completion_mode, _editor_failure,
+    _editor_failure_with_fallback, _editor_reason, _markdown_bullets, _markdown_cell,
+    _packet_outcome_label, _render_fallback_reproduction,
+    _render_fallback_result_review, _render_fallback_review, _task_target,
+    _write_fallback_reports,
+)
 
-
-REPORT_MARKDOWN_FILES = ("review.md", "reproduction_report.md", "result_review.md")
-REPORT_ASSETS_DIR = "report_assets"
-REPORT_FILE_ALIASES = {
-    "review.md": ("main_report.md", "final_review.md", "主报告.md", "审查报告.md"),
-    "reproduction_report.md": ("repro_report.md", "local_reproduction_report.md", "本地复现报告.md"),
-    "result_review.md": ("comparison_report.md", "result_comparison.md", "结果对比报告.md", "论文对比报告.md"),
-}
-REPORT_EDITOR_POLICY_VERSION = f"{SCIENTIFIC_POLICY_ID}:terminal-report-v1"
-REPORT_MARKDOWN_MAX_BYTES = 16 * 1024 * 1024
+REPORT_EDITOR_POLICY_VERSION = f"{SCIENTIFIC_POLICY_ID}:terminal-report-v2-host-facts"
+REPORT_EDITOR_PROMPT_VERSION = "final_report_editor_v4_run_attempt_semantics"
 
 
 def run_codex_report_editor_workflow(
@@ -39,7 +50,6 @@ def run_codex_report_editor_workflow(
     output_dir: Path,
     audit_dir: Path,
     resume: bool,
-    timeout: float = DEFAULT_CODEX_TIMEOUT_SECONDS,
     attempt_no: int = 1,
     repair_context: dict[str, Any] | None = None,
     allow_fallback: bool = False,
@@ -115,6 +125,7 @@ def run_codex_report_editor_workflow(
                 prior_workspace=Path(str(repair_context.get("workspace") or "")),
                 workspace=workspace,
                 repair_targets=repair_targets,
+                max_bytes=REPORT_MARKDOWN_MAX_BYTES,
             )
         prompt = _build_report_editor_brief(
             task_count=len(task_packets),
@@ -142,6 +153,7 @@ def run_codex_report_editor_workflow(
             attempt_no=attempt_no,
             error=exc,
             error_kind="preparation_failed",
+            report_markdown_max_bytes=REPORT_MARKDOWN_MAX_BYTES,
         )
 
     image_paths = [
@@ -156,18 +168,22 @@ def run_codex_report_editor_workflow(
         audit_dir=audit_dir,
         label="04b_report_editor" if attempt_no == 1 else f"04b_report_editor_attempt_{attempt_no:03d}",
         sandbox="workspace-write",
-        timeout=timeout,
         command_override=get_config_value("GENG_CODEX_REPORT_EDITOR_CMD"),
         image_paths=image_paths,
     )
-    restored_files = _restore_protected_reports(workspace=workspace, protected_reports=protected_reports)
-    normalization_actions = _normalize_report_editor_outputs(workspace)
-    inspection = _inspect_report_editor_outputs(workspace)
+    restored_files = _restore_protected_reports(
+        workspace=workspace,
+        protected_reports=protected_reports,
+        max_bytes=REPORT_MARKDOWN_MAX_BYTES,
+    )
+    normalization_actions = _normalize_report_editor_outputs(workspace, max_bytes=REPORT_MARKDOWN_MAX_BYTES)
+    inspection = _inspect_report_editor_outputs(workspace, max_bytes=REPORT_MARKDOWN_MAX_BYTES)
     missing = inspection["missing"]
     hard_issues = inspection["hard_issues"]
     recovered_packaging_issues = list(hard_issues)
     recovered_targets, recovery_actions, recovery_failures = _recover_unsafe_report_outputs(
-        workspace
+        workspace,
+        max_bytes=REPORT_MARKDOWN_MAX_BYTES,
     )
     normalization_actions.extend(recovery_actions)
     hard_issues = recovery_failures
@@ -181,14 +197,16 @@ def run_codex_report_editor_workflow(
             task_packets=task_packets,
             risk_report=risk_report,
         )
-        normalization_actions.extend(_normalize_report_editor_outputs(workspace))
-        inspection = _inspect_report_editor_outputs(workspace)
+        normalization_actions.extend(_normalize_report_editor_outputs(workspace, max_bytes=REPORT_MARKDOWN_MAX_BYTES))
+        inspection = _inspect_report_editor_outputs(workspace, max_bytes=REPORT_MARKDOWN_MAX_BYTES)
         missing = inspection["missing"]
         hard_issues = inspection["hard_issues"]
     copied: list[str] = []
     copy_error: str | None = None
     if not missing and not hard_issues:
         try:
+            from .report_facts import publish_terminal_facts
+            publish_terminal_facts(workspace, task_packets)
             for name in REPORT_MARKDOWN_FILES:
                 target = output_dir / name
                 shutil.copy2(workspace / name, target)
@@ -198,7 +216,7 @@ def run_codex_report_editor_workflow(
             _clear_editor_outputs(output_dir)
             copied = []
     ok = not missing and not hard_issues and copy_error is None
-    fingerprint = _report_outputs_fingerprint(output_dir) if ok else None
+    fingerprint = _report_outputs_fingerprint(output_dir, max_bytes=REPORT_MARKDOWN_MAX_BYTES) if ok else None
     if ok and fingerprint is None:
         ok = False
         copy_error = "report outputs could not be fingerprinted"
@@ -227,7 +245,7 @@ def run_codex_report_editor_workflow(
         "missing_outputs": missing,
         "coverage_issues": [],
         "hard_issues": hard_issues,
-        "validation_level": "structural_only",
+        "validation_level": "structural_with_host_terminal_facts",
         "normalization_actions": normalization_actions,
         "asset_warnings": asset_warnings,
         "repair_targets": repair_targets,
@@ -268,120 +286,6 @@ def run_codex_report_editor_workflow(
         )
     return status
 
-
-def _build_task_packets(
-    *,
-    facts: dict[str, Any],
-    tasks: dict[str, Any],
-    task_records: list[dict[str, Any]],
-    task_verifications: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    task_by_id = {
-        str(task.get("task_id") or ""): task
-        for task in tasks.get("repro_tasks", [])
-        if isinstance(task, dict)
-    }
-    record_by_id = {
-        str(record.get("task_id") or ""): record
-        for record in task_records
-        if isinstance(record, dict)
-    }
-    verification_by_id = {
-        str(item.get("task_id") or ""): item
-        for item in task_verifications
-        if isinstance(item, dict)
-    }
-    packets: list[dict[str, Any]] = []
-    for task_id, task in task_by_id.items():
-        record = record_by_id.get(task_id, {})
-        verification = verification_by_id.get(task_id, {})
-        writer_result = record.get("result_json") if isinstance(record.get("result_json"), dict) else {}
-        terminal_outcome = _task_terminal_outcome(verification)
-        packets.append(
-            {
-                "task_id": task_id,
-                "task": task,
-                "task_facts": facts_for_task(facts, task),
-                "writer_summary": writer_result.get("summary"),
-                "parameter_resolution": writer_result.get("parameter_resolution", []),
-                "detail_comparison": writer_result.get("detail_comparison", {}),
-                "writer_differences": writer_result.get("differences", []),
-                "remaining_uncertainties": writer_result.get("remaining_uncertainties", []),
-                "execution_summary": writer_result.get("execution_summary", record.get("execution_summary", {})),
-                "verification": verification,
-                "terminal_outcome": terminal_outcome,
-                "structured_evidence": {
-                    "core_conclusions": verification.get("core_conclusions", []),
-                    "key_numeric_comparisons": verification.get("key_numeric_comparisons", []),
-                    "evidence_files": verification.get("evidence_files", []),
-                    "writer_artifacts": writer_result.get("artifacts", []),
-                },
-                "local_assets": _editor_asset_paths(task_id, verification.get("local_assets")),
-                "paper_assets": _editor_asset_paths(task_id, verification.get("paper_assets")),
-            }
-        )
-    return packets
-
-
-def _task_terminal_outcome(verification: dict[str, Any]) -> str:
-    for key in ("terminal_outcome", "outcome", "scientific_outcome"):
-        value = str(verification.get(key) or "").strip()
-        if value:
-            return value
-    return "unclassified_terminal_result"
-
-
-def _editor_asset_paths(task_id: str, values: Any) -> list[str]:
-    paths: list[str] = []
-    for raw_path in values if isinstance(values, list) else []:
-        name = Path(str(raw_path)).name
-        if name:
-            paths.append(f"{REPORT_ASSETS_DIR}/{safe_label(task_id)}/{name}")
-    return paths
-
-
-def _sanitize_task_packet_assets(task_packets: list[dict[str, Any]], root: Path) -> list[str]:
-    warnings: list[str] = []
-    for packet in task_packets:
-        task_id = safe_label(str(packet.get("task_id") or "task"))
-        for key in ("local_assets", "paper_assets"):
-            retained: list[str] = []
-            values = packet.get(key) if isinstance(packet.get(key), list) else []
-            for raw_path in values:
-                resolved = _resolve_report_asset(root, task_id=task_id, raw_path=raw_path)
-                if resolved is None:
-                    warnings.append(f"{task_id}: ignored unavailable or unsafe {key[:-1]}: {raw_path}")
-                    continue
-                relative, _ = resolved
-                retained.append(f"{REPORT_ASSETS_DIR}/{relative.as_posix()}")
-            packet[key] = retained
-    return warnings
-
-
-def _resolve_report_asset(root: Path, *, task_id: str, raw_path: Any) -> tuple[Path, Path] | None:
-    try:
-        relative = Path(str(raw_path))
-        if relative.is_absolute():
-            return None
-        relative = relative.relative_to(REPORT_ASSETS_DIR)
-        if len(relative.parts) != 2 or relative.parts[0] != task_id:
-            return None
-        source_root = root.resolve()
-        candidate = source_root / relative
-        if candidate.is_symlink():
-            return None
-        asset = candidate.resolve()
-        if not asset.is_relative_to(source_root):
-            return None
-        if not asset.is_file() or asset.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
-            return None
-        if asset.stat().st_size > 20_000_000:
-            return None
-    except (OSError, ValueError):
-        return None
-    return relative, asset
-
-
 def _build_report_editor_brief(
     *,
     task_count: int,
@@ -412,10 +316,17 @@ You receive {task_count} terminal, reportable, isolated task packets. A packet m
 - You may create only `review.md`, `reproduction_report.md`, and `result_review.md`.
 - Do not access the network, install packages, edit images, or create new scientific evidence.
 - Do not expose raw JSON, paths, transcripts, commands, chain-of-thought, Writer logs, or an iteration appendix.
+- The host publishes an immutable task-outcome and criterion table in each report. Explain the supplied evidence; do not write a competing global or task verdict.
 
 ## Input
 - `inputs/report_editor_input.json` contains terminal task packets, compact runtime information, criterion-level observations, selected assets, and non-blocking asset warnings.
 - `report_assets/<task_id>/` may contain final local images and paper crops. Images are optional. Use only supplied relative paths; do not link to an input workspace or invent missing images.
+
+## Run-count semantics
+- `execution_summary.full_run_count` is the number of full-run attempts, not the number of valid or successful full runs. Never describe that field by itself as `有效完整运行次数` or equivalent wording.
+- Derive a valid-completed-run count only from explicit `iteration_records` together with the task's verification and terminal execution evidence. `supported`, `unsupported`, and `unassessable` may describe scientifically valid completed runs; `invalid`, `aborted`, or failed attempts do not.
+- A command-observation timeout, including return code 124, is not evidence that the scientific child run failed or completed. Do not count it as valid unless the supplied evidence independently verifies child completion and validity.
+- If the evidence is incomplete, report the valid-completed-run count as unavailable instead of inferring it. When counts matter, state both values explicitly, for example: `完整运行尝试 3 次，其中有明确证据的有效完成 1 次`.
 
 ## Required files
 Write exactly three Markdown files in Chinese.
@@ -455,642 +366,20 @@ def _editor_input_hash(**values: Any) -> str:
     payload = {
         **values,
         "assets": assets,
-        "prompt_version": "final_report_editor_v3_terminal_outcomes",
+        "prompt_version": REPORT_EDITOR_PROMPT_VERSION,
         "policy_version": REPORT_EDITOR_POLICY_VERSION,
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
-
-def _accepted_asset_inventory(root: Path, task_packets: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    inventory: list[dict[str, Any]] = []
-    for relative, source in _accepted_asset_sources(root, task_packets):
-        stat = source.stat()
-        inventory.append(
-            {
-                "path": relative.as_posix(),
-                "size": stat.st_size,
-                "sha256": _sha256_file(source),
-            }
-        )
-    return inventory
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _load_editor_cache(*, status_path: Path, output_dir: Path, input_hash: str) -> dict[str, Any] | None:
     status = _read_json_object(status_path)
     if not status.get("ok") or status.get("input_hash") != input_hash:
         return None
-    fingerprint = _report_outputs_fingerprint(output_dir)
+    fingerprint = _report_outputs_fingerprint(output_dir, max_bytes=REPORT_MARKDOWN_MAX_BYTES)
     if fingerprint is None or fingerprint != status.get("output_fingerprint"):
         return None
     return status
-
-
-def _copy_assets_for_editor(source: Path, target: Path, task_packets: list[dict[str, Any]]) -> list[str]:
-    warnings: list[str] = []
-    target.mkdir(parents=True, exist_ok=True)
-    copied_paths: set[str] = set()
-    for relative, asset in _accepted_asset_sources(source, task_packets):
-        destination = target / relative
-        try:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(asset, destination)
-            copied_paths.add(f"{REPORT_ASSETS_DIR}/{relative.as_posix()}")
-        except OSError as exc:
-            warnings.append(f"could not copy optional report asset {relative.as_posix()}: {type(exc).__name__}")
-    for packet in task_packets:
-        for key in ("local_assets", "paper_assets"):
-            values = packet.get(key) if isinstance(packet.get(key), list) else []
-            packet[key] = [value for value in values if str(value) in copied_paths]
-    return warnings
-
-
-def _accepted_asset_sources(
-    source: Path,
-    task_packets: list[dict[str, Any]],
-) -> list[tuple[Path, Path]]:
-    selected: list[tuple[Path, Path]] = []
-    seen: set[Path] = set()
-    for packet in task_packets:
-        task_id = safe_label(str(packet.get("task_id") or "task"))
-        for key in ("local_assets", "paper_assets"):
-            values = packet.get(key) if isinstance(packet.get(key), list) else []
-            for raw_path in values:
-                resolved = _resolve_report_asset(source, task_id=task_id, raw_path=raw_path)
-                if resolved is None:
-                    continue
-                relative, asset = resolved
-                if relative not in seen:
-                    seen.add(relative)
-                    selected.append((relative, asset))
-    return sorted(selected, key=lambda item: item[0].as_posix())
-
-
-def _repair_targets(context: dict[str, Any] | None) -> list[str]:
-    if not isinstance(context, dict):
-        return []
-    values = context.get("missing_outputs") if isinstance(context.get("missing_outputs"), list) else []
-    targets = [name for name in REPORT_MARKDOWN_FILES if name in values]
-    return targets or list(REPORT_MARKDOWN_FILES)
-
-
-def _repair_issues(context: dict[str, Any] | None) -> list[str]:
-    if not isinstance(context, dict):
-        return []
-    issues: list[str] = []
-    for name in context.get("missing_outputs", []) if isinstance(context.get("missing_outputs"), list) else []:
-        issues.append(f"missing or unreadable report: {name}")
-    reason = context.get("result_review_result")
-    reason = reason.get("reason") if isinstance(reason, dict) else None
-    if reason and str(reason) not in issues:
-        issues.append(str(reason))
-    return issues[:12]
-
-
-def _seed_repair_drafts(
-    *,
-    prior_workspace: Path,
-    workspace: Path,
-    repair_targets: list[str],
-) -> tuple[list[str], dict[str, bytes]]:
-    if not prior_workspace.is_dir() or prior_workspace.is_symlink():
-        return [], {}
-    preserved: list[str] = []
-    snapshots: dict[str, bytes] = {}
-    for name in REPORT_MARKDOWN_FILES:
-        if name in repair_targets:
-            continue
-        source = prior_workspace / name
-        if not _nonempty_file(source):
-            continue
-        payload = source.read_bytes()
-        (workspace / name).write_bytes(payload)
-        preserved.append(name)
-        snapshots[name] = payload
-    return preserved, snapshots
-
-
-def _restore_protected_reports(*, workspace: Path, protected_reports: dict[str, bytes]) -> list[str]:
-    restored: list[str] = []
-    for name, payload in protected_reports.items():
-        path = workspace / name
-        try:
-            current = path.read_bytes() if _nonempty_file(path) else None
-        except OSError:
-            current = None
-        if current == payload:
-            continue
-        if path.is_symlink() or path.is_file():
-            path.unlink(missing_ok=True)
-        elif path.is_dir():
-            shutil.rmtree(path)
-        path.write_bytes(payload)
-        restored.append(name)
-    return restored
-
-
-def _normalize_report_editor_outputs(workspace: Path) -> list[str]:
-    actions: list[str] = []
-    for target_name, aliases in REPORT_FILE_ALIASES.items():
-        target = workspace / target_name
-        if _nonempty_file(target) or target.is_symlink() or (target.exists() and not target.is_file()):
-            continue
-        candidates = [workspace / alias for alias in aliases]
-        candidates = [path for path in candidates if _nonempty_file(path)]
-        if len(candidates) == 1:
-            target.unlink(missing_ok=True)
-            candidates[0].replace(target)
-            actions.append(f"renamed {candidates[0].name} to {target_name}")
-
-    outer_fence = re.compile(r"\A\s*```(?:markdown|md)?\s*\n(?P<body>.*)\n```\s*\Z", re.IGNORECASE | re.DOTALL)
-    image_link = re.compile(r"(!\[[^\]\n]*\]\()([^\)\n]+)(\))")
-    for name in REPORT_MARKDOWN_FILES:
-        path = workspace / name
-        if not path.is_file() or path.is_symlink():
-            continue
-        try:
-            if path.stat().st_size > REPORT_MARKDOWN_MAX_BYTES:
-                continue
-            raw = path.read_bytes()
-        except OSError:
-            continue
-        try:
-            text = raw.decode("utf-8-sig")
-        except UnicodeDecodeError:
-            text = raw.decode("utf-8", errors="replace")
-            actions.append(f"replaced invalid UTF-8 bytes in {name}")
-        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-        match = outer_fence.fullmatch(normalized)
-        if match:
-            normalized = match.group("body")
-            actions.append(f"removed outer Markdown fence from {name}")
-        normalized, replacements = image_link.subn(
-            lambda item: item.group(1) + item.group(2).replace("\\", "/") + item.group(3),
-            normalized,
-        )
-        if replacements and "\\" in text:
-            actions.append(f"normalized image paths in {name}")
-        normalized = normalized.strip()
-        if normalized:
-            normalized += "\n"
-        encoded = normalized.encode("utf-8")
-        if encoded != raw:
-            path.write_bytes(encoded)
-            if not any(name in action for action in actions):
-                actions.append(f"normalized encoding or line endings in {name}")
-    return actions
-
-
-def _recover_unsafe_report_outputs(
-    workspace: Path,
-) -> tuple[list[str], list[str], list[str]]:
-    """Quarantine packaging-shaped outputs so deterministic reports can replace them."""
-
-    recovered: list[str] = []
-    actions: list[str] = []
-    failures: list[str] = []
-    quarantine_root = workspace / "discarded_report_outputs"
-    for name in REPORT_MARKDOWN_FILES:
-        path = workspace / name
-        unsafe_reason = ""
-        try:
-            if path.is_symlink():
-                unsafe_reason = "symbolic link"
-            elif path.exists() and not path.is_file():
-                unsafe_reason = "non-file output"
-            elif path.is_file():
-                size = path.stat().st_size
-                if size > REPORT_MARKDOWN_MAX_BYTES:
-                    unsafe_reason = f"resource limit exceeded ({size} bytes)"
-                else:
-                    with path.open("rb") as handle:
-                        handle.read(1)
-        except OSError as exc:
-            unsafe_reason = f"unreadable output: {type(exc).__name__}"
-        if not unsafe_reason:
-            continue
-        try:
-            quarantine_root.mkdir(parents=True, exist_ok=True)
-            target = quarantine_root / name
-            if target.exists() or target.is_symlink():
-                target = quarantine_root / f"{path.stem}_recovered{path.suffix}"
-            path.replace(target)
-        except OSError as exc:
-            failures.append(f"{name} could not be quarantined: {type(exc).__name__}")
-            continue
-        recovered.append(name)
-        actions.append(f"quarantined unsafe {name}: {unsafe_reason}")
-    return recovered, actions, failures
-
-
-
-def _inspect_report_editor_outputs(workspace: Path) -> dict[str, list[str]]:
-    missing: list[str] = []
-    hard_issues: list[str] = []
-    for name in REPORT_MARKDOWN_FILES:
-        path = workspace / name
-        try:
-            if path.is_symlink():
-                hard_issues.append(f"{name} must not be a symbolic link")
-            elif not path.exists():
-                missing.append(name)
-            elif not path.is_file():
-                hard_issues.append(f"{name} must be a regular file")
-            elif path.stat().st_size > REPORT_MARKDOWN_MAX_BYTES:
-                hard_issues.append(f"{name} exceeds the report resource limit")
-            elif not path.read_text(encoding="utf-8").strip():
-                missing.append(name)
-        except (OSError, UnicodeError) as exc:
-            hard_issues.append(f"{name} could not be read safely: {type(exc).__name__}")
-    return {"missing": missing, "hard_issues": hard_issues}
-
-
-def _write_fallback_reports(
-    *,
-    workspace: Path,
-    missing: list[str],
-    paper: dict[str, Any],
-    task_packets: list[dict[str, Any]],
-    risk_report: dict[str, Any],
-) -> list[str]:
-    reports = {
-        "review.md": _render_fallback_review(paper=paper, task_packets=task_packets, risk_report=risk_report),
-        "reproduction_report.md": _render_fallback_reproduction(task_packets),
-        "result_review.md": _render_fallback_result_review(task_packets),
-    }
-    written: list[str] = []
-    for name in missing:
-        if name not in reports:
-            continue
-        write_text(workspace / name, reports[name])
-        written.append(name)
-    return written
-
-
-def _render_fallback_review(
-    *,
-    paper: dict[str, Any],
-    task_packets: list[dict[str, Any]],
-    risk_report: dict[str, Any],
-) -> str:
-    title = _compact_value(paper.get("title")) or "未命名论文"
-    lines = [
-        "# 论文工程复现审查报告",
-        "",
-        f"论文：{title}",
-        "",
-        "本报告由确定性降级模板根据已进入终态的任务包生成，不增加或改变科学结论。",
-        "",
-        "| 任务 | 复现目标 | 终态 | 结论 |",
-        "|---|---|---|---|",
-    ]
-    for index, packet in enumerate(task_packets, start=1):
-        verification = packet.get("verification") if isinstance(packet.get("verification"), dict) else {}
-        lines.append(
-            "| "
-            + " | ".join(
-                (
-                    _markdown_cell(f"{index}. {packet.get('task_id') or 'task'}"),
-                    _markdown_cell(_task_target(packet)),
-                    _markdown_cell(_packet_outcome_label(packet)),
-                    _markdown_cell(_compact_value(verification.get("comparison_summary")) or "见任务级终态记录"),
-                )
-            )
-            + " |"
-        )
-    verdict = _compact_value(risk_report.get("reproducibility_verdict"))
-    lines.extend(
-        [
-            "",
-            "## 总体结论",
-            "",
-            verdict or f"共 {len(task_packets)} 个任务已形成可报告终态，详细参数、结构化证据和可用图像见另外两份报告。",
-            "",
-            "- [本地复现报告](reproduction_report.md)",
-            "- [论文复现结果对比报告](result_review.md)",
-        ]
-    )
-    return "\n".join(lines) + "\n"
-
-
-def _render_fallback_reproduction(task_packets: list[dict[str, Any]]) -> str:
-    lines = ["# 本地复现报告", "", "以下内容直接整理自终态任务包，不推导新的参数或结论。"]
-    for index, packet in enumerate(task_packets, start=1):
-        lines.extend(
-            [
-                "",
-                f"## {index}. {_task_target(packet)}",
-                "",
-                f"- 任务标识：`{packet.get('task_id') or 'task'}`",
-                f"- 终态：{_packet_outcome_label(packet)}",
-                f"- Writer 摘要：{_compact_value(packet.get('writer_summary')) or '未提供'}",
-                f"- 执行信息：{_compact_value(packet.get('execution_summary')) or '未提供'}",
-                "- 参数来源与处理：",
-            ]
-        )
-        values = packet.get("parameter_resolution") if isinstance(packet.get("parameter_resolution"), list) else []
-        if values:
-            lines.extend(f"  - {_compact_value(item)}" for item in values[:24])
-        else:
-            lines.append("  - 未提供额外参数解析记录。")
-        uncertainties = packet.get("remaining_uncertainties")
-        lines.extend(["- 剩余不确定性：", *_markdown_bullets(uncertainties)])
-    return "\n".join(lines) + "\n"
-
-
-def _render_fallback_result_review(task_packets: list[dict[str, Any]]) -> str:
-    lines: list[str] = []
-    for index, packet in enumerate(task_packets, start=1):
-        verification = packet.get("verification") if isinstance(packet.get("verification"), dict) else {}
-        local_assets = packet.get("local_assets") if isinstance(packet.get("local_assets"), list) else []
-        paper_assets = packet.get("paper_assets") if isinstance(packet.get("paper_assets"), list) else []
-        lines.extend([f"## {index}. {_task_target(packet)}", ""])
-        local = str(local_assets[0]) if local_assets else ""
-        paper_asset = str(paper_assets[0]) if paper_assets else ""
-        if local and paper_asset:
-            lines.extend(
-                [
-                    "| 本地复现图 | 论文原图 |",
-                    "|---|---|",
-                    f"| ![本地复现图]({local}) | ![论文原图]({paper_asset}) |",
-                    "",
-                ]
-            )
-        elif local or paper_asset:
-            label = "本地复现图" if local else "论文原图"
-            lines.extend([f"![{label}]({local or paper_asset})", ""])
-        else:
-            structured = packet.get("structured_evidence") if isinstance(packet.get("structured_evidence"), dict) else {}
-            evidence_files = structured.get("evidence_files") if isinstance(structured.get("evidence_files"), list) else []
-            lines.extend(
-                [
-                    "**证据形式：** 本任务未提供可用的成对图像，以下结论来自结构化结果、表格、CSV、summary 或文本证据。",
-                    "",
-                    "**结构化证据文件：**",
-                    *_markdown_bullets(evidence_files),
-                    "",
-                ]
-            )
-        lines.extend(
-            [
-                f"**终态：** {_packet_outcome_label(packet)}",
-                "",
-                f"**结论：** {_compact_value(verification.get('comparison_summary')) or '见任务级终态记录。'}",
-                "",
-                "**已记录差异：**",
-                *_markdown_bullets(verification.get("non_material_differences") or verification.get("differences")),
-                "",
-                "**剩余不确定性：**",
-                *_markdown_bullets(packet.get("remaining_uncertainties")),
-                "",
-            ]
-        )
-    return "\n".join(lines).rstrip() + "\n"
-
-
-def _packet_outcome_label(packet: dict[str, Any]) -> str:
-    outcome = str(packet.get("terminal_outcome") or "").strip()
-    labels = {
-        "reproduced": "已复现",
-        "reproduced_with_assumptions": "带公开假设复现",
-        "inconclusive_missing_information": "论文信息不足，结论不确定",
-        "not_reproduced": "未复现",
-        "execution_failed": "执行失败",
-    }
-    return labels.get(outcome, outcome or "已形成终态")
-
-
-def _task_target(packet: dict[str, Any]) -> str:
-    task = packet.get("task") if isinstance(packet.get("task"), dict) else {}
-    return _compact_value(task.get("figure_or_claim") or task.get("title") or packet.get("task_id")) or "复现任务"
-
-
-def _compact_value(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, bool):
-        return "是" if value else "否"
-    if isinstance(value, (str, int, float)):
-        return str(value).strip()
-    if isinstance(value, list):
-        return "；".join(filter(None, (_compact_value(item) for item in value[:16])))
-    if isinstance(value, dict):
-        return "；".join(
-            f"{key}={text}"
-            for key, item in list(value.items())[:16]
-            if (text := _compact_value(item))
-        )
-    return str(value).strip()
-
-
-def _markdown_cell(value: str) -> str:
-    return value.replace("|", "\\|").replace("\n", " ")
-
-
-def _markdown_bullets(values: Any) -> list[str]:
-    items = values if isinstance(values, list) else ([values] if values else [])
-    rendered = [f"- {_compact_value(item)}" for item in items if _compact_value(item)]
-    return rendered or ["- 无。"]
-
-
-def _codex_process_warning(codex_status: dict[str, Any]) -> str:
-    return str(
-        codex_status.get("blocked_reason")
-        or codex_status.get("error")
-        or codex_status.get("error_kind")
-        or "Codex process did not report success, but complete report files were recovered."
-    )
-
-
-def _completion_mode(
-    *,
-    ok: bool,
-    attempt_no: int,
-    fallback_files: list[str],
-    normalization_actions: list[str],
-    process_warning: str | None,
-) -> str:
-    if not ok:
-        return "hard_failure"
-    if fallback_files:
-        return "degraded_fallback"
-    if process_warning:
-        return "passed_with_process_warning"
-    if attempt_no > 1:
-        return "passed_after_targeted_repair"
-    if normalization_actions:
-        return "passed_after_normalization"
-    return "passed"
-
-
-def _clear_editor_outputs(output_dir: Path) -> None:
-    for name in (*REPORT_MARKDOWN_FILES, "review.docx", "reproduction_report.docx", "result_review.docx", "report_editor_error.json"):
-        path = output_dir / name
-        if path.is_file() or path.is_symlink():
-            path.unlink(missing_ok=True)
-        elif path.is_dir():
-            shutil.rmtree(path)
-
-
-def _report_outputs_fingerprint(output_dir: Path) -> str | None:
-    paths = [output_dir / name for name in REPORT_MARKDOWN_FILES]
-    if not all(_nonempty_file(path) for path in paths):
-        return None
-    digest = hashlib.sha256()
-    try:
-        for path in paths:
-            digest.update(path.name.encode("utf-8"))
-            with path.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
-    except OSError:
-        return None
-    return digest.hexdigest()
-
-
-def _nonempty_file(path: Path) -> bool:
-    try:
-        size = path.stat().st_size
-        return path.is_file() and not path.is_symlink() and 0 < size <= REPORT_MARKDOWN_MAX_BYTES
-    except OSError:
-        return False
-
-
-def _editor_failure_with_fallback(
-    *,
-    status_path: Path,
-    workspace: Path,
-    output_dir: Path,
-    input_hash: str,
-    paper: dict[str, Any],
-    task_packets: list[dict[str, Any]],
-    risk_report: dict[str, Any],
-    attempt_no: int,
-    error: Exception,
-    error_kind: str,
-) -> dict[str, Any]:
-    """Keep report packaging failures from changing the scientific terminal state."""
-
-    message = redact_text(f"{type(error).__name__}: {error}")[:1500]
-    try:
-        workspace.mkdir(parents=True, exist_ok=True)
-        recovered, actions, recovery_failures = _recover_unsafe_report_outputs(workspace)
-        if recovery_failures:
-            raise OSError("; ".join(recovery_failures))
-        fallback_files = _write_fallback_reports(
-            workspace=workspace,
-            missing=list(REPORT_MARKDOWN_FILES),
-            paper=paper,
-            task_packets=task_packets,
-            risk_report=risk_report,
-        )
-        inspection = _inspect_report_editor_outputs(workspace)
-        if inspection["missing"] or inspection["hard_issues"]:
-            raise OSError("deterministic report fallback remained incomplete")
-        output_dir.mkdir(parents=True, exist_ok=True)
-        copied: list[str] = []
-        for name in REPORT_MARKDOWN_FILES:
-            target = output_dir / name
-            shutil.copy2(workspace / name, target)
-            copied.append(str(target))
-        fingerprint = _report_outputs_fingerprint(output_dir)
-        if fingerprint is None:
-            raise OSError("deterministic report fallback could not be fingerprinted")
-    except Exception as fallback_error:
-        return _editor_failure(
-            status_path=status_path,
-            workspace=workspace,
-            input_hash=input_hash,
-            error=fallback_error,
-            error_kind=error_kind,
-        )
-
-    status = _editor_failure(
-        status_path=status_path,
-        workspace=workspace,
-        input_hash=input_hash,
-        error=error,
-        error_kind=error_kind,
-    )
-    status.update(
-        {
-            "ok": True,
-            "attempt_no": attempt_no,
-            "invocation_count": attempt_no,
-            "missing_outputs": [],
-            "hard_issues": [],
-            "recovered_packaging_issues": [message, *recovered],
-            "normalization_actions": actions,
-            "fallback_files": fallback_files,
-            "degraded_report_generation": True,
-            "completion_mode": "degraded_fallback",
-            "process_warning": message,
-            "retryable": False,
-            "output_fingerprint": fingerprint,
-            "files": copied,
-            "result_review_result": {
-                "enabled": True,
-                "passed": True,
-                "mode": "deterministic_report_fallback",
-                "reason": "report-editor preparation failed; terminal science was preserved",
-            },
-        }
-    )
-    write_json(status_path, status)
-    return status
-
-
-def _editor_failure(*, status_path: Path, workspace: Path, input_hash: str, error: Exception, error_kind: str) -> dict[str, Any]:
-    message = redact_text(f"{type(error).__name__}: {error}")[:1500]
-    status = {
-        "ok": False,
-        "backend": "codex",
-        "mode": "final_report_editor",
-        "input_hash": input_hash,
-        "cached": False,
-        "workspace": str(workspace),
-        "codex_status": {"ok": False, "error_kind": error_kind, "error": message},
-        "missing_outputs": list(REPORT_MARKDOWN_FILES),
-        "coverage_issues": [],
-        "hard_issues": [],
-        "validation_level": "structural_only",
-        "normalization_actions": [],
-        "repair_targets": [],
-        "preserved_files": [],
-        "restored_files": [],
-        "fallback_files": [],
-        "degraded_report_generation": False,
-        "completion_mode": "hard_failure",
-        "process_warning": None,
-        "retryable": error_kind != "preparation_failed",
-        "copy_error": None,
-        "output_fingerprint": None,
-        "files": [],
-        "result_review_result": {"enabled": True, "passed": False, "mode": "codex_report_editor", "reason": message},
-    }
-    write_json(status_path, status)
-    return status
-
-
-def _editor_reason(codex_status: dict[str, Any], missing: list[str], hard_issues: list[str], copy_error: str | None) -> str:
-    if hard_issues:
-        return "report editor output failed structural safety checks: " + "; ".join(hard_issues[:8])
-    if missing:
-        return "report editor did not create required reports: " + ", ".join(missing)
-    if copy_error:
-        return copy_error
-    if not codex_status.get("ok"):
-        return str(codex_status.get("blocked_reason") or codex_status.get("error") or "report editor failed")
-    return "report editor delivery was incomplete"
-
 
 def _read_json_object(path: Path) -> dict[str, Any]:
     if not path.is_file() or path.is_symlink():

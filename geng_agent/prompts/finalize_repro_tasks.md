@@ -15,6 +15,14 @@
 7. formula_chain、parameter_matrix、baseline_definitions、statistical_protocol 和 validation_anchors 应按当前证据尽量完善；暂时未知可以保留 unresolved 或空数组，不要为了填满格式而发明内容。
 8. 同一张图的曲线、baseline、参数点和共享仿真结果继续合并为一个任务。
 9. 不输出任何运行前复现评级。Writer 后续仍以尽可能完整复现论文为目标。
+10. 最终 pass（round_index=final）输出每个任务的完整当前快照：同一公式、参数、baseline 或 assumption 只保留当前版本；已经被新证据推翻或取代的旧版本不再重复附上，历史由宿主 audit 保存。最终 pass 明确撤销的 execution_relationships 从完整列表删除；空数组表示当前没有这些关系。保持任务覆盖和稳定 task_id，不得省略仍需验收的实验。
+
+任务执行关系刷新规则：
+1. `repro_tasks` 仍是原子科学验收单元。保留当前 `execution_relationships` 的稳定 relationship_id；只有新证据改变了真实执行依赖时才新增、删除或改变关系强度。
+2. `strong` 表示拆成独立执行会破坏科学可比性、同一状态/随机实现/数据划分要求或必需的产物流；`weak` 表示只需共享 Foundation 定义或实现，独立运行仍有效。不确定时不得猜成 strong。
+3. `kind` 只能按科学依赖选择 `same_run_outputs|checkpoint_flow|shared_pretraining|shared_random_realization|shared_dataset_partition|shared_definition|other`。不得根据特定论文、方法名、图号、绘图样式或为了减少 Writer 数量而创建关系。
+4. 只有定向产物流才使用 producer/consumer；`artifact_ids` 使用稳定逻辑 ID。`rationale` 说明独立执行的科学后果或为何 Foundation 共享已足够。
+5. 不存在跨任务科学依赖时输出空数组；不得为了结构完整性发明关系。
 
 科学验收契约刷新规则：
 1. 每个任务输出一个完整的 scientific_acceptance 快照（contract_version=`1.0`），不要把同一权威拆成第二份漂移的验收文件。
@@ -25,6 +33,8 @@
 6. 无法确定的内容转入 information_gaps；按真实后果选择 `assume_and_disclose|single_sensitivity_if_core|terminal_inconclusive`。允许空列表和保守默认，不得因缺字段机械中断。
 7. 宿主统一负责数值量级阈值与非阻塞视觉差异；不要自定义另一套误差阈值。论文明确要求更紧数值精度时，把该精度本身写成 core_conclusion。
 8. expected_trend、comparison.tolerance 和 validation_anchors 只作说明，不能覆盖 scientific_acceptance。
+9. 在 statement 或 regime 中简短说明判据为何影响论文主张，区分总体/机制结论与单个示例实现。若精确随机实现、几何或数据样本未披露，示例图的峰位或包络外形通常只保留为 validation_anchor 和信息缺口，不能自动要求所有代表性替代实现都满足；论文明确主张的峰位、阈值、严格精度和总体趋势仍是核心判据。
+10. 不要要求 Writer 通过筛选随机实现、改变坐标定义或调种子来追逐示例图外形。代表性替代实现应核验方法、机制、排序和总体趋势；原样本缺失不等于核心科学结论失败。
 
 软交接规则：
 1. 顶层必须输出 backfill_handoff，但它是任务专家的工作建议，不是科学结论。
@@ -35,14 +45,28 @@
 6. 如果没有真正阻塞项，blocking_request_ids 必须为空。
 
 输出顶层结构：
-注意：下面只突出本轮新增的交接与规格字段。`repro_tasks` 中每个任务仍须保留当前任务的全部既有必填字段（包括 target、metric、metric_formula、figure_or_claim、expected_artifacts、output_columns、expected_trend、comparison、required_facts 和 risk_if_unreproducible），不得按示意省略。
+注意：下面只突出本轮新增的交接、执行关系与规格字段。`repro_tasks` 中每个任务仍须保留当前任务的全部既有必填字段（包括 target、metric、metric_formula、figure_or_claim、expected_artifacts、output_columns、expected_trend、comparison、required_facts 和 risk_if_unreproducible），不得按示意省略。
 
 {
+  "schema_version": "2.0",
   "backfill_handoff": {
     "ready_for_writer": true,
     "blocking_request_ids": [],
-    "reason": "why the current task specification is sufficient, or why selected blockers still prevent a responsible implementation"
+    "reason": "why the current task specification is sufficient, or why selected blockers still prevent a responsible implementation",
+    "inferred": false
   },
+  "execution_relationships": [
+    {
+      "relationship_id": "stable_relationship_id",
+      "kind": "same_run_outputs|checkpoint_flow|shared_pretraining|shared_random_realization|shared_dataset_partition|shared_definition|other",
+      "strength": "strong|weak",
+      "task_ids": ["task_a", "task_b"],
+      "producer_task_id": null,
+      "consumer_task_ids": [],
+      "artifact_ids": [],
+      "rationale": "scientific execution dependency or Foundation-sharing reason"
+    }
+  ],
   "repro_tasks": [
     {
       "task_id": "stable existing task id",

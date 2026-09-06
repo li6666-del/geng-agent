@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .config import get_config_value
-from .codex_runner import DEFAULT_CODEX_TIMEOUT_SECONDS, resolve_codex_timeout, run_codex_subprocess
+from .codex_runner import run_codex_subprocess
 from .json_utils import parse_json_object
 from .llm import LLMImage
 from .outputs import write_json, write_text
@@ -18,7 +18,6 @@ from .schemas import ValidationIssue, format_issues, validate_stage
 
 
 CODEX_ANALYSIS_BACKEND = "codex"
-DEFAULT_CODEX_ANALYSIS_TIMEOUT = DEFAULT_CODEX_TIMEOUT_SECONDS
 
 
 def run_codex_json_stage(
@@ -29,7 +28,6 @@ def run_codex_json_stage(
     output_dir: Path,
     audit_dir: Path,
     max_attempts: int,
-    timeout: float | None = None,
     pre_validation: Callable[[dict[str, Any]], list[ValidationIssue]] | None = None,
     extra_validation: Callable[[dict[str, Any]], list[ValidationIssue]] | None = None,
     candidate_normalizer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
@@ -46,7 +44,6 @@ def run_codex_json_stage(
     """
 
     attempts = max(1, int(max_attempts or 1))
-    effective_timeout = resolve_codex_timeout(timeout)
     schema_path = _write_stage_schema(audit_dir, stage_label, schema_stage)
     schema_text = schema_path.read_text(encoding="utf-8")
     image_paths = _write_analysis_images(audit_dir, stage_label, images or [])
@@ -73,7 +70,6 @@ def run_codex_json_stage(
             audit_dir=audit_dir,
             label=label,
             sandbox="read-only",
-            timeout=effective_timeout,
             command_override=get_config_value("GENG_CODEX_ANALYSIS_CMD"),
             image_paths=[] if repair_mode else image_paths,
         )

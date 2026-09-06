@@ -6,15 +6,18 @@ import hashlib
 import json
 import shutil
 import sys
-from pathlib import Path
+import time
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable
 
 from .agentic_foundation import (
+    _assert_foundation_sandbox_layout_safe,
     foundation_violations,
     install_foundation_snapshot,
     restore_foundation_snapshot,
     validate_foundation_bundle,
 )
+from .foundation_snapshot import path_is_foundation_link
 from .verification_result import (
     FINAL_MATCHED_STATUS,
     WRITER_REVIEW_STATUS,
@@ -26,8 +29,13 @@ from .verification_result import (
     writer_delivery_issues,
 )
 from .task_writer_support import (
+    ANALYSIS_ARTIFACT_DIR,
     PAPER_EVIDENCE_DIR,
     CODEX_PROJECT_BACKEND,
+    WRITER_ANALYSIS_SCHEMA_VERSION,
+    WRITER_HANDOFF_POLICY_VERSION,
+    WRITER_OPTIONAL_ANALYSIS_ARTIFACTS,
+    WRITER_REQUIRED_ANALYSIS_ARTIFACTS,
     _analysis_snapshot_hash,
     _collect_writer_analysis_artifacts,
     _load_cached_task_writer_workflow,
@@ -39,64 +47,265 @@ from .task_writer_support import (
     _restore_trusted_files,
     _write_paper_evidence_bundle,
 )
-from .codex_runner import DEFAULT_CODEX_TIMEOUT_SECONDS, run_codex_subprocess
+from .codex_runner import run_codex_subprocess
+from .case_runtime import (
+    CaseRuntime,
+    EnvironmentRequestRequired,
+    environment_request_prompt,
+    read_environment_request,
+    requirements_missing_from_lock,
+)
+from .case_environment import EnvironmentPolicyError, RequirementRequest
+from .execution_plan import compile_execution_plan
+from .foundation_revision import FoundationRevisionRequired, collect_pending_foundation_revisions
+from .writer_lineage import build_writer_unit_lineage
 from .config import get_config_value
 from .io_runtime import BACKEND_RUNTIME_API_DOC, IO_RUNTIME_API_DOC, inject_io_runtime
 from .json_utils import pretty_json
 from .manifest_utils import expected_generated_paths
 from .outputs import inspect_output_artifacts, validate_repro_project, write_json, write_text
 from .paper_evidence import facts_for_task, paper_context_for_task, safe_label, thesis_ordering_anchor_for_task
+from .project_portability import build_source_inventory, validate_repro_project_portability
 from .security import (
     FOUNDATION_STATIC_SECURITY_ADVISORY_CATEGORIES,
     dependency_policy_prompt_text,
     redact_text,
     split_static_security_issues,
+    split_requirement_issues,
     static_scan_repro_project,
+    reconcile_runtime_requirements,
     validate_requirements,
 )
 from .scientific_materiality import CORE_RESULT_STOP_POLICY, TERMINAL_SCIENTIFIC_OUTCOMES
 from .stage_cleanup import _clear_stage_outputs
 from .task_scripts import build_tasks_manifest, write_task_scaffolding
+from .task_writer_contracts import (
+    DEFAULT_MAX_EVIDENCE_RERUNS,
+    TASK_WRITER_TERMINAL_STATUS,
+    WRITER_PAPER_FIDELITY_POLICY,
+)
+from .task_writer_delivery import _collect_task_writer_delivery, _collect_writer_images
+from .task_writer_execution_binding import (
+    _StaticCallScanner,
+    _analyze_static_function,
+    _analyze_static_module,
+    _assigned_task_entrypoint,
+    _canonical_static_symbol,
+    _declared_callable_is_called,
+    _dedupe_strings,
+    _imports_from_local_module,
+    _inspect_task_execution_source,
+    _load_task_execution_binding,
+    _normalize_python_module,
+    _reachable_local_src_modules,
+    _safe_task_source_path,
+    _sandbox_evidence_source,
+    _src_module_index,
+    _static_callable_usage,
+    _static_import_base,
+    _static_reference,
+    _task_execution_binding_from_architecture,
+    _task_execution_binding_issues,
+    _task_module_index,
+    _walk_static_calls,
+)
+from .task_writer_files import (
+    _read_optional_json_object,
+    _task_owned_files,
+    _task_result_file_path,
+    _task_source_files,
+    _writer_delivery_path_is_fresh,
+)
+from .task_writer_packaging import (
+    _build_artifact_lineage,
+    _clear_previous_packaged_runtime_files,
+    _copy_merged_writer_file,
+    _copy_python_without_bom,
+    _expected_paths_from_project_manifest,
+    _format_requirements,
+    _freeze_repro_project_package,
+    _merge_task_writer_deliveries,
+    _portable_environment_lock,
+    _read_requirement_names,
+    _remove_packaged_path,
+    _streaming_file_sha256,
+    _task_manifest_with_configs,
+    _write_final_shared_project_files,
+    _writer_package_files,
+    _writer_snapshot_hash,
+)
+from .task_writer_prompts import (
+    _build_execution_unit_continuation_brief,
+    _build_execution_unit_writer_brief,
+    _build_task_writer_brief,
+    _build_task_writer_continuation_brief,
+)
+from .task_writer_results import (
+    _classify_task_writer_security_issues,
+    _compact_task_writer_review,
+    _task_writer_alignment_summary,
+    _task_writer_blocked_by_codex,
+    _task_writer_runtime_result,
+    _task_writer_runtime_task_passed,
+    _task_writer_stop_class,
+    _task_writer_stopped_reason,
+    apply_verified_result,
+)
+from .task_writer_sandbox import (
+    _ensure_unit_asset_namespace,
+    _prepare_execution_unit_writer_sandbox,
+    _prepare_task_writer_sandbox,
+    _remove_legacy_writer_scoring_state,
+    _write_minimal_shared_project_files,
+)
+from .task_writer_units import (
+    _execution_unit_sandbox,
+    _execution_unit_work_items,
+    _public_execution_unit,
+)
+from .task_writer_state import (
+    _active_writer_artifact_path,
+    _archive_execution_unit_delivery,
+    _archive_nonterminal_writer_delivery,
+    _checkpoint_partial_task_writer_records,
+    _complete_execution_unit_runtime_refresh,
+    _complete_task_writer_runtime_refresh,
+    _load_task_writer_resume_records,
+    _move_writer_generation_to_archive,
+    _next_writer_progress_round,
+    _record_has_terminal_task_verification,
+    _record_is_valid_current_delivery,
+    _record_source_config_fingerprint,
+    _rerun_evidence_fingerprint,
+    _sandbox_analysis_handoff_hash,
+    _task_environment_requests,
+    _task_writer_record_refresh_pending,
+    _task_writer_record_refresh_reusable,
+    _task_writer_resume_layouts,
+    _task_writer_resume_sandbox_is_safe,
+    _task_writer_runtime_refresh_marker,
+    _task_writer_runtime_refresh_pending,
+    _terminalize_rerun_request,
+    _trusted_preserved_evidence_file,
+    _writer_source_config_fingerprint,
+)
+from .task_writer_runner import (
+    _attach_task_reporter_review,
+    _external_writer_rerun_budget,
+    _run_one_execution_unit_writer,
+    _run_one_task_writer,
+    _run_task_writer_codex_session,
+    _task_with_experiment_profile,
+)
+from .task_writer_dispatch import (
+    _dispatch_task_writers,
+    _failed_task_record,
+    _refresh_cached_task_reporters,
+    _reporter_callback_with_replay,
+    _task_writer_concurrency,
+)
 
 
-TASK_WRITER_TERMINAL_STATUS = WRITER_REVIEW_STATUS
-DEFAULT_MAX_EVIDENCE_RERUNS = 8
+def _commit_cached_task_reporter_refresh(
+    *,
+    audit_dir: Path,
+    cached_records: list[dict[str, Any]],
+    reporter_refresh_audit: dict[str, Any],
+    cached_status: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Atomically replace the authoritative Writer/Reporter audit envelopes."""
 
+    records_path = audit_dir / "03c_task_writers_records.json"
+    previous_records = _read_optional_json_object(records_path)
+    records_document: dict[str, Any] = {
+        "checkpoint": "cached_writer_reporters_revalidated",
+        "reporter_refresh": reporter_refresh_audit,
+        "previous_verification_superseded": isinstance(
+            previous_records.get("verification_result"),
+            dict,
+        ),
+        "tasks": cached_records,
+    }
+    if isinstance(previous_records.get("dispatch_policy"), dict):
+        records_document["dispatch_policy"] = previous_records["dispatch_policy"]
+    write_json(records_path, records_document)
 
-def _external_writer_rerun_budget() -> int:
-    """Return a generous emergency cap, optionally overridden by configuration."""
-
-    raw = get_config_value("GENG_TASK_WRITER_MAX_EVIDENCE_RERUNS")
-    if not raw:
-        return DEFAULT_MAX_EVIDENCE_RERUNS
-    try:
-        value = int(raw)
-    except (TypeError, ValueError):
-        return DEFAULT_MAX_EVIDENCE_RERUNS
-    return value if value >= 0 else DEFAULT_MAX_EVIDENCE_RERUNS
-
-
-WRITER_PAPER_FIDELITY_POLICY = """## Highest law: fidelity to the paper's established facts
-Fidelity outranks visual closeness, convenience, prior code, and reporter advice in both an initial implementation and every repair session.
-
-- Treat paper-explicit data, system models, equations, algorithm steps, experiment protocols, baseline identities, metric definitions, axes, and stated scan ranges as immutable constraints. Do not alter, replace, or bypass them merely to make a curve look closer to the target.
-- Use this evidence priority: explicit paper statements and figures; deterministic derivations from them; figure-level visual estimates; standard domain assumptions; target-informed calibration; reporter suggestions. Lower-priority evidence may fill a genuine gap but may never overwrite higher-priority evidence.
-- When the paper is silent, incomplete, or genuinely ambiguous, make a bold but scientifically plausible implementation or value assumption. Label it `assumed`, explain why it is reasonable, keep it separate from paper facts, and revise it when comparison evidence warrants that.
-- An assumed algorithm is acceptable only as an implementation completion for an unspecified step. It may not replace a model, data-generating law, objective, or core algorithm that the paper already defines.
-- Reporter feedback is evidence to investigate, not authority over the paper. Reject or reclassify feedback that conflicts with explicit paper evidence. Preserve the faithful main result and keep any conflicting figure-fitting alternative clearly labeled as a diagnostic branch.
-"""
-
-
-def _task_with_experiment_profile(task: dict[str, Any], experiment_index: dict[str, Any]) -> dict[str, Any]:
-    enriched = dict(task)
-    task_id = str(task.get("task_id") or "")
-    experiments = experiment_index.get("experiments") if isinstance(experiment_index, dict) else []
-    for experiment in experiments if isinstance(experiments, list) else []:
-        if not isinstance(experiment, dict) or str(experiment.get("task_id") or "") != task_id:
-            continue
-        enriched["experiment_id"] = experiment.get("experiment_id") or task_id
-        break
-    return enriched
+    actions_by_id = {
+        str(item.get("task_id") or ""): item
+        for item in reporter_refresh_audit.get("actions", [])
+        if isinstance(item, dict) and str(item.get("task_id") or "")
+    }
+    all_reporters_terminal = bool(cached_records) and all(
+        item.get("action") == "terminal" for item in actions_by_id.values()
+    ) and len(actions_by_id) == len(cached_records)
+    reporter_outcomes = [
+        record.get("task_verification", {}).get("outcome")
+        for record in cached_records
+        if isinstance(record.get("task_verification"), dict)
+    ]
+    all_reporters_successful = (
+        all_reporters_terminal
+        and len(reporter_outcomes) == len(cached_records)
+        and all(
+            outcome in {"reproduced", "reproduced_with_assumptions"}
+            for outcome in reporter_outcomes
+        )
+    )
+    status_path = audit_dir / "03c_task_writers_status.json"
+    status = _read_optional_json_object(status_path)
+    status.update(cached_status if isinstance(cached_status, dict) else {})
+    status.update(
+        {
+            "backend": CODEX_PROJECT_BACKEND,
+            "mode": "task_writers",
+            "cached": True,
+            "cached_writer_reused": True,
+            "task_reporters_revalidated": True,
+            "reporter_refresh_complete": True,
+            "reporter_refresh_audit": "03c_cached_task_reporters.json",
+            "stop_class": (
+                "verified_matched"
+                if all_reporters_successful
+                else (
+                    "verified_terminal"
+                    if all_reporters_terminal
+                    else "reporter_refresh_pending_host_terminalization"
+                )
+            ),
+            "stopped_reason": (
+                "all cached-Writer task Reporters reproduced their core conclusions"
+                if all_reporters_successful
+                else (
+                    "all cached-Writer task Reporters reached reportable scientific outcomes"
+                    if all_reporters_terminal
+                    else "one or more cached-Writer task Reporters require host terminalization"
+                )
+            ),
+            "tasks": [
+                {
+                    "task_id": record.get("task_id"),
+                    "status": record.get("task_writer_status"),
+                    "writer_completed": record.get("writer_completed"),
+                    "task_reporter_action": actions_by_id.get(
+                        str(record.get("task_id") or ""),
+                        {},
+                    ).get("action"),
+                    "task_reporter_cached": actions_by_id.get(
+                        str(record.get("task_id") or ""),
+                        {},
+                    ).get("reporter_cached"),
+                    "task_reporter_outcome": (
+                        record.get("task_verification", {}).get("outcome")
+                        if isinstance(record.get("task_verification"), dict)
+                        else None
+                    ),
+                }
+                for record in cached_records
+            ],
+        }
+    )
+    write_json(status_path, status)
+    return status
 
 
 def run_codex_task_writer_workflow(
@@ -113,13 +322,15 @@ def run_codex_task_writer_workflow(
     audit_dir: Path,
     repro_project_dir: Path,
     run_repro: bool,
-    timeout: float = DEFAULT_CODEX_TIMEOUT_SECONDS,
     run_timeout: float = 120.0,
     resume: bool = True,
     review_feedback: dict[str, dict[str, Any]] | None = None,
     force_task_ids: set[str] | None = None,
     task_review_callback: Callable[[int, dict[str, Any], dict[str, Any], int], dict[str, Any]] | None = None,
     foundation: dict[str, Any] | None = None,
+    case_runtime: CaseRuntime | None = None,
+    execution_plan: dict[str, Any] | None = None,
+    declined_foundation_revision_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     """Third-round autonomous per-task Codex writer workflow.
 
@@ -131,6 +342,15 @@ def run_codex_task_writer_workflow(
     audit_dir.mkdir(parents=True, exist_ok=True)
     del run_timeout
 
+    execution_plan = (
+        execution_plan
+        if isinstance(execution_plan, dict)
+        else compile_execution_plan(tasks)
+    )
+    # The Writer handoff hash must include the exact execution contract it is
+    # about to follow.  Pipeline callers already persist this file; direct API
+    # callers get the same authoritative artifact here.
+    write_json(output_dir / "execution_plan.json", execution_plan)
     analysis_artifacts = _collect_writer_analysis_artifacts(output_dir=output_dir)
     missing_analysis_artifacts = _missing_required_analysis_artifacts(analysis_artifacts)
     if missing_analysis_artifacts:
@@ -142,18 +362,62 @@ def run_codex_task_writer_workflow(
         foundation_issues = validate_foundation_bundle(foundation)
         if foundation_issues:
             raise RuntimeError(f"task writers require a valid Foundation snapshot: {foundation_issues[:5]}")
-    analysis_snapshot_hash = _analysis_snapshot_hash(
+    analysis_handoff_hash = _analysis_snapshot_hash(
         paper_path=paper_path,
         artifacts=analysis_artifacts,
     )
+    analysis_snapshot_hash = analysis_handoff_hash
     foundation_snapshot_hash = str(foundation["manifest"]["snapshot_hash"]) if foundation is not None else ""
     if foundation_snapshot_hash:
         analysis_snapshot_hash = _writer_snapshot_hash(analysis_snapshot_hash, foundation_snapshot_hash)
+    environment_hash = case_runtime.environment_hash if case_runtime is not None else ""
+    if environment_hash:
+        analysis_snapshot_hash = _writer_snapshot_hash(analysis_snapshot_hash, environment_hash)
 
-    task_manifest = build_tasks_manifest(tasks)
+    task_manifest = _task_manifest_with_configs(
+        build_tasks_manifest(tasks, execution_plan=execution_plan)
+    )
     task_items = [task for task in tasks.get("repro_tasks", []) if isinstance(task, dict)]
     manifest_entries = [entry for entry in task_manifest.get("tasks", []) if isinstance(entry, dict)]
     task_pairs = list(zip(task_items, manifest_entries))
+    task_root = audit_dir / "03c_task_writer_sandboxes"
+
+    def unit_lineage() -> dict[str, dict[str, Any]]:
+        return build_writer_unit_lineage(
+            task_pairs=task_pairs,
+            execution_plan=execution_plan,
+            facts=facts,
+            experiment_index=experiment_index,
+            paper_path=paper_path,
+            analysis_artifacts=analysis_artifacts,
+            foundation=foundation,
+            case_runtime=case_runtime,
+            task_root=task_root,
+            paper_thesis=paper_thesis,
+        )
+
+    lineage = unit_lineage()
+    snapshot_hashes = {key: value["snapshot_hash"] for key, value in lineage.items()}
+    write_json(audit_dir / "03c_writer_unit_lineage.json", lineage)
+
+    def finalize_unit_snapshot(unit: dict[str, Any], records: list[dict[str, Any]]) -> None:
+        # Writers can discover additional actual imports during implementation.
+        # Record that consumed runtime closure before the partial checkpoint so
+        # the first resume does not invalidate a just-completed unit.
+        unit_id = str(unit["unit_id"])
+        current = unit_lineage()[unit_id]
+        lineage[unit_id] = current
+        snapshot_hashes[unit_id] = str(current["snapshot_hash"])
+        for record in records:
+            record["analysis_snapshot_hash"] = current["snapshot_hash"]
+            record["unit_lineage_policy"] = current["inputs"]["policy"][0]
+            sandbox = Path(str(record.get("sandbox") or ""))
+            evidence_path = sandbox / PAPER_EVIDENCE_DIR / "index.json"
+            if evidence_path.is_file() and not path_is_foundation_link(evidence_path):
+                evidence = _read_optional_json_object(evidence_path)
+                evidence["analysis_snapshot_hash"] = current["snapshot_hash"]
+                write_json(evidence_path, evidence)
+        write_json(audit_dir / "03c_writer_unit_lineage.json", lineage)
     expected_paths = expected_generated_paths([item["script"] for item in manifest_entries])
     review_feedback = dict(review_feedback or {})
     force_task_ids = {str(item) for item in (force_task_ids or set()) if str(item)}
@@ -176,46 +440,157 @@ def run_codex_task_writer_workflow(
         and len(set(cached_task_ids)) == len(cached_task_ids)
         and set(cached_task_ids) == expected_task_ids
     )
-    cached_all_deliveries = cached_all_current and all(
-        _record_is_valid_current_delivery(record) for record in cached_records
-    )
-    cached_all_verified = cached_all_current and all(
-        _record_has_terminal_task_verification(record) for record in cached_records
-    )
-    cached_foundation_current = (
-        foundation is None
-        or not foundation_violations(repro_project_dir, foundation)
-    )
-    if (
-        resume
-        and not force_task_ids
-        and cached is not None
-        and cached_all_current
-        and cached_foundation_current
-        and (not run_repro or (cached_runtime_passed and cached_all_deliveries))
-        and (task_review_callback is None or cached_all_verified)
-    ):
-        cached["writer_review_doc"] = {
-            "_meta": {"mode": "task_writer_scientific_results"},
-            **_task_writer_alignment_summary(cached_records),
-            "task_writer_reviews": [_compact_task_writer_review(record) for record in cached_records],
-        }
-        write_json(audit_dir / "03c_task_writers_resume.json", {"ok": True, "source": "cached artifacts"})
-        return cached
     resume_records = (
         _load_task_writer_resume_records(
             audit_dir=audit_dir,
             task_pairs=task_pairs,
             expected_analysis_snapshot_hash=analysis_snapshot_hash,
+            expected_analysis_handoff_hash=analysis_handoff_hash,
+            execution_plan=execution_plan,
+            expected_snapshot_hashes=snapshot_hashes,
+            require_execution_receipts=run_repro,
+            declined_foundation_revision_ids=declined_foundation_revision_ids,
         )
         if resume
         else {}
     )
+    validated_cached_records = [
+        resume_records[index]
+        for index in range(1, len(task_pairs) + 1)
+        if index in resume_records
+    ]
+    cached_resume_all_current = (
+        len(validated_cached_records) == len(task_pairs)
+        and {
+            str(record.get("task_id") or "")
+            for record in validated_cached_records
+        }
+        == expected_task_ids
+    )
+    if cached_resume_all_current:
+        # The aggregate package cache validates the frozen project. Reporter
+        # inputs additionally require the host-validated task sandbox paths
+        # and handoff hashes from the resume loader.
+        cached_records = validated_cached_records
+    cached_all_deliveries = cached_all_current and all(
+        _record_is_valid_current_delivery(record) for record in cached_records
+    )
+    cached_refresh_complete = cached_all_current and all(
+        _task_writer_record_refresh_reusable(record) for record in cached_records
+    )
+    cached_foundation_current = (
+        foundation is None
+        or not foundation_violations(repro_project_dir, foundation)
+    )
+    cached_writer_reusable = (
+        resume
+        and not force_task_ids
+        and cached is not None
+        and cached_all_current
+        and cached_resume_all_current
+        and cached_refresh_complete
+        and cached_foundation_current
+        and (not run_repro or (cached_runtime_passed and cached_all_deliveries))
+    )
+    refreshed_cached_records_by_index: dict[int, dict[str, Any]] = {}
+    preserve_cached_report_assets = False
+    if cached_writer_reusable:
+        reporter_refresh_audit: dict[str, Any] | None = None
+        if task_review_callback is not None:
+            (
+                cached_records,
+                replay_by_task_id,
+                reporter_revisions,
+                reporter_refresh_audit,
+            ) = _refresh_cached_task_reporters(
+                task_pairs=task_pairs,
+                cached_records=cached_records,
+                experiment_index=experiment_index,
+                task_review_callback=task_review_callback,
+            )
+            cached["task_records"] = cached_records
+            write_json(
+                audit_dir / "03c_cached_task_reporters.json",
+                reporter_refresh_audit,
+            )
+            if reporter_revisions:
+                # Only an evidence-backed Reporter revision re-enters the
+                # existing Writer continuation state machine. Replay the
+                # already obtained Reporter decisions once so no Reporter is
+                # launched twice against the same cached scientific delivery.
+                review_feedback.update(reporter_revisions)
+                force_task_ids.update(reporter_revisions)
+                task_review_callback = _reporter_callback_with_replay(
+                    task_review_callback,
+                    replay_by_task_id,
+                )
+                refreshed_cached_records_by_index = {
+                    int(record.get("index") or index): record
+                    for index, record in enumerate(cached_records, start=1)
+                }
+                preserve_cached_report_assets = True
+            else:
+                cached["writer_review_doc"] = {
+                    "_meta": {"mode": "task_writer_scientific_results"},
+                    **_task_writer_alignment_summary(cached_records),
+                    "task_writer_reviews": [
+                        _compact_task_writer_review(record)
+                        for record in cached_records
+                    ],
+                }
+                refreshed_status = {
+                    **(
+                        cached.get("status")
+                        if isinstance(cached.get("status"), dict)
+                        else {}
+                    ),
+                    "cached": True,
+                    "cached_writer_reused": True,
+                    "task_reporters_revalidated": True,
+                }
+                cached["status"] = _commit_cached_task_reporter_refresh(
+                    audit_dir=audit_dir,
+                    cached_records=cached_records,
+                    reporter_refresh_audit=reporter_refresh_audit,
+                    cached_status=refreshed_status,
+                )
+                write_json(
+                    audit_dir / "03c_task_writers_resume.json",
+                    {
+                        "ok": True,
+                        "source": "cached_writer_with_independent_reporter_validation",
+                        "reporter_refresh": reporter_refresh_audit,
+                    },
+                )
+                return cached
+        else:
+            cached["writer_review_doc"] = {
+                "_meta": {"mode": "task_writer_scientific_results"},
+                **_task_writer_alignment_summary(cached_records),
+                "task_writer_reviews": [
+                    _compact_task_writer_review(record) for record in cached_records
+                ],
+            }
+            write_json(
+                audit_dir / "03c_task_writers_resume.json",
+                {"ok": True, "source": "cached artifacts"},
+            )
+            return cached
+    if refreshed_cached_records_by_index:
+        # Carry the Reporter-refreshed records into dispatch. Unaffected
+        # execution units remain reusable; only a unit containing a requested
+        # Writer revision is forced into its existing continuation path.
+        resume_records.update(refreshed_cached_records_by_index)
 
-    _clear_stage_outputs(output_dir, "manifest", preserve_audit=bool(resume_records))
+    _clear_stage_outputs(
+        output_dir,
+        "manifest",
+        preserve_audit=bool(resume),
+        preserve_paths={"report_assets"} if preserve_cached_report_assets else None,
+    )
 
     task_root = audit_dir / "03c_task_writer_sandboxes"
-    if task_root.exists() and not resume_records:
+    if task_root.exists() and not resume:
         shutil.rmtree(task_root)
     task_root.mkdir(parents=True, exist_ok=True)
     status: dict[str, Any] = {
@@ -228,9 +603,11 @@ def run_codex_task_writer_workflow(
         ),
         "run_repro": bool(run_repro),
         "task_count": len(task_pairs),
+        "logical_task_count": len(task_pairs),
+        "execution_unit_count": int(execution_plan.get("execution_unit_count") or 0),
         "orchestration": "launch_all_then_wait",
     }
-    status["agent_concurrency"] = len(task_pairs)
+    status["agent_concurrency"] = int(execution_plan.get("execution_unit_count") or 0)
     write_json(audit_dir / "03c_task_writers_start.json", status)
     task_records, dispatch_audit = _dispatch_task_writers(
         task_pairs=task_pairs,
@@ -247,13 +624,34 @@ def run_codex_task_writer_workflow(
         task_root=task_root,
         audit_dir=audit_dir,
         run_repro=run_repro,
-        timeout=timeout,
         initial_records_by_index=resume_records,
         review_feedback=review_feedback,
         force_task_ids=force_task_ids,
         task_review_callback=task_review_callback,
+        case_runtime=case_runtime,
+        execution_plan=execution_plan,
+        snapshot_hashes=snapshot_hashes,
+        snapshot_finalizer=finalize_unit_snapshot,
     )
     write_json(audit_dir / "writer_dispatch.json", dispatch_audit)
+
+    foundation_requests = collect_pending_foundation_revisions(
+        task_records, foundation, declined_foundation_revision_ids
+    )
+    if foundation_requests:
+        write_json(audit_dir / "03c_task_writers_records.json", {"dispatch_policy": dispatch_audit, "tasks": task_records})
+        raise FoundationRevisionRequired(foundation_requests)
+
+    pending_requests = _task_environment_requests(task_records)
+    if pending_requests:
+        write_json(
+            audit_dir / "03c_task_writers_records.json",
+            {"dispatch_policy": dispatch_audit, "tasks": task_records},
+        )
+        raise EnvironmentRequestRequired(
+            pending_requests,
+            source="task_writers",
+        )
 
     _prepare_project_workspace(repro_project_dir, task_manifest)
     expected_paths = _merge_task_writer_deliveries(
@@ -262,13 +660,30 @@ def run_codex_task_writer_workflow(
         expected_paths=set(expected_paths),
         task_records=task_records,
         foundation=foundation,
+        execution_plan=execution_plan,
+        case_runtime=case_runtime,
+        require_lineage=run_repro,
     )
     _restore_trusted_files(repro_project_dir, task_manifest)
-    final_task_manifest = _task_manifest_with_configs(task_manifest)
+    final_task_manifest = task_manifest
     write_json(repro_project_dir / "tasks_manifest.json", final_task_manifest)
+    reconcile_runtime_requirements(
+        repro_project_dir,
+        runtime_policy=case_runtime.manifest if case_runtime is not None else None,
+        runtime_lock=case_runtime.lock if case_runtime is not None else None,
+    )
     validation = validate_repro_project(repro_project_dir)
     validation["host_validation_skipped"] = False
-    requirement_warnings = validate_requirements(repro_project_dir)
+    requirement_findings = validate_requirements(
+        repro_project_dir,
+        runtime_policy=case_runtime.manifest if case_runtime is not None else None,
+        runtime_lock=case_runtime.lock if case_runtime is not None else None,
+    )
+    requirement_issues, requirement_warnings = split_requirement_issues(
+        requirement_findings,
+        runtime_policy=case_runtime.manifest if case_runtime is not None else None,
+        runtime_lock=case_runtime.lock if case_runtime is not None else None,
+    )
     foundation_integrity_issues = (
         foundation_violations(repro_project_dir, foundation)
         if foundation is not None
@@ -290,21 +705,28 @@ def run_codex_task_writer_workflow(
         validation["python_compiles"] = False
         validation["compile_errors"] = syntax_issues
         validation["host_validation_skipped"] = False
-    manifest = _manifest_from_project(
+    manifest, portability = _freeze_repro_project_package(
         repro_project_dir=repro_project_dir,
-        expected_paths=expected_paths,
+        output_dir=output_dir,
+        audit_path=audit_dir / "03c_project_portability.json",
         task_manifest=final_task_manifest,
-        round_no=1,
+        expected_paths=expected_paths,
+        analysis_snapshot_hash=analysis_snapshot_hash,
+        foundation_snapshot_hash=foundation_snapshot_hash,
+        environment_hash=environment_hash,
+        run_smoke=bool(run_repro),
+        python_executable=(
+            case_runtime.python_executable if case_runtime is not None else None
+        ),
     )
-    manifest["_meta"]["mode"] = "task_writers"
-    manifest["_meta"]["analysis_snapshot_hash"] = analysis_snapshot_hash
-    manifest["_meta"]["foundation_snapshot_hash"] = foundation_snapshot_hash or None
-    write_json(output_dir / "repro_project_manifest.json", manifest)
+    validation["portable"] = bool(portability.get("portable"))
+    validation["relocated_smoke"] = portability.get("smoke", {})
 
     runtime_result = _task_writer_runtime_result(
         task_records=task_records,
         validation=validation,
         requirement_warnings=requirement_warnings,
+        requirement_issues=requirement_issues,
         security_issues=security_issues,
     )
     write_json(output_dir / "runtime_result.json", runtime_result)
@@ -353,2553 +775,4 @@ def run_codex_task_writer_workflow(
         "writer_review_doc": writer_review_doc,
         "written_files": [str(path) for path in _manifest_disk_paths(manifest, repro_project_dir)],
         "status": status,
-    }
-
-
-def _load_task_writer_resume_records(
-    *,
-    audit_dir: Path,
-    task_pairs: list[tuple[dict[str, Any], dict[str, Any]]],
-    expected_analysis_snapshot_hash: str,
-) -> dict[int, dict[str, Any]]:
-    path = audit_dir / "03c_task_writers_records.json"
-    if not path.exists():
-        return {}
-    try:
-        document = json.loads(path.read_text(encoding="utf-8-sig"))
-    except Exception:
-        return {}
-    raw_records = document.get("tasks") if isinstance(document, dict) else None
-    if not isinstance(raw_records, list):
-        return {}
-    expected_by_id = {
-        str(task.get("task_id") or entry.get("task_id") or f"task_{index}"): index
-        for index, (task, entry) in enumerate(task_pairs, start=1)
-    }
-    records: dict[int, dict[str, Any]] = {}
-    for record in raw_records:
-        if not isinstance(record, dict):
-            continue
-        task_id = str(record.get("task_id") or "")
-        index = expected_by_id.get(task_id)
-        if index is None:
-            continue
-        expected_sandbox = audit_dir / "03c_task_writer_sandboxes" / f"{index:02d}_{safe_label(task_id)}"
-        sandbox = Path(str(record.get("sandbox") or ""))
-        if not sandbox.exists() or sandbox.resolve() != expected_sandbox.resolve():
-            continue
-        if str(record.get("analysis_snapshot_hash") or "") != expected_analysis_snapshot_hash:
-            continue
-        records[index] = record
-    return records
-
-
-def _record_is_valid_current_delivery(record: dict[str, Any]) -> bool:
-    raw_sandbox = str(record.get("sandbox") or "").strip()
-    if not raw_sandbox:
-        return False
-    sandbox = Path(raw_sandbox)
-    if not sandbox.is_dir():
-        return False
-    status = str(record.get("task_writer_status") or "")
-    if status not in {WRITER_REVIEW_STATUS, FINAL_MATCHED_STATUS}:
-        return False
-    if status == FINAL_MATCHED_STATUS:
-        verification = record.get("verification_result")
-        if record.get("verification_verified") is not True or not isinstance(verification, dict):
-            return False
-        if verification.get("outcome") not in {"reproduced", "reproduced_with_assumptions"}:
-            return False
-    if record.get("writer_completed") is not True:
-        return False
-    result = record.get("result_json")
-    artifacts = record.get("artifacts")
-    return bool(isinstance(result, dict) and result) or bool(
-        isinstance(artifacts, dict)
-        and artifacts.get("has_artifacts")
-    )
-def _record_has_terminal_task_verification(record: dict[str, Any]) -> bool:
-    """Return whether the Reporter reached any normal scientific terminal outcome."""
-
-    verification = record.get("task_verification")
-    task_id = str(record.get("task_id") or "")
-    return (
-        isinstance(verification, dict)
-        and verification.get("host_action") == "complete"
-        and verification.get("outcome") in TERMINAL_SCIENTIFIC_OUTCOMES
-        and not task_verification_issues(verification, task_id)
-    )
-
-def _dispatch_task_writers(
-    *,
-    task_pairs: list[tuple[dict[str, Any], dict[str, Any]]],
-    facts: dict[str, Any],
-    experiment_index: dict[str, Any],
-    paper: dict[str, Any],
-    paper_path: Path,
-    paper_context_json: str,
-    paper_images: list[Any] | None,
-    paper_thesis: dict[str, Any] | None,
-    foundation: dict[str, Any] | None = None,
-    analysis_snapshot_hash: str,
-    analysis_artifacts: dict[str, Path],
-    task_root: Path,
-    audit_dir: Path,
-    run_repro: bool,
-    timeout: float = DEFAULT_CODEX_TIMEOUT_SECONDS,
-    initial_records_by_index: dict[int, dict[str, Any]] | None = None,
-    review_feedback: dict[str, dict[str, Any]] | None = None,
-    force_task_ids: set[str] | None = None,
-    task_review_callback: Callable[[int, dict[str, Any], dict[str, Any], int], dict[str, Any]] | None = None,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    existing = dict(initial_records_by_index or {})
-    feedback_by_id = dict(review_feedback or {})
-    forced = {str(item) for item in (force_task_ids or set()) if str(item)}
-    by_index: dict[int, dict[str, Any]] = {
-        index: record
-        for index, record in existing.items()
-        if _task_writer_runtime_task_passed(record)
-        and str(record.get("task_id") or "") not in forced
-        and (task_review_callback is None or _record_has_terminal_task_verification(record))
-    }
-    pending_indexes = [index for index in range(1, len(task_pairs) + 1) if index not in by_index]
-    audit: dict[str, Any] = {
-        "policy": "parallel_first",
-        "parallel_attempted": len(task_pairs) > 1,
-        "task_count": len(task_pairs),
-        "runtime_capability": "parallel_subagents",
-        "session_timeout_s": float(timeout),
-        "overall_runtime_limit_s": None,
-        "dispatch_batches": [{
-            "batch_id": "stage5_all_task_writers",
-            "task_ids": [str(task_pairs[index - 1][0].get("task_id") or f"task_{index}") for index in pending_indexes],
-            "launched_before_wait": True,
-            "concurrency_limit": len(pending_indexes),
-        }] if pending_indexes else [],
-        "fallback_reason": None,
-        "fallback_evidence_files": [],
-        "attempts": [],
-        "reused_task_ids": [str(record.get("task_id") or "") for record in by_index.values()],
-        "launched_task_ids": [str(task_pairs[index - 1][0].get("task_id") or "") for index in pending_indexes],
-    }
-    audit_path = audit_dir / "writer_dispatch.json"
-    write_json(audit_path, audit)
-    futures: dict[Future[dict[str, Any]], int] = {}
-    if pending_indexes:
-        with ThreadPoolExecutor(max_workers=len(pending_indexes)) as executor:
-            for index in pending_indexes:
-                task, manifest_entry = task_pairs[index - 1]
-                futures[executor.submit(
-                    _run_one_task_writer,
-                    index=index,
-                    reuse_existing=bool(existing.get(index)),
-                    task=task,
-                    manifest_entry=manifest_entry,
-                    facts=facts,
-                    experiment_index=experiment_index,
-                    paper=paper,
-                    paper_path=paper_path,
-                    paper_context_json=paper_context_json,
-                    paper_images=paper_images,
-                    paper_thesis=paper_thesis,
-                    foundation=foundation,
-                    analysis_snapshot_hash=analysis_snapshot_hash,
-                    analysis_artifacts=analysis_artifacts,
-                    task_root=task_root,
-                    audit_dir=audit_dir,
-                    run_repro=run_repro,
-                    timeout=timeout,
-                    review_feedback=feedback_by_id.get(
-                        str(task.get("task_id") or manifest_entry.get("task_id") or "")
-                    ),
-                    task_review_callback=task_review_callback,
-                )] = index
-            for future in as_completed(futures):
-                index = futures[future]
-                try:
-                    by_index[index] = future.result()
-                except Exception as exc:
-                    task, manifest_entry = task_pairs[index - 1]
-                    failed_task_id = str(
-                        task.get("task_id")
-                        or manifest_entry.get("task_id")
-                        or f"task_{index}"
-                    )
-                    by_index[index] = _failed_task_record(
-                        index=index,
-                        task_id=failed_task_id,
-                        module=str(manifest_entry.get("module") or ""),
-                        output_subdir=str(
-                            manifest_entry.get("output_subdir") or failed_task_id
-                        ),
-                        sandbox=(
-                            task_root
-                            / f"{index:02d}_{safe_label(failed_task_id)}"
-                        ),
-                        error=f"{type(exc).__name__}: {exc}",
-                    )
-                audit["attempts"].append(
-                    {
-                        "task_id": by_index[index].get("task_id"),
-                        "index": index,
-                        "writer_error_kind": by_index[index].get("writer_error_kind"),
-                        "writer_completed": bool(by_index[index].get("writer_completed")),
-                    }
-                )
-                write_json(audit_path, audit)
-    records = [by_index[index] for index in range(1, len(task_pairs) + 1)]
-    audit["completed_task_count"] = len(records)
-    write_json(audit_path, audit)
-    return records, audit
-def _rerun_evidence_fingerprint(evidence: Any) -> str:
-    """Return an order-stable scientific rerun identity for loop detection."""
-
-    value = evidence if isinstance(evidence, dict) else {}
-
-    def _normalized_list(key: str) -> list[str]:
-        raw = value.get(key)
-        if not isinstance(raw, list):
-            return []
-        return sorted({str(item).strip().casefold() for item in raw if str(item).strip()})
-
-    payload = {
-        "rerun_reason": str(value.get("rerun_reason") or "none").strip().casefold(),
-        "contract_item_ids": _normalized_list("contract_item_ids"),
-        "change_targets": _normalized_list("change_targets"),
-    }
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
-
-
-def _writer_source_config_fingerprint(sandbox: Path) -> str:
-    """Hash task-owned source and run configuration, excluding outputs."""
-
-    digest = hashlib.sha256()
-    paths = list(_task_owned_files(sandbox))
-    for name in ("config.json", "config_smoke.json", "requirements.txt"):
-        path = sandbox / name
-        if path.is_file() and not path.is_symlink():
-            paths.append(path)
-    for path in sorted(set(paths), key=lambda item: item.relative_to(sandbox).as_posix()):
-        relative = path.relative_to(sandbox).as_posix()
-        digest.update(relative.encode("utf-8"))
-        digest.update(b"\0")
-        try:
-            with path.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
-        except OSError:
-            digest.update(b"<unreadable>")
-        digest.update(b"\0")
-    return digest.hexdigest()
-
-
-def _record_source_config_fingerprint(record: dict[str, Any], fallback: Path) -> str:
-    raw_sandbox = str(record.get("sandbox") or "").strip()
-    sandbox = Path(raw_sandbox) if raw_sandbox else fallback
-    return _writer_source_config_fingerprint(sandbox)
-
-
-def _terminalize_rerun_request(
-    *,
-    record: dict[str, Any],
-    verification: dict[str, Any] | None,
-    stop_reason: str,
-    uncertainty: str,
-) -> dict[str, Any]:
-    terminal = dict(verification or {})
-    terminal["host_action"] = "complete"
-    terminal["rerun_reason"] = "none"
-    terminal["outcome"] = (
-        "execution_failed" if terminal.get("run_valid") is False else "not_reproduced"
-    )
-    uncertainties = terminal.get("remaining_uncertainties")
-    if not isinstance(uncertainties, list):
-        uncertainties = []
-        terminal["remaining_uncertainties"] = uncertainties
-    uncertainties.append(uncertainty)
-    record["task_verification"] = terminal
-    if isinstance(record.get("task_reporter"), dict):
-        record["task_reporter"]["task_verification"] = terminal
-    record["scientific_stop_reason"] = stop_reason
-    return terminal
-
-
-def _run_one_task_writer(
-    *,
-    index: int,
-    reuse_existing: bool,
-    task: dict[str, Any],
-    manifest_entry: dict[str, Any],
-    facts: dict[str, Any],
-    experiment_index: dict[str, Any],
-    paper: dict[str, Any],
-    paper_path: Path,
-    paper_context_json: str,
-    paper_images: list[Any] | None,
-    paper_thesis: dict[str, Any] | None,
-    foundation: dict[str, Any] | None = None,
-    analysis_snapshot_hash: str,
-    analysis_artifacts: dict[str, Path],
-    task_root: Path,
-    audit_dir: Path,
-    run_repro: bool,
-    timeout: float = DEFAULT_CODEX_TIMEOUT_SECONDS,
-    review_feedback: dict[str, Any] | None = None,
-    task_review_callback: Callable[[int, dict[str, Any], dict[str, Any], int], dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    task_id = str(task.get("task_id") or manifest_entry.get("task_id") or f"task_{index}")
-    module = str(manifest_entry.get("module") or safe_label(task_id))
-    task = _task_with_experiment_profile(task, experiment_index)
-    base_label = f"03c_task_writer_{index:02d}_{safe_label(task_id)}"
-    sandbox = task_root / f"{index:02d}_{safe_label(task_id)}"
-    output_subdir = str(manifest_entry.get("output_subdir") or task_id)
-    _prepare_task_writer_sandbox(
-        sandbox=sandbox,
-        task=task,
-        manifest_entry=manifest_entry,
-        paper=paper,
-        paper_path=paper_path,
-        facts=facts,
-        paper_thesis=paper_thesis,
-        analysis_snapshot_hash=analysis_snapshot_hash,
-        analysis_artifacts=analysis_artifacts,
-        full_paper_images=paper_images,
-        reuse_existing=reuse_existing,
-        foundation=foundation,
-    )
-    execution_binding = _load_task_execution_binding(sandbox, task_id)
-    base_prompt = _build_task_writer_brief(
-        index=index,
-        task=task,
-        manifest_entry=manifest_entry,
-        facts=facts,
-        experiment_index=experiment_index,
-        paper=paper,
-        paper_context_json=paper_context_json,
-        paper_thesis=paper_thesis,
-        run_repro=run_repro,
-        review_feedback=review_feedback,
-        foundation_enabled=foundation is not None,
-        execution_binding=execution_binding,
-    )
-    session_round = 1
-    seen_rerun_requests: set[str] = set()
-    evidence_based_reruns = 0
-    rerun_budget = _external_writer_rerun_budget()
-    required_change_baseline: str | None = None
-    if reuse_existing:
-        archive_round = _next_writer_progress_round(sandbox)
-        if task_review_callback is None:
-            existing_record = _collect_task_writer_delivery(
-                index=index,
-                task=task,
-                manifest_entry=manifest_entry,
-                sandbox=sandbox,
-                writer_status={'ok': True, 'source': 'resumed_existing_delivery'},
-            )
-            existing_record['analysis_snapshot_hash'] = analysis_snapshot_hash
-            existing_record['writer_session_count'] = max(1, archive_round)
-            if existing_record.get('task_writer_status') == TASK_WRITER_TERMINAL_STATUS:
-                return existing_record
-        if task_review_callback is not None:
-            existing_record = _collect_task_writer_delivery(
-                index=index,
-                task=task,
-                manifest_entry=manifest_entry,
-                sandbox=sandbox,
-                writer_status={"ok": True, "source": "resumed_existing_delivery"},
-            )
-            existing_record["analysis_snapshot_hash"] = analysis_snapshot_hash
-            existing_record["writer_session_count"] = max(1, archive_round)
-            if existing_record.get("task_writer_status") == TASK_WRITER_TERMINAL_STATUS:
-                review_action, returned_feedback = _attach_task_reporter_review(
-                    callback=task_review_callback,
-                    index=index,
-                    task=task,
-                    record=existing_record,
-                    session_round=archive_round,
-                )
-                if review_action in {"terminal", "failed"}:
-                    return existing_record
-                if review_action == "writer_revision":
-                    evidence = (
-                        returned_feedback.get("rerun_evidence")
-                        if isinstance(returned_feedback, dict)
-                        else None
-                    )
-                    seen_rerun_requests.add(_rerun_evidence_fingerprint(evidence))
-                    evidence_based_reruns = 1
-                    review_feedback = returned_feedback
-                    required_change_baseline = _record_source_config_fingerprint(
-                        existing_record,
-                        sandbox,
-                    )
-        _archive_nonterminal_writer_delivery(
-            sandbox=sandbox,
-            output_subdir=output_subdir,
-            round_no=archive_round,
-            session_status={"ok": True, "source": "resumed_nonmatched_delivery"},
-        )
-        session_round = archive_round + 1
-
-    while True:
-        label = base_label if session_round == 1 else f"{base_label}_continue_{session_round:03d}"
-        prompt = (
-            base_prompt
-            if session_round == 1
-            else _build_task_writer_continuation_brief(
-                base_prompt=base_prompt,
-                task_id=task_id,
-                module=module,
-                session_round=session_round,
-                review_feedback=review_feedback,
-            )
-        )
-        writer_status = _run_task_writer_codex_session(
-            label=label,
-            prompt=prompt,
-            sandbox=sandbox,
-            audit_dir=audit_dir,
-            timeout=timeout,
-        )
-
-        if foundation is not None:
-            frozen_issues = foundation_violations(sandbox, foundation)
-            if frozen_issues:
-                restore_foundation_snapshot(sandbox, foundation)
-                writer_status = {
-                    **writer_status,
-                    "ok": False,
-                    "error_kind": "foundation_modified",
-                    "blocked_reason": "task writer changed the frozen scientific foundation",
-                    "foundation_violations": frozen_issues,
-                }
-        _restore_trusted_files(sandbox, {"version": 1, "tasks": [manifest_entry]})
-        record = _collect_task_writer_delivery(
-            index=index,
-            task=task,
-            manifest_entry=manifest_entry,
-            sandbox=sandbox,
-            writer_status=writer_status,
-            require_stopping_assessment=False,
-        )
-        record["analysis_snapshot_hash"] = analysis_snapshot_hash
-        record["writer_session_count"] = session_round
-        if required_change_baseline is not None:
-            current_state = _record_source_config_fingerprint(record, sandbox)
-            if current_state == required_change_baseline:
-                _terminalize_rerun_request(
-                    record=record,
-                    verification=review_feedback,
-                    stop_reason="writer_continuation_without_source_change",
-                    uncertainty=(
-                        "The Reporter-authorized continuation changed neither task source "
-                        "nor run configuration; the flow stopped instead of spending "
-                        "another unchanged scientific run."
-                    ),
-                )
-                return record
-            required_change_baseline = None
-        if not run_repro or task_review_callback is None:
-            return record
-        review_action, returned_feedback = _attach_task_reporter_review(
-            callback=task_review_callback,
-            index=index,
-            task=task,
-            record=record,
-            session_round=session_round,
-        )
-        if review_action in {"terminal", "failed"}:
-            return record
-        if review_action == "writer_revision":
-            evidence = (
-                returned_feedback.get("rerun_evidence")
-                if isinstance(returned_feedback, dict)
-                else None
-            )
-            rerun_fingerprint = _rerun_evidence_fingerprint(evidence)
-            if rerun_fingerprint in seen_rerun_requests:
-                _terminalize_rerun_request(
-                    record=record,
-                    verification=returned_feedback,
-                    stop_reason="repeated_rerun_request_without_new_causal_plan",
-                    uncertainty=(
-                        "The same causal rerun request recurred after one Writer attempt; "
-                        "the flow stopped instead of repeating unchanged work."
-                    ),
-                )
-                return record
-            if (
-                evidence_based_reruns >= rerun_budget
-            ):
-                _terminalize_rerun_request(
-                    record=record,
-                    verification=returned_feedback,
-                    stop_reason="external_rerun_budget_exhausted",
-                    uncertainty=(
-                        "The externally configured operational rerun budget was exhausted; "
-                        "the latest scientific result was retained for reporting."
-                    ),
-                )
-                return record
-            seen_rerun_requests.add(rerun_fingerprint)
-            evidence_based_reruns += 1
-            review_feedback = returned_feedback
-            required_change_baseline = _record_source_config_fingerprint(
-                record,
-                sandbox,
-            )
-            _archive_nonterminal_writer_delivery(
-                sandbox=sandbox,
-                output_subdir=output_subdir,
-                round_no=session_round,
-                session_status=writer_status,
-            )
-            session_round += 1
-            continue
-        return record
-
-
-def _attach_task_reporter_review(
-    *,
-    callback: Callable[[int, dict[str, Any], dict[str, Any], int], dict[str, Any]],
-    index: int,
-    task: dict[str, Any],
-    record: dict[str, Any],
-    session_round: int,
-) -> tuple[str, dict[str, Any] | None]:
-    expected_task_id = str(task.get("task_id") or record.get("task_id") or "")
-    try:
-        task_reporter = callback(index, task, record, session_round)
-    except Exception as exc:
-        message = redact_text(f"{type(exc).__name__}: {exc}")[:1000]
-        task_reporter = {
-            "ok": False,
-            "task_id": expected_task_id,
-            "task_verification": {},
-            "error": message,
-            "error_kind": "task_reporter_callback_failed",
-        }
-        record["task_reporter"] = task_reporter
-        record["task_reporter_error_kind"] = "task_reporter_callback_failed"
-        warnings = record.setdefault("delivery_warnings", [])
-        if isinstance(warnings, list):
-            warnings.append("task Reporter failed; the host will synthesize a terminal outcome")
-        return "failed", None
-
-    record["task_reporter"] = task_reporter
-    verification = task_reporter.get("task_verification") if isinstance(task_reporter, dict) else None
-    if isinstance(verification, dict):
-        record["task_verification"] = verification
-    if not isinstance(task_reporter, dict) or not task_reporter.get("ok"):
-        record["task_reporter_error_kind"] = "task_reporter_failed"
-        record["task_reporter_error"] = (
-            task_reporter.get("error")
-            if isinstance(task_reporter, dict)
-            else "task reporter callback failed"
-        )
-        warnings = record.setdefault("delivery_warnings", [])
-        if isinstance(warnings, list):
-            warnings.append("task Reporter was unavailable; preserving the Writer delivery")
-        return "failed", None
-    if not isinstance(verification, dict):
-        record["task_reporter_error_kind"] = "task_reporter_missing_result"
-        record["task_reporter_error"] = "task reporter produced no usable scientific note"
-        warnings = record.setdefault("delivery_warnings", [])
-        if isinstance(warnings, list):
-            warnings.append("task Reporter produced no note; preserving the Writer delivery")
-        return "failed", None
-    if verification.get("host_action") == "rerun_writer":
-        path_issues = rerun_evidence_path_issues(
-            verification,
-            task_reporter.get("workspace"),
-        )
-        if path_issues:
-            warnings = record.setdefault("delivery_warnings", [])
-            if isinstance(warnings, list):
-                warnings.extend(path_issues)
-            _terminalize_rerun_request(
-                record=record,
-                verification=verification,
-                stop_reason="untrusted_rerun_paper_evidence",
-                uncertainty=(
-                    "Reporter suggested a rerun without trusted existing paper evidence; "
-                    "the host declined it and retained a terminal outcome."
-                ),
-            )
-        elif writer_revision_allowed(verification, expected_task_id):
-            return "writer_revision", verification
-        else:
-            # A malformed rerun request is not a reason to burn another full run.
-            _terminalize_rerun_request(
-                record=record,
-                verification=verification,
-                stop_reason="incomplete_causal_rerun_plan",
-                uncertainty=(
-                    "Reporter suggested a rerun without a complete causal plan; "
-                    "the host recorded a terminal outcome."
-                ),
-            )
-    issues = task_verification_issues(record.get("task_verification"), expected_task_id)
-    if issues:
-        warnings = record.setdefault("delivery_warnings", [])
-        if isinstance(warnings, list):
-            warnings.extend(issues)
-    final_verification = record.get("task_verification")
-    record["task_reporter_successful"] = (
-        isinstance(final_verification, dict)
-        and final_verification.get("outcome") in {
-            "reproduced",
-            "reproduced_with_assumptions",
-        }
-    )
-    record["task_reporter_terminal"] = True
-    return "terminal", None
-def _next_writer_progress_round(sandbox: Path) -> int:
-    progress_root = sandbox / "writer_progress"
-    rounds: list[int] = []
-    if progress_root.is_dir():
-        for path in progress_root.iterdir():
-            if not path.is_dir() or not path.name.startswith("round_"):
-                continue
-            try:
-                rounds.append(int(path.name.split("_", 1)[1]))
-            except (TypeError, ValueError):
-                continue
-    return max(rounds, default=0) + 1
-
-
-def _run_task_writer_codex_session(
-    *,
-    label: str,
-    prompt: str,
-    sandbox: Path,
-    audit_dir: Path,
-    timeout: float = DEFAULT_CODEX_TIMEOUT_SECONDS,
-) -> dict[str, Any]:
-    write_text(audit_dir / f"{label}_brief.md", prompt)
-    python_dir = Path(sys.executable).resolve().parent
-    return run_codex_subprocess(
-        role="task_writer",
-        work_dir=sandbox,
-        prompt=prompt,
-        audit_dir=audit_dir,
-        label=label,
-        sandbox="workspace-write",
-        timeout=timeout,
-        command_override=get_config_value("GENG_CODEX_TASK_WRITER_CMD"),
-        image_paths=sorted(
-            path.resolve()
-            for path in (sandbox / PAPER_EVIDENCE_DIR / "full_paper_pages").glob("paper_page_*.png")
-            if path.is_file()
-        ),
-        extra_env={"GENG_PYTHON_EXECUTABLE": sys.executable, "PYTHONDONTWRITEBYTECODE": "1"},
-        path_prepend=[python_dir],
-    )
-
-
-def _build_task_writer_continuation_brief(
-    *,
-    base_prompt: str,
-    task_id: str,
-    module: str,
-    session_round: int,
-    review_feedback: dict[str, Any] | None = None,
-) -> str:
-    feedback_text = pretty_json(review_feedback) if review_feedback else "None"
-    return f"""# Mandatory continuation: session {session_round}
-
-The previous Codex session for `{task_id}` ended without a valid `ready_for_review` delivery, or the independent reporter reported a possible material paper mismatch. Continue in the existing sandbox; do not restart the implementation and do not merely rewrite the previous explanation.
-
-{WRITER_PAPER_FIDELITY_POLICY}
-
-{CORE_RESULT_STOP_POLICY}
-
-Before acting:
-1. Read the existing task code, configs, outputs, and `writer_progress/` archives.
-2. Inspect the latest local CSV/summary/PNG against the complete paper evidence.
-3. Classify every reporter item before editing: (a) a paper-grounded violation of an explicit fact, failure of any assigned core conclusion, or a key numerical mismatch by a factor of 10 or more; (b) a reasonable choice inside paper-silent or ambiguous space; or (c) a numerical mismatch below a factor of 10 or another non-material statistical, visual, or presentation difference.
-4. Create a concrete modification plan only for category (a). For category (b), keep or revise the explicit assumption according to evidence only before the mandatory stop condition is met. For category (c), record the caveat without changing faithful code merely to satisfy the reporter. Once the stop condition is met, do not change any assumption, seed, dataset filter, configuration, or epoch count.
-5. Run a fresh full with `python -m tasks.{module} config.json` only after a meaningful change that is permitted by the mandatory stopping policy. Never rerun unchanged code solely to answer non-blocking feedback.
-6. Keep iterating only while a permitted paper-grounded material blocker remains and a new concrete causal change is available. If the result is still unsupported or unassessable but no such change exists, stop scientific modification and submit it for an honest terminal report.
-7. Write `task_agent_result.json` with status `ready_for_review` after the latest full attempt. This means ready for independent classification, not a claim that reproduction succeeded.
-
-## Isolated task reporter feedback
-```json
-{feedback_text}
-```
-
-Investigate the causal rerun note, but do not obey it blindly. Make the specified change only if it remains consistent with the paper. If the same plan already failed, evidence is incomplete, or the issue is non-material, preserve the faithful result and resubmit without another unchanged run.
-
-The original task brief follows.
-
-{base_prompt}
-"""
-
-
-def _archive_nonterminal_writer_delivery(
-    *,
-    sandbox: Path,
-    output_subdir: str,
-    round_no: int,
-    session_status: dict[str, Any],
-) -> None:
-    progress_dir = sandbox / "writer_progress" / f"round_{round_no:03d}"
-    progress_dir.mkdir(parents=True, exist_ok=True)
-    for filename in ("task_agent_result.json", "task_agent_result.md"):
-        source, _ = _task_result_file_path(sandbox, output_subdir, filename)
-        if not source.is_file():
-            continue
-        shutil.copy2(source, progress_dir / filename)
-        source.unlink()
-    write_json(
-        progress_dir / "session_status.json",
-        {
-            "terminal": False,
-            "reason": "writer session ended without ready_for_review",
-            "session_status": session_status,
-        },
-    )
-
-
-def _collect_task_writer_delivery(
-    *,
-    index: int,
-    task: dict[str, Any],
-    manifest_entry: dict[str, Any],
-    sandbox: Path,
-    writer_status: dict[str, Any],
-    require_stopping_assessment: bool = False,
-) -> dict[str, Any]:
-    """Collect writer-owned outputs without repairing or format-gating them."""
-    task_id = str(task.get("task_id") or manifest_entry.get("task_id") or f"task_{index}")
-    module = str(manifest_entry.get("module") or "")
-    output_subdir = str(manifest_entry.get("output_subdir") or task.get("task_id") or "task")
-    result_path, _ = _task_result_file_path(sandbox, output_subdir, "task_agent_result.json")
-    markdown_path, _ = _task_result_file_path(sandbox, output_subdir, "task_agent_result.md")
-    result_doc = _read_optional_json_object(result_path)
-    reported_status = str(result_doc.get("status") or "")
-    delivery_issues = writer_delivery_issues(
-        result_doc,
-        require_stopping_assessment=require_stopping_assessment,
-    )
-    delivery_blockers, delivery_warnings = partition_writer_delivery_issues(
-        result_doc,
-        require_stopping_assessment=require_stopping_assessment,
-    )
-    artifacts = inspect_output_artifacts(
-        sandbox,
-        subdir=output_subdir,
-        declared_artifacts=task.get("expected_artifacts"),
-    )
-    binding_issues = _task_execution_binding_issues(
-        sandbox=sandbox,
-        task_id=task_id,
-        result_doc=result_doc,
-    )
-    if binding_issues:
-        binding_warnings = [f'shared_component_advisory: {issue}' for issue in binding_issues]
-        delivery_issues.extend(binding_warnings)
-        delivery_warnings.extend(binding_warnings)
-    # Writer JSON is self-reported disclosure. A malformed/incomplete object
-    # stays visible as warnings, while readable scientific artifacts still
-    # advance to the independent Reporter.
-    delivery_usable = bool(result_doc) or bool(artifacts.get("has_artifacts"))
-    if not delivery_usable:
-        blocker = "writer produced neither a readable result note nor a scientific artifact"
-        delivery_blockers.append(blocker)
-        delivery_issues.append(blocker)
-    status = TASK_WRITER_TERMINAL_STATUS if delivery_usable else "failed"
-    local_images = _collect_writer_images(
-        sandbox=sandbox,
-        output_subdir=output_subdir,
-        declared=result_doc.get("local_image_paths"),
-        fallback_pattern="*.png",
-        exclude_names={"paper_target_crop.png", "paper_target_locator.png"},
-    )
-    return {
-        "index": index,
-        "task_id": task_id,
-        "module": module,
-        "output_subdir": output_subdir,
-        "sandbox": str(sandbox),
-        "writer_status": writer_status,
-        "writer_completed": delivery_usable,
-        "task_writer_status": status,
-        "writer_reported_status": reported_status or None,
-        "delivery_validation_issues": delivery_issues,
-        "delivery_blockers": delivery_blockers,
-        "delivery_warnings": delivery_warnings,
-        "process_warning": None if writer_status.get("ok") else (writer_status.get("error") or writer_status.get("blocked_reason") or "writer process ended after producing a usable delivery"),
-        "result_json": result_doc,
-        "result_json_path": str(result_path) if result_path.exists() else None,
-        "result_markdown_path": str(markdown_path) if markdown_path.exists() else None,
-        "execution_summary": result_doc.get("execution_summary", {}),
-        "artifacts": artifacts,
-        "local_images": local_images,
-        "writer_error_kind": writer_status.get("error_kind"),
-        "blocked_reason": writer_status.get("blocked_reason"),
-    }
-
-
-def _read_optional_json_object(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        return {}
-    try:
-        value = json.loads(path.read_text(encoding="utf-8-sig"))
-    except Exception:
-        return {}
-    return value if isinstance(value, dict) else {}
-
-
-def _load_task_execution_binding(sandbox: Path, task_id: str) -> dict[str, Any] | None:
-    '''Load the task-scoped scientific execution contract from its sandbox copy.'''
-
-    architecture = _read_optional_json_object(
-        sandbox
-        / PAPER_EVIDENCE_DIR
-        / 'analysis_artifacts'
-        / 'scientific_architecture.json'
-    )
-    return _task_execution_binding_from_architecture(architecture, task_id)
-
-
-def _task_execution_binding_from_architecture(
-    architecture: Any,
-    task_id: str,
-) -> dict[str, Any] | None:
-    '''Resolve a 1.1 binding to concrete component execution records.
-
-    Architecture 1.0 deliberately returns ``None`` so existing cases retain
-    their legacy writer prompt and delivery behavior.
-    '''
-
-    if not isinstance(architecture, dict) or str(architecture.get('schema_version') or '') != '1.1':
-        return None
-    raw_components = architecture.get('components')
-    components_by_id = {
-        str(item.get('id')): item
-        for item in raw_components
-        if isinstance(item, dict) and str(item.get('id') or '')
-    } if isinstance(raw_components, list) else {}
-    raw_bindings = architecture.get('bindings')
-    binding = next(
-        (
-            item
-            for item in raw_bindings
-            if isinstance(item, dict)
-            and str(item.get('task_id') or '') == str(task_id)
-        ),
-        None,
-    ) if isinstance(raw_bindings, list) else None
-    configuration_issues: list[str] = []
-    bound_components: list[dict[str, Any]] = []
-    if not isinstance(binding, dict):
-        configuration_issues.append(f'no scientific_architecture/1.1 binding exists for task {task_id}')
-    else:
-        component_ids = binding.get('components')
-        if not isinstance(component_ids, list):
-            configuration_issues.append('binding.components must be a list of component IDs')
-            component_ids = []
-        for raw_component_id in component_ids:
-            component_id = str(raw_component_id or '')
-            component = components_by_id.get(component_id)
-            if not isinstance(component, dict):
-                label = component_id or '<empty>'
-                configuration_issues.append(f'binding refers to unknown component {label}')
-                continue
-            execution = component.get('execution')
-            bound_components.append(
-                {
-                    'component_id': component_id,
-                    'module': str(component.get('module') or ''),
-                    'callable': str(component.get('callable') or ''),
-                    'execution': dict(execution) if isinstance(execution, dict) else {},
-                }
-            )
-    return {
-        'schema_version': '1.1',
-        'task_id': str(task_id),
-        'experiment_id': str(binding.get('experiment_id') or '') if isinstance(binding, dict) else '',
-        'consistency_group': str(binding.get('consistency_group') or '') if isinstance(binding, dict) else '',
-        'components': bound_components,
-        'configuration_issues': configuration_issues,
-    }
-
-
-def _task_execution_binding_issues(
-    *,
-    sandbox: Path,
-    task_id: str,
-    result_doc: Any,
-    execution_binding: dict[str, Any] | None = None,
-) -> list[str]:
-    '''Apply the low-false-positive static gate for architecture 1.1.'''
-
-    contract = execution_binding or _load_task_execution_binding(sandbox, task_id)
-    if not isinstance(contract, dict) or str(contract.get('schema_version') or '') != '1.1':
-        return []
-    issues = [str(item) for item in contract.get('configuration_issues', []) if str(item)]
-    components = [item for item in contract.get('components', []) if isinstance(item, dict)]
-    usage_items = result_doc.get('component_usage') if isinstance(result_doc, dict) else None
-    usage_by_id: dict[str, dict[str, Any]] = {}
-    if not isinstance(usage_items, list):
-        issues.append('task_agent_result.json must contain component_usage for every bound component')
-        usage_items = []
-    for index, item in enumerate(usage_items):
-        if not isinstance(item, dict):
-            issues.append(f'component_usage[{index}] must be an object')
-            continue
-        component_id = str(item.get('component_id') or '')
-        if not component_id:
-            issues.append(f'component_usage[{index}].component_id is empty')
-        elif component_id in usage_by_id:
-            issues.append(f'component_usage contains duplicate component {component_id}')
-        else:
-            usage_by_id[component_id] = item
-
-    expected_ids = {str(item.get('component_id') or '') for item in components}
-    for unexpected in sorted(set(usage_by_id) - expected_ids):
-        issues.append(f'component_usage declares unbound component {unexpected}')
-
-    source_facts = _inspect_task_execution_source(sandbox, task_id)
-    imported_modules = source_facts['imported_modules']
-    reachable_task_files = source_facts['reachable_task_files']
-    for component in components:
-        component_id = str(component.get('component_id') or '')
-        module = str(component.get('module') or '')
-        callable_name = str(component.get('callable') or '')
-        execution = component.get('execution') if isinstance(component.get('execution'), dict) else {}
-        usage = usage_by_id.get(component_id)
-        if not isinstance(usage, dict):
-            issues.append(f'component_usage is missing bound component {component_id}')
-        else:
-            if str(usage.get('module') or '') != module:
-                issues.append(f'{component_id}: component_usage.module must equal declared module {module}')
-            if str(usage.get('callable') or '') != callable_name:
-                issues.append(f'{component_id}: component_usage.callable must equal declared callable {callable_name}')
-            usage_kind = str(usage.get('usage') or '')
-            if usage_kind not in {'in_scientific_path', 'reference_only', 'not_used'}:
-                issues.append(
-                    f'{component_id}: usage must be in_scientific_path, reference_only, or not_used'
-                )
-            evidence = usage.get('evidence_files')
-            evidence_items = (
-                [str(item).strip() for item in evidence if str(item).strip()]
-                if isinstance(evidence, list)
-                else []
-            )
-            if not evidence_items:
-                issues.append(f'{component_id}: evidence_files must identify the task scientific path')
-            for raw_evidence in evidence_items:
-                relative = _sandbox_evidence_source(sandbox, raw_evidence)
-                if relative is None:
-                    issues.append(
-                        f'{component_id}: evidence file {raw_evidence!r} must exist inside the sandbox'
-                    )
-                elif relative.casefold() not in reachable_task_files:
-                    issues.append(
-                        f'{component_id}: evidence file {raw_evidence!r} is not in the assigned task import closure'
-                    )
-            if execution.get('shared_implementation') is True and usage_kind != 'in_scientific_path':
-                declared = usage_kind or 'undeclared'
-                issues.append(
-                    f'{component_id}: shared_implementation must be used in_scientific_path, not {declared}'
-                )
-
-        expected_import = _normalize_python_module(module)
-        if not expected_import:
-            issues.append(f'{component_id}: declared component module is empty')
-        elif expected_import not in imported_modules:
-            issues.append(
-                f'{component_id}: expected module {expected_import} is not reachable from the assigned task entry through task-local and src import graphs'
-            )
-        elif callable_name and not _declared_callable_is_called(
-            source_facts,
-            module=expected_import,
-            callable_name=callable_name,
-        ):
-            issues.append(
-                f'{component_id}: declared callable {expected_import}.{callable_name} is imported but not called from the assigned task scientific path'
-            )
-    return _dedupe_strings(issues)
-
-
-def _normalize_python_module(module: str) -> str:
-    value = str(module or '').strip().replace('\\', '/').lstrip('./')
-    if value.endswith('/__init__.py'):
-        value = value[:-12]
-    elif value.endswith('.py'):
-        value = value[:-3]
-    return value.strip('/').replace('/', '.')
-
-
-def _inspect_task_execution_source(sandbox: Path, task_id: str) -> dict[str, Any]:
-    '''Inspect only the source closure rooted at the assigned task entrypoint.'''
-
-    module_paths, module_names = _task_module_index(sandbox)
-    entry = _assigned_task_entrypoint(sandbox, task_id)
-    imported_modules: set[str] = set()
-    reachable_task_files: set[str] = set()
-    pending = [entry.resolve()] if entry is not None else []
-    visited: set[Path] = set()
-    while pending:
-        path = pending.pop()
-        if path in visited:
-            continue
-        visited.add(path)
-        module_name = module_names.get(path)
-        if not module_name:
-            continue
-        try:
-            tree = ast.parse(path.read_text(encoding='utf-8-sig'), filename=str(path))
-        except (OSError, UnicodeError, SyntaxError):
-            continue
-        reachable_task_files.add(path.relative_to(sandbox.resolve()).as_posix().casefold())
-        imported = _imports_from_local_module(
-            tree,
-            module_name=module_name,
-            is_package=path.name == '__init__.py',
-        )
-        imported_modules.update(imported)
-        for imported_name in imported:
-            candidate = module_paths.get(imported_name)
-            if candidate is not None and candidate not in visited:
-                pending.append(candidate)
-    reachable_src_modules = _reachable_local_src_modules(sandbox, imported_modules)
-    callable_usage = _static_callable_usage(
-        sandbox,
-        entry=entry,
-        reachable_task_paths=visited,
-        reachable_src_modules=reachable_src_modules,
-    )
-    return {
-        'imported_modules': reachable_src_modules,
-        'direct_imported_modules': imported_modules,
-        'reachable_task_files': reachable_task_files,
-        'called_symbols': callable_usage,
-    }
-
-
-def _assigned_task_entrypoint(sandbox: Path, task_id: str) -> Path | None:
-    '''Prefer the trusted manifest entry, then fall back to a task-id filename.'''
-
-    manifest = _read_optional_json_object(sandbox / 'tasks_manifest.json')
-    raw_entries = manifest.get('tasks') if isinstance(manifest, dict) else None
-    for entry in raw_entries if isinstance(raw_entries, list) else []:
-        if not isinstance(entry, dict) or str(entry.get('task_id') or '') != str(task_id):
-            continue
-        candidates: list[str] = []
-        script = str(entry.get('script') or '').strip()
-        module = str(entry.get('module') or '').strip()
-        if script:
-            candidates.append(script)
-        if module:
-            candidates.append(f"tasks/{module.replace('.', '/')}.py")
-        for raw in candidates:
-            path = _safe_task_source_path(sandbox, raw)
-            if path is not None:
-                return path
-
-    raw_task_id = str(task_id or '').strip()
-    fallback_names = [raw_task_id]
-    slug = ''.join(
-        character if character.isalnum() or character == '_' else '_'
-        for character in raw_task_id
-    ).strip('_').lower()
-    if slug and slug[0].isdigit():
-        slug = f't_{slug}'
-    if slug and slug not in fallback_names:
-        fallback_names.append(slug)
-    for name in fallback_names:
-        path = _safe_task_source_path(sandbox, f'tasks/{name}.py')
-        if path is not None:
-            return path
-    return None
-
-
-def _safe_task_source_path(sandbox: Path, raw: str) -> Path | None:
-    value = str(raw or '').strip().replace('\\', '/')
-    if not value:
-        return None
-    candidate = Path(value)
-    if not candidate.is_absolute():
-        candidate = sandbox / candidate
-    try:
-        resolved = candidate.resolve()
-        resolved.relative_to((sandbox / 'tasks').resolve())
-    except (OSError, ValueError):
-        return None
-    if not resolved.is_file() or resolved.is_symlink() or resolved.suffix.lower() != '.py':
-        return None
-    return resolved
-
-
-def _task_module_index(sandbox: Path) -> tuple[dict[str, Path], dict[Path, str]]:
-    module_paths: dict[str, Path] = {}
-    module_names: dict[Path, str] = {}
-    for path in _task_source_files(sandbox):
-        resolved = path.resolve()
-        relative = path.relative_to(sandbox).with_suffix('')
-        parts = list(relative.parts)
-        if parts and parts[-1] == '__init__':
-            parts.pop()
-        module_name = '.'.join(parts)
-        if not module_name:
-            continue
-        module_names[resolved] = module_name
-        module_paths[module_name] = resolved
-        if module_name.startswith('tasks.'):
-            module_paths.setdefault(module_name[len('tasks.'):], resolved)
-    return module_paths, module_names
-
-
-def _sandbox_evidence_source(sandbox: Path, raw: str) -> str | None:
-    '''Resolve an optional line suffix and require a real sandbox file.'''
-
-    value = str(raw or '').strip().replace('\\', '/')
-    prefix, separator, suffix = value.rpartition(':')
-    compact_suffix = suffix.replace('-', '')
-    if separator and (
-        suffix.casefold() == 'line'
-        or compact_suffix.isdigit()
-        or (suffix[:1].casefold() == 'l' and suffix[1:].isdigit())
-    ):
-        value = prefix
-    fragment_prefix, fragment, fragment_line = value.rpartition('#L')
-    if fragment and fragment_line.isdigit():
-        value = fragment_prefix
-    candidate = Path(value)
-    if not candidate.is_absolute():
-        candidate = sandbox / candidate
-    try:
-        resolved = candidate.resolve()
-        relative = resolved.relative_to(sandbox.resolve())
-    except (OSError, ValueError):
-        return None
-    if not resolved.is_file() or resolved.is_symlink():
-        return None
-    return relative.as_posix()
-
-
-def _declared_callable_is_called(
-    source_facts: dict[str, Any],
-    *,
-    module: str,
-    callable_name: str,
-) -> bool:
-    target = '.'.join(
-        part
-        for part in (
-            _normalize_python_module(module),
-            str(callable_name or '').strip().replace(':', '.').strip('.'),
-        )
-        if part
-    )
-    if not target:
-        return False
-    for raw_symbol in source_facts.get('called_symbols', set()):
-        symbol = str(raw_symbol or '')
-        if symbol == target or symbol.startswith(f'{target}.'):
-            return True
-        if target.endswith('.__call__') and symbol == target[:-9]:
-            return True
-    return False
-
-
-def _static_callable_usage(
-    sandbox: Path,
-    *,
-    entry: Path | None,
-    reachable_task_paths: set[Path],
-    reachable_src_modules: set[str],
-) -> set[str]:
-    '''Return call targets reachable from the assigned task entry symbols.'''
-
-    _task_paths, task_names = _task_module_index(sandbox)
-    src_paths = _src_module_index(sandbox)
-    selected: dict[str, Path] = {}
-    for path in reachable_task_paths:
-        module_name = task_names.get(path.resolve())
-        if module_name:
-            selected[module_name] = path.resolve()
-    for module_name, path in src_paths.items():
-        if module_name in reachable_src_modules or any(
-            value.startswith(f'{module_name}.')
-            for value in reachable_src_modules
-        ):
-            selected[module_name] = path.resolve()
-
-    graph: dict[str, set[str]] = {}
-    aliases: dict[str, str] = {}
-    for module_name, path in selected.items():
-        analysis = _analyze_static_module(path, module_name)
-        aliases.update(analysis['aliases'])
-        for owner, targets in analysis['graph'].items():
-            graph.setdefault(owner, set()).update(targets)
-
-    if entry is None:
-        return set()
-    entry_module = task_names.get(entry.resolve())
-    if not entry_module:
-        return set()
-    roots = {f'{entry_module}.__module__'}
-    return _walk_static_calls(roots, graph=graph, aliases=aliases)
-
-
-def _src_module_index(sandbox: Path) -> dict[str, Path]:
-    module_paths: dict[str, Path] = {}
-    src_root = sandbox / 'src'
-    if not src_root.is_dir():
-        return module_paths
-    for path in src_root.rglob('*.py'):
-        if not path.is_file() or path.is_symlink():
-            continue
-        relative = path.relative_to(sandbox).with_suffix('')
-        parts = list(relative.parts)
-        if parts and parts[-1] == '__init__':
-            parts.pop()
-        module_name = '.'.join(parts)
-        if module_name:
-            module_paths[module_name] = path.resolve()
-    return module_paths
-
-
-def _analyze_static_module(path: Path, module_name: str) -> dict[str, Any]:
-    graph: dict[str, set[str]] = {}
-    aliases: dict[str, str] = {}
-    try:
-        tree = ast.parse(path.read_text(encoding='utf-8-sig'), filename=str(path))
-    except (OSError, UnicodeError, SyntaxError):
-        return {
-            'graph': graph,
-            'aliases': aliases,
-        }
-    is_package = path.name == '__init__.py'
-    module_aliases: dict[str, str] = {}
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            symbol = f'{module_name}.{node.name}'
-            module_aliases[node.name] = symbol
-        elif isinstance(node, ast.ClassDef):
-            module_aliases[node.name] = f'{module_name}.{node.name}'
-
-    module_owner = f'{module_name}.__module__'
-    module_scanner = _StaticCallScanner(
-        owner=module_owner,
-        aliases=module_aliases,
-        graph=graph,
-        module_name=module_name,
-        is_package=is_package,
-    )
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            for default in list(node.args.defaults) + [
-                item for item in node.args.kw_defaults if item is not None
-            ]:
-                module_scanner.visit(default)
-            continue
-        if isinstance(node, ast.ClassDef):
-            continue
-        module_scanner.visit(node)
-    module_aliases = module_scanner.aliases
-
-    for local_name, target in module_aliases.items():
-        if not local_name or '.' in local_name:
-            continue
-        exported = f'{module_name}.{local_name}'
-        if target and target != exported:
-            aliases[exported] = target
-
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            owner = f'{module_name}.{node.name}'
-            _analyze_static_function(
-                node,
-                owner=owner,
-                base_aliases=module_aliases,
-                graph=graph,
-                module_name=module_name,
-                is_package=is_package,
-            )
-            continue
-        if not isinstance(node, ast.ClassDef):
-            continue
-        class_symbol = f'{module_name}.{node.name}'
-        method_symbols = {
-            item.name: f'{class_symbol}.{item.name}'
-            for item in node.body
-            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
-        }
-        if '__init__' in method_symbols:
-            graph.setdefault(class_symbol, set()).add(method_symbols['__init__'])
-        class_aliases = dict(module_aliases)
-        class_aliases.update(method_symbols)
-        for item in node.body:
-            if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            owner = method_symbols[item.name]
-            function_aliases = dict(class_aliases)
-            positional = list(item.args.posonlyargs) + list(item.args.args)
-            if positional:
-                function_aliases[positional[0].arg] = class_symbol
-            _analyze_static_function(
-                item,
-                owner=owner,
-                base_aliases=function_aliases,
-                graph=graph,
-                module_name=module_name,
-                is_package=is_package,
-            )
-    return {
-        'graph': graph,
-        'aliases': aliases,
-    }
-
-
-def _analyze_static_function(
-    node: ast.FunctionDef | ast.AsyncFunctionDef,
-    *,
-    owner: str,
-    base_aliases: dict[str, str],
-    graph: dict[str, set[str]],
-    module_name: str,
-    is_package: bool,
-) -> None:
-    aliases = dict(base_aliases)
-    positional = list(node.args.posonlyargs) + list(node.args.args)
-    defaults = list(node.args.defaults)
-    for argument, default in zip(positional[-len(defaults):], defaults):
-        target = _static_reference(default, aliases)
-        if target:
-            aliases[argument.arg] = target
-    for argument, default in zip(node.args.kwonlyargs, node.args.kw_defaults):
-        if default is None:
-            continue
-        target = _static_reference(default, aliases)
-        if target:
-            aliases[argument.arg] = target
-    scanner = _StaticCallScanner(
-        owner=owner,
-        aliases=aliases,
-        graph=graph,
-        module_name=module_name,
-        is_package=is_package,
-    )
-    for statement in node.body:
-        scanner.visit(statement)
-
-
-class _StaticCallScanner(ast.NodeVisitor):
-    def __init__(
-        self,
-        *,
-        owner: str,
-        aliases: dict[str, str],
-        graph: dict[str, set[str]],
-        module_name: str,
-        is_package: bool,
-    ) -> None:
-        self.owner = owner
-        self.aliases = dict(aliases)
-        self.graph = graph
-        self.module_name = module_name
-        self.is_package = is_package
-
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        return
-
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        return
-
-    def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        return
-
-    def visit_Lambda(self, node: ast.Lambda) -> None:
-        return
-
-    def visit_Import(self, node: ast.Import) -> None:
-        for alias in node.names:
-            bound = alias.asname or alias.name.split('.')[0]
-            self.aliases[bound] = alias.name if alias.asname else alias.name.split('.')[0]
-
-    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
-        base = _static_import_base(
-            node,
-            module_name=self.module_name,
-            is_package=self.is_package,
-        )
-        for alias in node.names:
-            if alias.name == '*':
-                continue
-            target = '.'.join(part for part in (base, alias.name) if part)
-            self.aliases[alias.asname or alias.name] = target
-
-    def visit_Assign(self, node: ast.Assign) -> None:
-        self.visit(node.value)
-        value = _static_reference(node.value, self.aliases)
-        if not value:
-            return
-        for target in node.targets:
-            name = _static_reference(target, self.aliases)
-            if name:
-                self.aliases[name] = value
-            if isinstance(target, ast.Name):
-                self.aliases[target.id] = value
-
-    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
-        if node.value is None:
-            return
-        self.visit(node.value)
-        value = _static_reference(node.value, self.aliases)
-        if not value:
-            return
-        name = _static_reference(node.target, self.aliases)
-        if name:
-            self.aliases[name] = value
-        if isinstance(node.target, ast.Name):
-            self.aliases[node.target.id] = value
-
-    def visit_Call(self, node: ast.Call) -> None:
-        target = _static_reference(node.func, self.aliases)
-        if target:
-            self.graph.setdefault(self.owner, set()).add(target)
-        self.generic_visit(node)
-
-
-def _static_reference(node: ast.AST | None, aliases: dict[str, str]) -> str:
-    if isinstance(node, ast.Name):
-        return aliases.get(node.id, node.id)
-    if isinstance(node, ast.Attribute):
-        parent = _static_reference(node.value, aliases)
-        value = f'{parent}.{node.attr}' if parent else node.attr
-        return aliases.get(value, value)
-    if isinstance(node, ast.Call):
-        return _static_reference(node.func, aliases)
-    if isinstance(node, ast.Subscript):
-        return _static_reference(node.value, aliases)
-    return ''
-
-
-def _static_import_base(
-    node: ast.ImportFrom,
-    *,
-    module_name: str,
-    is_package: bool,
-) -> str:
-    base = str(node.module or '')
-    if not node.level:
-        return base
-    package = module_name if is_package else module_name.rpartition('.')[0]
-    package_parts = package.split('.') if package else []
-    trim = max(0, node.level - 1)
-    if trim:
-        package_parts = package_parts[:-trim] if trim <= len(package_parts) else []
-    prefix = '.'.join(package_parts)
-    return '.'.join(part for part in (prefix, base) if part)
-
-
-def _canonical_static_symbol(symbol: str, aliases: dict[str, str]) -> str:
-    current = str(symbol or '')
-    seen: set[str] = set()
-    while current and current not in seen:
-        seen.add(current)
-        parts = current.split('.')
-        replacement = ''
-        suffix: list[str] = []
-        for length in range(len(parts), 0, -1):
-            prefix = '.'.join(parts[:length])
-            target = aliases.get(prefix)
-            if target:
-                replacement = target
-                suffix = parts[length:]
-                break
-        if not replacement:
-            break
-        current = '.'.join([replacement, *suffix])
-    return current
-
-
-def _walk_static_calls(
-    roots: set[str],
-    *,
-    graph: dict[str, set[str]],
-    aliases: dict[str, str],
-) -> set[str]:
-    called: set[str] = set()
-    pending = list(roots)
-    visited: set[str] = set()
-    while pending:
-        raw_owner = pending.pop()
-        owner = _canonical_static_symbol(raw_owner, aliases)
-        if owner in visited:
-            continue
-        visited.add(owner)
-        targets = set(graph.get(owner, set()))
-        if owner != raw_owner:
-            targets.update(graph.get(raw_owner, set()))
-        for raw_target in targets:
-            target = _canonical_static_symbol(raw_target, aliases)
-            if not target:
-                continue
-            called.add(target)
-            if target not in visited:
-                pending.append(target)
-    return called
-
-
-def _reachable_local_src_modules(sandbox: Path, roots: set[str]) -> set[str]:
-    '''Follow static imports through local Foundation modules under src/.'''
-
-    src_root = sandbox / 'src'
-    module_paths: dict[str, Path] = {}
-    if src_root.is_dir():
-        for path in src_root.rglob('*.py'):
-            if not path.is_file() or path.is_symlink():
-                continue
-            relative = path.relative_to(sandbox).with_suffix('')
-            parts = list(relative.parts)
-            if parts and parts[-1] == '__init__':
-                parts.pop()
-            module_name = '.'.join(parts)
-            if module_name:
-                module_paths[module_name] = path
-
-    reachable = set(roots)
-    pending = list(roots)
-    visited: set[str] = set()
-    while pending:
-        module_name = pending.pop()
-        if module_name in visited:
-            continue
-        visited.add(module_name)
-        path = module_paths.get(module_name)
-        if path is None:
-            continue
-        try:
-            tree = ast.parse(path.read_text(encoding='utf-8-sig'), filename=str(path))
-        except (OSError, UnicodeError, SyntaxError):
-            continue
-        imported = _imports_from_local_module(
-            tree,
-            module_name=module_name,
-            is_package=path.name == '__init__.py',
-        )
-        for candidate in imported:
-            if candidate not in reachable:
-                reachable.add(candidate)
-                pending.append(candidate)
-    return reachable
-
-
-def _imports_from_local_module(
-    tree: ast.AST,
-    *,
-    module_name: str,
-    is_package: bool,
-) -> set[str]:
-    imported: set[str] = set()
-    package = module_name if is_package else module_name.rpartition('.')[0]
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            imported.update(alias.name for alias in node.names)
-            continue
-        if not isinstance(node, ast.ImportFrom):
-            continue
-        base = str(node.module or '')
-        if node.level:
-            package_parts = package.split('.') if package else []
-            trim = max(0, node.level - 1)
-            if trim:
-                package_parts = package_parts[:-trim] if trim <= len(package_parts) else []
-            prefix = '.'.join(package_parts)
-            base = '.'.join(value for value in (prefix, base) if value)
-        if base:
-            imported.add(base)
-        for alias in node.names:
-            if alias.name != '*':
-                imported.add('.'.join(value for value in (base, alias.name) if value))
-    return imported
-
-
-def _dedupe_strings(values: list[str]) -> list[str]:
-    result: list[str] = []
-    seen: set[str] = set()
-    for value in values:
-        text = str(value)
-        if text and text not in seen:
-            seen.add(text)
-            result.append(text)
-    return result
-
-
-def _collect_writer_images(
-    *,
-    sandbox: Path,
-    output_subdir: str,
-    declared: Any,
-    fallback_pattern: str,
-    exclude_names: set[str] | None = None,
-) -> list[str]:
-    output_dir = sandbox / "outputs" / output_subdir
-    candidates: list[Path] = []
-    values = declared if isinstance(declared, list) else [declared] if isinstance(declared, str) else []
-    for raw in values:
-        path = Path(str(raw))
-        candidates.extend([path] if path.is_absolute() else [sandbox / path, output_dir / path.name])
-    candidates.extend(sorted(output_dir.glob(fallback_pattern)) if output_dir.exists() else [])
-    excluded = {name.lower() for name in (exclude_names or set())}
-    result: list[str] = []
-    seen: set[str] = set()
-    for path in candidates:
-        if not path.is_file() or path.suffix.lower() != ".png" or path.name.lower() in excluded:
-            continue
-        key = str(path.resolve()).lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(str(path.resolve()))
-    return result
-
-
-def _prepare_task_writer_sandbox(
-    *,
-    sandbox: Path,
-    task: dict[str, Any],
-    manifest_entry: dict[str, Any],
-    paper: dict[str, Any],
-    paper_path: Path,
-    facts: dict[str, Any],
-    paper_thesis: dict[str, Any] | None,
-    analysis_snapshot_hash: str,
-    analysis_artifacts: dict[str, Path] | None = None,
-    full_paper_images: list[Any] | None = None,
-    reuse_existing: bool = False,
-    foundation: dict[str, Any] | None = None,
-) -> None:
-    if reuse_existing and sandbox.exists():
-        _remove_legacy_writer_scoring_state(sandbox)
-        _write_paper_evidence_bundle(
-            repro_project_dir=sandbox,
-            paper_path=paper_path,
-            paper=paper,
-            facts=facts,
-            tasks={"repro_tasks": [task]},
-            paper_thesis=paper_thesis,
-            analysis_snapshot_hash=analysis_snapshot_hash,
-            analysis_artifacts=analysis_artifacts,
-            full_paper_images=full_paper_images,
-        )
-        if foundation is not None:
-            frozen_issues = foundation_violations(sandbox, foundation)
-            if frozen_issues:
-                restore_foundation_snapshot(sandbox, foundation)
-                remaining_issues = foundation_violations(sandbox, foundation)
-                if remaining_issues:
-                    raise RuntimeError(
-                        f"cached task sandbox no longer matches frozen foundation: {remaining_issues}"
-                    )
-        return
-    if sandbox.exists():
-        shutil.rmtree(sandbox)
-    sandbox.mkdir(parents=True, exist_ok=True)
-    single_manifest = {"version": 1, "tasks": [manifest_entry]}
-    inject_io_runtime(sandbox)
-    write_task_scaffolding(sandbox, single_manifest)
-    _write_minimal_shared_project_files(
-        sandbox,
-        task,
-        manifest_entry,
-        foundation_enabled=foundation is not None,
-    )
-    if foundation is not None:
-        install_foundation_snapshot(sandbox, foundation)
-    _write_paper_evidence_bundle(
-        repro_project_dir=sandbox,
-        paper_path=paper_path,
-        paper=paper,
-        facts=facts,
-        tasks={"repro_tasks": [task]},
-        paper_thesis=paper_thesis,
-        analysis_snapshot_hash=analysis_snapshot_hash,
-        analysis_artifacts=analysis_artifacts,
-        full_paper_images=full_paper_images,
-    )
-
-
-def _remove_legacy_writer_scoring_state(sandbox: Path) -> None:
-    for path in sandbox.rglob("task_work_state.json"):
-        if path.is_file():
-            path.unlink()
-
-
-def _write_minimal_shared_project_files(
-    sandbox: Path,
-    task: dict[str, Any],
-    manifest_entry: dict[str, Any],
-    *,
-    foundation_enabled: bool = False,
-) -> None:
-    if foundation_enabled:
-        task_id = str(task.get('task_id') or manifest_entry.get('task_id') or 'task')
-        module = str(manifest_entry.get('module') or 'task')
-        write_text(sandbox / 'README.md', f'# Task writer sandbox\n\nTask: `{task_id}`\n')
-        write_json(
-            sandbox / 'config.json',
-            {'run_profile': 'full', 'task_id': task_id, 'seed': 1, 'backend': 'auto'},
-        )
-        write_json(
-            sandbox / 'config_smoke.json',
-            {
-                'run_profile': 'smoke',
-                'task_id': task_id,
-                'seed': 1,
-                'smoke': True,
-                'backend': 'auto',
-            },
-        )
-        task_script = sandbox / 'tasks' / f'{module}.py'
-        if not task_script.exists():
-            write_text(
-                task_script,
-                '\n'.join(
-                    [
-                        'from __future__ import annotations',
-                        '',
-                        'def main(config_path=None) -> int:',
-                        '''    raise RuntimeError('task writer did not implement this task yet')''',
-                        '',
-                        '''if __name__ == '__main__':''',
-                        '    raise SystemExit(main())',
-                        '',
-                    ]
-                ),
-            )
-        return
-    task_id = str(task.get("task_id") or manifest_entry.get("task_id") or "task")
-    module = str(manifest_entry.get("module") or "task")
-    write_text(sandbox / "README.md", f"# Task writer sandbox\n\nTask: `{task_id}`\n")
-    write_text(sandbox / "requirements.txt", "numpy\nmatplotlib\n")
-    write_json(sandbox / "config.json", {"run_profile": "full", "task_id": task_id, "seed": 1, "backend": "auto"})
-    write_json(
-        sandbox / "config_smoke.json",
-        {"run_profile": "smoke", "task_id": task_id, "seed": 1, "smoke": True, "backend": "auto"},
-    )
-    task_script = sandbox / "tasks" / f"{module}.py"
-    if not task_script.exists():
-        write_text(
-            task_script,
-            "\n".join(
-                [
-                    "from __future__ import annotations",
-                    "",
-                    "def main(config_path=None) -> int:",
-                    "    raise RuntimeError('task writer did not implement this task yet')",
-                    "",
-                    "if __name__ == '__main__':",
-                    "    raise SystemExit(main())",
-                    "",
-                ]
-            ),
-        )
-
-
-def _build_task_writer_brief(
-    *,
-    index: int,
-    task: dict[str, Any],
-    manifest_entry: dict[str, Any],
-    facts: dict[str, Any],
-    experiment_index: dict[str, Any],
-    paper: dict[str, Any],
-    paper_context_json: str,
-    paper_thesis: dict[str, Any] | None,
-    run_repro: bool,
-    review_feedback: dict[str, Any] | None = None,
-    foundation_enabled: bool = False,
-    execution_binding: dict[str, Any] | None = None,
-) -> str:
-    task_id = str(task.get("task_id") or manifest_entry.get("task_id") or f"task_{index}")
-    module = str(manifest_entry.get("module") or "")
-    output_subdir = str(manifest_entry.get("output_subdir") or task_id)
-    task_context = paper_context_for_task(paper=paper, task=task)
-    task_facts = facts_for_task(facts, task)
-    ordering_anchor = thesis_ordering_anchor_for_task(paper_thesis, task)
-    feedback_text = pretty_json(review_feedback) if review_feedback else "None"
-    full_instruction = (
-        f"Run your full task with `python -m tasks.{module} config.json` after each meaningful fix."
-        if run_repro
-        else "Do not run full config because --run-repro is disabled; prepare the code but do not write a final task result."
-    )
-    execution_binding_section = ''
-    component_usage_template = ''
-    hardware_instruction = (
-        'Inspect the available hardware yourself and choose CPU, CUDA, memory use, batch size, and parallelism appropriate to the task. '
-        'For Monte Carlo, batched matrix operations, large sweeps, or a CPU full likely to take minutes, prefer a real Torch CUDA implementation when CUDA is available.'
-    )
-    if isinstance(execution_binding, dict):
-        component_usage_example = [
-            {
-                'component_id': str(component.get('component_id') or ''),
-                'module': str(component.get('module') or ''),
-                'callable': str(component.get('callable') or ''),
-                'usage': 'in_scientific_path',
-                'evidence_files': [f'tasks/{module}.py:line'],
-            }
-            for component in execution_binding.get('components', [])
-            if isinstance(component, dict)
-        ]
-        component_usage_key = json.dumps('component_usage')
-        component_usage_template = (
-            f'  {component_usage_key}: {pretty_json(component_usage_example)},'
-        )
-        execution_binding_section = f'''## Mandatory scientific execution binding (architecture 1.1)
-The resolved component contract for this task is:
-```json
-{pretty_json(execution_binding)}
-```
-
-- Consume the listed `module` / `callable` implementations in the real computation that produces the submitted CSV, summary, and figure. A task may import a declared component itself or import a shared Foundation composition entrypoint whose local `src/**/*.py` import graph reaches it.
-- Every component with `execution.shared_implementation=true` must be reported as `in_scientific_path`. An audit-only call, shape check, reference comparison, or unused import does not count.
-- Do not mirror or rewrite a shared trainable model under `tasks/`. Reuse its Foundation model/trainer/checkpoint path so all bound tasks execute the same implementation.
-- Add `component_usage` to `task_agent_result.json`, with one exact entry per bound component:
-```json
-{pretty_json(component_usage_example)}
-```
-'''
-        hardware_instruction = (
-            'Follow each bound component execution.primary_framework and execution.device_policy exactly. '
-            'Do not substitute Torch, CUDA, NumPy, CPU, or another framework/device heuristic for the architecture contract. '
-            'Record evidence that expensive computation ran under the declared policy.'
-        )
-    ownership_instruction = (
-        "The shared `src/**/*.py`, Foundation tests, and `configs/foundation*` files are frozen. "
-        "Import and reuse them, but never edit, delete, replace, or shadow them. Put all task-private science and helpers under `tasks/`."
-        if foundation_enabled
-        else "You may create or edit any task-private code, config, helper, dependency, and output needed for this task."
-    )
-    return f"""# Role: autonomous Codex task writer
-
-You own exactly one reproduction task. Write the code, run the assigned full experiment, compare the result directly with the complete paper, and keep revising and rerunning while a paper-grounded material scientific blocker remains. Your handoff is `ready_for_review`; only the independent reporter may grant final `matched`.
-
-{WRITER_PAPER_FIDELITY_POLICY}
-
-{CORE_RESULT_STOP_POLICY}
-
-## Ownership
-- Assigned task_id: `{task_id}`
-- Assigned module: `tasks.{module}`
-- Output directory: `outputs/{output_subdir}/`
-- You own the task-private portion of this isolated sandbox. {ownership_instruction}
-- Do not edit `src/_io.py`, `src/_backend.py`, `run_experiment.py`, `tasks_manifest.json`, `tasks/__init__.py`, or any other task module.
-- Read your binding in `scientific_architecture.json` when present and preserve its shared shapes, units, normalization, component identities, and invariants.
-- {full_instruction}
-- You may run smoke with `python -m tasks.{module} config_smoke.json`.
-- Run Python and dependencies directly. The host does not guard commands, allocate hardware, define scientific thresholds, or interrupt your scientific loop.
-- {hardware_instruction}
-- Calling `_backend.select_backend()` is not GPU acceleration by itself. If CUDA is selected, the expensive computation must actually run on CUDA tensors. If CPU is selected despite available CUDA, record a concrete task-specific reason.
-- There is no arbitrary wall-clock cycle limit, but the mandatory core-result stopping policy is a hard upper boundary on scientific iteration. External process failures are handled by the host.
-
-{execution_binding_section}
-
-## Paper-faithful core objective
-Use `task.scientific_acceptance` as a short navigation list, not a format gate. Recover any missing intended claim from the task and paper. Prioritize paper-explicit models, equations, algorithms, baselines, regimes, axes, and statistics, then decide whether the scientific conclusion is supported. Do not spend runs reproducing pixels, typography, colors, crop boundaries, private code identity, or other presentation details.
-
-The core conclusion is normally a method identity, comparison direction, ordering, trend, crossing/threshold region, scaling behavior, gain/loss region, mechanism, or an explicitly claimed absolute level. Numerical agreement below a factor of 10 is non-material unless the paper itself makes tighter accuracy a core conclusion.
-
-## Self-iteration protocol
-You are the coder, runner, and first reviewer. You should compare and improve your own implementation, but another full run must have a scientific reason and a concrete causal change.
-
-For each cycle:
-1. Inspect the finalized artifacts, complete paper, assigned acceptance hints, Foundation/binding, and existing code/results.
-2. Search the complete paper before filling a missing parameter. If still absent, make and disclose a scientifically plausible assumption; do not relabel it as a paper fact.
-3. Implement the paper-faithful task, run smoke when useful, then run full with `python -m tasks.{module} config.json`.
-4. Compare explicit scientific facts, each core conclusion, and Task-Designer key numeric targets. Record material and non-material differences separately.
-5. Rerun only for `invalid_run`, `core_conclusion_failed`, or `key_numeric_ratio_ge_10`, and only after recording paper evidence, the specific code/config change, its target, and predicted effect.
-6. Stop changing the science immediately when the conclusions are supported and available key ratios are below 10. Also stop when a valid faithful result remains unsupported or unassessable but there is no new evidence-based causal change. In that case, hand the result to the Reporter; do not loop forever or tune toward the picture.
-7. Never rerun unchanged code. A repeated ineffective plan, seed fishing, broad hyperparameter sweep, extra epochs without a causal hypothesis, or report-only change is not progress.
-
-Your normal handoff is always `ready_for_review` after the latest full and honest comparison. It does not assert final success: the independent Reporter may classify it as reproduced, reproduced with assumptions, inconclusive, or not reproduced. Only the Reporter plus host may request another Writer run, and only with a complete causal rerun note.
-## Required final files
-Always write the handoff after the latest full attempt, including when the run failed or the scientific result remains unsupported. Structure is intentionally small; missing optional prose or images must not trigger another scientific run.
-
-- `task_agent_result.md`: Chinese audit log of evidence, implementation, each meaningful comparison/change, assumptions, and remaining uncertainty.
-- `task_agent_result.json`:
-```json
-{{
-{component_usage_template}
-  "task_id": "{task_id}",
-  "status": "ready_for_review",
-  "summary": "one Chinese sentence",
-  "differences": ["material scientific differences"],
-  "remaining_uncertainties": [],
-  "evidence_files": [],
-  "local_image_paths": [],
-  "parameter_resolution": [
-    {{"name": "parameter", "value": "value", "source": "paper|derived|assumed", "evidence": "page/equation or rationale"}}
-  ],
-  "iteration_records": [
-    {{
-      "full_run_index": 1,
-      "scientific_reason": "initial_run|invalid_run|core_conclusion_failed|key_numeric_ratio_ge_10",
-      "comparison": ["local observation versus the paper conclusion"],
-      "causal_change": "specific change made before this run, or empty for initial run",
-      "outcome": "supported|unsupported|unassessable|invalid"
-    }}
-  ],
-  "execution_summary": {{
-    "commands": [],
-    "full_run_count": 1,
-    "last_returncode": 0,
-    "cuda_available": false,
-    "backend_requested": "auto|cpu|cuda",
-    "backend": "cpu|cuda|other",
-    "device": "human-readable device name",
-    "actual_compute_device_evidence": "how expensive computation was placed",
-    "backend_choice_reason": "task-specific reason",
-    "full_durations_s": []
-  }}
-}}
-```
-A readable PNG is useful for a figure task but optional when structured CSV/JSON/table/text evidence represents the result. Do not manufacture an image merely to pass a gate.
-## Independent reporter feedback from a previous delivery
-```json
-{feedback_text}
-```
-If feedback is present, investigate every reported difference against the paper's evidence hierarchy. Fix and rerun for a material paper-grounded blocker. Do not alter explicit paper facts, do not blindly obey speculative feedback, and do not rerun unchanged code for an acceptable assumption or non-material caveat.
-
-## Trusted runtime APIs
-{IO_RUNTIME_API_DOC}
-
-{BACKEND_RUNTIME_API_DOC}
-
-## Dependency policy
-{dependency_policy_prompt_text()}
-
-## Mandatory complete inputs
-- `paper_evidence/index.json`
-- the copied original paper path recorded by `paper_evidence/index.json` under `paper_source.relative_path`
-- `paper_evidence/analysis_artifacts/manifest.json`
-- `paper_evidence/analysis_artifacts/engineering_facts.json`
-- `paper_evidence/analysis_artifacts/repro_tasks.json`
-- `paper_evidence/analysis_artifacts/experiment_index.json`
-- `paper_evidence/analysis_artifacts/scientific_architecture.json` when present; it is mandatory in workflow v2
-- `paper_evidence/analysis_artifacts/paper_thesis.json` when present
-- `paper_evidence/analysis_artifacts/analysis_warnings.json` when present
-- `paper_evidence/full_paper_pages/index.json` and every page image listed there
-
-## Task-scoped navigation aids
-- `paper_evidence/01_{safe_label(task_id)}/evidence.json`
-- `paper_evidence/01_{safe_label(task_id)}/context.md`
-## Task JSON
-```json
-{pretty_json(task)}
-```
-
-## Manifest entry
-```json
-{pretty_json(manifest_entry)}
-```
-
-## Task-scoped facts preview (not the information boundary)
-```json
-{pretty_json(task_facts)}
-```
-
-## Paper thesis / ordering anchor
-{ordering_anchor or "None"}
-
-## Task paper context
-{task_context[:12000]}
-
-## Truncated paper-context preview (read the copied paper for complete context)
-{paper_context_json[:8000]}
-
-## Experiment index
-```json
-{pretty_json(experiment_index)[:8000]}
-```
-"""
-
-
-def _task_result_file_path(sandbox: Path, output_subdir: str, filename: str) -> tuple[Path, bool]:
-    root_path = sandbox / filename
-    if root_path.exists():
-        return root_path, False
-    output_path = sandbox / "outputs" / output_subdir / filename
-    if output_path.exists():
-        return output_path, True
-    return root_path, False
-
-
-def _merge_task_writer_deliveries(
-    *,
-    repro_project_dir: Path,
-    task_manifest: dict[str, Any],
-    expected_paths: set[str],
-    task_records: list[dict[str, Any]],
-    foundation: dict[str, Any] | None = None,
-) -> set[str]:
-    _write_final_shared_project_files(repro_project_dir, task_records)
-    expected_paths.update(
-        {
-            "README.md",
-            "requirements.txt",
-            "config.json",
-            "config_smoke.json",
-        }
-    )
-    if foundation is not None:
-        expected_paths.update(install_foundation_snapshot(repro_project_dir, foundation))
-    configs_dir = repro_project_dir / "configs"
-    configs_dir.mkdir(parents=True, exist_ok=True)
-    combined_requirements: list[str] = ["numpy", "matplotlib"]
-    if foundation is not None:
-        combined_requirements.clear()
-    copied_task_files: dict[str, tuple[str, str]] = {}
-    for record in task_records:
-        raw_sandbox = str(record.get("sandbox") or "").strip()
-        if not raw_sandbox:
-            continue
-        sandbox = Path(raw_sandbox)
-        module = str(record.get("module") or "")
-        output_subdir = str(record.get("output_subdir") or record.get("task_id") or "")
-        if not sandbox.is_dir():
-            continue
-        for source in _task_owned_files(sandbox):
-            relative = source.relative_to(sandbox).as_posix()
-            content_hash = hashlib.sha256(source.read_bytes()).hexdigest()
-            previous = copied_task_files.get(relative)
-            if previous is not None and previous[0] != content_hash:
-                raise RuntimeError(
-                    "task writer source collision for "
-                    f"{relative}: {previous[1]} and {record.get('task_id')} supplied different content"
-                )
-            target = repro_project_dir / Path(relative)
-            if source.suffix.lower() == ".py":
-                _copy_python_without_bom(source, target)
-            else:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source, target)
-            copied_task_files[relative] = (content_hash, str(record.get("task_id") or module))
-            expected_paths.add(relative)
-        for config_name, target_name in (
-            ("config.json", f"{module}_config.json"),
-            ("config_smoke.json", f"{module}_config_smoke.json"),
-        ):
-            source = sandbox / config_name
-            if source.exists():
-                target = configs_dir / target_name
-                shutil.copy2(source, target)
-                expected_paths.add(f"configs/{target_name}")
-        source_output = sandbox / "outputs" / output_subdir
-        if source_output.exists():
-            target_output = repro_project_dir / "outputs" / output_subdir
-            if target_output.exists():
-                shutil.rmtree(target_output)
-            shutil.copytree(source_output, target_output, ignore=shutil.ignore_patterns("paper_target*"))
-        result_dir = repro_project_dir / "outputs" / output_subdir
-        result_dir.mkdir(parents=True, exist_ok=True)
-        for name in ("task_agent_result.json", "task_agent_result.md"):
-            source, _ = _task_result_file_path(sandbox, output_subdir, name)
-            if source.exists():
-                shutil.copy2(source, result_dir / name)
-        req_path = sandbox / "requirements.txt"
-        if req_path.exists():
-            combined_requirements.extend(_read_requirement_names(req_path))
-    write_text(repro_project_dir / "requirements.txt", _format_requirements(combined_requirements))
-    _prune_unexpected_files(repro_project_dir, expected_paths)
-    return expected_paths
-
-
-def _task_source_files(sandbox: Path) -> list[Path]:
-    """Return every task-owned Python module, including transitive helpers.
-
-    A writer sandbox contains exactly one task scaffold. Copying the complete
-    task package is safer than guessing a single ``<module>_lib.py`` filename
-    and keeps imports such as ``from tasks import _fig6_full_dd`` intact.
-    """
-
-    return [path for path in _task_owned_files(sandbox) if path.suffix.lower() == ".py"]
-
-
-def _task_owned_files(sandbox: Path) -> list[Path]:
-    """Return the complete task package dependency closure without following links."""
-
-    task_root = sandbox / "tasks"
-    if not task_root.is_dir():
-        return []
-    safe: list[Path] = []
-    task_root_resolved = task_root.resolve()
-    for path in sorted(task_root.rglob("*")):
-        if not path.is_file() or path.is_symlink():
-            continue
-        relative = path.relative_to(task_root).as_posix()
-        if relative == "__init__.py" or "__pycache__" in path.parts or path.suffix.lower() in {".pyc", ".pyo"}:
-            continue
-        try:
-            path.resolve().relative_to(task_root_resolved)
-        except ValueError:
-            continue
-        safe.append(path)
-    return safe
-
-
-def _writer_snapshot_hash(analysis_hash: str, foundation_hash: str) -> str:
-    payload = f"{analysis_hash}::{foundation_hash}".encode("ascii")
-    return hashlib.sha256(payload).hexdigest()
-
-
-def _write_final_shared_project_files(
-    repro_project_dir: Path,
-    task_records: list[dict[str, Any]],
-) -> None:
-    write_text(
-        repro_project_dir / "README.md",
-        "# Task-writer reproduction project\n\n"
-        "This project was assembled from autonomous per-task Codex writer sandboxes. "
-        "Each task delivered its own code, artifacts, and self-review before host aggregation.\n",
-    )
-    write_json(
-        repro_project_dir / "config.json",
-        {
-            "run_profile": "full",
-            "task_writer_mode": True,
-            "task_statuses": {str(r.get("task_id")): r.get("task_writer_status") for r in task_records},
-        },
-    )
-    write_json(repro_project_dir / "config_smoke.json", {"run_profile": "smoke", "task_writer_mode": True, "smoke": True})
-
-
-def _task_manifest_with_configs(task_manifest: dict[str, Any]) -> dict[str, Any]:
-    manifest = json.loads(json.dumps(task_manifest))
-    for entry in manifest.get("tasks", []):
-        if not isinstance(entry, dict):
-            continue
-        module = str(entry.get("module") or "")
-        if module:
-            entry["config_full"] = f"configs/{module}_config.json"
-            entry["config_smoke"] = f"configs/{module}_config_smoke.json"
-    return manifest
-
-
-def _read_requirement_names(path: Path) -> list[str]:
-    names: list[str] = []
-    for raw in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        names.append(line)
-    return names
-
-
-def _copy_python_without_bom(source: Path, target: Path) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(source.read_text(encoding="utf-8-sig"), encoding="utf-8", newline="\n")
-
-
-def _format_requirements(requirements: list[str]) -> str:
-    seen: set[str] = set()
-    lines: list[str] = []
-    for item in requirements:
-        key = item.strip().lower()
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        lines.append(item.strip())
-    return "\n".join(lines) + ("\n" if lines else "")
-
-
-def _task_writer_runtime_result(
-    *,
-    task_records: list[dict[str, Any]],
-    validation: dict[str, Any],
-    requirement_warnings: list[dict[str, Any]],
-    security_issues: list[dict[str, Any]],
-    manifest_issues: list[dict[str, Any]] | None = None,
-    requirement_issues: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    del manifest_issues, requirement_issues
-    passed = sum(1 for record in task_records if _task_writer_runtime_task_passed(record))
-    delivered = sum(1 for record in task_records if record.get("writer_completed"))
-    total = len(task_records)
-    valid_task_ids = [str(record.get("task_id")) for record in task_records if _task_writer_runtime_task_passed(record)]
-    valid_csv_files: list[str] = []
-    valid_png_files: list[str] = []
-    valid_summary_json_files: list[str] = []
-    valid_artifact_files: list[str] = []
-    for record in task_records:
-        if not _task_writer_runtime_task_passed(record):
-            continue
-        artifacts = record.get("artifacts") if isinstance(record.get("artifacts"), dict) else {}
-        output_subdir = str(record.get("output_subdir") or record.get("task_id") or "")
-        csv_files = artifacts.get("csv_files") if isinstance(artifacts.get("csv_files"), list) else []
-        png_files = artifacts.get("png_files") if isinstance(artifacts.get("png_files"), list) else []
-        summary_files = artifacts.get("summary_json_files") if isinstance(artifacts.get("summary_json_files"), list) else []
-        artifact_files = (
-            artifacts.get("artifact_files")
-            if isinstance(artifacts.get("artifact_files"), list)
-            else []
-        )
-        valid_csv_files.extend(f"{output_subdir}/{item}" for item in csv_files if isinstance(item, str))
-        valid_png_files.extend(f"{output_subdir}/{item}" for item in png_files if isinstance(item, str))
-        valid_summary_json_files.extend(
-            f"{output_subdir}/{item}" for item in summary_files if isinstance(item, str)
-        )
-        valid_artifact_files.extend(
-            f"{output_subdir}/{item}" for item in artifact_files if isinstance(item, str)
-        )
-    blocking_security = any(
-        not isinstance(issue, dict)
-        or str(issue.get("severity") or "error").strip().lower() != "warning"
-        for issue in security_issues
-    )
-    all_checks_passed = (
-        total > 0
-        and passed == total
-        and validation.get("required_files_present") is True
-        and validation.get("python_compiles") is not False
-        and validation.get("foundation_integrity_ok") is not False
-        and not blocking_security
-    )
-    return {
-        "enabled": True,
-        "passed": bool(all_checks_passed),
-        "run_profile": "task_writer_full",
-        "repair_backend": "codex_task_writers",
-        "per_task_orchestration": True,
-        "host_repeated_full": False,
-        "tasks_total": total,
-        "tasks_passed": passed,
-        "coverage": f"{passed}/{total}",
-        "deliveries_passed": delivered,
-        "delivery_coverage": f"{delivered}/{total}",
-        "partial_success": {
-            "has_partial_output": bool(0 < passed < total),
-            "valid_task_ids": valid_task_ids,
-            "valid_csv_files": valid_csv_files,
-            "valid_png_files": valid_png_files,
-            "valid_summary_json_files": valid_summary_json_files,
-            "valid_artifact_files": valid_artifact_files,
-        },
-        "per_task": [
-            {
-                "task_id": record.get("task_id"),
-                "module": record.get("module"),
-                "passed": _task_writer_runtime_task_passed(record),
-                "writer_completed": bool(record.get("writer_completed")),
-                "task_writer_status": record.get("task_writer_status"),
-                "writer_error_kind": record.get("writer_error_kind"),
-                "blocked_reason": record.get("blocked_reason"),
-                "task_reporter_outcome": (
-                    record.get("task_verification", {}).get("outcome")
-                    if isinstance(record.get("task_verification"), dict)
-                    else None
-                ),
-                "task_reporter_host_action": (
-                    record.get("task_verification", {}).get("host_action")
-                    if isinstance(record.get("task_verification"), dict)
-                    else None
-                ),
-                "task_reporter_rerun_reason": (
-                    record.get("task_verification", {}).get("rerun_reason")
-                    if isinstance(record.get("task_verification"), dict)
-                    else None
-                ),
-                "execution_summary": record.get("execution_summary"),
-                "artifacts": record.get("artifacts"),
-            }
-            for record in task_records
-        ],
-        "validation": validation,
-        "requirements_warnings": requirement_warnings,
-        "requirements_issues": [],
-        "security_issues": security_issues,
-        "foundation_integrity_violations": (
-            validation.get("foundation_violations")
-            if isinstance(validation.get("foundation_violations"), list)
-            else []
-        ),
-    }
-
-
-def _classify_task_writer_security_issues(
-    issues: list[dict[str, Any]],
-    *,
-    foundation: dict[str, Any] | None,
-    foundation_integrity_issues: list[dict[str, Any]] | None = None,
-) -> list[dict[str, str]]:
-    """Apply the Foundation-only advisory exception to strict scanner findings.
-
-    The global scanner remains fail-closed. A finding is downgraded only when
-    its category is explicitly approved for Foundation code, its file is owned
-    by the validated Foundation manifest, and the assembled project still
-    matches the Foundation hashes and frozen layout. Task Writer files
-    therefore remain strict even when a Foundation is installed in the same
-    project. Omitting the integrity result is deliberately fail-closed.
-    """
-
-    foundation_paths: set[str] = set()
-    foundation_is_current = (
-        isinstance(foundation, dict)
-        and foundation_integrity_issues is not None
-        and not foundation_integrity_issues
-    )
-    if foundation_is_current:
-        assert isinstance(foundation, dict)
-        manifest = foundation.get("manifest")
-        files = manifest.get("files") if isinstance(manifest, dict) else None
-        for item in files if isinstance(files, list) else []:
-            if isinstance(item, dict):
-                path = str(item.get("path") or "").replace("\\", "/")
-                if path:
-                    foundation_paths.add(path)
-
-    classified: list[dict[str, str]] = []
-    for issue in issues:
-        issue_file = str(issue.get("file") or "").replace("\\", "/")
-        advisory_categories = (
-            FOUNDATION_STATIC_SECURITY_ADVISORY_CATEGORIES
-            if issue_file in foundation_paths
-            else frozenset()
-        )
-        blocking, warnings = split_static_security_issues(
-            [issue],
-            advisory_categories=advisory_categories,
-        )
-        classified.extend(warnings or blocking)
-    return classified
-
-
-def _task_writer_runtime_task_passed(record: dict[str, Any]) -> bool:
-    delivery_passed = bool(record.get("writer_completed")) and str(record.get("task_writer_status") or "") in {
-        WRITER_REVIEW_STATUS,
-        FINAL_MATCHED_STATUS,
-    }
-    if not delivery_passed:
-        return False
-    verification = (
-        record.get("verification_result")
-        if isinstance(record.get("verification_result"), dict)
-        else record.get("task_verification")
-    )
-    if isinstance(verification, dict):
-        return (
-            verification.get("run_valid") is True
-            and verification.get("outcome") != "execution_failed"
-        )
-    # Build-only workflows have no independent scientific verification yet.
-    return True
-
-
-def apply_verified_result(
-    *,
-    task_records: list[dict[str, Any]],
-    verification_result: dict[str, Any],
-    output_dir: Path,
-    audit_dir: Path,
-    repro_project_dir: Path,
-) -> dict[str, Any]:
-    """Attach every normal scientific terminal outcome to the Writer records."""
-
-    expected_task_ids = [str(record.get("task_id") or "") for record in task_records]
-    result_issues = verification_result_issues(verification_result, expected_task_ids)
-    if result_issues:
-        raise ValueError("cannot finalize incomplete task outcomes: " + "; ".join(result_issues))
-    if not verification_result.get("all_terminal"):
-        raise ValueError("cannot finalize while a task still requests a Writer rerun")
-
-    outcome_by_id = {
-        str(item.get("task_id")): item
-        for item in verification_result.get("tasks", [])
-        if isinstance(item, dict) and str(item.get("task_id") or "")
-    }
-    for record in task_records:
-        task_id = str(record.get("task_id") or "")
-        task_outcome = outcome_by_id.get(task_id)
-        if not isinstance(task_outcome, dict):
-            raise ValueError(f"missing terminal outcome for {task_id}")
-        outcome = str(task_outcome.get("outcome") or "inconclusive_missing_information")
-        record["task_writer_status"] = (
-            FINAL_MATCHED_STATUS
-            if outcome in {"reproduced", "reproduced_with_assumptions"}
-            else WRITER_REVIEW_STATUS
-        )
-        record["scientific_outcome"] = outcome
-        record["verification_result"] = task_outcome
-        record["verification_verified"] = True
-
-    previous_runtime = _read_optional_json_object(output_dir / "runtime_result.json")
-    runtime_result = _task_writer_runtime_result(
-        task_records=task_records,
-        validation=(
-            previous_runtime.get("validation")
-            if isinstance(previous_runtime.get("validation"), dict)
-            else {"host_validation_skipped": True}
-        ),
-        requirement_warnings=(
-            previous_runtime.get("requirements_warnings")
-            if isinstance(previous_runtime.get("requirements_warnings"), list)
-            else []
-        ),
-        security_issues=(
-            previous_runtime.get("security_issues")
-            if isinstance(previous_runtime.get("security_issues"), list)
-            else []
-        ),
-    )
-    runtime_result["verification_verified"] = True
-    runtime_result["verification_mode"] = "host_derived_core_conclusion_outcomes"
-    runtime_result["scientific_all_terminal"] = True
-    runtime_result["scientific_all_successful"] = bool(
-        verification_result.get("all_successful")
-    )
-    runtime_result["scientific_outcome_counts"] = verification_result.get("outcome_counts", {})
-    write_json(output_dir / "runtime_result.json", runtime_result)
-    write_json(
-        audit_dir / "03c_task_writers_records.json",
-        {"verification_result": verification_result, "tasks": task_records},
-    )
-    status_path = audit_dir / "03c_task_writers_status.json"
-    status = _read_optional_json_object(status_path)
-    all_successful = bool(verification_result.get("all_successful"))
-    status.update(
-        {
-            "stop_class": "verified_matched" if all_successful else "verified_terminal",
-            "stopped_reason": (
-                "all tasks reproduced the assigned core conclusions"
-                if all_successful
-                else "all tasks reached reportable scientific terminal outcomes"
-            ),
-            "runtime": {"passed": runtime_result.get("passed"), "coverage": runtime_result.get("coverage")},
-            "tasks": [
-                {
-                    "task_id": record.get("task_id"),
-                    "status": record.get("task_writer_status"),
-                    "scientific_outcome": record.get("scientific_outcome"),
-                    "verification_verified": True,
-                }
-                for record in task_records
-            ],
-        }
-    )
-    write_json(status_path, status)
-    config_path = repro_project_dir / "config.json"
-    config = _read_optional_json_object(config_path)
-    config["task_statuses"] = {
-        str(record.get("task_id")): str(record.get("task_writer_status") or WRITER_REVIEW_STATUS)
-        for record in task_records
-    }
-    config["scientific_outcomes"] = {
-        str(record.get("task_id")): str(record.get("scientific_outcome") or "")
-        for record in task_records
-    }
-    config["verification_verified"] = True
-    write_json(config_path, config)
-    return runtime_result
-
-def _task_writer_alignment_summary(task_records: list[dict[str, Any]]) -> dict[str, Any]:
-    if not task_records:
-        return {
-            "overall_alignment": "inconclusive",
-            "overall_result_credibility": "low",
-            "overall_summary": "没有可审查的复现任务。",
-        }
-    if any(_task_writer_blocked_by_codex(record) for record in task_records):
-        return {
-            "overall_alignment": "inconclusive",
-            "overall_result_credibility": "low",
-            "overall_summary": "至少一个 Codex task writer 因额度或限流被阻塞，不能把缺失任务视为科学复现失败。",
-        }
-    if any(not record.get("writer_completed") for record in task_records):
-        return {
-            "overall_alignment": "inconclusive",
-            "overall_result_credibility": "low",
-            "overall_summary": "部分自治 writer 未正常完成，不能给出强复现结论。",
-        }
-    statuses = {str(record.get("task_writer_status") or "failed") for record in task_records}
-    if statuses <= {WRITER_REVIEW_STATUS, FINAL_MATCHED_STATUS}:
-        return {
-            "overall_alignment": "candidate",
-            "overall_result_credibility": "medium",
-            "overall_summary": "所有自治 writer 均已完成 full 并提交待独立审查的结果。",
-        }
-    return {
-        "overall_alignment": "inconclusive",
-        "overall_result_credibility": "low",
-        "overall_summary": "至少一个 writer 遭遇外部进程错误，任务尚未完成。",
-    }
-
-
-def _compact_task_writer_review(record: dict[str, Any]) -> dict[str, Any]:
-    result = record.get("result_json") if isinstance(record.get("result_json"), dict) else {}
-    return {
-        "task_id": record.get("task_id"),
-        "task_writer_status": record.get("task_writer_status"),
-        "writer_completed": record.get("writer_completed"),
-        "summary": result.get("summary"),
-        "differences": result.get("differences", []),
-        "possible_causes": result.get("possible_causes", []),
-        "remaining_uncertainties": result.get("remaining_uncertainties", []),
-        "evidence_files": result.get("evidence_files", []),
-        "writer_error_kind": record.get("writer_error_kind"),
-        "blocked_reason": record.get("blocked_reason"),
-    }
-
-
-def _task_writer_concurrency(task_count: int, requested: int | None, *, run_repro: bool = False) -> int:
-    del requested, run_repro
-    return max(1, task_count)
-
-
-def _task_writer_stop_class(task_records: list[dict[str, Any]]) -> str:
-    if not task_records:
-        return "no_tasks"
-    if any(_task_writer_blocked_by_codex(record) for record in task_records):
-        return "blocked_by_codex"
-    if any(not record.get("writer_completed") for record in task_records):
-        return "writer_failures"
-    if any(record.get("task_writer_status") == "failed" for record in task_records):
-        return "external_failures"
-    return "ready_for_review"
-
-
-def _task_writer_stopped_reason(task_records: list[dict[str, Any]]) -> str:
-    stop_class = _task_writer_stop_class(task_records)
-    return {
-        "no_tasks": "no reproduction tasks were available",
-        "blocked_by_codex": "one or more Codex task writers were blocked by usage limits or rate limits",
-        "writer_failures": "one or more autonomous task writers did not complete",
-        "external_failures": "one or more task writers stopped because of an external process failure",
-        "ready_for_review": "all task writers submitted successful full results for independent verification",
-    }.get(stop_class, stop_class)
-
-
-def _failed_task_record(
-    *,
-    index: int,
-    task_id: str,
-    module: str,
-    output_subdir: str,
-    sandbox: Path,
-    error: str,
-) -> dict[str, Any]:
-    return {
-        "index": index,
-        "task_id": task_id,
-        "module": module,
-        "output_subdir": output_subdir,
-        "sandbox": str(sandbox),
-        "task_writer_status": "failed",
-        "writer_completed": False,
-        "writer_status": {"ok": False, "error": redact_text(error)[:1000]},
-        "result_json": {"task_id": task_id, "status": "failed", "summary": redact_text(error)[:500]},
-        "execution_summary": {},
-        "artifacts": {},
-        "local_images": [],
-    }
-def _task_writer_blocked_by_codex(record: dict[str, Any]) -> bool:
-    return str(record.get("writer_error_kind") or "") in {
-        "codex_usage_limit",
-        "codex_rate_limit",
     }

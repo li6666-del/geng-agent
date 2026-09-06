@@ -15,12 +15,11 @@ import unittest
 from unittest.mock import patch
 
 from geng_agent.codex_runner import (
-    DEFAULT_CODEX_TIMEOUT_SECONDS,
+    CODEX_CLI_HELP_PROBE_TIMEOUT_SECONDS,
     DEFAULT_GENG_CODEX_MODEL,
     _FOUNDATION_UNITTEST_GUARD,
     _clear_ephemeral_capability_cache,
     _foundation_unittest_guard_config,
-    resolve_codex_timeout,
     run_codex_subprocess,
     run_python_unittest_subprocess,
 )
@@ -33,6 +32,9 @@ def _completed(command: list[str], *, stdout: str = "", returncode: int = 0):
 class CodexRunnerEphemeralTests(unittest.TestCase):
     def setUp(self) -> None:
         _clear_ephemeral_capability_cache()
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.case_root = Path(temporary.name)
 
     def _invoke(
         self,
@@ -44,7 +46,6 @@ class CodexRunnerEphemeralTests(unittest.TestCase):
         help_text: str = "Usage: codex exec [OPTIONS]\n  --ephemeral",
         output_schema: Path | None = None,
         image_paths: list[Path] | None = None,
-        timeout: float | None = 30,
     ):
         calls: list[tuple[list[str], dict]] = []
         writes: list[tuple[Path, dict]] = []
@@ -64,12 +65,11 @@ class CodexRunnerEphemeralTests(unittest.TestCase):
         ), patch("geng_agent.codex_runner.write_text"):
             status = run_codex_subprocess(
                 role=role,
-                work_dir=Path("case"),
+                work_dir=self.case_root,
                 prompt=prompt,
-                audit_dir=Path("case") / "audit",
+                audit_dir=self.case_root / "audit",
                 label=f"{role}_worker",
                 sandbox=sandbox,
-                timeout=timeout,
                 command_override=command_override,
                 output_schema=output_schema,
                 image_paths=image_paths,
@@ -78,7 +78,6 @@ class CodexRunnerEphemeralTests(unittest.TestCase):
 
     def test_default_command_is_ephemeral_and_prompt_stays_on_stdin(self) -> None:
         self.assertEqual(DEFAULT_GENG_CODEX_MODEL, "gpt-5.6-sol")
-        self.assertEqual(DEFAULT_CODEX_TIMEOUT_SECONDS, 1800.0)
 
         status, calls, writes = self._invoke()
 
@@ -88,23 +87,18 @@ class CodexRunnerEphemeralTests(unittest.TestCase):
         self.assertEqual(command[command.index("exec") + 1], "--ephemeral")
         self.assertEqual(command.count("--ephemeral"), 1)
         self.assertEqual(kwargs["input"], "test prompt")
+        self.assertNotIn("timeout", kwargs)
+        self.assertEqual(
+            calls[0][1]["timeout"],
+            CODEX_CLI_HELP_PROBE_TIMEOUT_SECONDS,
+        )
         self.assertEqual(status["model"], DEFAULT_GENG_CODEX_MODEL)
-        self.assertEqual(status["timeout_s"], 30.0)
+        self.assertNotIn("timeout_s", status)
+        self.assertNotIn("timed_out", status)
         self.assertEqual(status["session_persistence"], "ephemeral")
         self.assertTrue(status["ephemeral_capability"]["supported"])
         self.assertFalse(status["ephemeral_capability"]["cached"])
         self.assertEqual(writes[-1][1]["session_persistence"], "ephemeral")
-
-    def test_none_timeout_resolves_to_the_central_30_minute_limit(self) -> None:
-        status, calls, _ = self._invoke(timeout=None)
-        _, kwargs = next(item for item in calls if "--ephemeral" in item[0])
-        self.assertEqual(kwargs["timeout"], 1800.0)
-        self.assertEqual(status["timeout_s"], 1800.0)
-
-    def test_non_finite_timeout_is_rejected(self) -> None:
-        for value in (float("nan"), float("inf"), float("-inf")):
-            with self.subTest(value=value), self.assertRaises(ValueError):
-                resolve_codex_timeout(value)
 
     def test_worker_options_and_project_evidence_outputs_are_preserved(self) -> None:
         schema = Path("schemas") / "result.schema.json"
@@ -197,12 +191,11 @@ class CodexRunnerEphemeralTests(unittest.TestCase):
             statuses = [
                 run_codex_subprocess(
                     role="task_writer",
-                    work_dir=Path("."),
+                    work_dir=self.case_root,
                     prompt=str(index),
-                    audit_dir=Path("."),
+                    audit_dir=self.case_root / "audit",
                     label=f"writer_{index}",
                     sandbox="workspace-write",
-                    timeout=1,
                 )
                 for index in range(2)
             ]
@@ -244,12 +237,11 @@ class CodexRunnerEphemeralTests(unittest.TestCase):
                     executor.map(
                         lambda index: run_codex_subprocess(
                             role="task_writer",
-                            work_dir=Path("."),
+                            work_dir=self.case_root,
                             prompt=f"writer {index}",
-                            audit_dir=Path("."),
+                            audit_dir=self.case_root / "audit",
                             label=f"writer_{index}",
                             sandbox="workspace-write",
-                            timeout=1,
                         ),
                         range(4),
                     )
@@ -265,6 +257,8 @@ class CodexRunnerEphemeralTests(unittest.TestCase):
         def fake_run(command, **kwargs):
             captured["command"] = list(command)
             captured.update(kwargs)
+            runtime_home = Path(kwargs["env"]["HOME"])
+            (runtime_home / "sentinel.txt").write_text("runtime scratch", encoding="utf-8")
             return _completed(list(command))
 
         with TemporaryDirectory() as temp, patch(
@@ -286,11 +280,15 @@ class CodexRunnerEphemeralTests(unittest.TestCase):
         self.assertIn("def _require_allowed_read", command[4])
         self.assertIn("follows a case symlink outside the sandbox", command[4])
         self.assertIn('event == "os.chdir"', command[4])
-        self.assertIn("def _guarded_stat", command[4])
+        self.assertIn("def guarded_stat", command[4])
         self.assertIn("builtins.eval = _guarded_eval", command[4])
         self.assertIn("builtins.exec = _guarded_exec", command[4])
         self.assertIn("builtins.compile = _guarded_compile", command[4])
         self.assertIn("builtins.__import__ = _guarded_import", command[4])
+        self.assertNotIn("os.open = _guarded", command[4])
+        self.assertIn("relative low-level os.open", command[4])
+        self.assertIn("_DIR_FD_AUDIT_ARGUMENTS", command[4])
+        self.assertIn('"supports_dir_fd"', command[4])
         self.assertIn("os.stat = _guarded_stat", command[4])
         self.assertIn("not _is_import_statement(caller)", command[4])
         self.assertIn('event in {"compile", "exec"}', command[4])
@@ -300,11 +298,62 @@ class CodexRunnerEphemeralTests(unittest.TestCase):
         self.assertTrue(Path(env["HOME"]).is_relative_to(work_dir))
         self.assertTrue(Path(env["XDG_CACHE_HOME"]).is_relative_to(work_dir))
         self.assertTrue(Path(env["TMPDIR"]).is_relative_to(work_dir))
+        self.assertEqual(env["USER"], "geng-case-runtime")
+        self.assertEqual(env["LOGNAME"], "geng-case-runtime")
+        self.assertEqual(env["LNAME"], "geng-case-runtime")
+        self.assertEqual(env["USERNAME"], "geng-case-runtime")
+        self.assertTrue(Path(env["TORCH_HOME"]).is_relative_to(work_dir))
+        self.assertTrue(Path(env["TORCHINDUCTOR_CACHE_DIR"]).is_relative_to(work_dir))
+        self.assertFalse(Path(env["HOME"]).exists())
         self.assertEqual(Path(guard_config["work_dir"]), work_dir.resolve())
         self.assertEqual(guard_config["start_dir"], "tests")
         self.assertTrue(all(Path(path).is_absolute() for path in guard_config["sensitive_roots"]))
         self.assertIn(str(work_dir.resolve()), guard_config["trusted_read_roots"])
+        self.assertEqual(
+            set(guard_config["write_roots"]),
+            {
+                str((work_dir / ".runtime_home").resolve()),
+                str((work_dir / "tests" / "runtime_artifacts").resolve()),
+            },
+        )
         self.assertEqual(captured["cwd"], work_dir.resolve())
+
+    def test_generated_unittest_cleans_runtime_home_after_timeout_and_spawn_error(self) -> None:
+        with TemporaryDirectory() as temp:
+            work_dir = Path(temp) / "timeout-case"
+            work_dir.mkdir()
+            with patch(
+                "geng_agent.codex_runner.subprocess.run",
+                side_effect=subprocess.TimeoutExpired([sys.executable], 1),
+            ):
+                result = run_python_unittest_subprocess(work_dir=work_dir, timeout=1)
+            self.assertTrue(result["timed_out"])
+            self.assertFalse((work_dir / ".runtime_home").exists())
+
+            spawn_dir = Path(temp) / "spawn-error-case"
+            spawn_dir.mkdir()
+            with patch(
+                "geng_agent.codex_runner.subprocess.run",
+                side_effect=OSError("spawn failed"),
+            ), self.assertRaisesRegex(OSError, "spawn failed"):
+                run_python_unittest_subprocess(work_dir=spawn_dir, timeout=1)
+            self.assertFalse((spawn_dir / ".runtime_home").exists())
+
+    def test_generated_unittest_cleanup_failure_is_blocking(self) -> None:
+        with TemporaryDirectory() as temp:
+            work_dir = Path(temp) / "case"
+            work_dir.mkdir()
+            with patch(
+                "geng_agent.codex_runner.subprocess.run",
+                return_value=_completed([sys.executable]),
+            ), patch(
+                "geng_agent.codex_runner.shutil.rmtree",
+                side_effect=PermissionError("cleanup denied"),
+            ):
+                result = run_python_unittest_subprocess(work_dir=work_dir)
+
+        self.assertFalse(result["passed"])
+        self.assertIn("cleanup denied", result["runtime_cleanup_error"])
 
     def test_runtime_guard_allows_authorized_features_and_blocks_boundaries(self) -> None:
         with TemporaryDirectory() as temp:
@@ -312,16 +361,44 @@ class CodexRunnerEphemeralTests(unittest.TestCase):
             work_dir = root / "case"
             tests_dir = work_dir / "tests"
             tests_dir.mkdir(parents=True)
+            source_dir = work_dir / "src"
+            source_dir.mkdir()
+            immutable_source = source_dir / "immutable.py"
+            immutable_source.write_text("VALUE = 1\n", encoding="utf-8")
+            runtime_artifact = tests_dir / "runtime_artifacts" / "allowed.txt"
             outside = root / "outside.txt"
             outside.write_text("host-secret", encoding="utf-8")
+            trusted_dir = root / "trusted_runtime"
+            trusted_dir.mkdir()
+            trusted_helper = trusted_dir / "trusted_helper.py"
+            trusted_helper.write_text(
+                textwrap.dedent(
+                    """\
+                    def eval_with_explicit_none():
+                        f = lambda value: value + 1
+                        return eval("lambda value, f=f: f(value)", None, None)(2)
+
+
+                    def exec_with_explicit_none():
+                        value = 4
+                        box = {}
+                        exec("box['result'] = value + 1", None, None)
+                        return box["result"]
+                    """
+                ),
+                encoding="utf-8",
+            )
             scientific_modules = tuple(
-                name for name in ("numpy", "matplotlib", "torch")
+                name for name in ("numpy", "scipy", "matplotlib", "torch")
                 if importlib.util.find_spec(name) is not None
             )
             source = textwrap.dedent(
                 f"""\
                 import glob
+                import getpass
                 import importlib
+                import importlib.util
+                import __main__ as guard_main
                 import json
                 import math
                 import os
@@ -329,6 +406,10 @@ class CodexRunnerEphemeralTests(unittest.TestCase):
 
                 OUTSIDE = {str(outside)!r}
                 OUTSIDE_PARENT = {str(root)!r}
+                TRUSTED_HELPER = {str(trusted_helper)!r}
+                TRUSTED_DIR = {str(trusted_dir)!r}
+                IMMUTABLE_SOURCE = {str(immutable_source)!r}
+                RUNTIME_ARTIFACT = {str(runtime_artifact)!r}
                 SCIENTIFIC_MODULES = {scientific_modules!r}
 
 
@@ -341,6 +422,7 @@ class CodexRunnerEphemeralTests(unittest.TestCase):
                         os.environ["FOUNDATION_TEST_FLAG"] = "yes"
                         self.assertEqual(os.environ.get("FOUNDATION_TEST_FLAG"), "yes")
                         self.assertEqual(os.getenv("FOUNDATION_TEST_FLAG"), "yes")
+                        self.assertEqual(getpass.getuser(), "geng-case-runtime")
 
                         class Box:
                             pass
@@ -352,6 +434,11 @@ class CodexRunnerEphemeralTests(unittest.TestCase):
                         self.assertIn("GuardBehaviorTest", globals())
                         delattr(box, "value")
                         self.assertFalse(hasattr(box, "value"))
+                        if os.name == "posix":
+                            backend = importlib.import_module(os.name)
+                            self.assertIs(backend.open, os.open)
+                            self.assertIn(os.open, os.supports_dir_fd)
+                            self.assertIn(os.stat, os.supports_dir_fd)
 
                     def test_installed_scientific_dependencies_import(self):
                         imported = []
@@ -360,6 +447,26 @@ class CodexRunnerEphemeralTests(unittest.TestCase):
                                 module = importlib.import_module(module_name)
                                 imported.append(module.__name__)
                         self.assertEqual(imported, list(SCIENTIFIC_MODULES))
+
+                    def test_installed_scientific_dependencies_can_use_internal_runtime_features(self):
+                        if "scipy" in SCIENTIFIC_MODULES:
+                            from scipy.constants import c
+
+                            self.assertGreater(c, 1.0)
+                        if "torch" in SCIENTIFIC_MODULES:
+                            import torch
+
+                            tensor = torch.ones(1)
+                            tensor.fill_(2.0)
+                            self.assertEqual(float(tensor.item()), 2.0)
+                            torch.use_deterministic_algorithms(True, warn_only=True)
+
+                    def test_trusted_runtime_preserves_eval_and_exec_explicit_none_scope(self):
+                        spec = importlib.util.spec_from_file_location("trusted_helper", TRUSTED_HELPER)
+                        helper = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(helper)
+                        self.assertEqual(helper.eval_with_explicit_none(), 3)
+                        self.assertEqual(helper.exec_with_explicit_none(), 5)
 
                     def test_external_file_and_directory_access_is_blocked(self):
                         actions = (
@@ -394,11 +501,81 @@ class CodexRunnerEphemeralTests(unittest.TestCase):
                             with self.subTest(action=action):
                                 with self.assertRaises(PermissionError):
                                     action()
+
+                    def test_guard_does_not_publish_original_capabilities_in_main(self):
+                        exposed = (
+                            "_ORIGINAL_EVAL",
+                            "_ORIGINAL_EXEC",
+                            "_ORIGINAL_COMPILE",
+                            "_ORIGINAL_IMPORT",
+                            "_ORIGINAL_OS_OPEN",
+                            "_ORIGINAL_STAT",
+                            "_ORIGINAL_LSTAT",
+                            "_ORIGINAL_ACCESS",
+                            "_ORIGINAL_READLINK",
+                        )
+                        for name in exposed:
+                            with self.subTest(name=name):
+                                self.assertFalse(hasattr(guard_main, name))
+
+                    def test_relative_low_level_open_is_blocked_but_absolute_is_checked(self):
+                        with self.assertRaises(PermissionError):
+                            descriptor = os.open(
+                                os.path.join("tests", "runtime_artifacts", "relative.txt"),
+                                os.O_WRONLY | os.O_CREAT,
+                                0o600,
+                            )
+                            os.close(descriptor)
+                        descriptor = os.open(
+                            RUNTIME_ARTIFACT,
+                            os.O_WRONLY | os.O_CREAT,
+                            0o600,
+                        )
+                        os.close(descriptor)
+
+                    def test_runtime_writes_are_limited_to_explicit_artifact_roots(self):
+                        with self.assertRaises(PermissionError):
+                            with open(IMMUTABLE_SOURCE, "w", encoding="utf-8") as handle:
+                                handle.write("VALUE = 2\\n")
+                        with open(RUNTIME_ARTIFACT, "w", encoding="utf-8") as handle:
+                            handle.write("allowed runtime output\\n")
+
+                    def test_case_dir_fd_cannot_retarget_a_relative_write(self):
+                        if os.name != "posix":
+                            self.skipTest("dir_fd write boundary is POSIX-specific")
+                        descriptor = os.open(
+                            TRUSTED_DIR,
+                            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                        )
+                        try:
+                            backend = importlib.import_module(os.name)
+                            for opener in (os.open, backend.open):
+                                with self.subTest(opener=opener):
+                                    with self.assertRaises(PermissionError):
+                                        opener(
+                                            "dir_fd_escape.txt",
+                                            os.O_WRONLY | os.O_CREAT,
+                                            0o600,
+                                            dir_fd=descriptor,
+                                        )
+                        finally:
+                            os.close(descriptor)
                 """
             )
             (tests_dir / "test_guard_behavior.py").write_text(source, encoding="utf-8")
 
-            result = run_python_unittest_subprocess(work_dir=work_dir, timeout=30)
+            result = run_python_unittest_subprocess(
+                work_dir=work_dir,
+                timeout=60,
+                trusted_runtime_roots=(trusted_dir, Path(sys.prefix), Path(sys.base_prefix)),
+            )
+
+            self.assertEqual(immutable_source.read_text(encoding="utf-8"), "VALUE = 1\n")
+            self.assertEqual(
+                runtime_artifact.read_text(encoding="utf-8"),
+                "allowed runtime output\n",
+            )
+            self.assertFalse((trusted_dir / "dir_fd_escape.txt").exists())
 
         self.assertTrue(
             result["passed"],
@@ -448,7 +625,13 @@ class CodexRunnerEphemeralTests(unittest.TestCase):
 
         self.assertEqual(
             set(config),
-            {"work_dir", "start_dir", "sensitive_roots", "trusted_read_roots"},
+            {
+                "work_dir",
+                "start_dir",
+                "sensitive_roots",
+                "trusted_read_roots",
+                "write_roots",
+            },
         )
         self.assertEqual(config["work_dir"], str(work_dir.resolve()))
         self.assertEqual(config["start_dir"], "tests")
@@ -456,9 +639,16 @@ class CodexRunnerEphemeralTests(unittest.TestCase):
         self.assertTrue(
             all(
                 isinstance(path, str) and Path(path).is_absolute()
-                for key in ("sensitive_roots", "trusted_read_roots")
+                for key in ("sensitive_roots", "trusted_read_roots", "write_roots")
                 for path in config[key]
             )
+        )
+        self.assertEqual(
+            set(config["write_roots"]),
+            {
+                str((work_dir / ".runtime_home").resolve()),
+                str((work_dir / "tests" / "runtime_artifacts").resolve()),
+            },
         )
         self.assertIn(str(Path(sys.prefix).resolve()), config["trusted_read_roots"])
         self.assertIn(str(Path(sys.base_prefix).resolve()), config["trusted_read_roots"])
@@ -503,6 +693,13 @@ class CodexRunnerBoundaryTests(unittest.TestCase):
                 continue
             for node in ast.walk(tree):
                 if isinstance(node, ast.Call) and _qualified_name(node.func) in subprocess_names:
+                    # The science sandbox probes local OS capabilities, never
+                    # invokes a model. Only its explicit --help probes qualify.
+                    if (source_path.name == "execution_sandbox.py" and node.args
+                            and isinstance(node.args[0], ast.List) and node.args[0].elts
+                            and isinstance(node.args[0].elts[-1], ast.Constant)
+                            and node.args[0].elts[-1].value == "--help"):
+                        continue
                     offenders.append(
                         f"{source_path.relative_to(source_root)}:{node.lineno}:{_qualified_name(node.func)}"
                     )

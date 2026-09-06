@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 
 from .status import inspect_case_status
+from .benchmark_quality import assess_quality_baseline, quality_counts, scientific_outcome_counts, SCIENTIFIC_OUTCOMES
+from .codex_cost import summarize_codex_usage
 
 
 OUTCOME_STATUSES = ("matched", "explained_gap", "failed")
@@ -34,7 +36,18 @@ def build_case_summary(output_dir: str | Path) -> dict[str, Any]:
     ]
     runtime_fields = _runtime_fields(runtime)
     outcomes = _outcome_counts(case_dir, runtime)
-    cost_fields = _cost_fields(run_cost)
+    cumulative_cost = run_cost.get("cumulative") if run_cost else None
+    measured_cost = cumulative_cost if isinstance(cumulative_cost, dict) else run_cost
+    cost_fields = _cost_fields(measured_cost)
+    codex_cost = summarize_codex_usage(case_dir / "audit")
+    cost_scope = "cumulative" if isinstance(cumulative_cost, dict) else "legacy_latest_invocation"
+    if not isinstance(cumulative_cost, dict) and codex_cost["llm_calls"]:
+        cost_scope = "legacy_api_latest_plus_observed_codex_history"
+        cost_fields["llm_calls"] = (cost_fields.get("llm_calls") or 0) + codex_cost["llm_calls"]
+        for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            value = codex_cost.get(field)
+            cost_fields[field] = (cost_fields.get(field) or 0) + value if value is not None else None
+        cost_fields["cost_usd"] = None
 
     return {
         "case": case_dir.name,
@@ -49,8 +62,12 @@ def build_case_summary(output_dir: str | Path) -> dict[str, Any]:
         "tasks_count": _list_count(tasks, "repro_tasks"),
         **runtime_fields,
         **outcomes,
-        "wall_clock_s": _number(run_cost.get("wall_clock_s")) if run_cost else None,
+        "wall_clock_s": _number(measured_cost.get("wall_clock_s")) if measured_cost else None,
+        "cost_scope": cost_scope,
         **cost_fields,
+        "codex_cumulative": codex_cost,
+        "scientific_outcomes": scientific_outcome_counts(case_dir, tasks),
+        "quality": assess_quality_baseline(case_dir),
     }
 
 
@@ -79,12 +96,23 @@ def aggregate_benchmark(case_summaries: Iterable[Mapping[str, Any]]) -> dict[str
         "cost_usd": _sum_complete(cases, "cost_usd"),
     }
 
+    quality_rows = [row for case in cases for row in case.get("quality", {}).get("tasks", [])]
     return {
         "schema_version": "1.0",
         "case_count": len(cases),
         "totals": totals,
         "stage_totals": _aggregate_stages(cases),
         "cases": cases,
+        "quality": {**quality_counts(quality_rows), "by_paper_family": {
+            family: quality_counts([row for row in quality_rows if str(row.get("paper_family") or "unspecified") == family])
+            for family in sorted({str(row.get("paper_family") or "unspecified") for row in quality_rows})}},
+        "scientific_outcomes": {name: sum(case.get("scientific_outcomes", {}).get(name, 0) for case in cases)
+                                for name in (*SCIENTIFIC_OUTCOMES, "unassessed")},
+        "codex_cumulative": {
+            "llm_calls": sum(case.get("codex_cumulative", {}).get("llm_calls", 0) for case in cases),
+            "total_tokens": _sum_complete([case.get("codex_cumulative", {}) for case in cases], "total_tokens"),
+            "calls_missing_usage": sum(case.get("codex_cumulative", {}).get("calls_missing_usage", 0) for case in cases),
+        },
     }
 
 
@@ -108,6 +136,8 @@ def render_benchmark_markdown(report: Mapping[str, Any]) -> str:
         "# Offline Benchmark",
         "",
         f"Cases: {report.get('case_count', len(case_rows))}",
+        "",
+        "Cost columns use cumulative case costs when a run ledger is available. Older cases combine observed Codex history with only the last recorded API/time invocation; missing usage is unknown.",
         "",
         "| Case | Stages | Facts | Tasks | Runtime | Matched | Explained gap | Failed | Wall clock (s) | LLM calls | Total tokens | Cost (USD) |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
@@ -143,6 +173,23 @@ def render_benchmark_markdown(report: Mapping[str, Any]) -> str:
                     total=_markdown_value(item.get("total")),
                 )
             )
+    quality = report.get("quality") or {}
+    cumulative = report.get("codex_cumulative") or {}
+    lines += ["", "## Scientific outcomes", "",
+              "Runtime coverage measures process completion. These terminal scientific results are recorded separately.", "",
+              "| Case | Reproduced | With assumptions | Missing information | Not reproduced | Execution failed | Unassessed |",
+              "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
+    for case in [*case_rows, {"case": "**Total**", "scientific_outcomes": report.get("scientific_outcomes", {})}]:
+        outcomes = case.get("scientific_outcomes", {})
+        lines.append("| " + " | ".join([_markdown_text(case.get("case")),
+                     *[str(outcomes.get(name, 0)) for name in (*SCIENTIFIC_OUTCOMES, "unassessed")]]) + " |")
+    lines += ["", "## Scientific quality and cumulative Codex cost", "",
+              "Independent labels are optional. Missing labels/results are unassessed, never counted as correct.", "",
+              f"Assessed/labeled: {quality.get('assessed', 0)}/{quality.get('labeled', 0)}; "
+              f"false success: {quality.get('false_success', 0)}; false failure: {quality.get('false_failure', 0)}; "
+              f"unjustified/missed reruns: {quality.get('rerun_errors', 0)}.", "",
+              f"Cumulative Codex calls: {cumulative.get('llm_calls', 0)}; tokens: {cumulative.get('total_tokens') if cumulative.get('total_tokens') is not None else 'unknown'}; "
+              f"calls without complete usage: {cumulative.get('calls_missing_usage', 0)}."]
     return "\n".join(lines) + "\n"
 
 
@@ -361,8 +408,8 @@ def _markdown_case_row(case: Mapping[str, Any]) -> str:
         _markdown_value(case.get("failed")),
         _markdown_value(case.get("wall_clock_s")),
         _markdown_value(case.get("llm_calls")),
-        _markdown_value(case.get("total_tokens")),
-        _markdown_value(case.get("cost_usd")),
+        _markdown_value(case.get("total_tokens")) if case.get("total_tokens") is not None else "unknown",
+        _markdown_value(case.get("cost_usd")) if case.get("cost_usd") is not None else "unknown",
     ]
     return "| " + " | ".join(values) + " |"
 

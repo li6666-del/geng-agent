@@ -1,0 +1,71 @@
+{
+  "schema_version": "1.0",
+  "provenance": "Synthetic scientific review examples; no source paper or historical case is treated as ground truth.",
+  "reviewer_instructions": "Review each case independently, without opening quality_baseline.json. Identify the paper's core claim, state whether it is supported, and decide whether another full run has a concrete causal justification. Return case_id, outcome, rerun_allowed, evidence, and reason. A changed plot appearance alone is not a method failure; method/ordering/trend failures remain material even below a factor of 10.",
+  "cases": [
+    {
+      "case_id": "sample_shape_a", "task_id": "sample_shape_a", "pair_id": "sample_shape", "paper_family": "stochastic_channel", "failure_mode": "illustrative_realization_vs_core_claim",
+      "task": {"task_id": "sample_shape_a", "scientific_acceptance": {"core_conclusions": [{"claim_id": "mechanism", "statement": "Weak multipath creates nonconstant subcarrier gain."}], "key_numeric_targets": [], "information_gaps": [{"gap_id": "realization", "description": "The example's exact geometry is unpublished.", "affects_claim_ids": ["mechanism"], "disposition": "assume_and_disclose"}]}},
+      "paper_excerpt": "The contribution is that even a weak reflected path causes frequency selectivity. One illustrative realization is shown; the paper does not assert that every realization has its maximum in the central band and does not disclose the illustrated geometry.",
+      "local_observation": "A disclosed representative geometry uses the paper equations. Subcarrier gains vary by 20%, with an off-center maximum. Varying path delay retains frequency selectivity. Only the example's peak location differs.",
+      "available_change": "No equation, coordinate, or normalization error is identified. Candidate geometry selection could make a more similar-looking plot.",
+      "reviewer_question": "Does the off-center peak refute the claimed mechanism, and does searching for another geometry justify a full rerun?"
+    },
+    {
+      "case_id": "sample_shape_b", "task_id": "sample_shape_b", "pair_id": "sample_shape", "paper_family": "stochastic_channel", "failure_mode": "illustrative_realization_vs_core_claim",
+      "task": {"task_id": "sample_shape_b", "scientific_acceptance": {"core_conclusions": [{"claim_id": "mechanism", "statement": "Weak multipath creates nonconstant subcarrier gain."}, {"claim_id": "peak_location", "statement": "For the explicitly supplied geometry and frequency origin, the band maximum is central."}], "key_numeric_targets": [], "information_gaps": []}},
+      "paper_excerpt": "For the geometry, gains, delays, and frequency origin specified in Table A, the analytic response has a central maximum. This peak-location prediction is the scientific claim tested by the experiment.",
+      "local_observation": "The local result is frequency selective but its maximum is off-center. The output code applies a circular shift to gain samples without applying the corresponding frequency-coordinate shift, contradicting the supplied convention.",
+      "available_change": "Remove the unmatched sample permutation and evaluate the same supplied geometry on the correctly labeled frequency grid. No random realization search is needed.",
+      "reviewer_question": "Does the changed peak position now contradict a core claim, and is the identified coordinate correction a justified rerun?"
+    },
+    {
+      "case_id": "ordering_a", "task_id": "ordering_a", "pair_id": "ordering", "paper_family": "channel_estimation", "failure_mode": "method_ordering_reversal",
+      "task": {"task_id": "ordering_a", "scientific_acceptance": {"core_conclusions": [{"claim_id": "ordering", "statement": "A has lower NMSE than B on the held-out channel distribution."}], "key_numeric_targets": [{"target_id": "a_nmse", "name": "A NMSE", "paper_magnitude": 0.01}], "information_gaps": []}},
+      "paper_excerpt": "Under the specified paired held-out evaluation, A has lower NMSE than B. The reported values are 0.01 and 0.015; no tighter absolute error is claimed.",
+      "local_observation": "Paired independent trials give A=0.02 and B=0.03 with nonoverlapping uncertainty intervals. Both methods and the held-out evaluation follow the paper; their ranking is preserved.",
+      "available_change": "No evidence-based implementation correction is identified. Retuning the seed could reduce the absolute differences.",
+      "reviewer_question": "Should a factor-2 numerical difference alone trigger another run when the method identities and comparison are correct?"
+    },
+    {
+      "case_id": "ordering_b", "task_id": "ordering_b", "pair_id": "ordering", "paper_family": "channel_estimation", "failure_mode": "method_ordering_reversal",
+      "task": {"task_id": "ordering_b", "scientific_acceptance": {"core_conclusions": [{"claim_id": "ordering", "statement": "A has lower NMSE than B on the held-out channel distribution."}], "key_numeric_targets": [{"target_id": "a_nmse", "name": "A NMSE", "paper_magnitude": 0.01}], "information_gaps": []}},
+      "paper_excerpt": "Under the specified paired held-out evaluation, A has lower NMSE than B. The reported values are 0.01 and 0.015; no tighter absolute error is claimed.",
+      "local_observation": "Paired independent trials give A=0.03 and B=0.02 with nonoverlapping uncertainty intervals. Code inspection shows A divides by the channel variance twice, whereas the paper requires one division.",
+      "available_change": "Remove A's extra variance division, retain the same evaluation distribution, and check whether the corrected estimator restores the comparison.",
+      "reviewer_question": "Does the sub-factor-10 difference remain material because the ranking reverses, and is there a causal correction?"
+    },
+    {
+      "case_id": "numeric_accuracy_a", "task_id": "numeric_accuracy_a", "pair_id": "numeric_accuracy", "paper_family": "iterative_optimization", "failure_mode": "ordinary_scale_vs_explicit_accuracy",
+      "task": {"task_id": "numeric_accuracy_a", "scientific_acceptance": {"core_conclusions": [{"claim_id": "trend", "statement": "The objective decreases monotonically to a stable value."}], "key_numeric_targets": [{"target_id": "objective", "name": "Final objective", "paper_magnitude": 2.0}], "information_gaps": []}},
+      "paper_excerpt": "The claim is monotone stable convergence and the correct algorithmic comparison; a final objective of approximately 2 is an illustrative value. No tighter accuracy is claimed.",
+      "local_observation": "The faithful algorithm converges monotonically with the same comparison, to a value of 8. Both values use the same unit. No causal implementation discrepancy is identified.",
+      "available_change": "Additional epochs or changing seeds is the only proposed action, without an evidence-based error model.",
+      "reviewer_question": "Is a factor-4 scale difference by itself sufficient to trigger another full run?"
+    },
+    {
+      "case_id": "numeric_accuracy_b", "task_id": "numeric_accuracy_b", "pair_id": "numeric_accuracy", "paper_family": "iterative_optimization", "failure_mode": "ordinary_scale_vs_explicit_accuracy",
+      "task": {"task_id": "numeric_accuracy_b", "scientific_acceptance": {"core_conclusions": [{"claim_id": "trend", "statement": "The objective decreases monotonically to a stable value."}, {"claim_id": "accuracy", "statement": "The supplied benchmark objective is reproduced within 1 percent relative error."}], "key_numeric_targets": [{"target_id": "objective", "name": "Final objective", "paper_magnitude": 2.0}], "information_gaps": []}},
+      "paper_excerpt": "The claimed solver reproduces the supplied benchmark objective of 2 within 1 percent relative error. This accuracy is an explicit core claim.",
+      "local_observation": "The reported objective is 2.04, a 2 percent relative error. The implementation uses a stopping residual of 0.03 instead of the paper's 0.001.",
+      "available_change": "Use the specified residual threshold and rerun the supplied benchmark once; do not change its data or choose a more favorable seed.",
+      "reviewer_question": "Should the explicit 1 percent claim still fail even though the ratio is only 1.02, and does the stopping-rule correction justify a rerun?"
+    },
+    {
+      "case_id": "learned_method_a", "task_id": "learned_method_a", "pair_id": "learned_method", "paper_family": "learned_communication", "failure_mode": "method_identity_despite_matching_curves",
+      "task": {"task_id": "learned_method_a", "scientific_acceptance": {"core_conclusions": [{"claim_id": "ordering", "statement": "The proposed learned decoder outperforms the baseline."}], "key_numeric_targets": [], "information_gaps": []}},
+      "paper_excerpt": "The proposed decoder learns from the training split and evaluates the same learned parameters on an independent held-out split. Its comparison to the baseline is the core result.",
+      "local_observation": "The held-out comparison supports the ordering. Parameter digests change after training, checkpoint reload preserves predictions, and the evaluation trace invokes that trained decoder. The training and test splits do not overlap.",
+      "available_change": "No method, execution, or comparison error is identified.",
+      "reviewer_question": "Do the evidence and curve comparison support the actual learned method?"
+    },
+    {
+      "case_id": "learned_method_b", "task_id": "learned_method_b", "pair_id": "learned_method", "paper_family": "learned_communication", "failure_mode": "method_identity_despite_matching_curves",
+      "task": {"task_id": "learned_method_b", "scientific_acceptance": {"core_conclusions": [{"claim_id": "ordering", "statement": "The proposed learned decoder outperforms the baseline."}], "key_numeric_targets": [], "information_gaps": []}},
+      "paper_excerpt": "The proposed decoder learns from the training split and evaluates the same learned parameters on an independent held-out split. Its comparison to the baseline is the core result.",
+      "local_observation": "The plotted comparison supports the ordering. However, the evaluation code bypasses the decoder and substitutes a fixed analytic curve; parameter digests never change and no checkpoint is loaded. The Designer omitted a separate method-identity criterion.",
+      "available_change": "Execute the specified training step, save and reload its checkpoint, and use the actual trained decoder for held-out evaluation.",
+      "reviewer_question": "Must an independently discovered method-identity failure be retained even though its claim ID was not in the task and the plotted ordering agrees?"
+    }
+  ]
+}

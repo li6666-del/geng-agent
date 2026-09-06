@@ -91,7 +91,7 @@ class NormalizeReproTasksTests(unittest.TestCase):
         self.assertIn({"type": "figure_claim", "name": "Figure 11"}, task["required_facts"])
         self.assertTrue(doc["_meta"]["normalization_used"])
 
-    def test_moves_soft_backfill_handoff_into_meta(self) -> None:
+    def test_keeps_soft_backfill_handoff_in_public_v2_contract(self) -> None:
         document = {
             "backfill_handoff": {
                 "ready_for_writer": False,
@@ -103,15 +103,17 @@ class NormalizeReproTasksTests(unittest.TestCase):
 
         normalized = finalize_repro_tasks(document, FACTS)
 
-        self.assertNotIn("backfill_handoff", normalized)
         self.assertEqual(
-            normalized["_meta"]["backfill_handoff"],
+            normalized["backfill_handoff"],
             {
                 "ready_for_writer": False,
                 "blocking_request_ids": ["backfill_a"],
                 "reason": "a newly exposed formula is still missing",
+                "inferred": False,
             },
         )
+        self.assertEqual(normalized["schema_version"], "2.0")
+        self.assertNotIn("backfill_handoff", normalized.get("_meta", {}))
         self.assertEqual(validate_stage("repro_tasks", normalized), [])
 
     def test_preserves_task_when_only_legacy_description_fields_are_missing(self) -> None:
@@ -429,7 +431,11 @@ class NormalizeReproTasksTests(unittest.TestCase):
     def test_normalize_non_object_payload_to_empty_tasks(self) -> None:
         normalized, coercions = normalize_repro_tasks_candidate(["not", "object"], FACTS)
 
-        self.assertEqual(normalized, {"repro_tasks": []})
+        self.assertEqual(normalized["schema_version"], "2.0")
+        self.assertEqual(normalized["repro_tasks"], [])
+        self.assertEqual(normalized["execution_relationships"], [])
+        self.assertTrue(normalized["backfill_handoff"]["ready_for_writer"])
+        self.assertTrue(normalized["backfill_handoff"]["inferred"])
         self.assertTrue(coercions)
 
 

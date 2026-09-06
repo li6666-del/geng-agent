@@ -525,20 +525,20 @@ class TaskWriterExecutionBindingTests(unittest.TestCase):
                 ],
             }
             with patch(
-                'geng_agent.agentic_task_writers._prepare_task_writer_sandbox'
+                'geng_agent.task_writer_runner._prepare_task_writer_sandbox'
             ), patch(
-                'geng_agent.agentic_task_writers._build_task_writer_brief',
+                'geng_agent.task_writer_runner._build_task_writer_brief',
                 return_value='base',
             ), patch(
-                'geng_agent.agentic_task_writers._run_task_writer_codex_session',
+                'geng_agent.task_writer_runner._run_task_writer_codex_session',
                 return_value={'ok': True},
             ) as run_session, patch(
-                'geng_agent.agentic_task_writers._restore_trusted_files'
+                'geng_agent.task_writer_runner._restore_trusted_files'
             ), patch(
-                'geng_agent.agentic_task_writers._collect_task_writer_delivery',
+                'geng_agent.task_writer_runner._collect_task_writer_delivery',
                 return_value=ready,
             ), patch(
-                'geng_agent.agentic_task_writers._archive_nonterminal_writer_delivery'
+                'geng_agent.task_writer_runner._archive_nonterminal_writer_delivery'
             ) as archive:
                 result = _run_one_task_writer(
                     index=1,
@@ -600,7 +600,7 @@ class TaskWriterExecutionBindingTests(unittest.TestCase):
                 'tasks/fig_1.py',
             }
             with patch(
-                'geng_agent.agentic_task_writers.install_foundation_snapshot',
+                'geng_agent.task_writer_packaging.install_foundation_snapshot',
                 return_value={'requirements.txt'},
             ):
                 _merge_task_writer_deliveries(

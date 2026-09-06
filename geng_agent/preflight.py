@@ -9,10 +9,9 @@ before a paper run starts.
 Two distinct dependency classes, both required on a new machine:
   1. orchestrator deps  -> needed to even start geng-agent (parse PDF, render
      pages, validate JSON, write Word). Declared in pyproject [project].
-  2. repro whitelist     -> the third-party libs the *generated* reproduction
-     code is allowed to import. Single source of truth is
-     security.ALLOWED_REQUIREMENTS; if these are absent the generator is told
-     "don't use numpy" and the task writer cannot deliver a valid full run.
+  2. default repro profile -> common scientific libraries covered by ``.[repro]``.
+     This is deployment metadata, not a package whitelist; paper-specific packages
+     are resolved and locked in the isolated case environment.
 
 This module never imports heavy packages, so `geng-agent doctor` still runs on
 a machine that is missing them. The normal environment report uses
@@ -34,7 +33,7 @@ from typing import Any
 
 from .codex_runner import split_command
 from .config import get_config_value
-from .security import ALLOWED_REQUIREMENTS, import_names_for_requirement
+from .security import DEFAULT_REPRO_PACKAGE_PROFILES, import_names_for_requirement
 
 # Minimum interpreter. Keep in sync with pyproject `requires-python`.
 REQUIRED_PYTHON: tuple[int, int] = (3, 11)
@@ -114,14 +113,12 @@ class EnvironmentReport:
 
     @property
     def fatal(self) -> bool:
-        """True when the machine cannot do a real reproduction: wrong Python, a
-        missing orchestrator dep (CLI won't start), or a missing critical repro
-        lib (task writers cannot complete a faithful full run)."""
-        return (
-            (not self.python_ok)
-            or bool(self.missing_orchestrator)
-            or bool(self.missing_repro_critical)
-        )
+        """True only when the orchestrator itself cannot run.
+
+        Missing scientific packages are case-resolver work, not a reason to
+        pre-emptively weaken or reject a paper reproduction.
+        """
+        return (not self.python_ok) or bool(self.missing_orchestrator)
 
     @property
     def ok(self) -> bool:
@@ -143,10 +140,9 @@ def _distribution_version(package: str) -> str | None:
 
 
 def _repro_requirements() -> list[tuple[str, str]]:
-    """Canonical (package, import_name) pairs for the repro whitelist, sorted,
-    with pillow/sklearn aliases dropped."""
+    """Canonical convenience-profile packages, with duplicate aliases dropped."""
     items: dict[str, str] = {}
-    for package in ALLOWED_REQUIREMENTS:
+    for package in DEFAULT_REPRO_PACKAGE_PROFILES:
         if package in _REPRO_SKIP_REQUIREMENTS:
             continue
         import_name = sorted(import_names_for_requirement(package))[0]
@@ -172,7 +168,7 @@ def check_environment() -> EnvironmentReport:
             import_name=import_name,
             installed=_is_installed(import_name),
             version=_distribution_version(package),
-            purpose="复现代码可用库（关键）" if package in CRITICAL_REPRO_PACKAGES else "复现代码可用库（可选，缺失时报告能力缺口）",
+            purpose="常用复现资料包（Case Resolver 可补齐）",
             critical=package in CRITICAL_REPRO_PACKAGES,
         )
         for package, import_name in _repro_requirements()
@@ -268,24 +264,17 @@ def _architecture_runtime_inventory(report: EnvironmentReport) -> list[dict[str,
         package_status = reported.get(package)
         installed = package_status.installed if package_status is not None else _is_installed(import_name)
         version = package_status.version if package_status is not None else _distribution_version(package)
-        policy_allowed = package in ALLOWED_REQUIREMENTS
         runtimes.append(
             {
                 "runtime": runtime,
                 "aliases": list(aliases),
                 "package": package,
                 "import_name": import_name,
-                "policy_allowed": policy_allowed,
+                "resolution_supported": True,
                 "installed": installed,
                 "version": version,
-                "usable_now": policy_allowed and installed,
-                "status": (
-                    "ready"
-                    if policy_allowed and installed
-                    else "package_missing"
-                    if policy_allowed
-                    else "environment_extension_required"
-                ),
+                "usable_now": installed,
+                "status": "ready" if installed else "package_missing",
             }
         )
     known_packages = {str(item["package"]) for item in runtimes}
@@ -299,7 +288,7 @@ def _architecture_runtime_inventory(report: EnvironmentReport) -> list[dict[str,
                 "aliases": aliases,
                 "package": item.package,
                 "import_name": item.import_name,
-                "policy_allowed": True,
+                "resolution_supported": True,
                 "installed": item.installed,
                 "version": item.version,
                 "usable_now": item.installed,
@@ -375,13 +364,7 @@ def architecture_execution_capability_gaps(
             seen_supporting_keys.add(library_key)
             entry = alias_entries.get(library_key)
             if entry is not None:
-                if entry.get("policy_allowed") is not True:
-                    gap_kind = "environment_extension_required"
-                    gap_message = (
-                        "selected supporting library requires an explicit environment "
-                        f"policy extension: {library_name}"
-                    )
-                elif entry.get("installed") is not True:
+                if entry.get("installed") is not True:
                     gap_kind = "runtime_package_missing"
                     gap_message = (
                         f"selected supporting library is not installed on this host: {library_name}"
@@ -401,9 +384,9 @@ def architecture_execution_capability_gaps(
                         else f"required supporting runtime is not visible on this host: {library_name}"
                     )
                 else:
-                    gap_kind = "runtime_unregistered"
+                    gap_kind = "runtime_resolution_required"
                     gap_message = (
-                        "selected supporting library has no trusted host registry entry: "
+                        "selected supporting library must be resolved in the case environment: "
                         f"{library_name}"
                     )
             if gap_kind:
@@ -431,11 +414,8 @@ def architecture_execution_capability_gaps(
         if framework_key not in local_runtime_keys:
             entry = alias_entries.get(framework_key)
             if entry is None:
-                gap_kind = "runtime_unregistered"
-                gap_message = f"selected runtime has no trusted host registry entry: {framework}"
-            elif entry.get("policy_allowed") is not True:
-                gap_kind = "environment_extension_required"
-                gap_message = f"selected runtime requires an explicit environment policy extension: {framework}"
+                gap_kind = "runtime_resolution_required"
+                gap_message = f"selected runtime must be resolved in the case environment: {framework}"
             elif entry.get("installed") is not True:
                 gap_kind = "runtime_package_missing"
                 gap_message = f"selected runtime package is not installed on this host: {framework}"
@@ -493,7 +473,7 @@ def architecture_capability_inventory(
             "minimum_supported": current.python_required,
         },
         "installed_reproduction_packages": installed,
-        "unavailable_allowed_reproduction_packages": unavailable,
+        "unavailable_profiled_reproduction_packages": unavailable,
         "accelerators": _probe_nvidia_devices(),
         "python_runtime_registry": _architecture_runtime_inventory(current),
         "external_runtime_registry": [
@@ -550,10 +530,10 @@ def format_report(report: EnvironmentReport) -> str:
         version = f" {item.version}" if item.version else ""
         lines.append(f"  [{_mark(item.installed)}] {item.package}{version}  - {item.purpose}")
     lines.append("")
-    lines.append("二、复现代码使用的白名单库（缺关键项会阻碍 task writer 完成 full 运行）:")
+    lines.append("二、常用复现环境资料包（论文需要的其他库由 case resolver 补齐）:")
     for item in report.repro:
         version = f" {item.version}" if item.version else ""
-        tag = "关键" if item.critical else "可选"
+        tag = "常用" if item.critical else "扩展"
         lines.append(f"  [{_mark(item.installed)}] {item.package}{version}  ({tag})")
     if report.mineru is not None:
         lines.append("")
@@ -574,8 +554,8 @@ def format_report(report: EnvironmentReport) -> str:
         lines.append(f"  {command}")
     if not report.python_ok:
         lines.append(f"  注意: 当前 Python {report.python_version} 低于要求 {report.python_required}，需先升级解释器。")
-    if not report.fatal and report.missing_repro_optional:
-        lines.append("  （当前只缺可选库：不影响启动，但相关论文会退到近似实现。）")
+    if not report.fatal and (report.missing_repro_critical or report.missing_repro_optional):
+        lines.append("  （缺失项不阻断启动；若论文需要，Case Resolver 会从可信来源安装、锁定并验证。）")
     return "\n".join(lines)
 
 
@@ -591,10 +571,10 @@ def environment_warning(report: EnvironmentReport) -> str | None:
     if report.missing_orchestrator:
         problems.append("缺运行依赖: " + ", ".join(item.package for item in report.missing_orchestrator))
     if report.missing_repro_critical:
-        problems.append("缺关键复现库: " + ", ".join(item.package for item in report.missing_repro_critical))
+        problems.append("缺常用复现库（Case Resolver 可补齐）: " + ", ".join(item.package for item in report.missing_repro_critical))
     if report.missing_repro_optional:
         problems.append("缺可选复现库: " + ", ".join(item.package for item in report.missing_repro_optional))
-    header = "[警告] 环境自检未通过（继续运行，但 task writer 很可能无法完成 full）:" if report.fatal else "[提示] 复现环境不完整:"
+    header = "[警告] 编排器环境自检未通过:" if report.fatal else "[提示] 常用复现资料包不完整（Case Resolver 将按论文补齐）:"
     command = remedy_command(report)
     tail = f"\n  修复: {command}\n  详情: geng-agent doctor" if command else "\n  详情: geng-agent doctor"
     return f"{header}\n  " + "; ".join(problems) + tail

@@ -17,8 +17,10 @@ This module is deterministic, harness-owned plumbing (no LLM):
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -51,30 +53,104 @@ def build_tasks_manifest(
     *,
     smoke_timeout_s: int = DEFAULT_SMOKE_TIMEOUT_S,
     full_timeout_s: int = DEFAULT_FULL_TIMEOUT_S,
+    execution_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Derive the per-task run manifest from a repro_tasks document.
 
-    ``output_subdir`` uses :func:`io_slug` so it matches exactly the ``outputs/<slug>/``
-    folder ``_io`` writes the task's artifacts into."""
+    ``output_subdir`` normally uses :func:`io_slug`.  Distinct task ids can collapse
+    to the same filesystem slug, though (and case-only differences collide after a
+    portable project is copied to Windows), so colliding entries receive a stable
+    task-id hash suffix."""
     raw = tasks_doc.get("repro_tasks") if isinstance(tasks_doc, dict) else None
-    entries: list[dict[str, Any]] = []
-    used: set[str] = set()
+    plan = execution_plan if isinstance(execution_plan, dict) else {}
+    task_to_unit = plan.get("task_to_execution_unit")
+    task_to_unit = task_to_unit if isinstance(task_to_unit, dict) else {}
+    phase_by_task: dict[str, int] = {}
+    raw_units = plan.get("execution_units")
+    for unit in raw_units if isinstance(raw_units, list) else []:
+        if not isinstance(unit, dict):
+            continue
+        for phase, raw_task_id in enumerate(
+            unit.get("task_ids") if isinstance(unit.get("task_ids"), list) else [],
+            start=1,
+        ):
+            phase_by_task[str(raw_task_id)] = phase
+    task_records: list[tuple[str, dict[str, Any]]] = []
     for index, task in enumerate(raw if isinstance(raw, list) else [], start=1):
         if not isinstance(task, dict):
             continue
         task_id = str(task.get("task_id") or "").strip() or f"task_{index:02d}"
+        task_records.append((task_id, task))
+    output_subdirs = _stable_unique_output_subdirs(
+        [task_id for task_id, _task in task_records]
+    )
+
+    entries: list[dict[str, Any]] = []
+    used: set[str] = set()
+    for (task_id, _task), output_subdir in zip(task_records, output_subdirs):
         module = task_module_name(task_id, used)
-        entries.append(
-            {
+        entry = {
                 "task_id": task_id,
                 "module": module,
                 "script": f"tasks/{module}.py",
-                "output_subdir": io_slug(task_id),
+                "output_subdir": output_subdir,
                 "timeout_smoke_s": smoke_timeout_s,
                 "timeout_full_s": full_timeout_s,
             }
-        )
-    return {"version": 1, "tasks": entries}
+        unit_id = str(task_to_unit.get(task_id) or "").strip()
+        if unit_id:
+            entry["execution_unit_id"] = unit_id
+            entry["execution_phase"] = phase_by_task.get(task_id, 1)
+        entries.append(entry)
+    document: dict[str, Any] = {"version": 1, "tasks": entries}
+    if plan:
+        document["execution_plan_version"] = str(plan.get("schema_version") or "1.0")
+        document["execution_units"] = [
+            {
+                key: unit.get(key)
+                for key in (
+                    "unit_id",
+                    "mode",
+                    "task_ids",
+                    "dependencies",
+                    "artifact_ids",
+                )
+                if key in unit
+            }
+            for unit in (raw_units if isinstance(raw_units, list) else [])
+            if isinstance(unit, dict)
+        ]
+    return document
+
+
+def _stable_unique_output_subdirs(task_ids: list[str]) -> list[str]:
+    """Return deterministic, cross-platform-unique output directory names.
+
+    Non-colliding task ids retain the historical ``io_slug(task_id)`` path.  Every
+    member of a collision group is suffixed, so reordering otherwise-valid unique
+    task ids cannot transfer the unsuffixed directory from one task to another.
+    """
+    bases = [io_slug(task_id) for task_id in task_ids]
+    collision_counts = Counter(base.casefold() for base in bases)
+    reserved = {base.casefold() for base in bases}
+    used: set[str] = set()
+    results: list[str] = []
+    for task_id, base in zip(task_ids, bases):
+        if collision_counts[base.casefold()] == 1:
+            candidate = base
+        else:
+            digest = hashlib.sha256(task_id.encode("utf-8")).hexdigest()[:10]
+            candidate = f"{base}--{digest}"
+        unique = candidate
+        suffix = 2
+        while unique.casefold() in used or (
+            unique.casefold() in reserved and unique.casefold() != base.casefold()
+        ):
+            unique = f"{candidate}-{suffix}"
+            suffix += 1
+        used.add(unique.casefold())
+        results.append(unique)
+    return results
 
 
 _DISPATCHER_HEADER = '''"""Auto-generated run-all dispatcher (geng-agent, do not edit).
@@ -95,16 +171,64 @@ from src import _io
 
 _DISPATCHER_MAIN = '''
 
+def _task_config(requested, config_full, config_smoke):
+    requested_name = Path(requested).name
+    candidate = None
+    if requested_name == "config_smoke.json":
+        candidate = config_smoke
+    elif requested_name == "config.json":
+        candidate = config_full
+    if candidate and Path(candidate).is_file():
+        return candidate
+    return requested
+
+def _failed_return(value):
+    return value is False or (
+        isinstance(value, int) and not isinstance(value, bool) and value != 0
+    )
+
+def _blocked_dependencies(task_id, results):
+    blocked = []
+    for producer_task_id, artifact_ids in _DEPENDENCIES.get(task_id, ()):
+        producer_result = results.get(producer_task_id)
+        producer_status = (
+            producer_result.get("status") if isinstance(producer_result, dict) else "not_run"
+        )
+        if producer_status != "ok":
+            blocked.append({
+                "producer_task_id": producer_task_id,
+                "producer_status": producer_status,
+                "artifact_ids": list(artifact_ids),
+            })
+    return blocked
+
 def main() -> int:
     config_path = sys.argv[1] if len(sys.argv) > 1 else "config_smoke.json"
     results = {}
     all_passed = True
-    for task_id, run_task in _TASKS:
+    for task_id, run_task, config_full, config_smoke in _TASKS:
+        selected_config = _task_config(config_path, config_full, config_smoke)
+        blocked_by = _blocked_dependencies(task_id, results)
+        if blocked_by:
+            results[task_id] = {
+                "status": "skipped",
+                "config": selected_config,
+                "reason": "dependency_failed",
+                "blocked_by": blocked_by,
+            }
+            all_passed = False
+            continue
         try:
-            run_task(config_path)
-            results[task_id] = {"status": "ok"}
+            task_return = run_task(selected_config)
+            if _failed_return(task_return):
+                raise RuntimeError(f"task main returned failure status {task_return!r}")
+            results[task_id] = {"status": "ok", "config": selected_config}
         except Exception as exc:
-            results[task_id] = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+            results[task_id] = {
+                "status": "error",
+                "config": selected_config,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
             all_passed = False
     output_dir = Path("outputs")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -126,14 +250,96 @@ def render_run_experiment_dispatcher(manifest: dict[str, Any]) -> str:
     Static imports (not importlib) keep the generated project scan-clean while still
     letting the human entry point run every task."""
     tasks = [t for t in manifest.get("tasks", []) if isinstance(t, dict) and t.get("module")]
+    task_by_id = {str(task.get("task_id") or ""): task for task in tasks}
+    ordered_task_ids = [
+        str(task_id)
+        for unit in (
+            manifest.get("execution_units")
+            if isinstance(manifest.get("execution_units"), list)
+            else []
+        )
+        if isinstance(unit, dict)
+        for task_id in (
+            unit.get("task_ids") if isinstance(unit.get("task_ids"), list) else []
+        )
+    ]
+    if ordered_task_ids:
+        ordered = [task_by_id[task_id] for task_id in ordered_task_ids if task_id in task_by_id]
+        ordered.extend(task for task in tasks if task not in ordered)
+        tasks = ordered
     imports = "\n".join(f"from tasks import {t['module']} as _task_{t['module']}" for t in tasks)
-    entries = "\n".join(f"    ({t['task_id']!r}, _task_{t['module']}.main)," for t in tasks)
+    entries = "\n".join(
+        f"    ({t['task_id']!r}, _task_{t['module']}.main, "
+        f"{t.get('config_full')!r}, {t.get('config_smoke')!r}),"
+        for t in tasks
+    )
+    dependencies = _dispatcher_dependencies(manifest, task_by_id=set(task_by_id))
+    dependency_literal = json.dumps(dependencies, ensure_ascii=False, sort_keys=True)
     block = _DISPATCHER_HEADER
     if imports:
         block += imports + "\n"
     block += "\n_TASKS = [\n" + (entries + "\n" if entries else "") + "]\n"
+    block += f"_DEPENDENCIES = {dependency_literal}\n"
     block += _DISPATCHER_MAIN
     return block
+
+
+def _dispatcher_dependencies(
+    manifest: dict[str, Any], *, task_by_id: set[str]
+) -> dict[str, list[list[Any]]]:
+    """Compile same-unit producer edges into a JSON-literal dispatcher map.
+
+    Execution-plan compiler output uses singular ``consumer_task_id`` and
+    ``artifact_id`` keys.  The aggregate form used by older fixtures and manually
+    authored manifests uses plural lists; accepting both keeps the generated entry
+    point faithful to the canonical plan without dynamic plan parsing at runtime.
+    """
+    by_consumer: dict[str, dict[str, set[str]]] = {}
+    raw_units = manifest.get("execution_units")
+    for unit in raw_units if isinstance(raw_units, list) else []:
+        if not isinstance(unit, dict):
+            continue
+        unit_task_ids = {
+            str(task_id)
+            for task_id in unit.get("task_ids", [])
+            if str(task_id) in task_by_id
+        } if isinstance(unit.get("task_ids"), list) else set()
+        if len(unit_task_ids) < 2:
+            continue
+        raw_dependencies = unit.get("dependencies")
+        for dependency in raw_dependencies if isinstance(raw_dependencies, list) else []:
+            if not isinstance(dependency, dict):
+                continue
+            producer = str(dependency.get("producer_task_id") or "").strip()
+            if producer not in unit_task_ids:
+                continue
+            consumers: list[str] = []
+            consumer = str(dependency.get("consumer_task_id") or "").strip()
+            if consumer:
+                consumers.append(consumer)
+            raw_consumers = dependency.get("consumer_task_ids")
+            if isinstance(raw_consumers, list):
+                consumers.extend(str(item).strip() for item in raw_consumers)
+            artifacts: list[str] = []
+            artifact = str(dependency.get("artifact_id") or "").strip()
+            if artifact:
+                artifacts.append(artifact)
+            raw_artifacts = dependency.get("artifact_ids")
+            if isinstance(raw_artifacts, list):
+                artifacts.extend(str(item).strip() for item in raw_artifacts)
+            for consumer_task_id in consumers:
+                if consumer_task_id not in unit_task_ids or consumer_task_id == producer:
+                    continue
+                by_consumer.setdefault(consumer_task_id, {}).setdefault(producer, set()).update(
+                    item for item in artifacts if item
+                )
+    return {
+        consumer: [
+            [producer, sorted(artifacts)]
+            for producer, artifacts in sorted(producers.items())
+        ]
+        for consumer, producers in sorted(by_consumer.items())
+    }
 
 
 def write_task_scaffolding(project_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
@@ -151,6 +357,10 @@ def write_task_scaffolding(project_dir: Path, manifest: dict[str, Any]) -> dict[
     )
     (project_dir / "run_experiment.py").write_text(
         render_run_experiment_dispatcher(manifest), encoding="utf-8", newline="\n"
+    )
+    (project_dir / "run_task.py").write_text(
+        Path(__file__).with_name("execution_client.py").read_text(encoding="utf-8"),
+        encoding="utf-8", newline="\n",
     )
     return manifest
 

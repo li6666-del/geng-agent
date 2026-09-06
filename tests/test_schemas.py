@@ -7,13 +7,12 @@ from geng_agent.schemas import validate_stage, validate_task_fact_refs
 
 
 class SchemaTests(unittest.TestCase):
-    def test_repro_project_manifest_requires_smoke_config(self) -> None:
+    def test_repro_project_manifest_requires_host_entrypoint(self) -> None:
         manifest = {
             "files": [
                 {"path": "README.md", "content": ""},
                 {"path": "requirements.txt", "content": ""},
                 {"path": "config.json", "content": "{}"},
-                {"path": "run_experiment.py", "content": ""},
                 {"path": "src/channel.py", "content": ""},
                 {"path": "src/modulation.py", "content": ""},
                 {"path": "src/metrics.py", "content": ""},
@@ -23,7 +22,7 @@ class SchemaTests(unittest.TestCase):
 
         issues = validate_stage("repro_project_manifest", manifest)
 
-        self.assertTrue(any("config_smoke.json" in issue.message for issue in issues))
+        self.assertTrue(any("run_experiment.py" in issue.message for issue in issues))
 
     def test_task_fact_refs_must_exist(self) -> None:
         tasks = {

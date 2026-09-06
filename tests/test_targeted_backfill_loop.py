@@ -100,10 +100,11 @@ def _set_handoff(
     blocking_request_ids: list[str] | None = None,
     reason: str = "",
 ) -> None:
-    document.setdefault("_meta", {})["backfill_handoff"] = {
+    document["backfill_handoff"] = {
         "ready_for_writer": ready,
         "blocking_request_ids": blocking_request_ids or [],
         "reason": reason,
+        "inferred": False,
     }
 
 

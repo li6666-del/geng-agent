@@ -1,0 +1,5 @@
+These eight synthetic inputs cover four paired failure modes across channel simulation, estimation, optimization, and learned communications.
+
+For blind evaluation, provide only `cases.json` to independent reviewers. Keep `quality_baseline.json` hidden until their decisions are recorded. The baseline format is also accepted by the case benchmark: `task_id`, `expected_outcome`, `failure_mode`, and `pair_id` identify each assessment.
+
+The regression test uses the baseline's reference Reporter observations to test host normalization and materiality routing. Passing that regression proves the host preserves those observations; it does not prove a model can independently discover them. A real blind run must separately record model, prompt version, input case IDs, raw answers, elapsed time, token usage, false successes, false failures, and unjustified reruns. Do not tune prompts on these eight examples and then describe them as held-out validation; reserve additional unseen paper families for that purpose.

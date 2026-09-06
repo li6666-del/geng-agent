@@ -7,6 +7,7 @@ from typing import Any
 from .foundation_snapshot import path_is_foundation_link, validate_foundation_snapshot
 from .outputs import validate_repro_project
 from .schemas import validate_stage
+from .security import _runtime_lock_is_trusted
 
 
 STAGES = [
@@ -14,8 +15,10 @@ STAGES = [
     ("engineering_facts", "engineering_facts.json", "engineering_facts"),
     ("paper_thesis", "paper_thesis.json", "paper_thesis"),
     ("repro_tasks", "repro_tasks.json", "repro_tasks"),
+    ("execution_plan", "execution_plan.json", None),
     ("experiment_index", "experiment_index.json", "experiment_index"),
     ("scientific_architecture", "scientific_architecture.json", "scientific_architecture"),
+    ("environment_lock", "03a_environment.lock.json", None),
     ("foundation_manifest", "foundation_manifest.json", None),
     ("repro_project_manifest", "repro_project_manifest.json", "repro_project_manifest"),
     ("repro_project", "repro_project", None),
@@ -38,13 +41,22 @@ OPTIONAL_STAGES = {
     "review_docx", "reproduction_report_docx", "result_review_docx",
 }
 
+CURRENT_WORKFLOW_VERSION = "2"
+
+
+class UnsupportedCaseWorkflowError(RuntimeError):
+    """The case cannot be interpreted by the sole supported workflow."""
+
+
 RESUME_LABELS = {
     "paper": "01_extract_engineering_facts",
     "engineering_facts": "01_extract_engineering_facts",
     "paper_thesis": "02d_extract_paper_thesis",
     "repro_tasks": "02c_finalize_repro_tasks",
+    "execution_plan": "02e_compile_execution_plan",
     "experiment_index": "02e_build_experiment_index",
     "scientific_architecture": "02f_design_scientific_architecture",
+    "environment_lock": "03a_environment_resolver",
     "foundation_manifest": "03b_foundation_writer",
     "repro_project_manifest": "03c_task_writer_workflow",
     "repro_project": "03c_task_writer_workflow",
@@ -61,19 +73,45 @@ RESUME_LABELS = {
 
 def inspect_case_status(output_dir: Path) -> dict[str, Any]:
     output_dir = output_dir.expanduser().resolve()
+    try:
+        _validate_v2_workflow(output_dir)
+    except UnsupportedCaseWorkflowError as exc:
+        try:
+            latest_audit = latest_audit_items(output_dir / "audit")
+        except OSError:
+            latest_audit = []
+        try:
+            output_exists = output_dir.exists()
+        except OSError:
+            output_exists = False
+        return {
+            "output_dir": str(output_dir),
+            "exists": output_exists,
+            "workflow_version": None,
+            "supported": False,
+            "error_kind": "unsupported_workflow_version",
+            "error": str(exc),
+            "next_stage": None,
+            "resume_from": "rebuild_case",
+            "suggested_command": None,
+            "stages": [],
+            "latest_audit": latest_audit,
+        }
+
     stage_status = []
     next_stage = None
-    workflow_version = _case_workflow_version(output_dir)
     for name, rel_path, schema_stage in STAGES:
-        if workflow_version == "1" and name in {"scientific_architecture", "foundation_manifest"}:
-            continue
         status = inspect_stage(output_dir, name, rel_path, schema_stage)
         required = name not in OPTIONAL_STAGES
         status["required"] = required
         if not required and not status["ok"]:
             status["advisory"] = True
         stage_status.append(status)
-        if next_stage is None and required and not status["ok"]:
+        if (
+            next_stage is None
+            and not status["ok"]
+            and (required or status.get("reason") != "missing")
+        ):
             next_stage = name
 
     try:
@@ -87,6 +125,8 @@ def inspect_case_status(output_dir: Path) -> dict[str, Any]:
     return {
         "output_dir": str(output_dir),
         "exists": output_exists,
+        "workflow_version": CURRENT_WORKFLOW_VERSION,
+        "supported": True,
         "next_stage": next_stage,
         "resume_from": RESUME_LABELS.get(next_stage, "complete" if next_stage is None else next_stage),
         "suggested_command": suggested_review_command(output_dir, next_stage),
@@ -95,20 +135,27 @@ def inspect_case_status(output_dir: Path) -> dict[str, Any]:
     }
 
 
-def _case_workflow_version(output_dir: Path) -> str:
+def _validate_v2_workflow(output_dir: Path) -> None:
     marker = output_dir / "workflow.json"
     if marker.is_file():
         try:
-            value = str(read_json(marker).get("workflow_version") or "")
-        except Exception:
-            value = ""
-        if value in {"1", "2"}:
-            return value
-    return (
-        "2"
-        if any((output_dir / name).is_file() for name in ("scientific_architecture.json", "foundation_manifest.json"))
-        else "1"
-    )
+            payload = read_json(marker)
+        except Exception as exc:
+            raise UnsupportedCaseWorkflowError(
+                "workflow.json is unreadable; rebuild in a new clean case directory"
+            ) from exc
+        value = str(payload.get("workflow_version") or "") if isinstance(payload, dict) else ""
+        if value != CURRENT_WORKFLOW_VERSION:
+            raise UnsupportedCaseWorkflowError(
+                f"unsupported case workflow_version {value or '<missing>'!r}; "
+                "rebuild in a new clean case directory"
+            )
+        return
+    if any((output_dir / rel_path).exists() for _, rel_path, _ in STAGES):
+        raise UnsupportedCaseWorkflowError(
+            "case has pipeline artifacts but no V2 workflow marker; "
+            "rebuild in a new clean case directory"
+        )
 
 
 def inspect_stage(output_dir: Path, name: str, rel_path: str, schema_stage: str | None) -> dict[str, Any]:
@@ -138,6 +185,24 @@ def inspect_stage(output_dir: Path, name: str, rel_path: str, schema_stage: str 
             return {"stage": name, "ok": ok, "path": str(path), "reason": "valid" if ok else "paper chunks missing"}
         except Exception as exc:
             return {"stage": name, "ok": False, "path": str(path), "reason": f"invalid json: {exc}"}
+
+    if name == "environment_lock":
+        try:
+            lock = read_json(path)
+        except Exception as exc:
+            return {"stage": name, "ok": False, "path": str(path), "reason": f"invalid json: {exc}"}
+        ok = bool(
+            isinstance(lock, dict)
+            and _runtime_lock_is_trusted(lock)
+            and lock.get("capabilities_ok") is True
+            and str(lock.get("environment_hash") or "")
+        )
+        return {
+            "stage": name,
+            "ok": ok,
+            "path": str(path),
+            "reason": "valid" if ok else "environment lock is not ready or trusted",
+        }
 
     if name == "foundation_manifest":
         try:

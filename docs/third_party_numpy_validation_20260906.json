@@ -1,0 +1,56 @@
+{
+  "schema_version": "1.0",
+  "status": "passed",
+  "verified": true,
+  "environment_reused": false,
+  "system_site_packages": false,
+  "environment_key": "76e0af8350ae2ae99e8cdc72bbeaf006aa7c4a7c3534940597880946cc8d0ef4",
+  "installation": {
+    "returncode": 0,
+    "stdout_tail": "Collecting numpy (from -r requirements.txt (line 1))\n  Downloading numpy-2.4.3-cp311-cp311-win_amd64.whl.metadata (6.6 kB)\nDownloading numpy-2.4.3-cp311-cp311-win_amd64.whl (12.6 MB)\n   ---------------------------------------- 12.6/12.6 MB 9.9 MB/s eta 0:00:00\nInstalling collected packages: numpy\nSuccessfully installed numpy-2.4.3\n",
+    "stderr_tail": ""
+  },
+  "installed_distributions": [
+    {
+      "name": "numpy",
+      "version": "2.4.3"
+    },
+    {
+      "name": "pip",
+      "version": "24.0"
+    },
+    {
+      "name": "setuptools",
+      "version": "79.0.1"
+    }
+  ],
+  "smoke": {
+    "requested": true,
+    "ran": true,
+    "command_source": "manifest",
+    "command": [
+      "{python}",
+      "run_experiment.py",
+      "config_smoke.json"
+    ],
+    "timeout_s": 120.0,
+    "returncode": 0,
+    "stdout_tail": "{\"numpy_version\": \"2.4.3\", \"snr_linear\": [0.1, 1.0, 10.0], \"rate\": [0.13017480449301796, 0.8525329393099685, 2.891963969417264], \"isolated_prefix\": \"C:\\\\Users\\\\84475\\\\AppData\\\\Local\\\\Temp\\\\geng-clean-numpy-validation-56231f5b010043769bd099d12246da83\\\\clean_environments\\\\76e0af8350ae2ae99e8cdc72bbeaf006aa7c4a7c3534940597880946cc8d0ef4\"}\n",
+    "stderr_tail": "",
+    "status": "passed",
+    "verified": true,
+    "copy_file_count": 8,
+    "copy_bytes": 3413,
+    "copy_large": false,
+    "environment_policy": "isolated_minimal"
+  },
+  "issues": [],
+  "warnings": [],
+  "duration_s": 27.703,
+  "scientific_outcome_unchanged": true,
+  "validation_project": "C:\\Users\\84475\\AppData\\Local\\Temp\\geng-clean-numpy-validation-56231f5b010043769bd099d12246da83\\delivered_project",
+  "recorded_constraints": [
+    "numpy==2.4.3"
+  ],
+  "validation_scope": "Real third-party NumPy installation pinned from selected execution interpreter, followed by isolated communication simulation smoke; not an LLM paper reproduction."
+}

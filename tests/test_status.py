@@ -8,6 +8,48 @@ from geng_agent.outputs import write_json
 from geng_agent.status import inspect_case_status
 
 
+def valid_host_environment_lock() -> dict:
+    return {
+        "kind": "geng.case_environment.lock",
+        "ready": True,
+        "runtime_mode": "host_shared",
+        "capabilities_ok": True,
+        "environment_hash": "f" * 64,
+        "host_provenance": {
+            "kind": "geng.host_shared_runtime",
+            "runtime_mode": "host_shared",
+            "selected_launcher": "/trusted/bin/python",
+            "resolved_executable": "/trusted/bin/python3",
+            "prefix": "/trusted",
+            "mutex_identity_sha256": "e" * 64,
+        },
+        "source_policy": {
+            "trusted": True,
+            "binary_wheels_only": True,
+            "host_runtime_verified": True,
+            "artifact_report_verified": False,
+            "artifact_evidence": {},
+        },
+        "index": {
+            "fingerprint": "a" * 64,
+            "artifact_hosts": ["files.pythonhosted.org"],
+        },
+        "requirements": [
+            {
+                "requirement": "numpy",
+                "distribution": "numpy",
+                "applicable": True,
+                "installed_version": "2.4.6",
+                "version_satisfied": True,
+                "imports_ok": True,
+                "satisfied": True,
+                "resolution_source": "host_runtime",
+            }
+        ],
+    }
+
+
+
 class StatusTests(unittest.TestCase):
     def test_optional_v2_stages_are_advisory_not_resume_blockers(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -26,11 +68,12 @@ class StatusTests(unittest.TestCase):
                 self.assertFalse(by_name[name]["required"])
                 self.assertTrue(by_name[name]["advisory"])
 
-    def test_status_reports_resume_from_generate_project(self) -> None:
+    def test_status_reports_resume_from_environment_resolver(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             case = root / "case"
             case.mkdir()
+            write_json(case / "workflow.json", {"workflow_version": "2"})
             write_json(case / "paper_chunks.json", {"source_path": str(root / "paper.md"), "chunks": [{"chunk_id": "text_c1", "text": "AWGN"}]})
             write_json(
                 case / "engineering_facts.json",
@@ -108,16 +151,51 @@ class StatusTests(unittest.TestCase):
 
             status = inspect_case_status(case)
 
-            self.assertEqual(status["next_stage"], "repro_project_manifest")
-            self.assertEqual(status["resume_from"], "03c_task_writer_workflow")
+            self.assertEqual(status["next_stage"], "execution_plan")
+            self.assertEqual(status["resume_from"], "02e_compile_execution_plan")
+
+            write_json(
+                case / "execution_plan.json",
+                {
+                    "schema_version": "1.0",
+                    "logical_task_count": 1,
+                    "execution_unit_count": 1,
+                    "task_to_execution_unit": {
+                        "reproduce_fig_1": "unit_reproduce_fig_1"
+                    },
+                    "execution_units": [
+                        {
+                            "unit_id": "unit_reproduce_fig_1",
+                            "mode": "singleton",
+                            "task_ids": ["reproduce_fig_1"],
+                            "relationships": [],
+                            "dependencies": [],
+                            "artifact_ids": [],
+                        }
+                    ],
+                    "weak_consistency_groups": [],
+                    "artifact_dependencies": [],
+                    "task_order": ["reproduce_fig_1"],
+                },
+            )
+            status = inspect_case_status(case)
+            self.assertEqual(status["next_stage"], "environment_lock")
+            self.assertEqual(status["resume_from"], "03a_environment_resolver")
             self.assertIn("python -m geng_agent review", status["suggested_command"])
             self.assertIn(str(root / "paper.md"), status["suggested_command"])
             self.assertIn("--run-repro", status["suggested_command"])
+
+            write_json(case / "03a_environment.lock.json", valid_host_environment_lock())
+            status = inspect_case_status(case)
+            self.assertEqual(status["next_stage"], "repro_project_manifest")
+            self.assertEqual(status["resume_from"], "03c_task_writer_workflow")
+
 
     def test_status_accepts_task_writer_manifest_required_files(self) -> None:
         with TemporaryDirectory() as temp_dir:
             case = Path(temp_dir) / "case"
             case.mkdir()
+            write_json(case / "workflow.json", {"workflow_version": "2"})
             files = ["README.md", "requirements.txt", "config.json", "config_smoke.json", "src/channel.py"]
             write_json(
                 case / "repro_project_manifest.json",
@@ -135,6 +213,7 @@ class StatusTests(unittest.TestCase):
         with TemporaryDirectory() as temp_dir:
             case = Path(temp_dir) / "case"
             case.mkdir()
+            write_json(case / "workflow.json", {"workflow_version": "2"})
             dims = [
                 "artifact_coverage",
                 "reproduction_logic",
@@ -186,6 +265,7 @@ class StatusTests(unittest.TestCase):
         with TemporaryDirectory() as temp_dir:
             case = Path(temp_dir) / "case"
             case.mkdir()
+            write_json(case / "workflow.json", {"workflow_version": "2"})
             (case / "result_review.md").write_text("# result review\n\nhuman readable report\n", encoding="utf-8")
 
             stage = next(item for item in inspect_case_status(case)["stages"] if item["stage"] == "result_review")

@@ -26,7 +26,11 @@ STEP_FILES: dict[str, tuple[str, ...]] = {
         "engineering_facts.json",
         "analysis_warnings.json",
     ),
-    "repro_tasks": ("repro_tasks_preliminary.json", "repro_tasks.json"),
+    "repro_tasks": (
+        "repro_tasks_preliminary.json",
+        "repro_tasks.json",
+        "execution_plan.json",
+    ),
     "experiment_index": (
         "experiment_index.json",
         "paper_thesis.json",
@@ -34,6 +38,13 @@ STEP_FILES: dict[str, tuple[str, ...]] = {
         "task_conflicts.json",
     ),
     "scientific_architecture": ("scientific_architecture.json",),
+    "environment_lock": (
+        "03a_environment_request.json",
+        "03a_environment.lock.json",
+        "03a_environment_report.json",
+        "03a_pip_resolution_report.json",
+        "03a_pip_install_report.json",
+    ),
     "foundation_manifest": ("foundation_manifest.json", "audit/03b_foundation_snapshot/"),
     "repro_project_manifest": ("repro_project_manifest.json",),
     "repro_project": (

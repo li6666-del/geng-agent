@@ -17,7 +17,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     review = subparsers.add_parser("review", help="审查论文并生成复现项目。")
-    _add_common_review_args(review, include_resume=False)
+    _add_common_review_args(review)
     review.add_argument("--no-resume", action="store_true", help="不复用已有阶段产物，从头重新运行。")
 
     status = subparsers.add_parser("status", help="检查已有 case 目录的断点续跑状态。")
@@ -25,7 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser(
         "doctor",
-        help="自检本机环境（Python 版本 + 运行依赖 + 复现白名单库）；建议在输入 PDF 前先运行。",
+        help="自检本机环境（Python 版本 + 编排器依赖 + 常用复现资料包）；建议在输入 PDF 前先运行。",
     )
     benchmark = subparsers.add_parser("benchmark", help="离线汇总多个 case 的复现覆盖、结论、耗时和成本。")
     benchmark.add_argument(
@@ -38,7 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _add_common_review_args(parser: argparse.ArgumentParser, *, include_resume: bool) -> None:
+def _add_common_review_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("paper", type=Path, help="论文文件，支持 PDF/TXT/Markdown。")
     parser.add_argument(
         "--out",
@@ -53,18 +53,12 @@ def _add_common_review_args(parser: argparse.ArgumentParser, *, include_resume: 
     parser.add_argument("--temperature", type=float, default=0.1, help="LLM 采样温度，默认 0.1。")
     parser.add_argument("--timeout", type=float, default=120.0, help="单次 LLM 请求超时时间，单位秒。")
     parser.add_argument("--tasks-timeout", type=float, default=300.0, help="第二轮生成复现任务的单次 LLM 请求超时时间，单位秒。")
-    parser.add_argument("--project-timeout", type=float, default=1800.0, help="所有 Codex 推理会话的公共默认超时，单位秒；默认 1800（30 分钟）。")
     parser.add_argument("--thinking", choices=("enabled", "disabled"), default=None, help="DeepSeek V4 Pro thinking 开关。")
     parser.add_argument("--reasoning-effort", choices=("low", "medium", "high"), default=None, help="推理模型 reasoning_effort 参数。")
     run_group = parser.add_mutually_exclusive_group()
     run_group.add_argument("--run-repro", dest="run_repro", action="store_true", help="允许每个 task writer 运行自己的 full，并直接对照论文持续迭代后提交 ready_for_review。")
     run_group.add_argument("--no-run-repro", dest="run_repro", action="store_false", help="不自动运行生成代码；这是默认行为。")
     parser.set_defaults(run_repro=False)
-    if include_resume:
-        resume_group = parser.add_mutually_exclusive_group()
-        resume_group.add_argument("--resume", dest="resume", action="store_true", help="复用已有阶段产物；这是默认行为。")
-        resume_group.add_argument("--no-resume", dest="resume", action="store_false", help="不复用已有阶段产物，从头重新运行。")
-        parser.set_defaults(resume=True)
     parser.add_argument("--no-analysis-fallback", action="store_true", help="禁用前两阶段本地确定性兜底；默认启用以提高端到端稳定性。")
     parser.add_argument("--run-timeout", type=float, default=120.0, help="单次复现运行超时时间，单位秒。")
     parser.add_argument(
@@ -80,14 +74,6 @@ def _add_common_review_args(parser: argparse.ArgumentParser, *, include_resume: 
         default="codex",
         help="前两阶段事实抽取/任务拆解 backend；默认 codex，llm 为旧 OpenAI-compatible 兼容路径。",
     )
-    parser.add_argument(
-        "--codex-analysis-timeout",
-        type=float,
-        default=None,
-        help="Analysis/架构专家单次 Codex 会话超时，单位秒；默认继承 1800。",
-    )
-    parser.add_argument("--codex-agent-timeout", type=float, default=None, help="Foundation Writer 和 Task Writer 单次 Codex 会话超时；默认继承 1800 秒。")
-    parser.add_argument("--codex-reporter-timeout", type=float, default=None, help="Task Reporter 和 Report Editor 单次 Codex 会话超时；默认继承 agent/公共 1800 秒。")
     parser.add_argument(
         "--analysis-only",
         action="store_true",
@@ -124,13 +110,9 @@ def main(argv: list[str] | None = None) -> int:
             mineru_timeout=args.mineru_timeout,
             json_repair_attempts=args.json_repair_attempts,
             tasks_timeout=args.tasks_timeout,
-            project_timeout=args.project_timeout,
             resume=not args.no_resume,
             analysis_fallback=not args.no_analysis_fallback,
             analysis_backend=args.analysis_backend,
-            codex_analysis_timeout=args.codex_analysis_timeout,
-            codex_agent_timeout=args.codex_agent_timeout,
-            codex_reporter_timeout=args.codex_reporter_timeout,
             analysis_only=args.analysis_only,
         )
         if args.analysis_only:
@@ -214,5 +196,4 @@ def _build_client_or_error(args: argparse.Namespace, parser: argparse.ArgumentPa
         )
     except ValueError as exc:
         parser.error(str(exc))
-
 

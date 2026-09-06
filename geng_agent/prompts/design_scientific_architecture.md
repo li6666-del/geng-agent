@@ -27,13 +27,15 @@ Your job is to turn the finalized paper evidence and reproduction tasks into one
    - `shared_implementation`, `required_capabilities`, and a non-empty `rationale`.
 10. Use `gradient_mode` from `required`, `not_required`, or `not_applicable`, and `checkpoint_policy` from `required`, `optional`, or `not_applicable`. These are component-local decisions; do not force one global training policy.
    If a component is trainable or requires gradients, its primary framework must provide the needed differentiation, optimizer, parameter, and checkpoint semantics. A non-differentiable array implementation may support preprocessing or evaluation, but must not replace that learned scientific component.
-11. Reused components must remain one shared implementation. The host derives `shared_implementation` from bindings, so a missing or stale boolean must not be used to reject the architecture.
+11. Reused components must remain one shared implementation. The host derives ownership from all task/experiment bindings and transitive `depends_on` edges. Only code consumed by different execution units is frozen in Foundation; components private to one unit remain editable by that unit's Writer. Use separate module paths for private and shared components so file ownership stays unambiguous. A missing or stale `shared_implementation` boolean must not reject the architecture.
+    Shared source code does not share learned state. When experiments must use the same pretrained checkpoint, fitted preprocessing, dataset split, or random realization, point to the execution plan's actual producer/consumer artifact flow. Do not replace that flow with a common model class or frozen trainer. `checkpoint_flow` and `shared_pretraining` require one producer, named consumers, persisted artifact IDs, and a strong relationship. If the finalized task plan lacks scientifically necessary state flow, report that concrete gap; never silently retrain a different model for each consumer.
 12. Neural training, transfer learning, mutual-information estimation, learned encoders/decoders, and similar mechanisms must explicitly name the capabilities they need. Examples include autograd, optimizer steps, device/dtype propagation, frozen-parameter control, checkpoint save/load round trips, batched sampling, or differentiable MI objectives. Include only capabilities genuinely needed by that component.
 13. Bind every finalized reproduction task to at least one assigned experiment and its actual components/outputs. A task may have multiple bindings when it genuinely contains multiple experiments. `allowed_overrides`, consistency bookkeeping, and `acceptance_bindings` are derivable/advisory metadata rather than reasons to reject executable science:
     - `criterion_id` references either a task `core_conclusions[*].claim_id` or `key_numeric_targets[*].target_id`;
     - `criterion_kind` is `core_conclusion` or `key_numeric_target`;
     - `output_quantity_ids` contains declared quantities that are also listed in this task binding's `outputs`.
    Map criteria when the architecture exposes a meaningful measurable output. If a criterion is qualitative, underspecified, or cannot be represented by a shared output, omit the mapping instead of inventing a proxy. Missing, duplicate, or unknown criterion mappings are advisory and must never be used to reject otherwise executable science.
+   The Task Designer's execution relationships are authoritative scientific dependencies. Every compound execution unit must remain covered by at least one top-level consistency group and expose the shared quantities/components or producer artifact interface that makes the unit executable. Never split or downgrade a strong relationship. Weak consistency groups may overlap: represent every real membership in top-level `consistency_groups`; the singular `binding.consistency_group` is only a primary bookkeeping pointer and is not an exhaustive membership list.
 14. Never put a `global` quantity in a task binding's `overrides`. Bindings in the same consistency group must not assign conflicting values to the same quantity.
 15. Add machine-checkable invariants only for important cross-task shape, unit, normalization, baseline identity, component reuse, and ownership constraints. Use severity `error` only when violation makes execution scientifically incomparable.
     Never turn typography, colors, line placement, crop geometry, visual layout, or pixel similarity into a scientific invariant.
@@ -43,7 +45,7 @@ Your job is to turn the finalized paper evidence and reproduction tasks into one
     - `assumed` only when it references a declared task assumption;
     - `unresolved` when the paper and declared assumptions still do not determine it.
 17. Reference final facts and assumptions when resolvable. Preserve useful architecture content with an unresolved-reference warning when names differ or provenance is incomplete; never invent a matching fact merely for schema compliance.
-18. This contract plans shared science only. Do not include figure styling, output directories, report prose, generated curves, task-private implementation helpers, acceptance verdicts, or numeric pass/fail thresholds. The host policy owns acceptance; architecture only exposes measurable interfaces.
+18. This contract maps the scientific components needed by every experiment. Mark their ownership through actual bindings and dependency edges; being listed here does not make a task-private evaluator or algorithm a Foundation module. Do not include figure styling, output directories, report prose, generated curves, incidental helpers, acceptance verdicts, or numeric pass/fail thresholds. The host policy owns acceptance; architecture only exposes measurable interfaces.
 
 ## Structural conventions
 
@@ -56,7 +58,7 @@ Your job is to turn the finalized paper evidence and reproduction tasks into one
 
 ## Host capability inventory (execution feasibility only)
 
-Use this inventory to assess whether the selected scientific implementation is immediately runnable. It is not paper evidence and must not change a paper-derived algorithm. Package importability and visible accelerator hardware do not prove that a framework can use a device; the Foundation must verify that at runtime. If the scientifically required stack is unavailable, preserve the required contract and expose the capability gap instead of silently choosing a weaker implementation. Read `python_runtime_registry[*].policy_allowed/installed/usable_now` and `external_runtime_registry[*].available` explicitly; a non-ready entry is a host gap, not permission to change the algorithm.
+Use this inventory to assess whether the selected scientific implementation is immediately runnable. It is not paper evidence and must not change a paper-derived algorithm. Package importability and visible accelerator hardware do not prove that a framework can use a device; the Foundation must verify that at runtime. If the scientifically required stack is unavailable, preserve the required contract and request case-environment resolution instead of silently choosing a weaker implementation. Read `python_runtime_registry[*].resolution_supported/installed/usable_now` and `external_runtime_registry[*].available` explicitly; a non-ready entry is a resolvable host gap, not permission to change the algorithm.
 
 {{ host_capabilities_json }}
 
@@ -67,6 +69,12 @@ Use this inventory to assess whether the selected scientific implementation is i
 ## Finalized reproduction tasks
 
 {{ repro_tasks_json }}
+
+## Deterministic execution plan
+
+This plan is compiled by the host from the Task Designer's relationships. It fixes Writer co-location and producer-before-consumer order. Architecture maps those decisions to real quantities, components, checkpoint/data interfaces, and consistency groups; it must not reinterpret the relationship strength or merge unrelated logical tasks.
+
+{{ execution_plan_json }}
 
 ## Paper thesis
 

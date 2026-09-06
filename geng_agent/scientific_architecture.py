@@ -12,6 +12,7 @@ def validate_scientific_architecture(
     facts: dict[str, Any],
     tasks: dict[str, Any],
     experiment_index: dict[str, Any],
+    execution_plan: dict[str, Any] | None = None,
 ) -> list[ValidationIssue]:
     """Validate cross-document references and shared-model consistency.
 
@@ -78,9 +79,11 @@ def validate_scientific_architecture(
         for group in consistency_groups
         if group.get("id")
     }
+    group_ids_by_task: dict[str, set[str]] = {}
     for index, group in enumerate(consistency_groups):
         base = f"$.consistency_groups[{index}]"
         for task_index, task_id in enumerate(group.get("task_ids", []) if isinstance(group.get("task_ids"), list) else []):
+            group_ids_by_task.setdefault(str(task_id), set()).add(str(group.get("id") or ""))
             if str(task_id) not in task_ids:
                 issues.append(ValidationIssue(f"{base}.task_ids[{task_index}]", "must refer to a finalized task"))
         for quantity_index, quantity_id in enumerate(group.get("shared_quantity_ids", []) if isinstance(group.get("shared_quantity_ids"), list) else []):
@@ -111,6 +114,7 @@ def validate_scientific_architecture(
         issues.extend(_basis_issues(component.get("basis"), f"{base}.basis", fact_keys, assumption_names))
 
     bound_task_ids: set[str] = set()
+    bound_experiment_pairs: set[tuple[str, str]] = set()
     group_overrides: dict[tuple[str, str], Any] = {}
     for index, binding in enumerate(bindings):
         base = f"$.bindings[{index}]"
@@ -118,10 +122,11 @@ def validate_scientific_architecture(
         experiment_id = str(binding.get("experiment_id") or "")
         if task_id not in task_ids:
             issues.append(ValidationIssue(f"{base}.task_id", "must refer to a finalized reproduction task"))
-        elif task_id in bound_task_ids:
-            issues.append(ValidationIssue(f"{base}.task_id", "each task may have only one architecture binding"))
+        elif (task_id, experiment_id) in bound_experiment_pairs:
+            issues.append(ValidationIssue(f"{base}.task_id", "each task/experiment pair may have only one architecture binding"))
         else:
             bound_task_ids.add(task_id)
+            bound_experiment_pairs.add((task_id, experiment_id))
         if (task_id, experiment_id) not in experiment_pairs:
             issues.append(ValidationIssue(f"{base}.experiment_id", "must match the experiment assigned to this task"))
         group_id = str(binding.get("consistency_group") or "")
@@ -256,13 +261,18 @@ def validate_scientific_architecture(
                 issues.append(ValidationIssue(f"{base}.overrides.{quantity_id}", "quantity is not listed in allowed_overrides"))
             if quantity_id in global_quantities:
                 issues.append(ValidationIssue(f"{base}.overrides.{quantity_id}", "global quantities cannot be overridden per task"))
-            group = str(binding.get("consistency_group") or "")
-            group_definition = groups_by_id.get(group, {})
-            shared_quantity_ids = {
-                str(item)
-                for item in group_definition.get("shared_quantity_ids", [])
-            } if isinstance(group_definition.get("shared_quantity_ids"), list) else set()
-            if group and quantity_id in shared_quantity_ids:
+            primary_group = str(binding.get("consistency_group") or "")
+            memberships = set(group_ids_by_task.get(task_id, set()))
+            if primary_group:
+                memberships.add(primary_group)
+            for group in memberships:
+                group_definition = groups_by_id.get(group, {})
+                shared_quantity_ids = {
+                    str(item)
+                    for item in group_definition.get("shared_quantity_ids", [])
+                } if isinstance(group_definition.get("shared_quantity_ids"), list) else set()
+                if quantity_id not in shared_quantity_ids:
+                    continue
                 key = (group, str(quantity_id))
                 previous = group_overrides.get(key)
                 if previous is not None and not _scientifically_equivalent(previous, value):
@@ -301,6 +311,18 @@ def validate_scientific_architecture(
             if str(task_id) not in task_ids:
                 issues.append(ValidationIssue(f"$.invariants[{index}].task_ids[{task_index}]", "must refer to a finalized task"))
 
+    issues.extend(
+        _task_relationship_architecture_issues(
+            tasks=tasks,
+            consistency_groups=consistency_groups,
+            bindings=bindings,
+            declared_quantity_ids=quantity_ids,
+            material_relationship_ids=_material_weak_relationship_ids(
+                execution_plan
+            ),
+        )
+    )
+
     return _dedupe(issues)
 
 
@@ -310,6 +332,7 @@ def partition_scientific_architecture_issues(
     facts: dict[str, Any],
     tasks: dict[str, Any],
     experiment_index: dict[str, Any],
+    execution_plan: dict[str, Any] | None = None,
 ) -> tuple[list[ValidationIssue], list[ValidationIssue]]:
     """Split cross-document findings into execution blockers and advice.
 
@@ -321,17 +344,28 @@ def partition_scientific_architecture_issues(
 
     blockers: list[ValidationIssue] = []
     warnings: list[ValidationIssue] = []
+    material_relationship_ids = _material_weak_relationship_ids(execution_plan)
+    material_relationship_indexes = {
+        index
+        for index, relationship in enumerate(
+            _dict_items(tasks.get("execution_relationships"))
+        )
+        if str(relationship.get("relationship_id") or "")
+        in material_relationship_ids
+    }
     for issue in validate_scientific_architecture(
         architecture,
         facts=facts,
         tasks=tasks,
         experiment_index=experiment_index,
+        execution_plan=execution_plan,
     ):
         target = (
             blockers
             if _is_execution_blocker(
                 issue,
                 schema_version=str(architecture.get("schema_version") or ""),
+                material_relationship_indexes=material_relationship_indexes,
             )
             else warnings
         )
@@ -345,6 +379,7 @@ def scientific_architecture_execution_blockers(
     facts: dict[str, Any],
     tasks: dict[str, Any],
     experiment_index: dict[str, Any],
+    execution_plan: dict[str, Any] | None = None,
 ) -> list[ValidationIssue]:
     """Return only cross-document defects that make execution ambiguous."""
 
@@ -353,13 +388,20 @@ def scientific_architecture_execution_blockers(
         facts=facts,
         tasks=tasks,
         experiment_index=experiment_index,
+        execution_plan=execution_plan,
     )
     return blockers
 
 
-def foundation_module_paths(architecture: dict[str, Any]) -> set[str]:
+def foundation_module_paths(
+    architecture: dict[str, Any],
+    execution_plan: dict[str, Any] | None = None,
+) -> set[str]:
     """Return normalized shared Python paths owned by the Foundation Writer."""
 
+    if execution_plan is not None:
+        from .foundation_scope import scoped_foundation_architecture
+        architecture = scoped_foundation_architecture(architecture, execution_plan)
     paths: set[str] = set()
     for component in _dict_items(architecture.get("components")):
         module = str(component.get("module") or "").replace("\\", "/")
@@ -372,6 +414,7 @@ def _is_execution_blocker(
     issue: ValidationIssue,
     *,
     schema_version: str,
+    material_relationship_indexes: set[int],
 ) -> bool:
     del schema_version  # classification is based on material execution impact.
     path = issue.path
@@ -379,6 +422,12 @@ def _is_execution_blocker(
         return False
     if path.startswith("$.consistency_groups["):
         return False
+    if path.startswith("$.execution_relationships["):
+        try:
+            relationship_index = int(path.split("[", 1)[1].split("]", 1)[0])
+        except (IndexError, ValueError):
+            return False
+        return relationship_index in material_relationship_indexes
     if any(
         marker in path
         for marker in (
@@ -412,6 +461,135 @@ def _is_execution_blocker(
             )
         )
     return False
+
+
+def _task_relationship_architecture_issues(
+    *,
+    tasks: dict[str, Any],
+    consistency_groups: list[dict[str, Any]],
+    bindings: list[dict[str, Any]],
+    declared_quantity_ids: set[str],
+    material_relationship_ids: set[str],
+) -> list[ValidationIssue]:
+    """Check only shared-science omissions that would change execution semantics."""
+
+    relationships = _dict_items(tasks.get("execution_relationships"))
+    if not relationships:
+        return []
+    group_records: list[tuple[set[str], set[str]]] = []
+    for group in consistency_groups:
+        members = {
+            str(item)
+            for item in group.get("task_ids", [])
+        } if isinstance(group.get("task_ids"), list) else set()
+        shared_quantities = {
+            str(item)
+            for item in group.get("shared_quantity_ids", [])
+            if str(item) in declared_quantity_ids
+        } if isinstance(group.get("shared_quantity_ids"), list) else set()
+        group_records.append((members, shared_quantities))
+    components_by_task: dict[str, set[str]] = {}
+    quantities_by_task: dict[str, set[str]] = {}
+    for binding in bindings:
+        task_id = str(binding.get("task_id") or "")
+        components = binding.get("components")
+        if task_id and isinstance(components, list):
+            components_by_task.setdefault(task_id, set()).update(map(str, components))
+        outputs = binding.get("outputs")
+        if task_id and isinstance(outputs, list):
+            quantities_by_task.setdefault(task_id, set()).update(
+                str(value) for value in outputs if str(value) in declared_quantity_ids
+            )
+
+    issues: list[ValidationIssue] = []
+    for index, relationship in enumerate(relationships):
+        members = {
+            str(item)
+            for item in relationship.get("task_ids", [])
+            if str(item)
+        } if isinstance(relationship.get("task_ids"), list) else set()
+        if len(members) < 2:
+            continue
+        relationship_id = str(relationship.get("relationship_id") or "")
+        material = relationship_id in material_relationship_ids
+        covering_groups = [
+            shared_quantities
+            for group_members, shared_quantities in group_records
+            if (
+                group_members == members
+                if material
+                else members.issubset(group_members)
+            )
+        ]
+        base = f"$.execution_relationships[{index}]"
+        if not covering_groups:
+            issues.append(
+                ValidationIssue(
+                    f"{base}.task_ids",
+                    (
+                        "architecture must keep this cross-Writer weak relationship "
+                        "in an exact shared consistency group"
+                        if material
+                        else "architecture should keep this task relationship in one shared consistency group"
+                    ),
+                )
+            )
+            continue
+        shared_components: set[str] | None = None
+        for task_id in members:
+            task_components = components_by_task.get(task_id, set())
+            shared_components = (
+                set(task_components)
+                if shared_components is None
+                else shared_components.intersection(task_components)
+            )
+        common_quantities: set[str] | None = None
+        for task_id in members:
+            task_quantities = quantities_by_task.get(task_id, set())
+            common_quantities = (
+                set(task_quantities)
+                if common_quantities is None
+                else common_quantities.intersection(task_quantities)
+            )
+        has_shared_quantities = any(
+            bool(shared_quantities.intersection(common_quantities or set()))
+            for shared_quantities in covering_groups
+        )
+        if not has_shared_quantities and not shared_components:
+            issues.append(
+                ValidationIssue(
+                    f"{base}.shared_science",
+                    "architecture exposes neither a shared quantity nor a shared component for this relationship",
+                )
+            )
+    return issues
+
+
+def _material_weak_relationship_ids(
+    execution_plan: dict[str, Any] | None,
+) -> set[str]:
+    if not isinstance(execution_plan, dict):
+        return set()
+    groups = execution_plan.get("weak_consistency_groups")
+    material: set[str] = set()
+    for group in groups if isinstance(groups, list) else []:
+        if not isinstance(group, dict):
+            continue
+        unit_ids = {
+            str(unit_id)
+            for unit_id in group.get("execution_unit_ids", [])
+            if str(unit_id)
+        } if isinstance(group.get("execution_unit_ids"), list) else set()
+        if len(unit_ids) <= 1:
+            continue
+        relationship_ids = group.get("relationship_ids")
+        if isinstance(relationship_ids, list):
+            material.update(
+                str(relationship_id)
+                for relationship_id in relationship_ids
+                if str(relationship_id)
+            )
+    return material
 
 
 def _basis_issues(

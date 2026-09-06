@@ -11,7 +11,6 @@ the pipeline on schema shape alone.
 from __future__ import annotations
 
 import copy
-import math
 import re
 from typing import Any, get_args
 
@@ -19,6 +18,25 @@ from pydantic import ValidationError
 
 from .facts_normalize import _map_enum, _norm_token, _salvage_array_objects
 from .json_utils import prepare_json_candidate
+from .task_acceptance_normalize import (
+    DIRECTION_SYNONYMS,
+    _acceptance_text,
+    _contract_id_token,
+    _default_core_conclusion,
+    _finite_float_or_none,
+    _is_presentation_only,
+    _map_direction,
+    _normalize_comparison,
+    _normalize_scientific_acceptance,
+    _normalize_trend,
+    _numeric_magnitude_and_unit,
+    _stable_contract_id,
+)
+from .task_relationship_normalize import (
+    _normalize_backfill_handoff,
+    _normalize_execution_relationships,
+    _relationship_string_list,
+)
 from .schema_models import (
     AssumptionRisk,
     FactType,
@@ -30,7 +48,6 @@ from .schema_models import (
 )
 
 _ALLOWED_METRICS = set(get_args(MetricName))
-_ALLOWED_DIRECTIONS = set(get_args(TrendDirection))
 _ALLOWED_RISK = set(get_args(AssumptionRisk))
 _ALLOWED_FACT_TYPES = set(get_args(FactType))
 _ALLOWED_IMPACTS = set(get_args(MissingImpact))
@@ -57,50 +74,6 @@ _TASK_KEYS = {
     "validation_anchors",
     "scientific_acceptance",
 }
-_TREND_KEYS = {"x_axis", "y_axis", "direction", "reason"}
-_COMPARISON_KEYS = {"baselines", "curve_groups", "tolerance"}
-_SCIENTIFIC_ACCEPTANCE_KEYS = {
-    "contract_version",
-    "core_conclusions",
-    "key_numeric_targets",
-    "information_gaps",
-}
-_CONCLUSION_KINDS = {
-    "ordering",
-    "trend",
-    "crossing",
-    "threshold",
-    "scaling",
-    "gain_loss",
-    "mechanism",
-    "absolute_level",
-    "other",
-}
-_NUMERIC_EVIDENCE_QUALITIES = {
-    "paper_explicit",
-    "paper_derived",
-    "visual_estimate",
-    "unavailable",
-}
-_GAP_DISPOSITIONS = {
-    "assume_and_disclose",
-    "single_sensitivity_if_core",
-    "terminal_inconclusive",
-}
-_STYLE_ONLY_RE = re.compile(
-    r"(?:pixel[\s_-]*perfect|exact[\s_-]*pixels?|plot[\s_-]*styling|"
-    r"marker[\s_-]*style|line[\s_-]*(?:width|colou?r)|font[\s_-]*(?:size|family)|"
-    r"\u50cf\u7d20\u7ea7|\u9010\u50cf\u7d20|\u7ed8\u56fe\u6837\u5f0f|\u66f2\u7ebf\u989c\u8272|\u7ebf\u6761\u989c\u8272|\u7ebf\u5bbd|\u5b57\u4f53|\u6807\u8bb0\u6837\u5f0f|\u6392\u7248\u4e00\u81f4)",
-    re.IGNORECASE,
-)
-_SCIENTIFIC_IMAGE_RE = re.compile(
-    r"(?:image[\s_-]*reconstruct|pixel[\s_-]*reconstruct|reconstruct(?:ion|ed)?[\s_-]*(?:image|pixel)|"
-    r"per[\s_-]*pixel[\s_-]*(?:loss|error|accuracy)|psnr|ssim|super[\s_-]*resolution|"
-    r"semantic[\s_-]*segment|object[\s_-]*detect|image[\s_-]*(?:quality|distortion)|"
-    r"\u56fe\u50cf\u91cd\u5efa|\u50cf\u7d20\u7ea7(?:\u635f\u5931|\u8bef\u5dee|\u51c6\u786e\u7387|\u91cd\u5efa)|"
-    r"\u5cf0\u503c\u4fe1\u566a\u6bd4|\u7ed3\u6784\u76f8\u4f3c|\u8bed\u4e49\u5206\u5272|\u76ee\u6807\u68c0\u6d4b)",
-    re.IGNORECASE,
-)
 _ASSUMPTION_KEYS = {
     "name",
     "default_value",
@@ -110,7 +83,13 @@ _ASSUMPTION_KEYS = {
     "field_ids",
     "sensitivity_check",
 }
-_DOC_KEYS = {"repro_tasks", "_meta"}
+_DOC_KEYS = {
+    "schema_version",
+    "backfill_handoff",
+    "execution_relationships",
+    "repro_tasks",
+    "_meta",
+}
 
 METRIC_SYNONYMS = {
     "ber": "bit_error_rate",
@@ -133,29 +112,6 @@ METRIC_SYNONYMS = {
     "cost": "loss",
 }
 
-DIRECTION_SYNONYMS = {
-    "decreases": "decreasing",
-    "decrease": "decreasing",
-    "down": "decreasing",
-    "falling": "decreasing",
-    "declining": "decreasing",
-    "monotonically_decreasing": "decreasing",
-    "increases": "increasing",
-    "increase": "increasing",
-    "up": "increasing",
-    "rising": "increasing",
-    "growing": "increasing",
-    "monotonically_increasing": "increasing",
-    "constant": "flat",
-    "stable": "flat",
-    "unchanged": "flat",
-    "non_monotonic": "unknown",
-    "mixed": "unknown",
-    "varies": "unknown",
-    "na": "unknown",
-    "none": "unknown",
-}
-
 _RISK_SYNONYMS = {"med": "medium", "moderate": "medium", "mid": "medium", "hi": "high", "critical": "high", "severe": "high", "lo": "low", "minor": "low", "unknown": "medium"}
 
 
@@ -169,21 +125,6 @@ def _map_metric(value: Any) -> tuple[str, bool]:
             if needle in token:
                 return target, True
     return "other", changed
-
-
-def _map_direction(value: Any) -> tuple[str, bool]:
-    mapped, changed = _map_enum(value, _ALLOWED_DIRECTIONS, DIRECTION_SYNONYMS, "unknown")
-    if mapped != "unknown" or (isinstance(value, str) and _norm_token(value) in {"unknown", "na", "none", "non_monotonic", "mixed", "varies"}):
-        return mapped, changed
-    if isinstance(value, str):  # substring fallback ("decreasing then flat", "BER falls", ...)
-        token = _norm_token(value)
-        if "decreas" in token or "fall" in token or "declin" in token:
-            return "decreasing", True
-        if "increas" in token or "ris" in token or "grow" in token:
-            return "increasing", True
-        if "flat" in token or "constant" in token or "stable" in token:
-            return "flat", True
-    return "unknown", changed
 
 
 def _compact_token(value: str) -> str:
@@ -279,49 +220,21 @@ def _build_fact_index(facts: Any) -> tuple[set[tuple[str, str]], dict[str, set[s
     return keys, name_to_types, alias_to_key
 
 
-def _normalize_backfill_handoff(
-    value: Any, coercions: list[str]
-) -> dict[str, Any] | None:
-    """Normalize optional task-expert advice without making it a schema gate."""
-    if value is None:
-        return None
-    if not isinstance(value, dict):
-        coercions.append("ignored malformed backfill_handoff")
-        return None
-
-    raw_ready = value.get("ready_for_writer", True)
-    if isinstance(raw_ready, bool):
-        ready = raw_ready
-    elif isinstance(raw_ready, str) and raw_ready.strip().lower() in {"false", "no", "0"}:
-        ready = False
-        coercions.append("backfill_handoff.ready_for_writer string -> false")
-    else:
-        ready = True
-        if raw_ready is not True:
-            coercions.append("backfill_handoff.ready_for_writer -> true")
-
-    request_ids: list[str] = []
-    raw_ids = value.get("blocking_request_ids")
-    for item in raw_ids if isinstance(raw_ids, list) else []:
-        request_id = item.strip() if isinstance(item, str) else ""
-        if request_id and request_id not in request_ids:
-            request_ids.append(request_id)
-    return {
-        "ready_for_writer": ready,
-        "blocking_request_ids": request_ids,
-        "reason": str(value.get("reason") or "").strip(),
-    }
-
-
 def normalize_repro_tasks_candidate(data: Any, facts: Any) -> tuple[dict[str, Any], list[str]]:
     """Return a coerced copy of the candidate plus a log of every change made."""
     coercions: list[str] = []
     if not isinstance(data, dict):
-        return {"repro_tasks": []}, ["top-level was not a JSON object"]
+        data = {"repro_tasks": []}
+        coercions.append("top-level was not a JSON object")
 
     out = copy.deepcopy(data)
     existing_meta = out.get("_meta") if isinstance(out.get("_meta"), dict) else {}
-    raw_handoff = out.pop("backfill_handoff", existing_meta.get("backfill_handoff"))
+    raw_handoff = out.get("backfill_handoff", existing_meta.get("backfill_handoff"))
+    raw_relationships = out.get("execution_relationships")
+
+    if out.get("schema_version") != "2.0":
+        out["schema_version"] = "2.0"
+        coercions.append("schema_version -> '2.0'")
 
     extra_top = [key for key in out if key not in _DOC_KEYS]
     for key in extra_top:
@@ -353,11 +266,13 @@ def normalize_repro_tasks_candidate(data: Any, facts: Any) -> tuple[dict[str, An
         out["repro_tasks"] = []
         if tasks is not None:
             coercions.append("repro_tasks was not a list -> []")
-    handoff = _normalize_backfill_handoff(raw_handoff, coercions)
-    if handoff is not None:
-        meta = dict(out.get("_meta", {})) if isinstance(out.get("_meta"), dict) else {}
-        meta["backfill_handoff"] = handoff
-        out["_meta"] = meta
+    out["backfill_handoff"] = _normalize_backfill_handoff(raw_handoff, coercions)
+    out["execution_relationships"] = _normalize_execution_relationships(
+        raw_relationships,
+        coercions,
+    )
+    if isinstance(out.get("_meta"), dict):
+        out["_meta"].pop("backfill_handoff", None)
     return out, coercions
 
 
@@ -486,388 +401,6 @@ def _recover_task_scientific_goal(task: dict[str, Any], task_id: str) -> str:
         if reason:
             return reason
     return f"Reproduce the primary scientific result assigned to {task_id}."
-
-def _normalize_trend(trend: dict[str, Any], index: int, coercions: list[str]) -> None:
-    extra = [key for key in trend if key not in _TREND_KEYS]
-    for key in extra:
-        trend.pop(key, None)
-    if extra:
-        coercions.append(f"tasks[{index}].expected_trend dropped unknown keys {sorted(extra)}")
-    raw_dir = trend.get("direction")
-    direction, changed = _map_direction(raw_dir)
-    trend["direction"] = direction
-    if changed:
-        coercions.append(f"tasks[{index}].expected_trend.direction {raw_dir!r} -> {direction!r}")
-    for key in ("x_axis", "y_axis", "reason"):
-        value = trend.get(key)
-        if value is None or key not in trend:
-            trend[key] = ""
-        elif not isinstance(value, str):
-            trend[key] = str(value)
-
-
-def _normalize_comparison(comparison: dict[str, Any], index: int, coercions: list[str]) -> None:
-    extra = [key for key in comparison if key not in _COMPARISON_KEYS]
-    for key in extra:
-        comparison.pop(key, None)
-    if extra:
-        coercions.append(f"tasks[{index}].comparison dropped unknown keys {sorted(extra)}")
-    for key in ("baselines", "curve_groups"):
-        value = comparison.get(key)
-        comparison[key] = [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
-    tolerance = comparison.get("tolerance")
-    if not (isinstance(tolerance, str) and tolerance.strip()):
-        comparison["tolerance"] = "unspecified"
-        coercions.append(f"tasks[{index}].comparison.tolerance -> 'unspecified'")
-
-
-def _normalize_scientific_acceptance(
-    task: dict[str, Any], index: int, coercions: list[str]
-) -> None:
-    """Keep a permissive, deterministic scientific contract on every task.
-
-    This is shared semantics for later agents, not a format gate. A missing or
-    cosmetic near miss is repaired into the smallest honest task-level contract.
-    """
-    raw = task.get("scientific_acceptance")
-    acceptance = copy.deepcopy(raw) if isinstance(raw, dict) else {}
-    if not isinstance(raw, dict):
-        coercions.append(
-            f"tasks[{index}].scientific_acceptance generated from task semantics"
-        )
-
-    extra = [key for key in acceptance if key not in _SCIENTIFIC_ACCEPTANCE_KEYS]
-    for key in extra:
-        acceptance.pop(key, None)
-    if extra:
-        coercions.append(
-            f"tasks[{index}].scientific_acceptance dropped unknown keys {sorted(extra)}"
-        )
-
-    if acceptance.get("contract_version") != "1.0":
-        acceptance["contract_version"] = "1.0"
-        coercions.append(
-            f"tasks[{index}].scientific_acceptance.contract_version -> '1.0'"
-        )
-
-    used_claim_ids: set[str] = set()
-    claim_aliases: dict[str, str] = {}
-    conclusions: list[dict[str, str]] = []
-    raw_conclusions = acceptance.get("core_conclusions")
-    for position, item in enumerate(
-        raw_conclusions if isinstance(raw_conclusions, list) else []
-    ):
-        if not isinstance(item, dict):
-            statement = _acceptance_text(item)
-            if not statement:
-                continue
-            item = {"statement": statement}
-            coercions.append(
-                f"tasks[{index}].scientific_acceptance.core_conclusions[{position}] recovered from text"
-            )
-        statement = _acceptance_text(item.get("statement"))
-        if not statement or _is_presentation_only(statement):
-            if statement:
-                coercions.append(
-                    f"tasks[{index}].scientific_acceptance.core_conclusions[{position}] "
-                    "dropped presentation-only criterion"
-                )
-            continue
-        raw_id = _acceptance_text(item.get("claim_id"))
-        claim_id = _stable_contract_id(
-            raw_id,
-            task_id=_acceptance_text(task.get("task_id")),
-            kind="claim",
-            position=position,
-            used=used_claim_ids,
-        )
-        if raw_id:
-            claim_aliases.setdefault(raw_id, claim_id)
-            claim_aliases.setdefault(_contract_id_token(raw_id), claim_id)
-        raw_kind = _acceptance_text(item.get("kind")).casefold()
-        conclusions.append(
-            {
-                "claim_id": claim_id,
-                "statement": statement,
-                "kind": raw_kind if raw_kind in _CONCLUSION_KINDS else "other",
-                "regime": (
-                    _acceptance_text(item.get("regime")) or "paper-defined regime"
-                ),
-                "paper_anchor": (
-                    _acceptance_text(item.get("paper_anchor"))
-                    or _acceptance_text(task.get("figure_or_claim"))
-                    or "paper result targeted by this task"
-                ),
-            }
-        )
-
-    generated_conclusion = False
-    if not conclusions:
-        generated_conclusion = True
-        default = _default_core_conclusion(task)
-        default["claim_id"] = _stable_contract_id(
-            "",
-            task_id=_acceptance_text(task.get("task_id")),
-            kind="claim",
-            position=0,
-            used=used_claim_ids,
-        )
-        conclusions.append(default)
-        coercions.append(
-            f"tasks[{index}].scientific_acceptance added a minimal core conclusion"
-        )
-
-    used_target_ids: set[str] = set()
-    numeric_targets: list[dict[str, Any]] = []
-    raw_targets = acceptance.get("key_numeric_targets")
-    for position, item in enumerate(
-        raw_targets if isinstance(raw_targets, list) else []
-    ):
-        if not isinstance(item, dict):
-            target_text = _acceptance_text(item)
-            if not target_text:
-                continue
-            item = {"name": target_text, "paper_magnitude": target_text}
-            coercions.append(
-                f"tasks[{index}].scientific_acceptance.key_numeric_targets[{position}] recovered from text"
-            )
-        name = (
-            _acceptance_text(item.get("name"))
-            or f"key numeric target {position + 1}"
-        )
-        if _is_presentation_only(name):
-            coercions.append(
-                f"tasks[{index}].scientific_acceptance.key_numeric_targets[{position}] "
-                "dropped presentation-only target"
-            )
-            continue
-        magnitude, magnitude_unit = _numeric_magnitude_and_unit(
-            item.get("paper_magnitude"), item.get("unit")
-        )
-        evidence_quality = _acceptance_text(
-            item.get("evidence_quality")
-        ).casefold()
-        if evidence_quality not in _NUMERIC_EVIDENCE_QUALITIES or magnitude is None:
-            evidence_quality = "unavailable"
-        numeric_targets.append(
-            {
-                "target_id": _stable_contract_id(
-                    _acceptance_text(item.get("target_id")),
-                    task_id=_acceptance_text(task.get("task_id")),
-                    kind="target",
-                    position=position,
-                    used=used_target_ids,
-                ),
-                "name": name,
-                "paper_magnitude": magnitude,
-                "unit": magnitude_unit,
-                "regime": (
-                    _acceptance_text(item.get("regime")) or "paper-defined regime"
-                ),
-                "evidence_quality": evidence_quality,
-            }
-        )
-
-    used_gap_ids: set[str] = set()
-    gaps: list[dict[str, Any]] = []
-    raw_gaps = acceptance.get("information_gaps")
-    for position, item in enumerate(raw_gaps if isinstance(raw_gaps, list) else []):
-        if not isinstance(item, dict):
-            gap_text = _acceptance_text(item)
-            if not gap_text:
-                continue
-            item = {"description": gap_text}
-            coercions.append(
-                f"tasks[{index}].scientific_acceptance.information_gaps[{position}] recovered from text"
-            )
-        raw_refs = (
-            item.get("affects_claim_ids")
-            if isinstance(item.get("affects_claim_ids"), list)
-            else []
-        )
-        affects: list[str] = []
-        for raw_ref in raw_refs:
-            ref = _acceptance_text(raw_ref)
-            if not ref:
-                continue
-            normalized = (
-                claim_aliases.get(ref)
-                or claim_aliases.get(_contract_id_token(ref))
-                or _contract_id_token(ref)
-            )
-            if normalized and normalized not in affects:
-                affects.append(normalized)
-        raw_disposition = _acceptance_text(item.get("disposition")).casefold()
-        gaps.append(
-            {
-                "gap_id": _stable_contract_id(
-                    _acceptance_text(item.get("gap_id")),
-                    task_id=_acceptance_text(task.get("task_id")),
-                    kind="gap",
-                    position=position,
-                    used=used_gap_ids,
-                ),
-                "description": (
-                    _acceptance_text(item.get("description"))
-                    or "A paper-specific acceptance detail remains unavailable."
-                ),
-                "affects_claim_ids": affects,
-                "disposition": (
-                    raw_disposition
-                    if raw_disposition in _GAP_DISPOSITIONS
-                    else "assume_and_disclose"
-                ),
-            }
-        )
-
-    if generated_conclusion:
-        gaps.append(
-            {
-                "gap_id": _stable_contract_id(
-                    "",
-                    task_id=_acceptance_text(task.get("task_id")),
-                    kind="gap_acceptance_evidence",
-                    position=len(gaps),
-                    used=used_gap_ids,
-                ),
-                "description": (
-                    "The task designer did not provide a paper-specific scientific "
-                    "acceptance contract; the minimal conclusion was derived from the "
-                    "task target or expected trend."
-                ),
-                "affects_claim_ids": [conclusions[0]["claim_id"]],
-                "disposition": "assume_and_disclose",
-            }
-        )
-
-    task["scientific_acceptance"] = {
-        "contract_version": "1.0",
-        "core_conclusions": conclusions,
-        "key_numeric_targets": numeric_targets,
-        "information_gaps": gaps,
-    }
-
-
-def _default_core_conclusion(task: dict[str, Any]) -> dict[str, str]:
-    trend = task.get("expected_trend")
-    trend = trend if isinstance(trend, dict) else {}
-    direction = _acceptance_text(trend.get("direction")).casefold()
-    if direction in {"decreasing", "increasing", "flat"}:
-        x_axis = _acceptance_text(trend.get("x_axis")) or "the swept variable"
-        y_axis = (
-            _acceptance_text(trend.get("y_axis"))
-            or _acceptance_text(task.get("metric"))
-            or "the metric"
-        )
-        statement = f"{y_axis} is {direction} as {x_axis} changes"
-        reason = _acceptance_text(trend.get("reason"))
-        if reason:
-            statement += f"; {reason}"
-        kind = "trend"
-    else:
-        statement = (
-            _acceptance_text(task.get("target"))
-            or _acceptance_text(task.get("figure_or_claim"))
-            or "Reproduce the task's primary scientific result."
-        )
-        kind = "other"
-    return {
-        "claim_id": "",
-        "statement": statement,
-        "kind": kind,
-        "regime": "paper-defined regime",
-        "paper_anchor": (
-            _acceptance_text(task.get("figure_or_claim"))
-            or "paper result targeted by this task"
-        ),
-    }
-
-
-def _stable_contract_id(
-    value: str,
-    *,
-    task_id: str,
-    kind: str,
-    position: int,
-    used: set[str],
-) -> str:
-    base = _contract_id_token(value)
-    if not base:
-        task_token = _contract_id_token(task_id) or "task"
-        base = f"{task_token}_{kind}_{position + 1}"
-    candidate = base
-    suffix = 2
-    while candidate in used:
-        candidate = f"{base}_{suffix}"
-        suffix += 1
-    used.add(candidate)
-    return candidate
-
-
-def _contract_id_token(value: Any) -> str:
-    token = re.sub(
-        r"[^a-zA-Z0-9_.:-]+", "_", _acceptance_text(value)
-    ).strip("_.:-")
-    return token.casefold()
-
-
-def _is_presentation_only(value: str) -> bool:
-    return bool(_STYLE_ONLY_RE.search(value)) and not bool(
-        _SCIENTIFIC_IMAGE_RE.search(value)
-    )
-
-
-def _numeric_magnitude_and_unit(value: Any, unit: Any) -> tuple[float | None, str]:
-    declared_unit = (
-        unit.strip()
-        if isinstance(unit, str)
-        else str(unit).strip() if unit is not None else ""
-    )
-    if not isinstance(value, str):
-        return _finite_float_or_none(value), declared_unit or "unspecified"
-
-    text = value.strip()
-    if not text:
-        return None, declared_unit or "unspecified"
-    power_match = re.search(
-        r"(?:([-+]?(?:\d+(?:\.\d*)?|\.\d+))\s*[x\u00d7]\s*)?10\s*(?:\^|\*\*)\s*([-+]?\d+)",
-        text,
-        re.IGNORECASE,
-    )
-    if power_match:
-        coefficient = float(power_match.group(1) or "1")
-        magnitude = coefficient * 10 ** int(power_match.group(2))
-        span = power_match.span()
-    else:
-        number_match = re.search(
-            r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?",
-            text,
-        )
-        if number_match is None:
-            return None, declared_unit or f"paper text: {text}"
-        magnitude = _finite_float_or_none(number_match.group())
-        span = number_match.span()
-    residual = (text[: span[0]] + " " + text[span[1] :]).strip(" \t=:;,()[]")
-    if declared_unit and residual and residual.casefold() not in declared_unit.casefold():
-        preserved_unit = f"{declared_unit}; source unit: {residual}"
-    else:
-        preserved_unit = declared_unit or residual or "unspecified"
-    return _finite_float_or_none(magnitude), preserved_unit
-
-
-def _finite_float_or_none(value: Any) -> float | None:
-    if value is None or isinstance(value, bool):
-        return None
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    return number if math.isfinite(number) else None
-
-
-def _acceptance_text(value: Any) -> str:
-    return value.strip() if isinstance(value, str) else ""
-
 
 def _normalize_required_facts(items: Any, index: int, coercions: list[str], fact_keys: set[tuple[str, str]], name_to_types: dict[str, set[str]], alias_to_key: dict[str, tuple[str, str]]) -> list[dict[str, str]]:
     if not isinstance(items, list):
@@ -1169,7 +702,12 @@ def finalize_repro_tasks(data: Any, facts: Any) -> dict[str, Any]:
         _normalize_task(seed, 0, coercions, fact_keys, name_to_types, alias_to_key)
         kept = [seed]
 
-    doc: dict[str, Any] = {"repro_tasks": kept}
+    doc: dict[str, Any] = {
+        "schema_version": "2.0",
+        "backfill_handoff": normalized["backfill_handoff"],
+        "execution_relationships": normalized["execution_relationships"],
+        "repro_tasks": kept,
+    }
     meta = dict(normalized["_meta"]) if isinstance(normalized.get("_meta"), dict) else {}
     if coercions:
         meta["normalization_used"] = True

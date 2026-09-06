@@ -1,0 +1,142 @@
+{
+  "schema_version": "1.0",
+  "review_date": "2026-09-06",
+  "review_type": "independent_blind_review",
+  "reviewed_sources": [
+    "tests/fixtures/scientific_calibration/cases.json"
+  ],
+  "blindness_declaration": "只读取 cases.json 中的任务、论文摘录、本地观察及可行修改；未读取 quality_baseline.json、其他测试文件、报告文档或其他 agent 输出。以下结论在与任何预设标签比较之前形成。",
+  "evidence_scope": "结论基于案例提供的证据；本评审没有独立执行实验或核验底层代码。",
+  "decision_policy": "优先检验真实方法、核心趋势、方法排序与明确的严格精度要求。普通小于 10 倍的数值差异不单独否定复现，也不单独授权重跑。重跑必须包含针对已识别问题的因果修改，不能仅搜索更好看的随机结果。",
+  "host_action_definitions": {
+    "do_not_rerun": "不请求 Writer 重跑；按当前结论报告证据、差异与假设。",
+    "rerun_writer": "允许 Writer 实施已识别的因果修正后重新执行相关实验；修正前仍按当前失败结论记录。"
+  },
+  "cases": [
+    {
+      "case_id": "sample_shape_a",
+      "task_id": "sample_shape_a",
+      "outcome": "reproduced_with_assumptions",
+      "host_action": "do_not_rerun",
+      "rerun_allowed": false,
+      "core_claim": "弱多径产生非恒定子载波增益。",
+      "claim_supported": true,
+      "evidence": [
+        "采用论文方程和已披露的代表性几何后，子载波增益有 20% 起伏。",
+        "改变路径时延后仍具有频率选择性。",
+        "论文未公开示例的精确几何，也未把中心频带出现最大值作为普遍结论。"
+      ],
+      "reason": "核心机制得到支持。原示例几何缺失由明确披露的代表性几何代替，因此附带假设报告。离中心峰值仅是具体实现形态差异，不反驳该机制。当前没有方程、坐标或归一化错误；为匹配外观挑选几何没有因果修复理由。",
+      "causal_change": null
+    },
+    {
+      "case_id": "sample_shape_b",
+      "task_id": "sample_shape_b",
+      "outcome": "not_reproduced",
+      "host_action": "rerun_writer",
+      "rerun_allowed": true,
+      "core_claim": "指定几何与频率原点下具有频率选择性，且频带最大值位于中心。",
+      "claim_supported": false,
+      "evidence": [
+        "本地仍具有频率选择性，但最大值偏离中心，违背明确的峰值位置预测。",
+        "代码循环移动增益采样点，却没有同步变换频率坐标。"
+      ],
+      "reason": "中心峰值是本案例的核心、可检验预测，不能将其视为无关的图形外观。已识别的采样点与坐标不一致直接影响峰值位置，提供了可检验的修正理由。当前结果仍未复现该预测，不能提前把修正后的预期结果计为成功。",
+      "causal_change": "移除未配套的采样排列，保持给定几何不变，在正确标注的频率网格上重新计算并检验峰值。"
+    },
+    {
+      "case_id": "ordering_a",
+      "task_id": "ordering_a",
+      "outcome": "reproduced",
+      "host_action": "do_not_rerun",
+      "rerun_allowed": false,
+      "core_claim": "在指定独立留出信道分布上，A 的 NMSE 低于 B。",
+      "claim_supported": true,
+      "evidence": [
+        "配对独立试验得到 A=0.02、B=0.03，且不确定性区间不重叠。",
+        "方法身份和留出评估均遵循论文，排序与论文一致。",
+        "论文没有提出比给定数值更严格的绝对误差要求。"
+      ],
+      "reason": "核心比较在有效的评估和不确定性证据下得到支持。与论文数值均相差 2 倍，应披露这一差异，但没有证据表明其破坏方法或核心结论。只调整随机种子以缩小差异不构成重跑理由。",
+      "causal_change": null
+    },
+    {
+      "case_id": "ordering_b",
+      "task_id": "ordering_b",
+      "outcome": "not_reproduced",
+      "host_action": "rerun_writer",
+      "rerun_allowed": true,
+      "core_claim": "在指定独立留出信道分布上，A 的 NMSE 低于 B。",
+      "claim_supported": false,
+      "evidence": [
+        "配对独立试验得到 A=0.03、B=0.02，且不确定性区间不重叠，方法排序反转。",
+        "A 对信道方差做了两次除法，而论文仅要求一次。"
+      ],
+      "reason": "排序反转直接违背核心比较，小于 10 倍的数值差异不能豁免此失败。重复方差除法是明确的方法实现错误，修正后重新评估有因果依据，但是否恢复排序仍需实测。",
+      "causal_change": "移除 A 多余的一次方差除法，保持同一评估分布与比较流程，重新测量双方 NMSE 及不确定性。"
+    },
+    {
+      "case_id": "numeric_accuracy_a",
+      "task_id": "numeric_accuracy_a",
+      "outcome": "reproduced",
+      "host_action": "do_not_rerun",
+      "rerun_allowed": false,
+      "core_claim": "忠实实现的算法单调收敛至稳定目标值，并保持论文中的算法比较。",
+      "claim_supported": true,
+      "evidence": [
+        "本地算法忠实实现且目标值单调稳定收敛，算法比较一致。",
+        "终值为 8，论文约为 2，两者单位相同。",
+        "论文的 2 是示例数值，没有更严格精度承诺，也未发现因果实现偏差。"
+      ],
+      "reason": "已支持核心趋势与比较。4 倍终值差异需要在报告中保留，但本案例不以精确终值作为核心断言。缺乏误差机制支持的追加训练轮数或换种子，不能单独授权整轮重跑。",
+      "causal_change": null
+    },
+    {
+      "case_id": "numeric_accuracy_b",
+      "task_id": "numeric_accuracy_b",
+      "outcome": "not_reproduced",
+      "host_action": "rerun_writer",
+      "rerun_allowed": true,
+      "core_claim": "给定基准的目标值 2 必须在 1% 相对误差内复现。",
+      "claim_supported": false,
+      "evidence": [
+        "本地目标值 2.04 对应 2% 相对误差，超过明确的 1% 要求。",
+        "实现采用残差停止阈值 0.03，而论文规定为 0.001。"
+      ],
+      "reason": "显式精度承诺属于核心科学结论，因此即使数值比仅为 1.02，也已不满足要求。停止条件与规定不符能直接解释提前终止风险；采用正确阈值后重跑同一基准有因果依据。",
+      "causal_change": "把残差停止阈值改为论文规定的 0.001，固定基准数据，重新运行一次并检查相对误差是否不超过 1%。"
+    },
+    {
+      "case_id": "learned_method_a",
+      "task_id": "learned_method_a",
+      "outcome": "reproduced",
+      "host_action": "do_not_rerun",
+      "rerun_allowed": false,
+      "core_claim": "在独立留出数据上，用训练得到的同一解码器参数评估时，所提方法优于基线。",
+      "claim_supported": true,
+      "evidence": [
+        "留出评估支持所提方法优于基线。",
+        "训练后参数摘要发生变化，检查点重载保持预测一致。",
+        "执行轨迹实际调用了训练后的解码器，训练与测试数据不重叠。"
+      ],
+      "reason": "方法身份、训练有效性、检查点连续性、独立评估和核心比较均有对应证据。没有已识别的方法、执行或比较错误，不需要重跑。",
+      "causal_change": null
+    },
+    {
+      "case_id": "learned_method_b",
+      "task_id": "learned_method_b",
+      "outcome": "not_reproduced",
+      "host_action": "rerun_writer",
+      "rerun_allowed": true,
+      "core_claim": "在独立留出数据上，用训练得到的同一解码器参数评估时，所提方法优于基线。",
+      "claim_supported": false,
+      "evidence": [
+        "图中排序符合预期，但评估绕过了解码器，代入固定解析曲线。",
+        "参数摘要没有变化，也没有加载检查点。",
+        "任务清单未单独列出方法身份约束，但论文方法本身明确要求训练与真实解码器评估。"
+      ],
+      "reason": "匹配的曲线不能证明从未实际执行的学习方法。真实方法身份是科学有效性的前提，Designer 漏列判据不能抹去直接证据揭示的失败。案例没有描述进程崩溃或执行器错误，因此判断为科学方法未复现，而非 execution_failed。现有具体修改能够补足被跳过的训练和评估过程。",
+      "causal_change": "执行规定的训练，保存并重载实际检查点，用训练后的解码器在独立留出数据上重新评估，再与基线比较。"
+    }
+  ]
+}

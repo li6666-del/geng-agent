@@ -137,15 +137,17 @@ class FoundationStatusTests(unittest.TestCase):
             self.assertFalse(stage["ok"], stage)
             self.assertTrue(stage["issues"])
 
-    def test_markerless_foundation_case_is_inferred_as_v2(self) -> None:
+    def test_markerless_foundation_case_requires_a_clean_rebuild(self) -> None:
         with TemporaryDirectory() as temp:
             case = Path(temp) / "case"
             case.mkdir()
             _write_foundation_fixture(case)
 
-            stage = _foundation_stage(case)
+            status = inspect_case_status(case)
 
-            self.assertTrue(stage["ok"], stage)
+            self.assertFalse(status["supported"])
+            self.assertEqual(status["resume_from"], "rebuild_case")
+            self.assertEqual(status["stages"], [])
 
     def test_status_turns_snapshot_io_error_into_resumeable_stage(self) -> None:
         with TemporaryDirectory() as temp:
@@ -167,20 +169,19 @@ class FoundationStatusTests(unittest.TestCase):
             self.assertEqual(status["latest_audit"], [])
             self.assertIn("cannot inspect Foundation snapshot", status["stages"][0]["issues"][0]["message"])
 
-    def test_v1_status_skips_foundation_stages(self) -> None:
+    def test_unsupported_workflow_requires_a_clean_rebuild(self) -> None:
         with TemporaryDirectory() as temp:
             case = Path(temp) / "case"
             case.mkdir()
-            write_json(case / "workflow.json", {"workflow_version": "1"})
+            write_json(case / "workflow.json", {"workflow_version": "unsupported"})
             write_json(case / "foundation_manifest.json", {"broken": True})
 
-            stage_names = {
-                item["stage"]
-                for item in inspect_case_status(case)["stages"]
-            }
+            status = inspect_case_status(case)
 
-            self.assertNotIn("scientific_architecture", stage_names)
-            self.assertNotIn("foundation_manifest", stage_names)
+            self.assertFalse(status["supported"])
+            self.assertEqual(status["error_kind"], "unsupported_workflow_version")
+            self.assertEqual(status["resume_from"], "rebuild_case")
+            self.assertEqual(status["stages"], [])
 
 
 if __name__ == "__main__":

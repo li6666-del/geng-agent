@@ -273,7 +273,10 @@ class FoundationExecutionContractTests(unittest.TestCase):
         )
 
         self.assertEqual(_required_foundation_modules(architecture), {"src/model.py"})
-        self.assertEqual(_initial_foundation_requirements(architecture), "numpy\ntorch\n")
+        self.assertEqual(
+            _initial_foundation_requirements(architecture),
+            "matplotlib\nnot-a-package\nnumpy\ntensorflow\ntorch\n",
+        )
         with TemporaryDirectory() as temp:
             sandbox = Path(temp)
             (sandbox / "requirements.txt").write_text(
@@ -284,14 +287,17 @@ class FoundationExecutionContractTests(unittest.TestCase):
             final_requirements = set(
                 (sandbox / "requirements.txt").read_text(encoding="utf-8").splitlines()
             )
-        self.assertEqual(final_requirements, {"matplotlib", "numpy", "torch"})
+        self.assertEqual(
+            final_requirements,
+            {"matplotlib", "not-a-package", "numpy", "tensorflow", "torch"},
+        )
 
         legacy = _architecture(schema_version="1.0")
         self.assertEqual(
             _required_foundation_modules(legacy),
             set(FOUNDATION_CORE_MODULES) | {"src/model.py"},
         )
-        self.assertEqual(_initial_foundation_requirements(legacy), "numpy\nmatplotlib\n")
+        self.assertEqual(_initial_foundation_requirements(legacy), "matplotlib\nnumpy\n")
 
     def test_valid_contract_accepts_dotted_callable_and_never_executes_source(self) -> None:
         architecture = _architecture()
@@ -497,7 +503,7 @@ class FoundationExecutionContractTests(unittest.TestCase):
                     issues,
                 )
 
-    def test_unregistered_python_framework_reports_environment_extension(self) -> None:
+    def test_unknown_safe_python_framework_is_not_blocked_by_a_registry(self) -> None:
         architecture = _architecture(
             execution=_execution(
                 primary_framework="JAX",
@@ -509,7 +515,10 @@ class FoundationExecutionContractTests(unittest.TestCase):
                 required_capabilities=[],
             )
         )
-        self.assertEqual(_initial_foundation_requirements(architecture), "")
+        self.assertEqual(
+            _initial_foundation_requirements(architecture),
+            "jax\nmatplotlib\nnumpy\n",
+        )
         with TemporaryDirectory() as temp:
             sandbox = Path(temp)
             _write_sandbox(
@@ -520,7 +529,7 @@ class FoundationExecutionContractTests(unittest.TestCase):
                     "    def forward(self, value):\n"
                     "        return jnp.asarray(value)\n"
                 ),
-                requirements="",
+                requirements="jax\nmatplotlib\nnumpy\n",
             )
             issues, _ = _validate_foundation_execution_contracts(
                 sandbox=sandbox,
@@ -528,9 +537,7 @@ class FoundationExecutionContractTests(unittest.TestCase):
                 result=_result(architecture),
             )
 
-        self.assertTrue(
-            any("environment_extension_required" in item["message"] for item in issues)
-        )
+        self.assertEqual(issues, [])
 
     def test_framework_import_must_be_reachable_but_trusted_backend_use_counts(self) -> None:
         architecture = _architecture(
@@ -1107,7 +1114,10 @@ class FoundationExecutionContractTests(unittest.TestCase):
             required_capabilities=[],
         )
         architecture = _architecture(execution=numpy_execution)
-        self.assertEqual(_initial_foundation_requirements(architecture), "numpy\n")
+        self.assertEqual(
+            _initial_foundation_requirements(architecture),
+            "matplotlib\nnumpy\n",
+        )
         with TemporaryDirectory() as temp:
             sandbox = Path(temp)
             _write_sandbox(
@@ -1142,7 +1152,10 @@ class FoundationExecutionContractTests(unittest.TestCase):
             required_capabilities=["runtime_availability", "runtime_invocation"],
         )
         architecture = _architecture(execution=external_execution)
-        self.assertEqual(_initial_foundation_requirements(architecture), "")
+        self.assertEqual(
+            _initial_foundation_requirements(architecture),
+            "matplotlib\nnumpy\n",
+        )
         capability_tests = [
             {
                 "component_id": "encoder",
@@ -1193,16 +1206,23 @@ class FoundationExecutionContractTests(unittest.TestCase):
             with patch(
                 "geng_agent.agentic_foundation.shutil.which",
                 return_value="/trusted/bin/matlab",
+            ), patch(
+                "geng_agent.agentic_foundation._run_foundation_tests",
+                return_value={"passed": True, "returncode": 0},
             ):
                 delivery_issues, test_result = _validate_foundation_delivery(
                     sandbox=sandbox,
                     architecture=architecture,
                     trusted_changed=[],
                 )
+        self.assertEqual(delivery_issues, [])
+        self.assertFalse(test_result.get("skipped", False))
         self.assertTrue(
-            any("environment_extension_required" in item["message"] for item in delivery_issues)
+            any(
+                "environment_extension_required" in item["message"]
+                for item in test_result.get("warnings", [])
+            )
         )
-        self.assertTrue(test_result.get("skipped"))
 
         missing_interface = _architecture(
             execution={**external_execution, "required_capabilities": ["runtime_availability"]}

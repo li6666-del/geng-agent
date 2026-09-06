@@ -7,11 +7,13 @@ import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 from geng_agent.agentic_foundation import (
     _foundation_project_files,
     _load_cached_foundation,
     _write_foundation_manifest,
+    foundation_violations,
     install_foundation_snapshot,
     restore_foundation_snapshot,
     validate_foundation_bundle,
@@ -111,6 +113,63 @@ class FoundationSnapshotSecurityTests(unittest.TestCase):
 
             with self.assertRaises(RuntimeError):
                 install_foundation_snapshot(root / "project", _foundation(snapshot, manifest))
+
+    def test_runtime_bytecode_exemption_keeps_unsafe_scan_issues_hard(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            snapshot, manifest = _fixture(root)
+            project = root / "project"
+            foundation = _foundation(snapshot, manifest)
+            install_foundation_snapshot(project, foundation)
+            source = project / "src" / "channel.py"
+            source.write_text("VALUE = 2\n", encoding="utf-8")
+            cache = project / "src" / "__pycache__" / "channel.cpython-311.pyc"
+            cache.parent.mkdir()
+            cache.write_bytes(b"runtime bytecode")
+            injected = project / "src" / "injected.py"
+            injected.write_text("VALUE = 3\n", encoding="utf-8")
+            unsafe = [
+                {
+                    "file": "src/__pycache__/escape.pyc",
+                    "message": "frozen Foundation tree contains a link or reparse point",
+                },
+                {
+                    "file": "tests/__pycache__/special.pyc",
+                    "message": "frozen Foundation tree contains a non-regular entry",
+                },
+            ]
+            actual = {
+                "src/channel.py": source,
+                "src/__pycache__/channel.cpython-311.pyc": cache,
+                "src/injected.py": injected,
+            }
+
+            with patch(
+                "geng_agent.foundation_snapshot_delivery._scan_restricted_project",
+                return_value=(actual, [], unsafe),
+            ):
+                issues = foundation_violations(project, foundation)
+
+            files = {item["file"] for item in issues}
+            messages = {item["message"] for item in issues}
+            self.assertNotIn("src/__pycache__/channel.cpython-311.pyc", files)
+            self.assertIn("src/channel.py", files)
+            self.assertIn("src/injected.py", files)
+            self.assertIn("src/__pycache__/escape.pyc", files)
+            self.assertIn("tests/__pycache__/special.pyc", files)
+            self.assertIn("frozen foundation file was modified", messages)
+            self.assertIn(
+                "task writer created a file inside frozen Foundation ownership",
+                messages,
+            )
+            self.assertIn(
+                "frozen Foundation tree contains a link or reparse point",
+                messages,
+            )
+            self.assertIn(
+                "frozen Foundation tree contains a non-regular entry",
+                messages,
+            )
 
     def test_manifest_cannot_shrink_the_frozen_subset(self) -> None:
         with TemporaryDirectory() as temp:

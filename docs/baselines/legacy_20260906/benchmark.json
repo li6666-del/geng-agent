@@ -1,0 +1,563 @@
+{
+  "schema_version": "1.0",
+  "case_count": 3,
+  "totals": {
+    "facts_count": 96,
+    "tasks_count": 18,
+    "runtime_tasks_passed": null,
+    "runtime_tasks_total": null,
+    "runtime_coverage": null,
+    "matched": 0,
+    "explained_gap": 0,
+    "failed": 6,
+    "wall_clock_s": null,
+    "llm_calls": 69,
+    "prompt_tokens": null,
+    "completion_tokens": null,
+    "total_tokens": null,
+    "cost_usd": null
+  },
+  "stage_totals": [
+    {
+      "stage": "paper",
+      "ok": 2,
+      "not_ok": 0,
+      "total": 2
+    },
+    {
+      "stage": "engineering_facts",
+      "ok": 2,
+      "not_ok": 0,
+      "total": 2
+    },
+    {
+      "stage": "paper_thesis",
+      "ok": 2,
+      "not_ok": 0,
+      "total": 2
+    },
+    {
+      "stage": "repro_tasks",
+      "ok": 2,
+      "not_ok": 0,
+      "total": 2
+    },
+    {
+      "stage": "execution_plan",
+      "ok": 1,
+      "not_ok": 1,
+      "total": 2
+    },
+    {
+      "stage": "experiment_index",
+      "ok": 2,
+      "not_ok": 0,
+      "total": 2
+    },
+    {
+      "stage": "scientific_architecture",
+      "ok": 2,
+      "not_ok": 0,
+      "total": 2
+    },
+    {
+      "stage": "environment_lock",
+      "ok": 1,
+      "not_ok": 1,
+      "total": 2
+    },
+    {
+      "stage": "foundation_manifest",
+      "ok": 1,
+      "not_ok": 1,
+      "total": 2
+    },
+    {
+      "stage": "repro_project_manifest",
+      "ok": 0,
+      "not_ok": 2,
+      "total": 2
+    },
+    {
+      "stage": "repro_project",
+      "ok": 1,
+      "not_ok": 1,
+      "total": 2
+    },
+    {
+      "stage": "runtime",
+      "ok": 1,
+      "not_ok": 1,
+      "total": 2
+    },
+    {
+      "stage": "verification_result",
+      "ok": 1,
+      "not_ok": 1,
+      "total": 2
+    },
+    {
+      "stage": "reproduction_report",
+      "ok": 1,
+      "not_ok": 1,
+      "total": 2
+    },
+    {
+      "stage": "result_review",
+      "ok": 1,
+      "not_ok": 1,
+      "total": 2
+    },
+    {
+      "stage": "review",
+      "ok": 1,
+      "not_ok": 1,
+      "total": 2
+    },
+    {
+      "stage": "review_docx",
+      "ok": 1,
+      "not_ok": 1,
+      "total": 2
+    },
+    {
+      "stage": "reproduction_report_docx",
+      "ok": 1,
+      "not_ok": 1,
+      "total": 2
+    },
+    {
+      "stage": "result_review_docx",
+      "ok": 1,
+      "not_ok": 1,
+      "total": 2
+    }
+  ],
+  "cases": [
+    {
+      "case": "case_observe_owc_2504_02134_20260823",
+      "output_dir": "C:\\Users\\84475\\Desktop\\耿同学agent_cases\\case_observe_owc_2504_02134_20260823",
+      "exists": true,
+      "next_stage": "repro_project_manifest",
+      "resume_from": "03c_task_writer_workflow",
+      "stages": [
+        {
+          "stage": "paper",
+          "ok": true,
+          "reason": "valid"
+        },
+        {
+          "stage": "engineering_facts",
+          "ok": true,
+          "reason": "valid"
+        },
+        {
+          "stage": "paper_thesis",
+          "ok": true,
+          "reason": "valid"
+        },
+        {
+          "stage": "repro_tasks",
+          "ok": true,
+          "reason": "valid"
+        },
+        {
+          "stage": "execution_plan",
+          "ok": true,
+          "reason": "present"
+        },
+        {
+          "stage": "experiment_index",
+          "ok": true,
+          "reason": "valid"
+        },
+        {
+          "stage": "scientific_architecture",
+          "ok": true,
+          "reason": "valid"
+        },
+        {
+          "stage": "environment_lock",
+          "ok": true,
+          "reason": "valid"
+        },
+        {
+          "stage": "foundation_manifest",
+          "ok": true,
+          "reason": "valid"
+        },
+        {
+          "stage": "repro_project_manifest",
+          "ok": false,
+          "reason": "schema validation failed"
+        },
+        {
+          "stage": "repro_project",
+          "ok": true,
+          "reason": "valid"
+        },
+        {
+          "stage": "runtime",
+          "ok": true,
+          "reason": "passed"
+        },
+        {
+          "stage": "verification_result",
+          "ok": true,
+          "reason": "valid"
+        },
+        {
+          "stage": "reproduction_report",
+          "ok": true,
+          "reason": "present"
+        },
+        {
+          "stage": "result_review",
+          "ok": true,
+          "reason": "present"
+        },
+        {
+          "stage": "review",
+          "ok": true,
+          "reason": "present"
+        },
+        {
+          "stage": "review_docx",
+          "ok": true,
+          "reason": "present"
+        },
+        {
+          "stage": "reproduction_report_docx",
+          "ok": true,
+          "reason": "present"
+        },
+        {
+          "stage": "result_review_docx",
+          "ok": true,
+          "reason": "present"
+        }
+      ],
+      "stages_ok": 18,
+      "stages_total": 19,
+      "facts_count": 32,
+      "tasks_count": 4,
+      "runtime_enabled": true,
+      "runtime_passed": true,
+      "runtime_tasks_passed": 4,
+      "runtime_tasks_total": 4,
+      "runtime_coverage": "4/4",
+      "matched": 0,
+      "explained_gap": 0,
+      "failed": 0,
+      "wall_clock_s": 23.411,
+      "cost_scope": "legacy_api_latest_plus_observed_codex_history",
+      "llm_calls": 27,
+      "prompt_tokens": null,
+      "completion_tokens": null,
+      "total_tokens": null,
+      "cost_usd": null,
+      "codex_cumulative": {
+        "llm_calls": 27,
+        "usage_complete": false,
+        "calls_with_usage": 0,
+        "calls_missing_usage": 27,
+        "observed_tokens": {
+          "prompt_tokens": 0,
+          "cached_prompt_tokens": 0,
+          "completion_tokens": 0,
+          "total_tokens": 0
+        },
+        "prompt_tokens": null,
+        "cached_prompt_tokens": null,
+        "completion_tokens": null,
+        "total_tokens": null,
+        "cost_usd": null,
+        "currency_note": "No token price is inferred for account-based Codex usage.",
+        "by_role": {
+          "analysis": 7,
+          "foundation_writer": 1,
+          "report_editor": 1,
+          "task_reporter": 13,
+          "task_writer": 5
+        }
+      },
+      "scientific_outcomes": {
+        "reproduced": 0,
+        "reproduced_with_assumptions": 0,
+        "inconclusive_missing_information": 0,
+        "not_reproduced": 4,
+        "execution_failed": 0,
+        "unassessed": 0
+      },
+      "quality": {
+        "available": false,
+        "baseline_version": null,
+        "tasks": [],
+        "labeled": 0,
+        "assessed": 0,
+        "unassessed": 0,
+        "correct": 0,
+        "false_success": 0,
+        "false_failure": 0,
+        "rerun_errors": 0
+      }
+    },
+    {
+      "case": "case_twc_otfs_multisat_20260719_023016",
+      "output_dir": "C:\\Users\\84475\\Desktop\\耿同学agent_cases\\case_twc_otfs_multisat_20260719_023016",
+      "exists": true,
+      "next_stage": null,
+      "resume_from": "rebuild_case",
+      "stages": [],
+      "stages_ok": 0,
+      "stages_total": 0,
+      "facts_count": 33,
+      "tasks_count": 7,
+      "runtime_enabled": true,
+      "runtime_passed": false,
+      "runtime_tasks_passed": 1,
+      "runtime_tasks_total": 7,
+      "runtime_coverage": "1/7",
+      "matched": 0,
+      "explained_gap": 0,
+      "failed": 6,
+      "wall_clock_s": null,
+      "cost_scope": "legacy_api_latest_plus_observed_codex_history",
+      "llm_calls": 37,
+      "prompt_tokens": null,
+      "completion_tokens": null,
+      "total_tokens": null,
+      "cost_usd": null,
+      "codex_cumulative": {
+        "llm_calls": 37,
+        "usage_complete": false,
+        "calls_with_usage": 0,
+        "calls_missing_usage": 37,
+        "observed_tokens": {
+          "prompt_tokens": 0,
+          "cached_prompt_tokens": 0,
+          "completion_tokens": 0,
+          "total_tokens": 0
+        },
+        "prompt_tokens": null,
+        "cached_prompt_tokens": null,
+        "completion_tokens": null,
+        "total_tokens": null,
+        "cost_usd": null,
+        "currency_note": "No token price is inferred for account-based Codex usage.",
+        "by_role": {
+          "analysis": 5,
+          "task_reporter": 14,
+          "task_writer": 18
+        }
+      },
+      "scientific_outcomes": {
+        "reproduced": 0,
+        "reproduced_with_assumptions": 0,
+        "inconclusive_missing_information": 0,
+        "not_reproduced": 0,
+        "execution_failed": 0,
+        "unassessed": 7
+      },
+      "quality": {
+        "available": false,
+        "baseline_version": null,
+        "tasks": [],
+        "labeled": 0,
+        "assessed": 0,
+        "unassessed": 0,
+        "correct": 0,
+        "false_success": 0,
+        "false_failure": 0,
+        "rerun_errors": 0
+      }
+    },
+    {
+      "case": "deepsc_s_2102_12605_full_20260722_001",
+      "output_dir": "C:\\Users\\84475\\Desktop\\耿同学agent_cases\\deepsc_s_2102_12605_full_20260722_001",
+      "exists": true,
+      "next_stage": "execution_plan",
+      "resume_from": "02e_compile_execution_plan",
+      "stages": [
+        {
+          "stage": "paper",
+          "ok": true,
+          "reason": "valid"
+        },
+        {
+          "stage": "engineering_facts",
+          "ok": true,
+          "reason": "valid"
+        },
+        {
+          "stage": "paper_thesis",
+          "ok": true,
+          "reason": "valid"
+        },
+        {
+          "stage": "repro_tasks",
+          "ok": true,
+          "reason": "valid"
+        },
+        {
+          "stage": "execution_plan",
+          "ok": false,
+          "reason": "missing"
+        },
+        {
+          "stage": "experiment_index",
+          "ok": true,
+          "reason": "valid"
+        },
+        {
+          "stage": "scientific_architecture",
+          "ok": true,
+          "reason": "valid"
+        },
+        {
+          "stage": "environment_lock",
+          "ok": false,
+          "reason": "missing"
+        },
+        {
+          "stage": "foundation_manifest",
+          "ok": false,
+          "reason": "missing"
+        },
+        {
+          "stage": "repro_project_manifest",
+          "ok": false,
+          "reason": "missing"
+        },
+        {
+          "stage": "repro_project",
+          "ok": false,
+          "reason": "missing"
+        },
+        {
+          "stage": "runtime",
+          "ok": false,
+          "reason": "missing"
+        },
+        {
+          "stage": "verification_result",
+          "ok": false,
+          "reason": "missing"
+        },
+        {
+          "stage": "reproduction_report",
+          "ok": false,
+          "reason": "missing"
+        },
+        {
+          "stage": "result_review",
+          "ok": false,
+          "reason": "missing"
+        },
+        {
+          "stage": "review",
+          "ok": false,
+          "reason": "missing"
+        },
+        {
+          "stage": "review_docx",
+          "ok": false,
+          "reason": "missing"
+        },
+        {
+          "stage": "reproduction_report_docx",
+          "ok": false,
+          "reason": "missing"
+        },
+        {
+          "stage": "result_review_docx",
+          "ok": false,
+          "reason": "missing"
+        }
+      ],
+      "stages_ok": 6,
+      "stages_total": 19,
+      "facts_count": 31,
+      "tasks_count": 7,
+      "runtime_enabled": null,
+      "runtime_passed": null,
+      "runtime_tasks_passed": null,
+      "runtime_tasks_total": null,
+      "runtime_coverage": null,
+      "matched": 0,
+      "explained_gap": 0,
+      "failed": 0,
+      "wall_clock_s": null,
+      "cost_scope": "legacy_api_latest_plus_observed_codex_history",
+      "llm_calls": 5,
+      "prompt_tokens": null,
+      "completion_tokens": null,
+      "total_tokens": null,
+      "cost_usd": null,
+      "codex_cumulative": {
+        "llm_calls": 5,
+        "usage_complete": false,
+        "calls_with_usage": 0,
+        "calls_missing_usage": 5,
+        "observed_tokens": {
+          "prompt_tokens": 0,
+          "cached_prompt_tokens": 0,
+          "completion_tokens": 0,
+          "total_tokens": 0
+        },
+        "prompt_tokens": null,
+        "cached_prompt_tokens": null,
+        "completion_tokens": null,
+        "total_tokens": null,
+        "cost_usd": null,
+        "currency_note": "No token price is inferred for account-based Codex usage.",
+        "by_role": {
+          "analysis": 5
+        }
+      },
+      "scientific_outcomes": {
+        "reproduced": 0,
+        "reproduced_with_assumptions": 0,
+        "inconclusive_missing_information": 0,
+        "not_reproduced": 0,
+        "execution_failed": 0,
+        "unassessed": 7
+      },
+      "quality": {
+        "available": false,
+        "baseline_version": null,
+        "tasks": [],
+        "labeled": 0,
+        "assessed": 0,
+        "unassessed": 0,
+        "correct": 0,
+        "false_success": 0,
+        "false_failure": 0,
+        "rerun_errors": 0
+      }
+    }
+  ],
+  "quality": {
+    "labeled": 0,
+    "assessed": 0,
+    "unassessed": 0,
+    "correct": 0,
+    "false_success": 0,
+    "false_failure": 0,
+    "rerun_errors": 0,
+    "by_paper_family": {}
+  },
+  "scientific_outcomes": {
+    "reproduced": 0,
+    "reproduced_with_assumptions": 0,
+    "inconclusive_missing_information": 0,
+    "not_reproduced": 4,
+    "execution_failed": 0,
+    "unassessed": 14
+  },
+  "codex_cumulative": {
+    "llm_calls": 69,
+    "total_tokens": null,
+    "calls_missing_usage": 69
+  }
+}

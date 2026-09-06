@@ -99,6 +99,8 @@ def _build_run_cost(
     *,
     total_wall_s: float,
     by_model: dict[str, dict[str, int]],
+    audit_dir: Path | None = None,
+    codex_since: float | None = None,
 ) -> dict[str, Any]:
     """Turn the cumulative stage marks into a per-stage cost ledger (time + tokens)."""
     keys = ("llm_calls", "prompt_tokens", "completion_tokens", "total_tokens")
@@ -112,13 +114,24 @@ def _build_run_cost(
             entry[key] = int(cur.get(key, 0)) - int(prev.get(key, 0))
         by_stage.append(entry)
     totals = marks[-1] if marks else {}
-    return {
+    result = {
         "wall_clock_s": total_wall_s,
-        "totals": {key: int(totals.get(key, 0)) for key in keys},
+        "totals": {key: max(0, int(totals.get(key, 0)) - int((marks[0] if len(marks) > 1 else {}).get(key, 0))) for key in keys},
         "by_stage": by_stage,
         "by_model": by_model,
-        "note": "墙钟为各阶段实测耗时；token 由 LLM API 的 usage 字段汇总，缺失字段按 0 计（部分服务商不返回 usage，此时 token 显示为 0 但调用次数仍准确）。",
+        "note": "墙钟为本次调用实测耗时；Codex token 来自已完成 turn 的 usage，缺失时为 null；累计成本保留此前调用。",
     }
+    if audit_dir is not None:
+        import time
+        from .codex_cost import summarize_codex_usage
+        delta = summarize_codex_usage(Path(audit_dir), since=codex_since if codex_since is not None else time.time() - total_wall_s)
+        cumulative = summarize_codex_usage(Path(audit_dir))
+        result["codex"] = {"delta": delta, "cumulative": cumulative}
+        result["llm_api_totals"] = dict(result["totals"])
+        for key in keys:
+            value = delta.get(key)
+            result["totals"][key] = result["totals"][key] + value if value is not None else None
+    return result
 
 
 def build_risk_report(

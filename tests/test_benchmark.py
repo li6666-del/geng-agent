@@ -15,6 +15,36 @@ from geng_agent.outputs import write_json
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_new_scientific_outcomes_and_missing_legacy_codex_usage(self) -> None:
+        with TemporaryDirectory() as temporary:
+            case = Path(temporary)
+            write_json(case / "repro_tasks.json", {"repro_tasks": [{"task_id": name} for name in ("wrong", "crashed", "pending")]})
+            write_json(case / "verification_result.json", {"tasks": [
+                {"task_id": "wrong", "outcome": "not_reproduced"},
+                {"task_id": "crashed", "outcome": "execution_failed"}]})
+            write_json(case / "run_cost.json", {"wall_clock_s": 2, "totals": {"llm_calls": 0, "total_tokens": 0}})
+            write_json(case / "audit" / "worker.json", {"backend": "codex", "role": "writer"})
+            (case / "audit" / "worker_transcript.txt").write_text("legacy output")
+            report = build_benchmark([case])
+            summary = report["cases"][0]
+            self.assertEqual(summary["llm_calls"], 1)
+            self.assertIsNone(summary["total_tokens"])
+            self.assertEqual(summary["scientific_outcomes"]["not_reproduced"], 1)
+            self.assertEqual(summary["scientific_outcomes"]["execution_failed"], 1)
+            self.assertEqual(summary["scientific_outcomes"]["unassessed"], 1)
+            self.assertIn("## Scientific outcomes", render_benchmark_markdown(report))
+
+    def test_resumed_case_uses_cumulative_cost_for_cross_paper_comparison(self) -> None:
+        with TemporaryDirectory() as temporary:
+            case = Path(temporary)
+            write_json(case / "run_cost.json", {"wall_clock_s": 2, "totals": {"llm_calls": 0, "total_tokens": 0},
+                "cumulative": {"wall_clock_s": 200, "totals": {"llm_calls": 7, "total_tokens": 4000}}})
+            summary = build_benchmark([case])["cases"][0]
+            self.assertEqual(summary["cost_scope"], "cumulative")
+            self.assertEqual(summary["wall_clock_s"], 200)
+            self.assertEqual(summary["llm_calls"], 7)
+            self.assertEqual(summary["total_tokens"], 4000)
+
     def test_multiple_cases_are_aggregated(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -112,6 +142,7 @@ class BenchmarkTests(unittest.TestCase):
         total_tokens: int,
         cost_usd: float,
     ) -> None:
+        write_json(case / "workflow.json", {"workflow_version": "2"})
         write_json(case / "engineering_facts.json", {"engineering_facts": [{} for _ in range(facts)]})
         write_json(case / "repro_tasks.json", {"repro_tasks": [{} for _ in range(tasks)]})
         passed = sum(status == "matched" for status in statuses)

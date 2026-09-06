@@ -266,6 +266,40 @@ class ScientificAcceptance(StrictModel):
     information_gaps: list[ScientificInformationGap] = Field(default_factory=list)
 
 
+class ReproTaskBackfillHandoff(StrictModel):
+    """Task Designer advice; an inferred value keeps legacy output runnable."""
+
+    ready_for_writer: bool = True
+    blocking_request_ids: list[str] = Field(default_factory=list)
+    reason: str = ""
+    inferred: bool = False
+
+
+ExecutionRelationshipKind = Literal[
+    "same_run_outputs",
+    "checkpoint_flow",
+    "shared_pretraining",
+    "shared_random_realization",
+    "shared_dataset_partition",
+    "shared_definition",
+    "other",
+]
+ExecutionRelationshipStrength = Literal["strong", "weak"]
+
+
+class TaskExecutionRelationship(StrictModel):
+    """Scientific execution dependency between otherwise atomic reproduction tasks."""
+
+    relationship_id: NonEmptyStr
+    kind: ExecutionRelationshipKind
+    strength: ExecutionRelationshipStrength
+    task_ids: list[NonEmptyStr] = Field(min_length=2)
+    producer_task_id: NonEmptyStr | None = None
+    consumer_task_ids: list[NonEmptyStr] = Field(default_factory=list)
+    artifact_ids: list[NonEmptyStr] = Field(default_factory=list)
+    rationale: str = ""
+
+
 class ReproTask(StrictModel):
     task_id: NonEmptyStr
     target: NonEmptyStr
@@ -306,6 +340,13 @@ class TargetedFactBackfillDocument(EngineeringFactsDocument):
 
 
 class ReproTasksDocument(StrictModel):
+    schema_version: Literal["2.0"] = "2.0"
+    backfill_handoff: ReproTaskBackfillHandoff = Field(
+        default_factory=ReproTaskBackfillHandoff
+    )
+    execution_relationships: list[TaskExecutionRelationship] = Field(
+        default_factory=list
+    )
     repro_tasks: list[ReproTask] = Field(min_length=1)
 
 

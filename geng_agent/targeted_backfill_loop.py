@@ -30,10 +30,13 @@ RoundObserver = Callable[[int, dict[str, Any]], None]
 
 def _task_backfill_handoff(tasks: dict[str, Any]) -> dict[str, Any]:
     raw = tasks.get("backfill_handoff") if isinstance(tasks, dict) else None
+    # Read legacy metadata only as an input bridge. Every document leaving this
+    # loop writes the handoff at the public top level.
     if not isinstance(raw, dict) and isinstance(tasks, dict):
         meta = tasks.get("_meta") if isinstance(tasks.get("_meta"), dict) else {}
         raw = meta.get("backfill_handoff")
-    provided = isinstance(raw, dict)
+    inferred = not isinstance(raw, dict) or bool(raw.get("inferred"))
+    provided = isinstance(raw, dict) and not inferred
     raw = raw if isinstance(raw, dict) else {}
     ready = raw.get("ready_for_writer")
     ready_for_writer = ready if isinstance(ready, bool) else True
@@ -47,6 +50,7 @@ def _task_backfill_handoff(tasks: dict[str, Any]) -> dict[str, Any]:
         "ready_for_writer": ready_for_writer,
         "blocking_request_ids": request_ids,
         "reason": str(raw.get("reason") or "").strip(),
+        "inferred": inferred,
     }
 
 
@@ -102,6 +106,12 @@ def run_targeted_backfill_loop(
     limit = max(1, int(max_rounds))
 
     initial_handoff = _task_backfill_handoff(tasks)
+    tasks["backfill_handoff"] = {
+        key: value for key, value in initial_handoff.items() if key != "provided"
+    }
+    initial_meta = tasks.get("_meta") if isinstance(tasks.get("_meta"), dict) else None
+    if initial_meta is not None:
+        initial_meta.pop("backfill_handoff", None)
     resolved_ids, ignored_ids = _resolve_blocking_request_ids(
         initial_handoff["blocking_request_ids"], known_requests
     )
@@ -201,26 +211,32 @@ def run_targeted_backfill_loop(
             break
         candidate_tasks = normalize_tasks(candidate_tasks, facts)
         candidate_handoff = _task_backfill_handoff(candidate_tasks)
+        candidate_tasks["backfill_handoff"] = {
+            key: value
+            for key, value in candidate_handoff.items()
+            if key != "provided"
+        }
+        candidate_meta = (
+            candidate_tasks.get("_meta")
+            if isinstance(candidate_tasks.get("_meta"), dict)
+            else None
+        )
+        if candidate_meta is not None:
+            candidate_meta.pop("backfill_handoff", None)
         candidate_requests = collect_missing_fact_requests(candidate_tasks)
         known_requests = merge_request_worklists(known_requests, candidate_requests)
         cumulative_resolution = cumulative_resolution_from_ledger(
             known_requests, facts, ledger
         )
         tasks = reconcile_final_tasks(tasks, candidate_tasks, cumulative_resolution)
-        task_meta = (
-            dict(tasks.get("_meta", {}))
-            if isinstance(tasks.get("_meta"), dict)
-            else {}
-        )
-        if candidate_handoff["provided"]:
-            task_meta["backfill_handoff"] = {
-                key: value
-                for key, value in candidate_handoff.items()
-                if key != "provided"
-            }
-        else:
+        tasks["backfill_handoff"] = {
+            key: value
+            for key, value in candidate_handoff.items()
+            if key != "provided"
+        }
+        task_meta = tasks.get("_meta") if isinstance(tasks.get("_meta"), dict) else None
+        if task_meta is not None:
             task_meta.pop("backfill_handoff", None)
-        tasks["_meta"] = task_meta
         tasks = normalize_tasks(tasks, facts)
 
         refreshed_requests = collect_missing_fact_requests(tasks)

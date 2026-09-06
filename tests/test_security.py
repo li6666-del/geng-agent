@@ -8,12 +8,13 @@ from geng_agent.security import (
     FOUNDATION_STATIC_SECURITY_ADVISORY_CATEGORIES,
     FORBIDDEN_BUILTINS,
     codex_safe_env,
-    reconcile_whitelisted_requirements,
+    reconcile_runtime_requirements,
     requirement_name_for_import,
     split_static_security_issues,
     split_requirement_issues,
     static_scan_repro_project,
     validate_requirements,
+    _runtime_lock_is_trusted,
 )
 
 
@@ -27,6 +28,67 @@ def scan_source(source: str) -> list[dict[str, str]]:
 def messages(issues: list[dict[str, str]]) -> list[str]:
     return [issue["message"] for issue in issues]
 
+
+def trusted_lock(requirements: list[dict]) -> dict:
+    normalized_requirements = []
+    for raw_item in requirements:
+        item = dict(raw_item)
+        if "resolution_source" not in item:
+            item["resolution_source"] = (
+                "not_applicable"
+                if item.get("applicable") is False
+                else "trusted_index"
+            )
+        normalized_requirements.append(item)
+    artifacts = [
+        {
+            "distribution": item["distribution"],
+            "version": item["installed_version"],
+            "url": (
+                "https://files.pythonhosted.org/packages/"
+                f"{item['distribution']}-{item['installed_version']}.whl"
+            ),
+            "sha256": "d" * 64,
+        }
+        for item in normalized_requirements
+        if (
+            item.get("applicable") is not False
+            and item.get("satisfied") is True
+            and item.get("resolution_source") == "trusted_index"
+        )
+    ]
+    return {
+        "kind": "geng.case_environment.lock",
+        "ready": True,
+        "runtime_mode": "host_shared",
+        "host_provenance": {
+            "kind": "geng.host_shared_runtime",
+            "runtime_mode": "host_shared",
+            "selected_launcher": "/trusted/bin/python",
+            "resolved_executable": "/trusted/bin/python3",
+            "prefix": "/trusted",
+            "mutex_identity_sha256": "e" * 64,
+        },
+        "source_policy": {
+            "trusted": True,
+            "host_runtime_verified": any(
+                item.get("resolution_source") == "host_runtime"
+                for item in normalized_requirements
+            ),
+            "artifact_report_verified": bool(artifacts),
+            "binary_wheels_only": True,
+            "artifact_evidence": {
+                "plan_report_sha256": "b" * 64,
+                "install_report_sha256": "c" * 64,
+                "artifacts": artifacts,
+            },
+        },
+        "index": {
+            "fingerprint": "a" * 64,
+            "artifact_hosts": ["files.pythonhosted.org", "pypi.org"],
+        },
+        "requirements": normalized_requirements,
+    }
 
 class StaticScanDynamicBuiltinTests(unittest.TestCase):
     def test_flags_every_forbidden_dynamic_builtin(self) -> None:
@@ -330,6 +392,40 @@ class StaticScanDynamicBuiltinTests(unittest.TestCase):
 
 
 class ReconcileRequirementsTests(unittest.TestCase):
+    def test_host_runtime_requirement_uses_probe_and_provenance_not_artifact(self) -> None:
+        lock = trusted_lock([{
+            "requirement": "torch",
+            "distribution": "torch",
+            "import_names": ["torch"],
+            "applicable": True,
+            "installed_version": "2.11.0+cu128",
+            "version_satisfied": True,
+            "imports_ok": True,
+            "satisfied": True,
+            "resolution_source": "host_runtime",
+        }])
+        lock["source_policy"]["artifact_report_verified"] = False
+        lock["source_policy"]["artifact_evidence"] = {}
+        self.assertTrue(_runtime_lock_is_trusted(lock))
+
+        lock["source_policy"]["host_runtime_verified"] = False
+        self.assertFalse(_runtime_lock_is_trusted(lock))
+
+    def test_trusted_index_requirement_still_requires_artifact_evidence(self) -> None:
+        lock = trusted_lock([{
+            "requirement": "transformers",
+            "distribution": "transformers",
+            "import_names": ["transformers"],
+            "applicable": True,
+            "installed_version": "5.0.0",
+            "version_satisfied": True,
+            "imports_ok": True,
+            "satisfied": True,
+        }])
+        self.assertTrue(_runtime_lock_is_trusted(lock))
+        lock["source_policy"]["artifact_evidence"]["artifacts"] = []
+        self.assertFalse(_runtime_lock_is_trusted(lock))
+
     def _project(self, tmp: str, *, requirements: str, sim_source: str) -> Path:
         root = Path(tmp)
         (root / "requirements.txt").write_text(requirements, encoding="utf-8")
@@ -338,12 +434,12 @@ class ReconcileRequirementsTests(unittest.TestCase):
         (root / "src" / "simulation.py").write_text(sim_source, encoding="utf-8")
         return root
 
-    def test_adds_undeclared_whitelisted_installed_import(self) -> None:
+    def test_adds_undeclared_installed_import(self) -> None:
         with TemporaryDirectory() as tmp:
             root = self._project(
                 tmp, requirements="numpy\n", sim_source="import numpy as np\nimport scipy.linalg\n"
             )
-            added = reconcile_whitelisted_requirements(root)
+            added = reconcile_runtime_requirements(root)
             self.assertEqual(added, ["scipy"])
             text = (root / "requirements.txt").read_text(encoding="utf-8")
             self.assertIn("scipy", text)
@@ -372,10 +468,10 @@ class ReconcileRequirementsTests(unittest.TestCase):
                 sim_source="from mpl_toolkits.axes_grid1.inset_locator import inset_axes\n",
             )
             with patch("geng_agent.security.importlib.util.find_spec", return_value=object()):
-                self.assertEqual(reconcile_whitelisted_requirements(root), ["matplotlib"])
+                self.assertEqual(reconcile_runtime_requirements(root), ["matplotlib"])
             self.assertIn("matplotlib", (root / "requirements.txt").read_text(encoding="utf-8"))
 
-    def test_split_requirement_issues_downgrades_installed_whitelisted_missing_declaration(self) -> None:
+    def test_split_requirement_issues_downgrades_installed_missing_declaration(self) -> None:
         issue = {
             "file": "tasks/demo.py",
             "line": "1",
@@ -387,31 +483,61 @@ class ReconcileRequirementsTests(unittest.TestCase):
         self.assertEqual(len(warnings), 1)
         self.assertEqual(warnings[0]["severity"], "warning")
 
-    def test_split_requirement_issues_keeps_unknown_package_blocking(self) -> None:
+    def test_split_requirement_issues_uses_case_lock_for_unknown_package(self) -> None:
         issue = {
             "file": "tasks/demo.py",
             "line": "1",
-            "message": "third-party import is not declared in requirements.txt: yaml (expected package yaml)",
+            "category": "dependency_declaration_missing",
+            "package": "custom-runtime",
+            "message": "third-party import is not declared in requirements.txt: custom_runtime (expected package custom-runtime)",
         }
-        blocking, warnings = split_requirement_issues([issue])
+        lock = trusted_lock([{
+            "requirement": "custom-runtime>=1",
+            "distribution": "custom-runtime",
+            "import_names": ["custom_runtime"],
+            "applicable": True,
+            "installed_version": "1.2",
+            "version_satisfied": True,
+            "imports_ok": True,
+            "satisfied": True,
+        }])
+        blocking, warnings = split_requirement_issues([issue], runtime_lock=lock)
+        self.assertEqual(blocking, [])
+        self.assertEqual(len(warnings), 1)
+        blocking, warnings = split_requirement_issues(
+            [issue], runtime_lock=trusted_lock([])
+        )
         self.assertEqual(warnings, [])
         self.assertEqual(len(blocking), 1)
         self.assertEqual(blocking[0]["severity"], "error")
 
-    def test_does_not_add_non_whitelisted_import(self) -> None:
+    def test_reconcile_adds_unknown_import_proven_by_case_lock(self) -> None:
         with TemporaryDirectory() as tmp:
             root = self._project(
-                tmp, requirements="numpy\n", sim_source="import numpy as np\nimport yaml\n"
+                tmp, requirements="numpy\n", sim_source="import numpy as np\nimport custom_runtime\n"
             )
-            self.assertEqual(reconcile_whitelisted_requirements(root), [])
-            self.assertNotIn("yaml", (root / "requirements.txt").read_text(encoding="utf-8"))
+            lock = trusted_lock([{
+                "requirement": "custom-runtime>=1",
+                "distribution": "custom-runtime",
+                "import_names": ["custom_runtime"],
+                "applicable": True,
+                "installed_version": "1.2",
+                "version_satisfied": True,
+                "imports_ok": True,
+                "satisfied": True,
+            }])
+            self.assertEqual(
+                reconcile_runtime_requirements(root, runtime_lock=lock),
+                ["custom-runtime"],
+            )
+            self.assertIn("custom-runtime>=1", (root / "requirements.txt").read_text(encoding="utf-8"))
 
     def test_noop_when_all_declared(self) -> None:
         with TemporaryDirectory() as tmp:
             root = self._project(
                 tmp, requirements="numpy\nscipy\n", sim_source="import numpy as np\nimport scipy.linalg\n"
             )
-            self.assertEqual(reconcile_whitelisted_requirements(root), [])
+            self.assertEqual(reconcile_runtime_requirements(root), [])
 
     def test_trusted_backend_torch_call_requires_requirement(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -434,8 +560,54 @@ class ReconcileRequirementsTests(unittest.TestCase):
                 sim_source="from src import _backend\n\ndef f():\n    return _backend.torch()\n",
             )
             with patch("geng_agent.security.importlib.util.find_spec", return_value=object()):
-                self.assertEqual(reconcile_whitelisted_requirements(root), ["torch"])
+                self.assertEqual(reconcile_runtime_requirements(root), ["torch"])
             self.assertIn("torch", (root / "requirements.txt").read_text(encoding="utf-8"))
+
+    def test_unknown_distribution_is_not_rejected_by_name(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = self._project(
+                tmp,
+                requirements="custom-runtime>=1\n",
+                sim_source="import custom_runtime\n",
+            )
+            with patch("geng_agent.security.importlib.util.find_spec", return_value=object()):
+                issues = validate_requirements(root)
+        self.assertEqual(issues, [])
+
+    def test_explicit_case_lock_is_authoritative_and_constraint_bound(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = self._project(
+                tmp,
+                requirements="custom-runtime>=1\n",
+                sim_source="import custom_runtime\n",
+            )
+            lock = trusted_lock([{
+                "requirement": "custom-runtime>=1",
+                "distribution": "custom-runtime",
+                "import_names": ["custom_runtime"],
+                "applicable": True,
+                "installed_version": "1.2",
+                "version_satisfied": True,
+                "imports_ok": True,
+                "satisfied": True,
+            }])
+            with patch("geng_agent.security.importlib.util.find_spec", return_value=None):
+                self.assertEqual(validate_requirements(root, runtime_lock=lock), [])
+            (root / "requirements.txt").write_text("custom-runtime>=999\n", encoding="utf-8")
+            issues = validate_requirements(root, runtime_lock=lock)
+        self.assertIn("dependency_lock_constraint_mismatch", {item["category"] for item in issues})
+
+    def test_rejects_untrusted_requirement_sources_and_installer_options(self) -> None:
+        samples = (
+            "--extra-index-url https://evil.invalid/simple",
+            "demo @ https://evil.invalid/a.whl",
+            "../demo.whl",
+        )
+        for sample in samples:
+            with self.subTest(sample=sample), TemporaryDirectory() as tmp:
+                root = self._project(tmp, requirements=sample + "\n", sim_source="")
+                issues = validate_requirements(root)
+                self.assertIn("unsafe_requirement_syntax", {item["category"] for item in issues})
 
 
 class CodexSafeEnvTests(unittest.TestCase):

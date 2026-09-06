@@ -134,12 +134,15 @@ class DocumentTests(unittest.TestCase):
         self.assertEqual(len(kept), 1)
         self.assertEqual(len(dropped), 0)
 
-        # bad chunk_id -> dropped (traceability enforced)
+        # bad chunk_id -> retained but explicitly marked unverified
         bad_text_fact = dict(good_text_fact)
         bad_text_fact["source"] = dict(good_text_fact["source"], chunk_id="p99_c99")
         kept2, dropped2 = select_valid_engineering_facts({"engineering_facts": [bad_text_fact]}, valid_chunk_ids, valid_pages)
-        self.assertEqual(len(kept2), 0)
-        self.assertTrue(any("chunk_id" in d["reason"] for d in dropped2))
+        self.assertEqual(len(kept2), 1)
+        self.assertEqual(dropped2, [])
+        provenance = kept2[0]["value"]["_provenance"]
+        self.assertFalse(provenance["verified"])
+        self.assertTrue(any("chunk id" in reason for reason in provenance["reasons"]))
 
         # figure fact citing a page that exists in the document's chunk pages (simulates paper with figures where facts ref Fig on page X)
         fig_fact = {

@@ -10,10 +10,10 @@ class CliDefaultsTests(unittest.TestCase):
         parser = build_parser()
         args = parser.parse_args(["review", "paper.pdf", "--out", "case"])
         self.assertEqual(args.analysis_backend, "codex")
-        self.assertIsNone(args.codex_analysis_timeout)
-        self.assertIsNone(args.codex_agent_timeout)
-        self.assertIsNone(args.codex_reporter_timeout)
-        self.assertEqual(args.project_timeout, 1800.0)
+        self.assertFalse(hasattr(args, "project_timeout"))
+        self.assertFalse(hasattr(args, "codex_analysis_timeout"))
+        self.assertFalse(hasattr(args, "codex_agent_timeout"))
+        self.assertFalse(hasattr(args, "codex_reporter_timeout"))
         self.assertEqual(args.mineru_timeout, 1800.0)
         self.assertEqual(args.json_repair_attempts, 1)
         self.assertFalse(args.analysis_only)
@@ -29,17 +29,19 @@ class CliDefaultsTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, 0)
         help_text = stdout.getvalue()
-        self.assertIn("30 分钟", help_text)
         self.assertIn("--analysis-backend", help_text)
         self.assertIn("--analysis-only", help_text)
         self.assertNotIn("--analysis-agent-width", help_text)
-        self.assertIn("--codex-analysis-timeout", help_text)
+        self.assertNotIn("--project-timeout", help_text)
+        self.assertNotIn("--codex-analysis-timeout", help_text)
         self.assertNotIn("--codex-agent-rounds", help_text)
-        self.assertIn("--codex-agent-timeout", help_text)
-        self.assertIn("--codex-reporter-timeout", help_text)
+        self.assertNotIn("--codex-agent-timeout", help_text)
+        self.assertNotIn("--codex-reporter-timeout", help_text)
+        self.assertIn("--timeout", help_text)
+        self.assertIn("--tasks-timeout", help_text)
+        self.assertIn("--run-timeout", help_text)
         self.assertIn("--mineru-timeout", help_text)
         self.assertNotIn("--no-result-review", help_text)
-        self.assertIn("Foundation Writer", help_text)
         self.assertNotIn("--codex-agent-stall-rounds", help_text)
         self.assertNotIn("--codex-agent-mode", help_text)
         self.assertNotIn("--project-backend", help_text)
@@ -58,6 +60,21 @@ class CliDefaultsTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, 2)
         self.assertIn("unrecognized arguments", stderr.getvalue())
+
+    def test_removed_codex_wall_clock_options_are_rejected(self) -> None:
+        parser = build_parser()
+        for option in (
+            "--project-timeout",
+            "--codex-analysis-timeout",
+            "--codex-agent-timeout",
+            "--codex-reporter-timeout",
+        ):
+            with self.subTest(option=option):
+                stderr = io.StringIO()
+                with self.assertRaises(SystemExit) as raised, contextlib.redirect_stderr(stderr):
+                    parser.parse_args(["review", "paper.pdf", "--out", "case", option, "30"])
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn("unrecognized arguments", stderr.getvalue())
 
     def test_benchmark_accepts_multiple_case_directories(self) -> None:
         args = build_parser().parse_args(["benchmark", "case_a", "case_b", "--out", "report"])

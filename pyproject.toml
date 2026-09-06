@@ -9,6 +9,7 @@ dependencies = [
   "pydantic>=2.7",
   "pillow>=10",
   "pymupdf>=1.24",
+  "packaging>=24",
   "python-docx>=1.1",
   "psutil>=5.9"
 ]
@@ -24,11 +25,9 @@ web = [
   "redis>=5.2",
   "psycopg[binary]>=3.2",
 ]
-# Libraries the generated reproduction code is allowed to import. Single source of
-# truth for the allow-list is geng_agent/security.ALLOWED_REQUIREMENTS; this extra
-# makes them installable in one command. tests/test_preflight.py asserts the two
-# stay in sync. Missing critical packages prevents task writers from completing a
-# faithful full run for papers that need them.
+# Convenience scientific profile for common papers. It is not an admission list:
+# a case environment resolver may install other distributions from trusted sources
+# and records the exact result in that case's runtime lock.
 repro = [
   "numpy>=1.24",
   "scipy>=1.10",

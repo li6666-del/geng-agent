@@ -339,6 +339,36 @@
       "title": "ReproTask",
       "type": "object"
     },
+    "ReproTaskBackfillHandoff": {
+      "additionalProperties": false,
+      "description": "Task Designer advice; an inferred value keeps legacy output runnable.",
+      "properties": {
+        "ready_for_writer": {
+          "default": true,
+          "title": "Ready For Writer",
+          "type": "boolean"
+        },
+        "blocking_request_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Blocking Request Ids",
+          "type": "array"
+        },
+        "reason": {
+          "default": "",
+          "title": "Reason",
+          "type": "string"
+        },
+        "inferred": {
+          "default": false,
+          "title": "Inferred",
+          "type": "boolean"
+        }
+      },
+      "title": "ReproTaskBackfillHandoff",
+      "type": "object"
+    },
     "RequestedFactField": {
       "additionalProperties": false,
       "properties": {
@@ -564,6 +594,89 @@
       "title": "ScientificNumericTarget",
       "type": "object"
     },
+    "TaskExecutionRelationship": {
+      "additionalProperties": false,
+      "description": "Scientific execution dependency between otherwise atomic reproduction tasks.",
+      "properties": {
+        "relationship_id": {
+          "minLength": 1,
+          "title": "Relationship Id",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "same_run_outputs",
+            "checkpoint_flow",
+            "shared_pretraining",
+            "shared_random_realization",
+            "shared_dataset_partition",
+            "shared_definition",
+            "other"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "strength": {
+          "enum": [
+            "strong",
+            "weak"
+          ],
+          "title": "Strength",
+          "type": "string"
+        },
+        "task_ids": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 2,
+          "title": "Task Ids",
+          "type": "array"
+        },
+        "producer_task_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Producer Task Id"
+        },
+        "consumer_task_ids": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Consumer Task Ids",
+          "type": "array"
+        },
+        "artifact_ids": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Artifact Ids",
+          "type": "array"
+        },
+        "rationale": {
+          "default": "",
+          "title": "Rationale",
+          "type": "string"
+        }
+      },
+      "required": [
+        "relationship_id",
+        "kind",
+        "strength",
+        "task_ids"
+      ],
+      "title": "TaskExecutionRelationship",
+      "type": "object"
+    },
     "TaskSpecificationItem": {
       "additionalProperties": false,
       "properties": {
@@ -609,6 +722,22 @@
   },
   "additionalProperties": false,
   "properties": {
+    "schema_version": {
+      "const": "2.0",
+      "default": "2.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "backfill_handoff": {
+      "$ref": "#/$defs/ReproTaskBackfillHandoff"
+    },
+    "execution_relationships": {
+      "items": {
+        "$ref": "#/$defs/TaskExecutionRelationship"
+      },
+      "title": "Execution Relationships",
+      "type": "array"
+    },
     "repro_tasks": {
       "items": {
         "$ref": "#/$defs/ReproTask"

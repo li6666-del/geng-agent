@@ -21,7 +21,7 @@ from geng_agent.preflight import (
     format_report,
     remedy_command,
 )
-from geng_agent.security import ALLOWED_REQUIREMENTS
+from geng_agent.security import DEFAULT_REPRO_PACKAGE_PROFILES
 
 
 def _load_pyproject() -> dict:
@@ -107,9 +107,9 @@ class ReportFormattingTests(unittest.TestCase):
         self.assertIsNone(remedy_command(report))
         self.assertIn("环境就绪", format_report(report))
 
-    def test_missing_critical_is_fatal_with_remedy(self) -> None:
+    def test_missing_common_packages_are_resolver_work_not_fatal(self) -> None:
         report = _missing_report()
-        self.assertTrue(report.fatal)
+        self.assertFalse(report.fatal)
         self.assertFalse(report.ok)
         self.assertEqual([item.package for item in report.missing_repro_critical], ["numpy"])
         self.assertEqual([item.package for item in report.missing_repro_optional], ["reedsolo"])
@@ -121,7 +121,7 @@ class ReportFormattingTests(unittest.TestCase):
 
         warning = environment_warning(report)
         self.assertIsNotNone(warning)
-        self.assertIn("缺关键复现库", warning)
+        self.assertIn("Case Resolver 可补齐", warning)
         self.assertIn("numpy", warning)
         self.assertIn("缺可选复现库", warning)
 
@@ -192,15 +192,15 @@ class ArchitectureCapabilityInventoryTests(unittest.TestCase):
             inventory["installed_reproduction_packages"],
             [{"package": "torch", "import_name": "torch", "version": "1.0"}],
         )
-        self.assertEqual(inventory["unavailable_allowed_reproduction_packages"], ["numpy"])
+        self.assertEqual(inventory["unavailable_profiled_reproduction_packages"], ["numpy"])
         self.assertTrue(
             inventory["interpretation"]["missing_package_must_not_trigger_silent_scientific_downgrade"]
         )
         self.assertEqual(inventory["accelerators"]["devices"][0]["name"], "test GPU")
         runtimes = {item["runtime"]: item for item in inventory["python_runtime_registry"]}
-        self.assertTrue(runtimes["pytorch"]["policy_allowed"])
-        self.assertFalse(runtimes["tensorflow"]["policy_allowed"])
-        self.assertEqual(runtimes["tensorflow"]["status"], "environment_extension_required")
+        self.assertTrue(runtimes["pytorch"]["resolution_supported"])
+        self.assertTrue(runtimes["tensorflow"]["resolution_supported"])
+        self.assertEqual(runtimes["tensorflow"]["status"], "package_missing")
         self.assertEqual(
             {item["runtime"] for item in inventory["external_runtime_registry"]},
             {"julia", "matlab"},
@@ -232,7 +232,7 @@ class ArchitectureCapabilityInventoryTests(unittest.TestCase):
                     "aliases": ["tensorflow", "keras"],
                     "package": "tensorflow",
                     "import_name": "tensorflow",
-                    "policy_allowed": False,
+                    "resolution_supported": True,
                     "installed": False,
                 }
             ],
@@ -244,7 +244,7 @@ class ArchitectureCapabilityInventoryTests(unittest.TestCase):
 
         self.assertEqual(
             {item["kind"] for item in gaps},
-            {"environment_extension_required", "accelerator_unavailable"},
+            {"runtime_package_missing", "accelerator_unavailable"},
         )
         self.assertTrue(all(item["component_id"] == "learned_model" for item in gaps))
 
@@ -276,7 +276,7 @@ class ArchitectureCapabilityInventoryTests(unittest.TestCase):
                     "aliases": ["torch", "pytorch"],
                     "package": "torch",
                     "import_name": "torch",
-                    "policy_allowed": True,
+                    "resolution_supported": True,
                     "installed": True,
                 },
                 {
@@ -284,7 +284,7 @@ class ArchitectureCapabilityInventoryTests(unittest.TestCase):
                     "aliases": ["scipy"],
                     "package": "scipy",
                     "import_name": "scipy",
-                    "policy_allowed": True,
+                    "resolution_supported": True,
                     "installed": False,
                 },
                 {
@@ -292,7 +292,7 @@ class ArchitectureCapabilityInventoryTests(unittest.TestCase):
                     "aliases": ["tensorflow", "keras"],
                     "package": "tensorflow",
                     "import_name": "tensorflow",
-                    "policy_allowed": False,
+                    "resolution_supported": True,
                     "installed": False,
                 },
             ],
@@ -308,9 +308,9 @@ class ArchitectureCapabilityInventoryTests(unittest.TestCase):
             {(item["runtime"], item["kind"]) for item in gaps},
             {
                 ("scipy", "runtime_package_missing"),
-                ("tensorflow", "environment_extension_required"),
+                ("tensorflow", "runtime_package_missing"),
                 ("julia", "external_runtime_unavailable"),
-                ("mysterylib", "runtime_unregistered"),
+                ("mysterylib", "runtime_resolution_required"),
             },
         )
         self.assertTrue(all(item["role"] == "supporting_library" for item in gaps))
@@ -336,8 +336,7 @@ class ArchitectureCapabilityInventoryTests(unittest.TestCase):
 
 
 class PyprojectSyncTests(unittest.TestCase):
-    """Guard against drift between the enforced whitelist and what the documented
-    install command actually installs."""
+    """Guard the convenience environment profile without turning it into policy."""
 
     def test_required_python_matches_pyproject(self) -> None:
         requires = _load_pyproject()["project"]["requires-python"]
@@ -345,14 +344,15 @@ class PyprojectSyncTests(unittest.TestCase):
         self.assertIsNotNone(match)
         self.assertEqual((int(match.group(1)), int(match.group(2))), REQUIRED_PYTHON)
 
-    def test_repro_extra_covers_whitelist(self) -> None:
+    def test_repro_extra_covers_default_profiles(self) -> None:
         data = _load_pyproject()
         core = data["project"]["dependencies"]
         repro = data["project"]["optional-dependencies"]["repro"]
         installable = {_pkg_name(item) for item in [*core, *repro]}
-        canonical = {("scikit-learn" if pkg == "sklearn" else pkg) for pkg in ALLOWED_REQUIREMENTS}
+        canonical = set(DEFAULT_REPRO_PACKAGE_PROFILES)
         missing = canonical - installable
-        self.assertFalse(missing, f"whitelist packages not installable via pyproject: {sorted(missing)}")
+        self.assertFalse(missing, f"default profile packages not installable via pyproject: {sorted(missing)}")
+        self.assertIn("packaging", installable)
 
 
 if __name__ == "__main__":

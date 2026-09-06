@@ -66,7 +66,6 @@ def _normalize_core_item(
     observation = str(
         item.get("local_observation")
         or item.get("evidence")
-        or fallback_observation
         or ""
     ).strip()
     evidence_files = _string_list(item.get("evidence_files"))
@@ -79,24 +78,40 @@ def _normalize_core_item(
             else str(item.get("claim_id") or claim_id).strip()
         ),
         "status": status,
-        "local_observation": observation,
+        # Explanatory host text describes missing evidence. It must never be
+        # considered an observation that supports a scientific conclusion.
+        "local_observation": observation or fallback_observation,
         "evidence_files": evidence_files,
     }
+
+
+def _combine_core_observations(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Retain conflicting assessments of one claim instead of last-write wins."""
+
+    result = dict(items[0])
+    statuses = {item["status"] for item in items}
+    result["status"] = (
+        "unsupported" if "unsupported" in statuses
+        else "unassessable_missing_information"
+        if "unassessable_missing_information" in statuses
+        else "supported"
+    )
+    result["local_observation"] = "\n".join(dict.fromkeys(
+        str(item.get("local_observation") or "") for item in items
+        if str(item.get("local_observation") or "")
+    ))
+    result["evidence_files"] = list(dict.fromkeys(
+        path for item in items for path in item["evidence_files"]
+    ))
+    return result
+
+
 def _normalize_core_conclusions(
     raw: dict[str, Any],
     task: dict[str, Any] | None,
 ) -> list[dict[str, Any]]:
     raw_items = raw.get("core_conclusions")
     candidates = [item for item in raw_items if isinstance(item, dict)] if isinstance(raw_items, list) else []
-    by_id = {
-        str(item.get("claim_id") or "").strip(): item
-        for item in candidates
-        if str(item.get("claim_id") or "").strip()
-    }
-    unkeyed_candidates = [
-        item for item in candidates if not str(item.get("claim_id") or "").strip()
-    ]
-    unkeyed_index = 0
     contract = _scientific_acceptance(task)
     criteria = [
         item
@@ -104,33 +119,49 @@ def _normalize_core_conclusions(
         if isinstance(item, dict)
     ]
     normalized: list[dict[str, Any]] = []
-    if criteria:
-        for index, criterion in enumerate(criteria):
-            claim_id = str(criterion.get("claim_id") or f"claim_{index + 1}").strip()
-            candidate = by_id.get(claim_id)
-            if candidate is None and unkeyed_index < len(unkeyed_candidates):
-                candidate = unkeyed_candidates[unkeyed_index]
-                unkeyed_index += 1
-            normalized.append(
-                _normalize_core_item(
-                    candidate,
-                    claim_id=claim_id,
-                    force_claim_id=True,
-                    fallback_observation=(
-                        "Reporter did not provide a conclusion assessment; "
-                        "recorded as missing information rather than blocking the flow."
-                    ),
-                )
-            )
-        return normalized
-    if candidates:
-        for index, candidate in enumerate(candidates):
-            normalized.append(
-                _normalize_core_item(
-                    candidate,
-                    claim_id=str(candidate.get("claim_id") or f"claim_{index + 1}"),
-                )
-            )
+    consumed: set[int] = set()
+    for index, criterion in enumerate(criteria):
+        claim_id = str(criterion.get("claim_id") or f"claim_{index + 1}").strip()
+        matches = [
+            item_index for item_index, item in enumerate(candidates)
+            if item_index not in consumed
+            and str(item.get("claim_id") or "").strip() == claim_id
+        ]
+        if not matches:
+            matches = [
+                item_index for item_index, item in enumerate(candidates)
+                if item_index not in consumed
+                and not str(item.get("claim_id") or "").strip()
+            ][:1]
+        consumed.update(matches)
+        observations = [candidates[item_index] for item_index in matches] or [{}]
+        normalized.append(_combine_core_observations([
+            _normalize_core_item(
+                observation,
+                claim_id=claim_id,
+                force_claim_id=True,
+                fallback_observation=(
+                    "Reporter did not provide a conclusion assessment; "
+                    "recorded as missing information rather than blocking the flow."
+                ),
+            ) for observation in observations
+        ]))
+
+    # A Designer omission or stale ID must not erase an independently observed
+    # failure. Preserve every unconsumed Reporter claim, including unsupported
+    # mechanism/method findings outside the Designer's navigation list.
+    by_id = {item["claim_id"]: index for index, item in enumerate(normalized)}
+    for index, candidate in enumerate(candidates):
+        if index in consumed:
+            continue
+        item = _normalize_core_item(candidate, claim_id=f"reported_claim_{index + 1}")
+        position = by_id.get(item["claim_id"])
+        if position is None:
+            by_id[item["claim_id"]] = len(normalized)
+            normalized.append(item)
+        else:
+            normalized[position] = _combine_core_observations([normalized[position], item])
+    if normalized:
         return normalized
     task_id = str((task or {}).get("task_id") or "task")
     return [
@@ -476,7 +507,7 @@ def normalize_task_verification(
         "comparison_summary": summary,
         "differences": _string_list(raw.get("differences")),
         "non_material_differences": _string_list(raw.get("non_material_differences")),
-        "evidence_files": _string_list(raw.get("evidence_files")) or ["inputs/task_report_input.json"],
+        "evidence_files": _string_list(raw.get("evidence_files")),
         "feedback": feedback,
         "confidence": confidence,
         "remaining_uncertainties": remaining_uncertainties,

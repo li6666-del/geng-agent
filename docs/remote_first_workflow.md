@@ -1,6 +1,6 @@
-# Remote-first development workflow
+# Optional remote execution tools
 
-The local Windows checkout is the source of truth. The AutoDL host is the execution mirror.
+The local Windows checkout is the source of truth and the default execution and validation environment. Remote access is not required. This page documents optional tools retained for an explicitly requested remote run; it is not a repository execution policy.
 
 ## Locations
 

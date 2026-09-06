@@ -17,14 +17,17 @@ from .paper_evidence import (
     safe_label,
     thesis_ordering_anchor_for_task,
 )
+from .project_portability import validate_repro_project_portability
 from .security import redact_text
 from .scientific_materiality import SCIENTIFIC_POLICY_ID
+from .schema_models import MAX_FILE_CHARS
 from .stage_cleanup import _clear_project_code_files
 from .task_scripts import write_task_scaffolding
 
 
 CODEX_PROJECT_BACKEND = "codex"
 TRUSTED_PROJECT_FILES = (
+    "run_task.py",
     "src/_io.py",
     "src/_backend.py",
     "run_experiment.py",
@@ -44,7 +47,7 @@ SHARED_PROJECT_FILES = (
 PAPER_EVIDENCE_DIR = "paper_evidence"
 ANALYSIS_ARTIFACT_DIR = "analysis_artifacts"
 FULL_PAPER_PAGES_DIR = "full_paper_pages"
-WRITER_HANDOFF_POLICY_VERSION = f"{SCIENTIFIC_POLICY_ID}:writer-evidence-v3"
+WRITER_HANDOFF_POLICY_VERSION = f"{SCIENTIFIC_POLICY_ID}:writer-evidence-v4-observed-execution"
 WRITER_ANALYSIS_SCHEMA_VERSION = "scientific_acceptance_contract_v1"
 
 # Finalized analysis files produced before task writers start. Intermediate
@@ -54,6 +57,7 @@ WRITER_REQUIRED_ANALYSIS_ARTIFACTS = (
     "engineering_facts.json",
     "repro_tasks.json",
     "experiment_index.json",
+    "execution_plan.json",
 )
 WRITER_OPTIONAL_ANALYSIS_ARTIFACTS = (
     "scientific_architecture.json",
@@ -404,9 +408,33 @@ def _manifest_from_project(
     round_no: int,
 ) -> dict[str, Any]:
     files: list[dict[str, Any]] = []
+    packaged_only: list[dict[str, Any]] = []
     for rel in _ordered_expected_paths(expected_paths, task_manifest):
         path = resolve_inside(repro_project_dir, rel)
-        content_lines = path.read_text(encoding="utf-8", errors="replace").splitlines() if path.is_file() else []
+        if path.is_file():
+            try:
+                size = path.stat().st_size
+                raw = path.read_bytes() if size <= MAX_FILE_CHARS else b""
+                text = raw.decode("utf-8-sig") if raw else ""
+                if size > MAX_FILE_CHARS or "\x00" in text:
+                    raise ValueError("binary_or_large")
+                content_lines = text.splitlines()
+            except (OSError, UnicodeDecodeError, ValueError):
+                packaged_only.append(
+                    {
+                        "path": rel,
+                        "bytes": path.stat().st_size if path.exists() else 0,
+                        "sha256": (
+                            _sha256_file(path)
+                            if path.is_file()
+                            else None
+                        ),
+                        "represented_by": "source_inventory.json",
+                    }
+                )
+                continue
+        else:
+            content_lines = []
         files.append({"path": rel, "content_lines": content_lines})
     return {
         "files": files,
@@ -417,6 +445,7 @@ def _manifest_from_project(
             "round": round_no,
             "tasks_manifest": task_manifest,
             "generated_paths": [item["path"] for item in files],
+            "packaged_only_files": packaged_only,
         },
     }
 
@@ -434,13 +463,54 @@ def _ordered_expected_paths(expected_paths: set[str], task_manifest: dict[str, A
 
 
 def _manifest_disk_paths(manifest: dict[str, Any], project_dir: Path) -> list[Path]:
+    """Return the complete frozen package, including outputs and binary files."""
+
+    inventory_path = project_dir / "source_inventory.json"
+    if inventory_path.is_file():
+        try:
+            inventory = json.loads(inventory_path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            inventory = {}
+        raw_files = inventory.get("files") if isinstance(inventory, dict) else None
+        if isinstance(raw_files, list):
+            paths: list[Path] = []
+            seen: set[str] = set()
+            for item in raw_files:
+                relative = item.get("path") if isinstance(item, dict) else None
+                if not isinstance(relative, str) or relative in seen:
+                    continue
+                try:
+                    path = resolve_inside(project_dir, relative)
+                except ValueError:
+                    continue
+                if path.is_file():
+                    paths.append(path)
+                    seen.add(relative)
+            paths.append(inventory_path)
+            return paths
+
+    return [
+        path
+        for path in _manifest_declared_disk_paths(manifest, project_dir)
+        if path.is_file()
+    ]
+
+
+def _manifest_declared_disk_paths(manifest: dict[str, Any], project_dir: Path) -> list[Path]:
     paths: list[Path] = []
-    for item in manifest.get("files", []):
+    items = list(manifest.get("files", []))
+    meta = manifest.get("_meta")
+    packaged = meta.get("packaged_only_files") if isinstance(meta, dict) else None
+    if isinstance(packaged, list):
+        items.extend(packaged)
+    seen: set[str] = set()
+    for item in items:
         if isinstance(item, dict) and isinstance(item.get("path"), str):
-            try:
-                paths.append(resolve_inside(project_dir, item["path"]))
-            except ValueError:
+            relative = str(item["path"])
+            if relative in seen:
                 continue
+            paths.append(resolve_inside(project_dir, relative))
+            seen.add(relative)
     return paths
 
 
@@ -468,6 +538,31 @@ def _load_cached_task_writer_workflow(
         not validation.get("required_files_present")
         or not validation.get("python_compiles")
         or not validation.get("local_imports_resolve")
+    ):
+        return None
+    try:
+        declared_paths = _manifest_declared_disk_paths(manifest, repro_project_dir)
+    except ValueError:
+        return None
+    if any(not path.is_file() for path in declared_paths):
+        return None
+    try:
+        portability = validate_repro_project_portability(
+            repro_project_dir,
+            run_smoke=False,
+            raise_on_error=False,
+        )
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if portability.get("portable") is not True:
+        return None
+    inventory = portability.get("inventory")
+    inventory_sha256 = (
+        inventory.get("inventory_sha256") if isinstance(inventory, dict) else None
+    )
+    if (
+        not isinstance(inventory_sha256, str)
+        or meta.get("source_inventory_sha256") != inventory_sha256
     ):
         return None
 

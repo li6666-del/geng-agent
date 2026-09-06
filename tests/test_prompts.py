@@ -10,12 +10,15 @@ class PromptTests(unittest.TestCase):
 
         self.assertIn("第三方库", policy)
         self.assertIn("requirements.txt", policy)
-        self.assertIn("当前环境已安装且允许使用", policy)
+        self.assertIn("不是包白名单", policy)
+        self.assertIn("environment request", policy)
+        self.assertIn("可信来源", policy)
         self.assertIn("numpy", policy)
         self.assertIn("torch", policy)
         self.assertIn("commpy", policy)
         self.assertIn("优先调", policy)
         self.assertIn("Never silently replace", policy)
+        self.assertNotIn("清单外的库不要 import", policy)
 
     def test_active_analysis_prompts_render(self) -> None:
         book = PromptBook()
@@ -57,6 +60,7 @@ class PromptTests(unittest.TestCase):
                 repro_tasks_json="{}",
                 paper_thesis_json="{}",
                 experiment_index_json="{}",
+                execution_plan_json="{}",
                 host_capabilities_json="{}",
                 paper_chunks_json="[]",
             ),

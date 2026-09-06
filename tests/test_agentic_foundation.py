@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import hashlib
-import inspect
+import json
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -9,7 +10,11 @@ from unittest.mock import patch
 
 from geng_agent.agentic_foundation import (
     _foundation_brief,
+    _host_revalidation_already_attempted,
+    _load_foundation_validation_record,
+    _load_cached_foundation_failure,
     _restore_trusted_runtime_atomically,
+    _validation_allows_writer_delivery_reuse,
     _validate_foundation_delivery,
     foundation_violations,
     run_codex_foundation_writer_workflow,
@@ -17,6 +22,12 @@ from geng_agent.agentic_foundation import (
     restore_foundation_snapshot,
 )
 from geng_agent.foundation_snapshot import foundation_snapshot_hash
+from geng_agent.foundation_snapshot_delivery import (
+    _publish_foundation_snapshot,
+    load_foundation_writer_delivery,
+    persist_foundation_writer_delivery,
+    restore_foundation_writer_delivery,
+)
 
 
 def _sha(path: Path) -> str:
@@ -38,9 +49,733 @@ def _hardlink_or_skip(test: unittest.TestCase, link: Path, target: Path) -> None
 
 
 class FoundationSnapshotTests(unittest.TestCase):
-    def test_foundation_writer_default_session_timeout_is_30_minutes(self) -> None:
-        timeout = inspect.signature(run_codex_foundation_writer_workflow).parameters["timeout"].default
-        self.assertEqual(timeout, 1800.0)
+    def test_matching_failed_validation_reuses_completed_writer_delivery_for_host_recheck(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            output_dir = root / "output"
+            audit_dir = root / "audit"
+            sandbox = audit_dir / "03b_foundation_writer_sandbox"
+            (sandbox / "src").mkdir(parents=True)
+            (sandbox / "src" / "model.py").write_text("VALUE = 1\n", encoding="utf-8")
+            output_dir.mkdir()
+            (audit_dir / "03b_foundation_writer.json").write_text(
+                json.dumps({"ok": True, "role": "foundation_writer"}),
+                encoding="utf-8",
+            )
+            cached_issues = [{"file": "tests", "message": "Foundation contract tests failed or timed out"}]
+            validation_record = {
+                "ok": False,
+                "input_hash": "current-input",
+                "issues": cached_issues,
+                "tests": {
+                    "passed": False,
+                    "returncode": 1,
+                    "stderr": (
+                        "C:/env/Lib/site-packages/torch/library.py: "
+                        "PermissionError: Foundation runtime guard: host import blocked"
+                    ),
+                    "delivery_immutable": True,
+                },
+            }
+            writer_delivery = {"trusted_changed": []}
+            finalized = {"snapshot_hash": "revalidated"}
+
+            with patch(
+                "geng_agent.agentic_foundation._collect_writer_analysis_artifacts",
+                return_value={"scientific_architecture.json": {}},
+            ), patch(
+                "geng_agent.agentic_foundation._missing_required_analysis_artifacts",
+                return_value=[],
+            ), patch(
+                "geng_agent.agentic_foundation._analysis_snapshot_hash",
+                return_value="a" * 64,
+            ), patch(
+                "geng_agent.agentic_foundation._foundation_input_hash",
+                return_value="current-input",
+            ), patch(
+                "geng_agent.agentic_foundation._load_cached_foundation",
+                return_value=None,
+            ), patch(
+                "geng_agent.agentic_foundation.load_foundation_writer_delivery",
+                return_value=writer_delivery,
+            ), patch(
+                "geng_agent.agentic_foundation._load_foundation_validation_record",
+                return_value=validation_record,
+            ), patch(
+                "geng_agent.agentic_foundation._required_foundation_modules",
+                return_value={"src/model.py"},
+            ), patch(
+                "geng_agent.agentic_foundation.restore_foundation_writer_delivery",
+            ), patch(
+                "geng_agent.agentic_foundation._finalize_foundation_delivery",
+                return_value=finalized,
+            ) as finalize, patch(
+                "geng_agent.agentic_foundation.run_codex_subprocess",
+            ) as writer:
+                result = run_codex_foundation_writer_workflow(
+                    facts={},
+                    tasks={},
+                    experiment_index={},
+                    scientific_architecture={},
+                    paper={},
+                    paper_path=root / "paper.pdf",
+                    paper_images=[],
+                    paper_thesis=None,
+                    output_dir=output_dir,
+                    audit_dir=audit_dir,
+                    resume=True,
+                )
+
+            resume_record = json.loads(
+                (audit_dir / "03b_foundation_writer_resume.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(result, finalized)
+        writer.assert_not_called()
+        finalize.assert_called_once()
+        self.assertEqual(resume_record["source"], "cached_writer_delivery_host_revalidation")
+        self.assertFalse(resume_record["writer_rerun"])
+
+    def test_validation_reuse_classifier_separates_host_failures_from_writer_defects(self) -> None:
+        infrastructure = {
+            "ok": False,
+            "issues": [{"file": "tests", "message": "contract tests failed"}],
+            "tests": {
+                "passed": False,
+                "returncode": 1,
+                "stderr": (
+                    "C:/env/Lib/site-packages/numpy/core.py: "
+                    "NameError raised while NumPy initialized through the host guard"
+                ),
+                "delivery_immutable": True,
+            },
+        }
+        assertion_failure = {
+            "ok": False,
+            "issues": [{"file": "tests", "message": "contract tests failed"}],
+            "tests": {
+                "passed": False,
+                "returncode": 1,
+                "stderr": "AssertionError: expected shape (4, 4)",
+                "delivery_immutable": True,
+            },
+        }
+        pretest_failure = {
+            "ok": False,
+            "issues": [{"file": "src/model.py", "message": "syntax error"}],
+            "tests": {"passed": False, "skipped": True},
+        }
+        immutable_timeout = {
+            "ok": False,
+            "issues": [
+                {
+                    "file": "tests",
+                    "message": "Foundation contract tests failed or timed out",
+                }
+            ],
+            "tests": {
+                "passed": False,
+                "timed_out": True,
+                "delivery_immutable": True,
+            },
+        }
+        mutated_timeout = {
+            "ok": False,
+            "issues": [
+                {
+                    "file": "tests",
+                    "message": "Foundation contract tests failed or timed out",
+                }
+            ],
+            "tests": {
+                "passed": False,
+                "timed_out": True,
+                "delivery_immutable": False,
+            },
+        }
+        timeout_with_assertion = {
+            "ok": False,
+            "issues": [
+                {
+                    "file": "tests",
+                    "message": "Foundation contract tests failed or timed out",
+                }
+            ],
+            "tests": {
+                "passed": False,
+                "timed_out": True,
+                "delivery_immutable": True,
+                "stderr": "FAIL: test_shape\nAssertionError: expected shape (4, 4)",
+            },
+        }
+        timeout_with_returncode = {
+            "ok": False,
+            "issues": [
+                {
+                    "file": "tests",
+                    "message": "Foundation contract tests failed or timed out",
+                }
+            ],
+            "tests": {
+                "passed": False,
+                "timed_out": True,
+                "delivery_immutable": True,
+                "returncode": 1,
+            },
+        }
+        malformed_empty_timeout = {
+            "ok": False,
+            "issues": [],
+            "tests": {
+                "passed": False,
+                "timed_out": True,
+                "delivery_immutable": True,
+            },
+        }
+
+        self.assertTrue(_validation_allows_writer_delivery_reuse(None))
+        self.assertTrue(_validation_allows_writer_delivery_reuse({"ok": True}))
+        self.assertTrue(_validation_allows_writer_delivery_reuse(infrastructure))
+        self.assertTrue(
+            _validation_allows_writer_delivery_reuse(immutable_timeout)
+        )
+        self.assertFalse(
+            _validation_allows_writer_delivery_reuse(mutated_timeout)
+        )
+        self.assertFalse(
+            _validation_allows_writer_delivery_reuse(timeout_with_assertion)
+        )
+        self.assertFalse(
+            _validation_allows_writer_delivery_reuse(timeout_with_returncode)
+        )
+        self.assertFalse(
+            _validation_allows_writer_delivery_reuse(malformed_empty_timeout)
+        )
+        self.assertFalse(
+            _validation_allows_writer_delivery_reuse(
+                {
+                    "ok": False,
+                    "issues": [{"file": "tests", "message": "delivery changed"}],
+                    "tests": {"passed": False, "delivery_immutable": False},
+                }
+            )
+        )
+        self.assertFalse(_validation_allows_writer_delivery_reuse(assertion_failure))
+        self.assertFalse(_validation_allows_writer_delivery_reuse(pretest_failure))
+        self.assertFalse(
+            _validation_allows_writer_delivery_reuse(
+                {
+                    "ok": False,
+                    "issues": [{"file": "tests", "message": "contract tests failed"}],
+                    "tests": {
+                        "passed": False,
+                        "returncode": 1,
+                        "stderr": "NameError: missing in numpy.asarray(missing)",
+                        "delivery_immutable": True,
+                    },
+                }
+            )
+        )
+        self.assertFalse(
+            _validation_allows_writer_delivery_reuse(
+                {
+                    "ok": False,
+                    "issues": [{"file": "tests", "message": "contract tests failed"}],
+                    "tests": {
+                        "passed": False,
+                        "returncode": 1,
+                        "stderr": "PermissionError: Foundation runtime guard: open outside output roots",
+                        "delivery_immutable": True,
+                    },
+                }
+            )
+        )
+
+    def test_host_delivery_revalidation_is_limited_to_one_attempt(self) -> None:
+        with TemporaryDirectory() as temp:
+            resume_path = Path(temp) / "03b_foundation_writer_resume.json"
+            resume_path.write_text(
+                json.dumps(
+                    {
+                        "source": "cached_writer_delivery_host_revalidation",
+                        "input_hash": "current-input",
+                        "host_validation_policy_hash": "policy-v1",
+                        "writer_rerun": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            attempted = _host_revalidation_already_attempted(
+                resume_path=resume_path,
+                expected_input_hash="current-input",
+                expected_policy_hash="policy-v1",
+            )
+            stale = _host_revalidation_already_attempted(
+                resume_path=resume_path,
+                expected_input_hash="different-input",
+                expected_policy_hash="policy-v1",
+            )
+            changed_policy = _host_revalidation_already_attempted(
+                resume_path=resume_path,
+                expected_input_hash="current-input",
+                expected_policy_hash="policy-v2",
+            )
+
+        self.assertTrue(attempted)
+        self.assertFalse(stale)
+        self.assertFalse(changed_policy)
+
+    def test_completed_writer_delivery_retries_freeze_without_rerunning_writer(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            output_dir = root / "output"
+            audit_dir = root / "audit"
+            output_dir.mkdir()
+            audit_dir.mkdir()
+            writer_delivery = {"trusted_changed": []}
+            finalized = {"snapshot_hash": "freeze-retried"}
+
+            with patch(
+                "geng_agent.agentic_foundation._collect_writer_analysis_artifacts",
+                return_value={"scientific_architecture.json": {}},
+            ), patch(
+                "geng_agent.agentic_foundation._missing_required_analysis_artifacts",
+                return_value=[],
+            ), patch(
+                "geng_agent.agentic_foundation._analysis_snapshot_hash",
+                return_value="a" * 64,
+            ), patch(
+                "geng_agent.agentic_foundation._foundation_input_hash",
+                return_value="current-input",
+            ), patch(
+                "geng_agent.agentic_foundation._load_cached_foundation",
+                return_value=None,
+            ), patch(
+                "geng_agent.agentic_foundation.load_foundation_writer_delivery",
+                return_value=writer_delivery,
+            ), patch(
+                "geng_agent.agentic_foundation._load_foundation_validation_record",
+                return_value={
+                    "ok": True,
+                    "input_hash": "current-input",
+                    "issues": [],
+                    "tests": {"passed": True, "delivery_immutable": True},
+                },
+            ), patch(
+                "geng_agent.agentic_foundation._required_foundation_modules",
+                return_value={"src/model.py"},
+            ), patch(
+                "geng_agent.agentic_foundation.restore_foundation_writer_delivery",
+            ) as restore, patch(
+                "geng_agent.agentic_foundation._finalize_foundation_delivery",
+                return_value=finalized,
+            ) as finalize, patch(
+                "geng_agent.agentic_foundation.run_codex_subprocess",
+            ) as writer:
+                result = run_codex_foundation_writer_workflow(
+                    facts={},
+                    tasks={},
+                    experiment_index={},
+                    scientific_architecture={},
+                    paper={},
+                    paper_path=root / "paper.pdf",
+                    paper_images=[],
+                    paper_thesis=None,
+                    output_dir=output_dir,
+                    audit_dir=audit_dir,
+                    resume=True,
+                )
+
+            resume_record = json.loads(
+                (audit_dir / "03b_foundation_writer_resume.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(result, finalized)
+        writer.assert_not_called()
+        restore.assert_called_once()
+        finalize.assert_called_once()
+        self.assertEqual(resume_record["source"], "cached_writer_delivery_freeze_retry")
+        self.assertFalse(resume_record["writer_rerun"])
+
+    def test_matching_timed_out_validation_reuses_pristine_delivery_without_rerunning_writer(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            output_dir = root / "output"
+            audit_dir = root / "audit"
+            output_dir.mkdir()
+            audit_dir.mkdir()
+            validation_record = {
+                "ok": False,
+                "input_hash": "current-input",
+                "issues": [
+                    {
+                        "file": "tests",
+                        "message": "Foundation contract tests failed or timed out",
+                    }
+                ],
+                "tests": {
+                    "passed": False,
+                    "timed_out": True,
+                    "delivery_immutable": True,
+                },
+            }
+            writer_delivery = {"trusted_changed": []}
+            finalized = {"snapshot_hash": "revalidated-after-timeout"}
+
+            with patch(
+                "geng_agent.agentic_foundation._collect_writer_analysis_artifacts",
+                return_value={"scientific_architecture.json": {}},
+            ), patch(
+                "geng_agent.agentic_foundation._missing_required_analysis_artifacts",
+                return_value=[],
+            ), patch(
+                "geng_agent.agentic_foundation._analysis_snapshot_hash",
+                return_value="a" * 64,
+            ), patch(
+                "geng_agent.agentic_foundation._foundation_input_hash",
+                return_value="current-input",
+            ), patch(
+                "geng_agent.agentic_foundation._load_cached_foundation",
+                return_value=None,
+            ), patch(
+                "geng_agent.agentic_foundation.load_foundation_writer_delivery",
+                return_value=writer_delivery,
+            ), patch(
+                "geng_agent.agentic_foundation._load_foundation_validation_record",
+                return_value=validation_record,
+            ), patch(
+                "geng_agent.agentic_foundation._required_foundation_modules",
+                return_value={"src/model.py"},
+            ), patch(
+                "geng_agent.agentic_foundation._host_validation_policy_hash",
+                return_value="policy-v1",
+            ), patch(
+                "geng_agent.agentic_foundation.restore_foundation_writer_delivery",
+            ) as restore, patch(
+                "geng_agent.agentic_foundation._finalize_foundation_delivery",
+                return_value=finalized,
+            ) as finalize, patch(
+                "geng_agent.agentic_foundation.run_codex_subprocess",
+            ) as writer:
+                result = run_codex_foundation_writer_workflow(
+                    facts={},
+                    tasks={},
+                    experiment_index={},
+                    scientific_architecture={},
+                    paper={},
+                    paper_path=root / "paper.pdf",
+                    paper_images=[],
+                    paper_thesis=None,
+                    output_dir=output_dir,
+                    audit_dir=audit_dir,
+                    resume=True,
+                )
+
+            resume_record = json.loads(
+                (audit_dir / "03b_foundation_writer_resume.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(result, finalized)
+        writer.assert_not_called()
+        restore.assert_called_once()
+        finalize.assert_called_once()
+        self.assertEqual(
+            resume_record["source"],
+            "cached_writer_delivery_host_revalidation",
+        )
+        self.assertFalse(resume_record["writer_rerun"])
+        self.assertEqual(resume_record["host_validation_policy_hash"], "policy-v1")
+
+    def test_repeated_timed_out_revalidation_stops_without_accepting_or_rerunning_writer(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            output_dir = root / "output"
+            audit_dir = root / "audit"
+            output_dir.mkdir()
+            audit_dir.mkdir()
+            (audit_dir / "03b_foundation_writer_resume.json").write_text(
+                json.dumps(
+                    {
+                        "ok": None,
+                        "source": "cached_writer_delivery_host_revalidation",
+                        "input_hash": "current-input",
+                        "writer_rerun": False,
+                        "host_validation_policy_hash": "policy-v1",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            validation_record = {
+                "ok": False,
+                "input_hash": "current-input",
+                "issues": [
+                    {
+                        "file": "tests",
+                        "message": "Foundation contract tests failed or timed out",
+                    }
+                ],
+                "tests": {
+                    "passed": False,
+                    "timed_out": True,
+                    "delivery_immutable": True,
+                },
+            }
+
+            with patch(
+                "geng_agent.agentic_foundation._collect_writer_analysis_artifacts",
+                return_value={"scientific_architecture.json": {}},
+            ), patch(
+                "geng_agent.agentic_foundation._missing_required_analysis_artifacts",
+                return_value=[],
+            ), patch(
+                "geng_agent.agentic_foundation._analysis_snapshot_hash",
+                return_value="a" * 64,
+            ), patch(
+                "geng_agent.agentic_foundation._foundation_input_hash",
+                return_value="current-input",
+            ), patch(
+                "geng_agent.agentic_foundation._load_cached_foundation",
+                return_value=None,
+            ), patch(
+                "geng_agent.agentic_foundation.load_foundation_writer_delivery",
+                return_value={"trusted_changed": []},
+            ), patch(
+                "geng_agent.agentic_foundation._load_foundation_validation_record",
+                return_value=validation_record,
+            ), patch(
+                "geng_agent.agentic_foundation._required_foundation_modules",
+                return_value={"src/model.py"},
+            ), patch(
+                "geng_agent.agentic_foundation._host_validation_policy_hash",
+                return_value="policy-v1",
+            ), patch(
+                "geng_agent.agentic_foundation.restore_foundation_writer_delivery",
+            ) as restore, patch(
+                "geng_agent.agentic_foundation._finalize_foundation_delivery",
+            ) as finalize, patch(
+                "geng_agent.agentic_foundation._publish_foundation_snapshot",
+            ) as publish, patch(
+                "geng_agent.agentic_foundation.run_codex_subprocess",
+            ) as writer:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "still fails after one pristine delivery revalidation",
+                ):
+                    run_codex_foundation_writer_workflow(
+                        facts={},
+                        tasks={},
+                        experiment_index={},
+                        scientific_architecture={},
+                        paper={},
+                        paper_path=root / "paper.pdf",
+                        paper_images=[],
+                        paper_thesis=None,
+                        output_dir=output_dir,
+                        audit_dir=audit_dir,
+                        resume=True,
+                    )
+
+            writer.assert_not_called()
+            restore.assert_not_called()
+            finalize.assert_not_called()
+            publish.assert_not_called()
+            self.assertFalse((output_dir / "foundation_manifest.json").exists())
+
+    def test_pristine_writer_delivery_restores_test_pollution_before_resume(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            sandbox = root / "sandbox"
+            source = sandbox / "src" / "model.py"
+            source.parent.mkdir(parents=True)
+            source.write_text("VALUE = 1\n", encoding="utf-8")
+            (sandbox / "requirements.txt").write_text("numpy\n", encoding="utf-8")
+            (sandbox / "foundation_result.json").write_text(
+                '{"status": "ready_for_tasks"}\n',
+                encoding="utf-8",
+            )
+            delivery_dir = root / "deliveries" / ("a" * 64)
+
+            receipt = persist_foundation_writer_delivery(
+                sandbox=sandbox,
+                delivery_dir=delivery_dir,
+                input_hash="a" * 64,
+                analysis_hash="b" * 64,
+                environment_hash="host-runtime",
+                required_modules={"src/model.py"},
+                trusted_changed=[],
+            )
+            source.write_text("VALUE = 2\n", encoding="utf-8")
+            (sandbox / "src" / "pollution.py").write_text("BAD = True\n", encoding="utf-8")
+
+            loaded = load_foundation_writer_delivery(
+                delivery_dir=delivery_dir,
+                expected_input_hash="a" * 64,
+                expected_required_modules={"src/model.py"},
+            )
+            self.assertIsNotNone(loaded)
+            restore_foundation_writer_delivery(
+                delivery_dir=delivery_dir,
+                receipt=loaded or receipt,
+                sandbox=sandbox,
+            )
+
+            self.assertEqual((sandbox / "src" / "model.py").read_text(encoding="utf-8"), "VALUE = 1\n")
+            self.assertFalse((sandbox / "src" / "pollution.py").exists())
+            self.assertTrue((sandbox / "src" / "_io.py").is_file())
+            self.assertTrue((sandbox / "src" / "_backend.py").is_file())
+
+    def test_snapshot_publication_restores_previous_directory_when_replace_fails(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            sandbox = root / "sandbox"
+            source = sandbox / "src" / "model.py"
+            source.parent.mkdir(parents=True)
+            source.write_text("VALUE = 2\n", encoding="utf-8")
+            snapshot = root / "snapshot"
+            snapshot.mkdir()
+            previous = snapshot / "previous.txt"
+            previous.write_text("preserve me\n", encoding="utf-8")
+            real_replace = os.replace
+            replace_count = 0
+
+            def fail_new_publication(source_path: object, target_path: object) -> None:
+                nonlocal replace_count
+                replace_count += 1
+                if replace_count == 2:
+                    raise OSError("publish failed")
+                real_replace(source_path, target_path)
+
+            with patch(
+                "geng_agent.foundation_snapshot_delivery.os.replace",
+                side_effect=fail_new_publication,
+            ), self.assertRaisesRegex(OSError, "publish failed"):
+                _publish_foundation_snapshot(sandbox=sandbox, snapshot_dir=snapshot)
+
+            self.assertEqual(previous.read_text(encoding="utf-8"), "preserve me\n")
+            self.assertFalse(snapshot.with_name(".snapshot.previous").exists())
+
+    def test_successful_validation_record_is_reusable_for_freeze_retry(self) -> None:
+        with TemporaryDirectory() as temp:
+            path = Path(temp) / "03b_foundation_validation.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "input_hash": "current-input",
+                        "issues": [],
+                        "tests": {"passed": True, "delivery_immutable": True},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            record = _load_foundation_validation_record(
+                validation_path=path,
+                expected_input_hash="current-input",
+            )
+
+        self.assertIsNotNone(record)
+        self.assertTrue(_validation_allows_writer_delivery_reuse(record))
+
+    def test_cached_foundation_failure_returns_matching_nonempty_issues(self) -> None:
+        with TemporaryDirectory() as temp:
+            audit_dir = Path(temp)
+            issues = [
+                {
+                    "file": "src/model.py",
+                    "message": "Foundation contract tests failed",
+                }
+            ]
+            (audit_dir / "03b_foundation_validation.json").write_text(
+                (
+                    '{"ok": false, "input_hash": "current-input", '
+                    '"issues": [{"file": "src/model.py", '
+                    '"message": "Foundation contract tests failed"}]}\n'
+                ),
+                encoding="utf-8",
+            )
+
+            cached = _load_cached_foundation_failure(
+                validation_path=audit_dir / "03b_foundation_validation.json",
+                expected_input_hash="current-input",
+            )
+
+            self.assertEqual(cached, issues)
+
+    def test_cached_foundation_failure_ignores_different_input_hash(self) -> None:
+        with TemporaryDirectory() as temp:
+            audit_dir = Path(temp)
+            (audit_dir / "03b_foundation_validation.json").write_text(
+                (
+                    '{"ok": false, "input_hash": "stale-input", '
+                    '"issues": [{"message": "stale failure"}]}\n'
+                ),
+                encoding="utf-8",
+            )
+
+            cached = _load_cached_foundation_failure(
+                validation_path=audit_dir / "03b_foundation_validation.json",
+                expected_input_hash="current-input",
+            )
+
+            self.assertIsNone(cached)
+
+    def test_cached_foundation_failure_ignores_successful_validation(self) -> None:
+        with TemporaryDirectory() as temp:
+            audit_dir = Path(temp)
+            (audit_dir / "03b_foundation_validation.json").write_text(
+                (
+                    '{"ok": true, "input_hash": "current-input", '
+                    '"issues": [{"message": "not a cached failure"}]}\n'
+                ),
+                encoding="utf-8",
+            )
+
+            cached = _load_cached_foundation_failure(
+                validation_path=audit_dir / "03b_foundation_validation.json",
+                expected_input_hash="current-input",
+            )
+
+            self.assertIsNone(cached)
+
+    def test_cached_foundation_failure_requires_nonempty_issue_list(self) -> None:
+        with TemporaryDirectory() as temp:
+            audit_dir = Path(temp)
+            validation_path = audit_dir / "03b_foundation_validation.json"
+            for issues_json in ("[]", '"not-a-list"', "null"):
+                with self.subTest(issues=issues_json):
+                    validation_path.write_text(
+                        (
+                            '{"ok": false, "input_hash": "current-input", '
+                            f'"issues": {issues_json}}}\n'
+                        ),
+                        encoding="utf-8",
+                    )
+
+                    cached = _load_cached_foundation_failure(
+                        validation_path=validation_path,
+                        expected_input_hash="current-input",
+                    )
+
+                    self.assertIsNone(cached)
+
+    def test_cached_foundation_failure_ignores_corrupt_json(self) -> None:
+        with TemporaryDirectory() as temp:
+            audit_dir = Path(temp)
+            (audit_dir / "03b_foundation_validation.json").write_text(
+                '{"ok": false,',
+                encoding="utf-8",
+            )
+
+            cached = _load_cached_foundation_failure(
+                validation_path=audit_dir / "03b_foundation_validation.json",
+                expected_input_hash="current-input",
+            )
+
+            self.assertIsNone(cached)
 
     def test_foundation_brief_treats_acceptance_bindings_as_output_interfaces_only(self) -> None:
         architecture = {
@@ -694,6 +1429,49 @@ class FoundationSnapshotTests(unittest.TestCase):
             self.assertFalse(result["passed"])
             host_tests.assert_called_once_with(sandbox)
 
+    def test_host_tests_cannot_change_files_eligible_for_freezing(self) -> None:
+        with TemporaryDirectory() as temp:
+            sandbox = Path(temp)
+            source = sandbox / "src" / "model.py"
+            source.parent.mkdir(parents=True)
+            source.write_text("VALUE = 1\n", encoding="utf-8")
+
+            def mutate_delivery(work_dir: Path) -> dict[str, object]:
+                source.write_text("VALUE = 2\n", encoding="utf-8")
+                artifact = work_dir / "tests" / "runtime_artifacts" / "result.json"
+                artifact.parent.mkdir(parents=True)
+                artifact.write_text("{}\n", encoding="utf-8")
+                return {"passed": True, "returncode": 0}
+
+            with patch(
+                "geng_agent.agentic_foundation._validate_foundation_execution_contracts",
+                return_value=([], []),
+            ), patch(
+                "geng_agent.agentic_foundation._required_foundation_modules",
+                return_value={"src/model.py"},
+            ), patch(
+                "geng_agent.agentic_foundation._missing_local_imports",
+                return_value=[],
+            ), patch(
+                "geng_agent.agentic_foundation.static_scan_repro_project",
+                return_value=[],
+            ), patch(
+                "geng_agent.agentic_foundation._run_foundation_tests",
+                side_effect=mutate_delivery,
+            ):
+                issues, result = _validate_foundation_delivery(
+                    sandbox=sandbox,
+                    architecture={},
+                    trusted_changed=[],
+                )
+
+            self.assertFalse(result["passed"])
+            self.assertFalse(result["delivery_immutable"])
+            self.assertEqual(result["changed_delivery_files"], ["src/model.py"])
+            self.assertTrue(
+                any("eligible for freezing" in item["message"] for item in issues)
+            )
+
     def test_snapshot_is_installed_frozen_and_restorable(self) -> None:
         with TemporaryDirectory() as temp:
             root = Path(temp)
@@ -736,6 +1514,10 @@ class FoundationSnapshotTests(unittest.TestCase):
             pyc = project / "src" / "__pycache__" / "rogue.pyc"
             pyc.parent.mkdir()
             pyc.write_bytes(b"bytecode")
+            pyo = project / "tests" / "legacy.pyo"
+            pyo.write_bytes(b"optimized bytecode")
+            cached_source = project / "src" / "__pycache__" / "injected.py"
+            cached_source.write_text("VALUE = 5\n", encoding="utf-8")
             extra_test = project / "tests" / "extra.py"
             extra_test.write_text("VALUE = 4\n", encoding="utf-8")
             override = project / "configs" / "foundation_override.yaml"
@@ -746,16 +1528,20 @@ class FoundationSnapshotTests(unittest.TestCase):
             files = {item["file"] for item in violations}
             self.assertIn("frozen foundation file was modified", messages)
             self.assertTrue(
-                {"src/shadow.py", "src/payload.pyd", "src/__pycache__/rogue.pyc", "tests/extra.py", "configs/foundation_override.yaml"}
+                {"src/shadow.py", "src/payload.pyd", "src/__pycache__/injected.py", "tests/extra.py", "configs/foundation_override.yaml"}
                 <= files,
                 violations,
             )
+            self.assertNotIn("src/__pycache__/rogue.pyc", files)
+            self.assertNotIn("tests/legacy.pyo", files)
 
             restore_foundation_snapshot(project, foundation)
             self.assertEqual(foundation_violations(project, foundation), [])
             self.assertFalse((project / "src" / "shadow.py").exists())
             self.assertFalse((project / "src" / "payload.pyd").exists())
             self.assertFalse(pyc.exists())
+            self.assertFalse(pyo.exists())
+            self.assertFalse(cached_source.exists())
             self.assertFalse(extra_test.exists())
             self.assertFalse(override.exists())
 

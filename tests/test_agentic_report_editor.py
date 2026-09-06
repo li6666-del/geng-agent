@@ -8,7 +8,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from geng_agent.agentic_report_editor import run_codex_report_editor_workflow
+from geng_agent.agentic_report_editor import (
+    REPORT_EDITOR_PROMPT_VERSION,
+    run_codex_report_editor_workflow,
+)
 
 
 PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
@@ -69,7 +72,6 @@ def _workflow_inputs(output: Path) -> dict:
         }],
         "output_dir": output,
         "audit_dir": output / "audit",
-        "timeout": 30,
         "resume": False,
     }
 
@@ -113,7 +115,7 @@ class FinalReportEditorTests(unittest.TestCase):
                         "local_assets": ["report_assets/task_1/local_result.png"],
                         "paper_assets": ["report_assets/task_1/paper_target.png"],
                     }],
-                    output_dir=output, audit_dir=output / "audit", timeout=30, resume=False,
+                    output_dir=output, audit_dir=output / "audit", resume=False,
                 )
             finally:
                 if old is None: os.environ.pop("GENG_CODEX_REPORT_EDITOR_CMD", None)
@@ -125,6 +127,45 @@ class FinalReportEditorTests(unittest.TestCase):
             editor_assets = Path(result["workspace"]) / "report_assets"
             self.assertTrue((editor_assets / "task_1" / "local_result.png").is_file())
             self.assertFalse((editor_assets / "stale_task").exists())
+
+    def test_full_run_count_is_only_attempt_count_and_iteration_records_are_available(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / "case"
+            inputs = _workflow_inputs(output)
+            iterations = [
+                {
+                    "full_run_index": 1,
+                    "scientific_reason": "initial_run",
+                    "outcome": "invalid",
+                },
+                {
+                    "full_run_index": 2,
+                    "scientific_reason": "invalid_run",
+                    "outcome": "supported",
+                },
+            ]
+            writer_result = inputs["task_records"][0]["result_json"]
+            writer_result["execution_summary"] = {"full_run_count": 2, "last_returncode": 0}
+            writer_result["iteration_records"] = iterations
+
+            result = _run_with_command(_fake_editor(root), **inputs)
+
+            self.assertTrue(result["ok"], result)
+            report_input = json.loads(
+                (Path(result["workspace"]) / "inputs" / "report_editor_input.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(report_input["task_packets"][0]["iteration_records"], iterations)
+            brief = (output / "audit" / "04b_report_editor_brief.md").read_text(encoding="utf-8")
+            self.assertIn("is the number of full-run attempts", brief)
+            self.assertIn("Never describe that field by itself as `有效完整运行次数`", brief)
+            self.assertIn("return code 124", brief)
+            self.assertEqual(
+                REPORT_EDITOR_PROMPT_VERSION,
+                "final_report_editor_v4_run_attempt_semantics",
+            )
 
     def test_human_readable_task_headings_do_not_require_machine_task_ids(self) -> None:
         with TemporaryDirectory() as temp:
@@ -252,7 +293,9 @@ class FinalReportEditorTests(unittest.TestCase):
             self.assertEqual(result["completion_mode"], "degraded_fallback")
             self.assertEqual(result["missing_outputs"], [])
             self.assertEqual(result["fallback_files"], ["reproduction_report.md"])
-            self.assertEqual((output / "review.md").read_text(encoding="utf-8"), "# 原始总览")
+            review = (output / "review.md").read_text(encoding="utf-8")
+            self.assertTrue(review.endswith("# 原始总览\n"))
+            self.assertIn("任务终态与核验记录", review)
             self.assertTrue((output / "reproduction_report.md").is_file())
 
     def test_empty_editor_output_gets_all_deterministic_reports(self) -> None:

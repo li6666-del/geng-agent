@@ -86,6 +86,21 @@ class ManifestTests(unittest.TestCase):
         modules = [t["module"] for t in manifest["tasks"]]
         self.assertEqual(len(set(modules)), 2)
 
+    def test_output_subdirs_are_stably_unique_across_slug_and_case_collisions(self) -> None:
+        task_ids = ["Fig 4", "Fig_4", "fig_4", "independent"]
+        first = build_tasks_manifest(_tasks_doc(*task_ids))
+        reordered = build_tasks_manifest(_tasks_doc(*reversed(task_ids)))
+
+        first_by_id = {entry["task_id"]: entry["output_subdir"] for entry in first["tasks"]}
+        reordered_by_id = {
+            entry["task_id"]: entry["output_subdir"] for entry in reordered["tasks"]
+        }
+        output_keys = [entry["output_subdir"].casefold() for entry in first["tasks"]]
+        self.assertEqual(len(output_keys), len(set(output_keys)))
+        self.assertEqual(first_by_id, reordered_by_id)
+        self.assertEqual(first_by_id["independent"], io_slug("independent"))
+        self.assertNotEqual(first_by_id["Fig 4"], io_slug("Fig 4"))
+
     def test_handles_missing_and_malformed(self) -> None:
         manifest = build_tasks_manifest({"repro_tasks": [{}, "junk", {"task_id": "ok"}]})
         ids = [t["task_id"] for t in manifest["tasks"]]
@@ -108,6 +123,45 @@ class DispatcherTests(unittest.TestCase):
 
     def test_empty_manifest_still_compiles(self) -> None:
         ast.parse(render_run_experiment_dispatcher({"tasks": []}))
+
+    def test_dispatcher_treats_false_and_nonzero_integer_returns_as_failures(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            inject_io_runtime(root)
+            manifest = build_tasks_manifest(
+                _tasks_doc("returns_false", "returns_nonzero", "returns_true")
+            )
+            write_task_scaffolding(root, manifest)
+            returns = {
+                "returns_false": "False",
+                "returns_nonzero": "7",
+                "returns_true": "True",
+            }
+            for entry in manifest["tasks"]:
+                (root / entry["script"]).write_text(
+                    "def main(config_path=None):\n"
+                    f"    return {returns[entry['task_id']]}\n",
+                    encoding="utf-8",
+                )
+            (root / "config_smoke.json").write_text("{}", encoding="utf-8")
+
+            completed = subprocess.run(
+                [sys.executable, "run_experiment.py", "config_smoke.json"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            self.assertEqual(completed.returncode, 1, msg=completed.stderr)
+            summary = json.loads(
+                (root / "outputs" / "summary.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(summary["tasks"]["returns_false"]["status"], "error")
+            self.assertIn("False", summary["tasks"]["returns_false"]["error"])
+            self.assertEqual(summary["tasks"]["returns_nonzero"]["status"], "error")
+            self.assertIn("7", summary["tasks"]["returns_nonzero"]["error"])
+            self.assertEqual(summary["tasks"]["returns_true"]["status"], "ok")
 
     def test_scaffolding_is_scan_clean(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -184,12 +238,15 @@ class EndToEndDispatcherTests(unittest.TestCase):
 
 
 class GeneratedPathContractTests(unittest.TestCase):
-    def test_expected_paths_are_shared_plus_task_scripts(self) -> None:
+    def test_expected_paths_are_task_owned_scripts_only(self) -> None:
         scripts = [t["script"] for t in build_tasks_manifest(_tasks_doc("reproduce_fig_7", "reproduce_fig_4"))["tasks"]]
         expected = expected_generated_paths(scripts)
-        self.assertIn("src/simulation.py", expected)
-        self.assertIn("tasks/reproduce_fig_7.py", expected)
-        self.assertIn("tasks/reproduce_fig_4.py", expected)
+        self.assertEqual(
+            expected,
+            {"tasks/reproduce_fig_7.py", "tasks/reproduce_fig_4.py"},
+        )
+        # shared scientific modules belong to the architecture/Foundation stage
+        self.assertNotIn("src/simulation.py", expected)
         # harness-injected files are NOT in the model-generated set
         self.assertNotIn("run_experiment.py", expected)
         self.assertNotIn("src/_io.py", expected)

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 from geng_agent.agentic_task_writers import (
     _classify_task_writer_security_issues,
@@ -13,6 +15,29 @@ from geng_agent.outputs import validate_repro_project
 
 
 class TaskWriterAssemblyTests(unittest.TestCase):
+    def test_old_unconsumed_foundation_from_cached_unit_cannot_overwrite_current_snapshot(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sandbox = root / "cached_writer"
+            project = root / "project"
+            (sandbox / "src").mkdir(parents=True)
+            (sandbox / "src" / "other_component.py").write_text("VERSION = 'old'\n", encoding="utf-8")
+            (sandbox / "src" / "private_science.py").write_text("VALUE = 3\n", encoding="utf-8")
+            (sandbox / "foundation_manifest.json").write_text(json.dumps({"frozen_files": [
+                {"path": "src/other_component.py", "sha256": "old"}]}), encoding="utf-8")
+            (sandbox / "requirements.txt").write_text("", encoding="utf-8")
+            def install(target, foundation):
+                (target / "src").mkdir(parents=True, exist_ok=True)
+                (target / "src" / "other_component.py").write_text("VERSION = 'new'\n", encoding="utf-8")
+                (target / "foundation_manifest.json").write_text(json.dumps({"frozen_files": [
+                    {"path": "src/other_component.py", "sha256": "new"}]}), encoding="utf-8")
+                return {"src/other_component.py", "foundation_manifest.json"}
+            with patch("geng_agent.task_writer_packaging.install_foundation_snapshot", side_effect=install):
+                _merge_task_writer_deliveries(repro_project_dir=project, task_manifest={"tasks": []},
+                    expected_paths=set(), task_records=[{"task_id": "a", "sandbox": str(sandbox)}], foundation={})
+            self.assertEqual((project / "src" / "other_component.py").read_text(), "VERSION = 'new'\n")
+            self.assertEqual((project / "src" / "private_science.py").read_text(), "VALUE = 3\n")
+
     def test_transitive_task_helper_is_preserved(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -119,7 +144,7 @@ class TaskWriterAssemblyTests(unittest.TestCase):
                 (sandbox / "requirements.txt").write_text("numpy\n", encoding="utf-8")
                 records.append({"task_id": task_id, "module": task_id, "output_subdir": task_id, "sandbox": str(sandbox)})
 
-            with self.assertRaisesRegex(RuntimeError, "source collision.*fig_1.*fig_2"):
+            with self.assertRaisesRegex(RuntimeError, "package collision.*fig_1.*fig_2"):
                 _merge_task_writer_deliveries(
                     repro_project_dir=root / "project",
                     task_manifest={"version": 1, "tasks": []},
@@ -296,6 +321,34 @@ class TaskWriterAssemblyTests(unittest.TestCase):
 
         self.assertTrue(warning_result["passed"])
         self.assertFalse(error_result["passed"])
+
+    def test_runtime_blocks_unresolved_dependency_issue(self) -> None:
+        result = _task_writer_runtime_result(
+            task_records=[
+                {
+                    "task_id": "fig_1",
+                    "writer_completed": True,
+                    "task_writer_status": "ready_for_review",
+                    "artifacts": {},
+                }
+            ],
+            validation={
+                "required_files_present": True,
+                "python_compiles": True,
+                "foundation_integrity_ok": True,
+            },
+            requirement_warnings=[],
+            requirement_issues=[
+                {
+                    "file": "requirements.txt",
+                    "message": "dependency is absent from the active case lock",
+                }
+            ],
+            security_issues=[],
+        )
+
+        self.assertFalse(result["passed"])
+        self.assertEqual(len(result["requirements_issues"]), 1)
 
     def test_runtime_blocks_and_exposes_foundation_integrity_violations(self) -> None:
         violation = {

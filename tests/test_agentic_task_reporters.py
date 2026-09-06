@@ -16,6 +16,13 @@ from geng_agent.agentic_task_reporters import (
     run_codex_task_reporter_workflow,
     task_verifications_document,
 )
+from geng_agent.task_reporter_context import TASK_REPORTER_PROMPT_VERSION
+from geng_agent.task_writer_dispatch import _refresh_cached_task_reporters
+from geng_agent.report_editor_assets import (
+    _build_task_packets,
+    _sanitize_task_packet_assets,
+)
+from geng_agent.task_reporter_validation import _materialize_task_assets
 from geng_agent.verification_result import (
     normalize_task_verification,
     task_verification_issues,
@@ -126,9 +133,18 @@ def _rerun_raw(*, paper_evidence: str, claim_id: str = "claim_order") -> dict:
     }
 
 
-def _fake_reporter_command(root: Path, payload: dict) -> str:
+def _fake_reporter_command(
+    root: Path,
+    payload: dict,
+    *,
+    asset_files: dict[str, bytes] | None = None,
+) -> str:
     script = root / "fake_task_reporter.py"
     encoded = json.dumps(payload, ensure_ascii=False)
+    encoded_assets = json.dumps(
+        {path: value.hex() for path, value in (asset_files or {}).items()},
+        ensure_ascii=False,
+    )
     script.write_text(textwrap.dedent(f"""
         import json
         import sys
@@ -139,6 +155,11 @@ def _fake_reporter_command(root: Path, payload: dict) -> str:
             raise SystemExit(0)
 
         result = json.loads({encoded!r})
+        assets = json.loads({encoded_assets!r})
+        for relative, payload_hex in assets.items():
+            target = Path(relative)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(bytes.fromhex(payload_hex))
         Path("task_verification_result.json").write_text(
             json.dumps(result, ensure_ascii=False),
             encoding="utf-8",
@@ -153,27 +174,36 @@ def _run_reporter(
     *,
     resume: bool = False,
     record: dict | None = None,
+    reporter_assets: dict[str, bytes] | None = None,
+    assigned_task: dict | None = None,
+    assigned_experiment_index: dict | None = None,
 ) -> dict:
     paper = root / "paper.md"
     if not paper.exists():
         paper.write_text("# Paper\n\nFig. 1 reports A above B at scale 1.", encoding="utf-8")
     task_record = record or _record(root)
-    command = _fake_reporter_command(root, payload)
+    command = _fake_reporter_command(
+        root,
+        payload,
+        asset_files=reporter_assets,
+    )
     with patch.dict(os.environ, {"GENG_CODEX_TASK_REPORTER_CMD": command}):
         return run_codex_task_reporter_workflow(
             index=1,
-            task=_task(),
+            task=assigned_task or _task(),
             task_record=task_record,
             paper={"format": "markdown", "chunks": []},
             paper_path=paper,
             facts={"paper_domain": "test", "paper_repro_type": "figure", "engineering_facts": [], "missing_information": []},
-            experiment_index={"experiments": [{"task_id": "task_a", "source_pages": []}]},
+            experiment_index=(
+                assigned_experiment_index
+                or {"experiments": [{"task_id": "task_a", "source_pages": []}]}
+            ),
             paper_thesis=None,
             paper_images=[],
             output_dir=root / "case",
             audit_dir=root / "case" / "audit",
             resume=resume,
-            timeout=30,
             round_no=1,
         )
 
@@ -195,6 +225,13 @@ class IsolatedTaskReporterTests(unittest.TestCase):
         self.assertIn("key_numeric_ratio_ge_10", prompt)
         self.assertIn("not_reproduced", prompt)
         self.assertIn("inconclusive_missing_information", prompt)
+        self.assertIn("Visual packaging is independent of the scientific outcome", prompt)
+        self.assertIn("PNG/JPG/JPEG", prompt)
+        self.assertIn("CSV, JSON, PDF", prompt)
+        self.assertEqual(
+            TASK_REPORTER_PROMPT_VERSION,
+            "isolated_task_reporter_v9_lossless_scientific_observations",
+        )
         self.assertNotIn('"verdict"', prompt)
         self.assertNotIn('"revision_target"', prompt)
 
@@ -274,7 +311,7 @@ class IsolatedTaskReporterTests(unittest.TestCase):
         self.assertEqual(result["rerun_reason"], "core_conclusion_failed")
         self.assertTrue(writer_revision_allowed(result, "task_a"))
 
-    def test_unknown_contract_id_cannot_trigger_rerun(self) -> None:
+    def test_reporter_discovered_failure_is_not_erased_by_unknown_designer_id(self) -> None:
         result = normalize_task_verification(
             _rerun_raw(
                 paper_evidence="paper_evidence/index.json",
@@ -285,10 +322,11 @@ class IsolatedTaskReporterTests(unittest.TestCase):
             run_valid_hint=True,
         )
 
-        self.assertEqual(result["host_action"], "complete")
-        self.assertEqual(result["rerun_reason"], "none")
-        self.assertEqual(result["outcome"], "inconclusive_missing_information")
-        self.assertFalse(writer_revision_allowed(result, "task_a"))
+        self.assertEqual(result["host_action"], "rerun_writer")
+        self.assertEqual(result["rerun_reason"], "core_conclusion_failed")
+        self.assertEqual(result["outcome"], "not_reproduced")
+        self.assertTrue(writer_revision_allowed(result, "task_a"))
+        self.assertEqual(result["core_conclusions"][1]["claim_id"], "invented_claim")
 
     def test_wrong_numeric_target_id_cannot_be_counted_as_success(self) -> None:
         raw = _supported_raw(local_magnitude=1.0)
@@ -359,6 +397,31 @@ class IsolatedTaskReporterTests(unittest.TestCase):
                 crop_result={"status": "not_applicable"},
             )
             self.assertTrue(any("outside the assigned asset directory" in issue for issue in issues))
+
+    def test_host_materialization_rejects_asset_symlinks(self) -> None:
+        with TemporaryDirectory() as temp:
+            workspace = Path(temp)
+            output = workspace / "inputs" / "writer_output" / "outputs"
+            output.mkdir(parents=True)
+            target = output / "real.png"
+            target.write_bytes(b"png")
+            linked = output / "linked.png"
+            try:
+                os.symlink(target, linked)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlink creation is unavailable: {exc}")
+
+            published, warnings = _materialize_task_assets(
+                asset_candidates={
+                    "local_assets": ["inputs/writer_output/outputs/linked.png"],
+                    "paper_assets": [],
+                },
+                workspace=workspace,
+                task_id="task_a",
+            )
+
+            self.assertEqual(published, {"local_assets": [], "paper_assets": []})
+            self.assertTrue(any("symbolic links" in warning for warning in warnings))
 
     def test_writer_output_symlink_is_skipped_without_failing_reporter(self) -> None:
         with TemporaryDirectory() as temp:
@@ -457,6 +520,275 @@ class IsolatedTaskReporterTests(unittest.TestCase):
             self.assertTrue((workspace / "inputs" / "writer_output" / "source" / "tasks" / "task_a.py").is_file())
             self.assertTrue((workspace / "inputs" / "writer_output" / "source" / "tasks" / "kernel.cu").is_file())
             self.assertFalse((workspace / "inputs" / "writer_output" / "source" / "outputs").exists())
+
+    def test_not_reproduced_terminal_publishes_safe_local_and_paper_images(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            record = _record(root)
+            writer_image = Path(record["sandbox"]) / "outputs" / "task_a" / "local_plot.png"
+            writer_image.write_bytes(b"local-png")
+            raw = _supported_raw()
+            raw["core_conclusions"][0]["status"] = "unsupported"
+            raw["core_conclusions"][0]["local_observation"] = "A falls below B"
+            raw["local_assets"] = ["inputs/writer_output/outputs/local_plot.png"]
+            raw["paper_assets"] = ["report_assets/task_a/paper_plot.jpg"]
+
+            item = _run_reporter(
+                root,
+                raw,
+                record=record,
+                reporter_assets={"report_assets/task_a/paper_plot.jpg": b"paper-jpg"},
+            )
+
+            self.assertTrue(item["ok"], item)
+            self.assertTrue(item["terminal"])
+            self.assertEqual(item["scientific_outcome"], "not_reproduced")
+            self.assertEqual(
+                item["task_verification"]["local_assets"],
+                ["report_assets/task_a/local_plot.png"],
+            )
+            self.assertEqual(
+                item["task_verification"]["paper_assets"],
+                ["report_assets/task_a/paper_plot.jpg"],
+            )
+            self.assertTrue((root / "case" / "report_assets" / "task_a" / "local_plot.png").is_file())
+            self.assertTrue((root / "case" / "report_assets" / "task_a" / "paper_plot.jpg").is_file())
+            self.assertEqual(len(item["asset_manifest"]), 2)
+            packets = _build_task_packets(
+                facts={"engineering_facts": []},
+                tasks={"repro_tasks": [_task()]},
+                task_records=[record],
+                task_verifications=[item["task_verification"]],
+            )
+            warnings = _sanitize_task_packet_assets(
+                packets,
+                root / "case" / "report_assets",
+            )
+            self.assertEqual(warnings, [])
+            self.assertEqual(
+                packets[0]["local_assets"],
+                ["report_assets/task_a/local_plot.png"],
+            )
+            self.assertEqual(
+                packets[0]["paper_assets"],
+                ["report_assets/task_a/paper_plot.jpg"],
+            )
+
+    def test_only_materialized_images_reach_normalized_asset_lists(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            record = _record(root)
+            writer_output = Path(record["sandbox"]) / "outputs" / "task_a"
+            (writer_output / "local_plot.png").write_bytes(b"local-png")
+            raw = _supported_raw()
+            raw["local_assets"] = [
+                "inputs/writer_output/outputs/local_plot.png",
+                "inputs/writer_output/outputs/results.csv",
+            ]
+            raw["paper_assets"] = ["paper_evidence/source/paper.md"]
+
+            item = _run_reporter(root, raw, record=record)
+
+            self.assertTrue(item["ok"], item)
+            self.assertEqual(
+                item["task_verification"]["local_assets"],
+                ["report_assets/task_a/local_plot.png"],
+            )
+            self.assertEqual(item["task_verification"]["paper_assets"], [])
+            self.assertTrue(any("only ordinary PNG/JPG/JPEG" in issue for issue in item["asset_issues"]))
+            published = root / "case" / "report_assets" / "task_a"
+            self.assertTrue((published / "local_plot.png").is_file())
+            self.assertFalse((published / "results.csv").exists())
+            self.assertFalse((published / "paper.md").exists())
+            self.assertEqual(
+                [entry["path"] for entry in item["asset_manifest"]],
+                ["report_assets/task_a/local_plot.png"],
+            )
+
+    def test_declared_asset_cache_rejects_tampering_and_missing_files(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            record = _record(root)
+            writer_image = Path(record["sandbox"]) / "outputs" / "task_a" / "local_plot.png"
+            writer_image.write_bytes(b"local-png")
+            raw = _supported_raw()
+            raw["local_assets"] = ["inputs/writer_output/outputs/local_plot.png"]
+
+            first = _run_reporter(root, raw, record=record)
+            cached = _run_reporter(root, raw, record=record, resume=True)
+            published = root / "case" / "report_assets" / "task_a" / "local_plot.png"
+            published.write_bytes(b"tampered!")
+            repaired_tamper = _run_reporter(root, raw, record=record, resume=True)
+            published.unlink()
+            repaired_missing = _run_reporter(root, raw, record=record, resume=True)
+
+            self.assertTrue(first["ok"], first)
+            self.assertTrue(cached["cached"], cached)
+            self.assertFalse(repaired_tamper["cached"], repaired_tamper)
+            self.assertFalse(repaired_missing["cached"], repaired_missing)
+            self.assertTrue(published.is_file())
+
+    def test_cached_writer_revalidates_reporter_assets_and_prompt_hash_independently(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            record = _record(root)
+            writer_image = Path(record["sandbox"]) / "outputs" / "task_a" / "local_plot.png"
+            writer_image.write_bytes(b"local-png")
+            raw = _supported_raw()
+            raw["local_assets"] = ["inputs/writer_output/outputs/local_plot.png"]
+            first = _run_reporter(root, raw, record=record)
+            record["writer_session_count"] = 1
+            record["task_verification"] = first["task_verification"]
+            task_pairs = [
+                (
+                    _task(),
+                    {
+                        "task_id": "task_a",
+                        "module": "task_a",
+                        "script": "tasks/task_a.py",
+                        "output_subdir": "task_a",
+                    },
+                )
+            ]
+
+            def refresh() -> tuple[dict, dict]:
+                refreshed, _replay, revisions, audit = _refresh_cached_task_reporters(
+                    task_pairs=task_pairs,
+                    cached_records=[record],
+                    experiment_index={"experiments": []},
+                    task_review_callback=lambda index, task, cached_record, round_no: _run_reporter(
+                        root,
+                        raw,
+                        resume=True,
+                        record=cached_record,
+                    ),
+                )
+                self.assertEqual(revisions, {})
+                self.assertEqual(audit["writer_sessions_launched"], 0)
+                return refreshed[0]["task_reporter"], audit
+
+            valid_cache, valid_audit = refresh()
+            self.assertTrue(valid_cache["cached"], valid_cache)
+            self.assertEqual(valid_audit["actions"][0]["reporter_cached"], True)
+
+            old_workspace = Path(first["workspace"])
+            marker = old_workspace / "preserve_old_reporter_round.txt"
+            marker.write_text("old audit evidence", encoding="utf-8")
+            published = root / "case" / "report_assets" / "task_a" / "local_plot.png"
+            published.write_bytes(b"tampered")
+            asset_miss, asset_audit = refresh()
+            self.assertFalse(asset_miss["cached"], asset_miss)
+            self.assertEqual(asset_miss["round_no"], 2)
+            self.assertTrue(marker.is_file())
+            self.assertEqual(asset_audit["actions"][0]["reporter_cached"], False)
+            self.assertEqual(published.read_bytes(), b"local-png")
+
+            with patch(
+                "geng_agent.task_reporter_context.TASK_REPORTER_PROMPT_VERSION",
+                TASK_REPORTER_PROMPT_VERSION + "_test_next",
+            ):
+                prompt_miss, _ = refresh()
+                prompt_hit, _ = refresh()
+
+            self.assertFalse(prompt_miss["cached"], prompt_miss)
+            self.assertEqual(prompt_miss["round_no"], 3)
+            self.assertTrue(prompt_hit["cached"], prompt_hit)
+            self.assertEqual(prompt_hit["round_no"], 3)
+            self.assertTrue(marker.is_file())
+
+    def test_cached_writer_refresh_preserves_enriched_task_reporter_cache_hit(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            record = _record(root)
+            experiment_index = {
+                "experiments": [
+                    {
+                        "task_id": "task_a",
+                        "experiment_id": "experiment_alpha",
+                        "source_pages": [],
+                    }
+                ]
+            }
+            enriched_task = {**_task(), "experiment_id": "experiment_alpha"}
+            first = _run_reporter(
+                root,
+                _supported_raw(),
+                record=record,
+                assigned_task=enriched_task,
+                assigned_experiment_index=experiment_index,
+            )
+            record["writer_session_count"] = 1
+            record["task_verification"] = first["task_verification"]
+            callback_tasks: list[dict] = []
+
+            def callback(index, assigned_task, cached_record, round_no):
+                callback_tasks.append(assigned_task)
+                return _run_reporter(
+                    root,
+                    _supported_raw(),
+                    resume=True,
+                    record=cached_record,
+                    assigned_task=assigned_task,
+                    assigned_experiment_index=experiment_index,
+                )
+
+            refreshed, _replay, revisions, audit = _refresh_cached_task_reporters(
+                task_pairs=[
+                    (
+                        _task(),
+                        {
+                            "task_id": "task_a",
+                            "module": "task_a",
+                            "script": "tasks/task_a.py",
+                            "output_subdir": "task_a",
+                        },
+                    )
+                ],
+                cached_records=[record],
+                experiment_index=experiment_index,
+                task_review_callback=callback,
+            )
+
+            self.assertEqual(revisions, {})
+            self.assertEqual(callback_tasks[0]["experiment_id"], "experiment_alpha")
+            self.assertTrue(refreshed[0]["task_reporter"]["cached"])
+            self.assertEqual(audit["actions"][0]["reporter_cached"], True)
+
+    def test_oversized_declared_image_is_advisory_and_not_published(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            record = _record(root)
+            writer_image = Path(record["sandbox"]) / "outputs" / "task_a" / "large.png"
+            writer_image.write_bytes(b"123456789")
+            raw = _supported_raw()
+            raw["local_assets"] = ["inputs/writer_output/outputs/large.png"]
+
+            with patch(
+                "geng_agent.task_reporter_validation.REPORT_ASSET_MAX_BYTES",
+                8,
+            ):
+                item = _run_reporter(root, raw, record=record)
+
+            self.assertTrue(item["ok"], item)
+            self.assertTrue(item["terminal"])
+            self.assertEqual(item["task_verification"]["local_assets"], [])
+            self.assertEqual(item["asset_manifest"], [])
+            self.assertTrue(any("exceeds 8 bytes" in issue for issue in item["asset_issues"]))
+
+    def test_optional_crop_failure_does_not_change_scientific_terminal_state(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            with patch(
+                "geng_agent.agentic_task_reporters.finalize_paper_target",
+                side_effect=RuntimeError("crop backend unavailable"),
+            ):
+                item = _run_reporter(root, _supported_raw())
+
+            self.assertTrue(item["ok"], item)
+            self.assertTrue(item["terminal"])
+            self.assertEqual(item["scientific_outcome"], "reproduced")
+            self.assertEqual(item["crop_status"], "unresolved")
+            self.assertIn("optional paper crop failed", item["crop_result"]["issues"][0])
 
     def test_workflow_declines_missing_paper_evidence_without_failing(self) -> None:
         with TemporaryDirectory() as temp:

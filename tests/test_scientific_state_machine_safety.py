@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 import geng_agent.agentic_task_writers as writers
+import geng_agent.task_writer_runner as writer_runner
 from geng_agent.verification_result import (
     normalize_task_verification,
     rerun_evidence_path_issues,
@@ -113,8 +114,12 @@ class ScientificStateMachineSafetyTests(unittest.TestCase):
         with TemporaryDirectory() as temp:
             workspace = Path(temp)
             (workspace / "paper_evidence").mkdir()
+            note = _rerun_note()
+            note["core_conclusions"][0]["local_observation"] = (
+                "The submitted CSV reverses the paper's method ordering."
+            )
             verification = normalize_task_verification(
-                _rerun_note(), "task_a", task=_task(), run_valid_hint=True
+                note, "task_a", task=_task(), run_valid_hint=True
             )
             record = _writer_record()
             action, _ = writers._attach_task_reporter_review(
@@ -200,17 +205,17 @@ class ScientificStateMachineSafetyTests(unittest.TestCase):
 
             run_mock = unittest.mock.Mock(return_value={"ok": True})
             with ExitStack() as stack:
-                stack.enter_context(patch.object(writers, "_prepare_task_writer_sandbox"))
-                stack.enter_context(patch.object(writers, "_load_task_execution_binding", return_value=None))
-                stack.enter_context(patch.object(writers, "_build_task_writer_brief", return_value="prompt"))
-                stack.enter_context(patch.object(writers, "_run_task_writer_codex_session", run_mock))
-                stack.enter_context(patch.object(writers, "_restore_trusted_files"))
-                stack.enter_context(patch.object(writers, "_collect_task_writer_delivery", side_effect=lambda **_kwargs: dict(base_record)))
-                stack.enter_context(patch.object(writers, "_attach_task_reporter_review", side_effect=attach))
-                stack.enter_context(patch.object(writers, "_archive_nonterminal_writer_delivery"))
+                stack.enter_context(patch.object(writer_runner, "_prepare_task_writer_sandbox"))
+                stack.enter_context(patch.object(writer_runner, "_load_task_execution_binding", return_value=None))
+                stack.enter_context(patch.object(writer_runner, "_build_task_writer_brief", return_value="prompt"))
+                stack.enter_context(patch.object(writer_runner, "_run_task_writer_codex_session", run_mock))
+                stack.enter_context(patch.object(writer_runner, "_restore_trusted_files"))
+                stack.enter_context(patch.object(writer_runner, "_collect_task_writer_delivery", side_effect=lambda **_kwargs: dict(base_record)))
+                stack.enter_context(patch.object(writer_runner, "_attach_task_reporter_review", side_effect=attach))
+                stack.enter_context(patch.object(writer_runner, "_archive_nonterminal_writer_delivery"))
                 state_no = iter(range(100))
                 stack.enter_context(patch.object(
-                    writers,
+                    writer_runner,
                     "_record_source_config_fingerprint",
                     side_effect=lambda *_args: f"state-{next(state_no)}",
                 ))
@@ -268,20 +273,20 @@ class ScientificStateMachineSafetyTests(unittest.TestCase):
                 return_value=("writer_revision", verification)
             )
             with ExitStack() as stack:
-                stack.enter_context(patch.object(writers, "_prepare_task_writer_sandbox"))
-                stack.enter_context(patch.object(writers, "_load_task_execution_binding", return_value=None))
-                stack.enter_context(patch.object(writers, "_build_task_writer_brief", return_value="prompt"))
-                stack.enter_context(patch.object(writers, "_run_task_writer_codex_session", run_mock))
-                stack.enter_context(patch.object(writers, "_restore_trusted_files"))
+                stack.enter_context(patch.object(writer_runner, "_prepare_task_writer_sandbox"))
+                stack.enter_context(patch.object(writer_runner, "_load_task_execution_binding", return_value=None))
+                stack.enter_context(patch.object(writer_runner, "_build_task_writer_brief", return_value="prompt"))
+                stack.enter_context(patch.object(writer_runner, "_run_task_writer_codex_session", run_mock))
+                stack.enter_context(patch.object(writer_runner, "_restore_trusted_files"))
                 stack.enter_context(patch.object(
-                    writers,
+                    writer_runner,
                     "_collect_task_writer_delivery",
                     side_effect=lambda **_kwargs: dict(base_record),
                 ))
-                stack.enter_context(patch.object(writers, "_attach_task_reporter_review", attach_mock))
-                stack.enter_context(patch.object(writers, "_archive_nonterminal_writer_delivery"))
+                stack.enter_context(patch.object(writer_runner, "_attach_task_reporter_review", attach_mock))
+                stack.enter_context(patch.object(writer_runner, "_archive_nonterminal_writer_delivery"))
                 stack.enter_context(patch.object(
-                    writers,
+                    writer_runner,
                     "_record_source_config_fingerprint",
                     return_value="unchanged",
                 ))

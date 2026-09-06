@@ -15,6 +15,14 @@
 4. 任务应尽量输出一套共享 CSV/summary 和该图所需的全部曲线，而不是为每条曲线分别启动 writer。
 5. 不得预测任务最终能否复现，也不得输出任何运行前评级。任务阶段只记录已知证据、缺口、假设和执行目标。
 
+任务执行关系原则：
+1. `repro_tasks` 仍是独立的科学验收单元；`execution_relationships` 只表达跨任务的科学执行依赖，不得仅因为同属一篇论文、同一图表或实现方便就创建关系。
+2. `strength=strong` 仅用于拆成独立执行会改变结果的科学含义、破坏可比性或丢失必需产物流的情况，例如必须来自同一次运行的联合输出、精确检查点传递、成对比较必须共享的随机实现或数据划分。
+3. `strength=weak` 用于只需共享 Foundation 定义、模块、公式、归一化、数据规约或预训练方法，但各任务独立实例化和运行仍然科学有效的情况。不确定时不得猜成 strong。
+4. `kind` 按真实依赖选择：`same_run_outputs|checkpoint_flow|shared_pretraining|shared_random_realization|shared_dataset_partition|shared_definition|other`。不要根据论文名称、领域关键词或图号做特判。
+5. 每个关系至少包含两个稳定 task_id。只有定向产物流才填 `producer_task_id`/`consumer_task_ids`；`artifact_ids` 写稳定的逻辑产物 ID，不写临时路径。
+6. `rationale` 必须说明分开执行会造成的科学后果，或为何仅共享定义就足够。没有证据支持的关系不要输出，允许 `execution_relationships=[]`。
+
 事实请求原则：
 1. 仅为会改变算法实现、公式、配置、baseline、数据输入、坐标尺度或验收结论的缺口创建请求。
 2. 背景知识、措辞完善和不会改变实验的边缘细节不要请求。
@@ -38,6 +46,8 @@
 6. 当前证据不足时允许列表为空、字段暂缺或转成 information_gap；不得为了结构完整性发明论文结论，后续本地 normalizer 会补最小可交接语义。
 7. 数值量级阈值和非阻塞视觉差异由宿主统一策略控制，不得在任务内自定义另一套阈值。
 8. expected_trend、comparison.tolerance 和 validation_anchors 继续保留为说明材料，但不覆盖 scientific_acceptance 的判定权威。
+9. 在 statement 或 regime 中简短说明判据为何影响论文主张，并区分总体/机制结论与某个示例实现的观察。论文没有披露某个随机实现、几何或数据样本时，不能仅凭该示例图的峰位置或包络外形，把它升级为所有合理替代实现必须满足的核心结论；保留为 validation_anchor 和信息缺口。若论文明确以峰位、阈值、精度或趋势本身提出主张，则仍应设为核心判据。
+10. 不得用筛选随机实现、移动坐标、调种子或挑选结果来满足示例图的外形。采用代表性替代实现时，优先检验论文方法、机制、方法排序和总体趋势；明确区分“未取得原始样本”与“核心科学结论失败”。
 
 软交接规则：
 1. 初步任务设计完成后，立即判断当前信息是否已经足以让能够阅读全文、作出显式假设并运行迭代的 Writer 开始工作。
@@ -48,11 +58,25 @@
 
 输出 schema：
 {
+  "schema_version": "2.0",
   "backfill_handoff": {
     "ready_for_writer": true,
     "blocking_request_ids": [],
-    "reason": "why Writer can start, or why the selected requests still block a responsible implementation"
+    "reason": "why Writer can start, or why the selected requests still block a responsible implementation",
+    "inferred": false
   },
+  "execution_relationships": [
+    {
+      "relationship_id": "stable_relationship_id",
+      "kind": "same_run_outputs|checkpoint_flow|shared_pretraining|shared_random_realization|shared_dataset_partition|shared_definition|other",
+      "strength": "strong|weak",
+      "task_ids": ["task_a", "task_b"],
+      "producer_task_id": null,
+      "consumer_task_ids": [],
+      "artifact_ids": [],
+      "rationale": "scientific reason these tasks must share one execution or only a Foundation definition"
+    }
+  ],
   "repro_tasks": [
     {
       "task_id": "reproduce_fig_4",

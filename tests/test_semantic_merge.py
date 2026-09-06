@@ -71,12 +71,11 @@ class SemanticMergeTests(unittest.TestCase):
             "repro_tasks": [
                 {"task_id": "fig4", "figure_or_claim": "Fig. 4"}
             ],
-            "_meta": {
-                "backfill_handoff": {
-                    "ready_for_writer": False,
-                    "blocking_request_ids": ["fig4_setup"],
-                    "reason": "setup changes the experiment",
-                }
+            "backfill_handoff": {
+                "ready_for_writer": False,
+                "blocking_request_ids": ["fig4_setup"],
+                "reason": "setup changes the experiment",
+                "inferred": False,
             },
         }
 
@@ -85,9 +84,10 @@ class SemanticMergeTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            merged["_meta"]["backfill_handoff"],
-            addition["_meta"]["backfill_handoff"],
+            merged["backfill_handoff"],
+            addition["backfill_handoff"],
         )
+        self.assertNotIn("backfill_handoff", merged.get("_meta", {}))
 
     def test_merge_does_not_copy_untrusted_unrelated_metadata(self) -> None:
         facts, _ = semantic_merge_engineering_facts(
@@ -141,7 +141,7 @@ class SemanticMergeTests(unittest.TestCase):
         self.assertEqual(
             merged["repro_tasks"][0]["scientific_acceptance"], refined_contract
         )
-        self.assertEqual(merged["_meta"]["semantic_merge"]["merge_version"], 3)
+        self.assertEqual(merged["_meta"]["semantic_merge"]["merge_version"], 4)
     def test_task_coverage_does_not_use_fig9a_to_cover_fig9b(self) -> None:
         facts = {"engineering_facts": [
             {"type": "figure_claim", "name": "Fig. 9(a) BER vs SNR", "value": {}},
