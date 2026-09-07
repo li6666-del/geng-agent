@@ -13,6 +13,7 @@ from .outputs import write_json, write_text
 from .paper_evidence import facts_for_task, safe_label
 from .security import redact_text
 from .scientific_materiality import SCIENTIFIC_POLICY_ID
+from .prompt_identity import role_contract_identity
 from .report_editor_assets import (
     _accepted_asset_inventory, _accepted_asset_sources, _build_task_packets,
     _copy_assets_for_editor, _editor_asset_paths, _resolve_report_asset,
@@ -34,7 +35,7 @@ from .report_editor_fallback import (
 )
 
 REPORT_EDITOR_POLICY_VERSION = f"{SCIENTIFIC_POLICY_ID}:terminal-report-v2-host-facts"
-REPORT_EDITOR_PROMPT_VERSION = "final_report_editor_v4_run_attempt_semantics"
+REPORT_EDITOR_PROMPT_VERSION = "final_report_editor_v5_verified_facts_only"
 
 
 def run_codex_report_editor_workflow(
@@ -108,9 +109,7 @@ def run_codex_report_editor_workflow(
                 "title": paper.get("title") if isinstance(paper, dict) else None,
                 "format": paper.get("format") if isinstance(paper, dict) else None,
             },
-            "paper_thesis": paper_thesis or {},
-            "runtime_result": runtime_result,
-            "risk_summary": _compact_risk(risk_report),
+            "runtime_summary": {key: runtime_result[key] for key in ("scientific_all_terminal", "scientific_all_successful", "scientific_outcome_counts") if key in runtime_result},
             "task_packets": task_packets,
             "asset_warnings": asset_warnings,
             "repair": {
@@ -316,29 +315,27 @@ You receive {task_count} terminal, reportable, isolated task packets. A packet m
 - You may create only `review.md`, `reproduction_report.md`, and `result_review.md`.
 - Do not access the network, install packages, edit images, or create new scientific evidence.
 - Do not expose raw JSON, paths, transcripts, commands, chain-of-thought, Writer logs, or an iteration appendix.
-- The host publishes an immutable task-outcome and criterion table in each report. Explain the supplied evidence; do not write a competing global or task verdict.
+- The host publishes an immutable task-outcome and criterion table in each report. Explain the supplied evidence; do not write a competing global or task verdict. Do not derive a new reproducibility verdict or validate a method from the images.
 
 ## Input
-- `inputs/report_editor_input.json` contains terminal task packets, compact runtime information, criterion-level observations, selected assets, and non-blocking asset warnings.
+- `inputs/report_editor_input.json` contains terminal task packets, host execution counts, criterion observations, Reporter-verified facts, selected assets, and non-blocking asset warnings. Original evidence paths are provenance references, not proof you read those files.
 - `report_assets/<task_id>/` may contain final local images and paper crops. Images are optional. Use only supplied relative paths; do not link to an input workspace or invent missing images.
 
 ## Run-count semantics
-- `execution_summary.full_run_count` is the number of full-run attempts, not the number of valid or successful full runs. Never describe that field by itself as `有效完整运行次数` or equivalent wording.
-- Derive a valid-completed-run count only from explicit `iteration_records` together with the task's verification and terminal execution evidence. `supported`, `unsupported`, and `unassessable` may describe scientifically valid completed runs; `invalid`, `aborted`, or failed attempts do not.
-- A command-observation timeout, including return code 124, is not evidence that the scientific child run failed or completed. Do not count it as valid unless the supplied evidence independently verifies child completion and validity.
-- If the evidence is incomplete, report the valid-completed-run count as unavailable instead of inferring it. When counts matter, state both values explicitly, for example: `完整运行尝试 3 次，其中有明确证据的有效完成 1 次`.
+- Use only host `execution_summary` counts and preserve their scope. `observed_full_attempt_count` counts receipted attempts. `latest_valid_execution_count` means only that the latest execution and its artifacts are valid (0 or 1; unknown is null). Report it as `末次执行与产物有效`, never as scientific success or scientific validity. A not_reproduced task may have valid execution; scientific support is given only by the task outcome.
+- Never infer counts from Writer prose, iteration records, a successful process, or a command-observation timeout (including return code 124). Unknown counts are unavailable, not zero. Preserve `valid_count_scope` when reporting a count.
 
 ## Required files
 Write exactly three Markdown files in Chinese.
 
 ### `review.md`
-Give a concise paper/reproduction overview, task outcome table, major risks, final reproducibility verdict, and links to the two detailed reports. Preserve each supplied terminal outcome, including inconclusive or not reproduced results.
+Give a concise overview of the supplied task decisions and remaining uncertainties, and links to the two detailed reports. The host supplies the outcome table. Preserve its terminal outcomes without writing another global verdict.
 
 ### `reproduction_report.md`
-Create one compact section per task. Include the target, implementation/model, configuration where known, backend/device, key parameters, seeds/statistical settings, explicit assumptions, produced artifacts, and terminal conclusion. Clearly distinguish paper-provided, derived, assumed, and unavailable information.
+Create one compact section per task. State the target, then explain implementation, parameters, assumptions and measurements only from `verification.verified_facts` or explicit criterion observations. Preserve each fact's source (paper, derived, assumed, observed). If details or provenance were not verified upstream, state they were not provided; do not reconstruct them from a task plan or fill missing fields. Refer to the host terminal decision.
 
 ### `result_review.md`
-Start directly with task 1. When both images exist, include a two-column Markdown image table with the final local result on the left and the paper crop on the right. When one or both images are unavailable, report the supplied CSV/table/summary/text evidence instead and state the packaging limitation briefly. A missing crop, styling difference, or pixel-level mismatch is never a scientific failure. Add the criterion-level conclusion, material differences, assumptions, remaining uncertainty, and evidence-grounded explanation. Never show raw filesystem paths.
+Start directly with task 1. When both images exist, include a two-column Markdown image table with the final local result on the left and the paper crop on the right. When images are unavailable, explain the supplied criterion observations and verified facts and state the packaging limitation briefly. Do not claim to have inspected a CSV merely because its path is listed. A missing crop, styling difference, or pixel-level mismatch is never a scientific failure. Preserve supplied material differences and uncertainty. Never show raw filesystem paths.
 
 ## Layout
 - Use short headings, compact tables, and restrained prose suitable for Word rendering.
@@ -364,10 +361,13 @@ def _editor_input_hash(**values: Any) -> str:
     except (OSError, ValueError) as exc:
         assets = {"invalid": f"{type(exc).__name__}: {exc}"}
     payload = {
-        **values,
+        "paper": {"title": (values.get("paper") or {}).get("title"), "format": (values.get("paper") or {}).get("format")},
+        "task_packets": task_packets,
+        "runtime_summary": {key: (values.get("runtime_result") or {})[key] for key in ("scientific_all_terminal", "scientific_all_successful", "scientific_outcome_counts") if key in (values.get("runtime_result") or {})},
         "assets": assets,
         "prompt_version": REPORT_EDITOR_PROMPT_VERSION,
         "policy_version": REPORT_EDITOR_POLICY_VERSION,
+        "role_contract": role_contract_identity(role="report_editor", prompt=_build_report_editor_brief(task_count=len(task_packets))),
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()

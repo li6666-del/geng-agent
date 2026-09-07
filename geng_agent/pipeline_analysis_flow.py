@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any, Callable
 
 from .analysis_diagnostics import write_analysis_warnings
+from .analysis_prompt_context import (
+    analysis_paper_context, ledger_for_prompt, resolution_for_prompt,
+    scientific_prompt_value, tasks_for_backfill,
+)
 from .execution_plan import ExecutionPlanError, compile_execution_plan
 from .facts_coverage import compute_fact_coverage, compute_task_coverage
 from .facts_normalize import (
@@ -20,7 +23,7 @@ from .json_utils import pretty_json
 from .mineru_adapter import figure_index_prompt_summary
 from .outputs import write_json
 from .pipeline_context import PipelineRunContext
-from .pipeline_helpers import _paper_context_for_prompt, wrap_untrusted
+from .pipeline_helpers import wrap_untrusted
 from .pipeline_models import AnalysisFlowResult, PipelineResult
 from .risk_report import _build_run_cost
 from .schemas import (
@@ -86,14 +89,14 @@ def run_analysis_flow(
         else {"figures": [], "unmatched_visuals": []}
     )
     context.mark("mineru_layout")
-    paper_context_raw = pretty_json(
-        {
-            "paper_source_sha256": paper.get("source_sha256"),
-            "paper_chunks": json.loads(_paper_context_for_prompt(paper["chunks"])),
-            "paper_figure_index": figure_index_prompt_summary(figure_index),
-        }
-    )
-    paper_context = wrap_untrusted("paper_chunks_json", paper_context_raw)
+    def _evidence_context(*, images: list[Any], requests: list[dict[str, Any]] | None = None) -> str:
+        return analysis_paper_context(
+            paper=paper, figure_summary=figure_index_prompt_summary(figure_index),
+            paper_path=paper_path, chunks_path=output_dir / "paper_chunks.json",
+            images=images, backend=options.analysis_backend, requests=requests,
+        )
+
+    paper_context = _evidence_context(images=paper_images)
     valid_pages: set[int] = set()
     for image in paper_images:
         label = getattr(image, "label", "") or ""
@@ -198,12 +201,12 @@ def run_analysis_flow(
     prompt_2 = pipeline.prompt_book.render(
         "build_repro_tasks.md",
         engineering_facts_json=wrap_untrusted(
-            "engineering_facts_json", pretty_json(initial_facts)
+            "engineering_facts_json", pretty_json(scientific_prompt_value(initial_facts))
         ),
         fact_coverage_json=wrap_untrusted(
             "fact_coverage_json", pretty_json(fact_coverage)
         ),
-        paper_context_json=paper_context,
+        paper_context_json=_evidence_context(images=[]),
     )
     preliminary_tasks = pipeline._load_or_create_analysis_stage_json(
         output_path=output_dir / "repro_tasks_preliminary.json",
@@ -315,15 +318,15 @@ def run_analysis_flow(
                 "targeted_requests_json", pretty_json(requests)
             ),
             existing_facts_json=wrap_untrusted(
-                "existing_facts_json", pretty_json(current_facts)
+                "existing_facts_json", pretty_json(scientific_prompt_value(current_facts))
             ),
             current_tasks_json=wrap_untrusted(
-                "current_tasks_json", pretty_json(current_tasks)
+                "current_tasks_json", pretty_json(tasks_for_backfill(current_tasks, requests))
             ),
             search_ledger_json=wrap_untrusted(
-                "search_ledger_json", pretty_json(search_ledger)
+                "search_ledger_json", pretty_json(ledger_for_prompt(search_ledger))
             ),
-            paper_context_json=paper_context,
+            paper_context_json=_evidence_context(images=paper_images, requests=requests),
         )
 
         def _normalize_backfill(parsed: dict[str, Any]) -> dict[str, Any]:
@@ -387,16 +390,16 @@ def run_analysis_flow(
             "finalize_repro_tasks.md",
             round_index=str(round_index),
             current_tasks_json=wrap_untrusted(
-                "current_tasks_json", pretty_json(current_tasks)
+                "current_tasks_json", pretty_json(scientific_prompt_value(current_tasks, resolution_supplied=True))
             ),
             final_engineering_facts_json=wrap_untrusted(
-                "final_engineering_facts_json", pretty_json(current_facts)
+                "final_engineering_facts_json", pretty_json(scientific_prompt_value(current_facts))
             ),
             backfill_resolution_json=wrap_untrusted(
-                "backfill_resolution_json", pretty_json(cumulative_resolution)
+                "backfill_resolution_json", pretty_json(resolution_for_prompt(cumulative_resolution))
             ),
             search_ledger_json=wrap_untrusted(
-                "search_ledger_json", pretty_json(search_ledger)
+                "search_ledger_json", pretty_json(ledger_for_prompt(search_ledger))
             ),
             paper_thesis_json=wrap_untrusted("paper_thesis_json", "{}"),
             paper_context_json=paper_context,
@@ -605,19 +608,19 @@ def run_analysis_flow(
         "finalize_repro_tasks.md",
         round_index="final",
         current_tasks_json=wrap_untrusted(
-            "current_tasks_json", pretty_json(tasks)
+            "current_tasks_json", pretty_json(scientific_prompt_value(tasks, resolution_supplied=True))
         ),
         final_engineering_facts_json=wrap_untrusted(
-            "final_engineering_facts_json", pretty_json(facts)
+            "final_engineering_facts_json", pretty_json(scientific_prompt_value(facts))
         ),
         backfill_resolution_json=wrap_untrusted(
-            "backfill_resolution_json", pretty_json(resolution)
+            "backfill_resolution_json", pretty_json(resolution_for_prompt(resolution))
         ),
         search_ledger_json=wrap_untrusted(
-            "search_ledger_json", pretty_json(backfill_loop["ledger"])
+            "search_ledger_json", pretty_json(ledger_for_prompt(backfill_loop["ledger"]))
         ),
         paper_thesis_json=wrap_untrusted(
-            "paper_thesis_json", pretty_json(paper_thesis or {})
+            "paper_thesis_json", pretty_json(scientific_prompt_value(paper_thesis or {}))
         ),
         paper_context_json=paper_context,
     )

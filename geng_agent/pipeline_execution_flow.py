@@ -164,6 +164,7 @@ def run_execution_flow(
             not result.get("ok")
             and isinstance(result.get("codex_status"), dict)
             and result["codex_status"].get("ok")
+            and result.get("recovery_kind") == "structure"
         )
         if reporter_owned_retry:
             result = run_codex_task_reporter_workflow(
@@ -181,7 +182,7 @@ def run_execution_flow(
                 audit_dir=audit_dir,
                 resume=False,
                 round_no=writer_round * 100 + 1,
-                include_all_paper_pages=True,
+                repair_context=result,
             )
         return result
 

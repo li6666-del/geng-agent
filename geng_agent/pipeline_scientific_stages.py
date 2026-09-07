@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from .analysis_prompt_context import scientific_prompt_value
+
 from pathlib import Path
 from typing import Any
 
@@ -63,7 +65,7 @@ def load_or_create_paper_thesis(
     prompt = pipeline.prompt_book.render(
         "extract_paper_thesis.md",
         engineering_facts_json=wrap_untrusted(
-            "engineering_facts_json", pretty_json(facts)
+            "engineering_facts_json", pretty_json(scientific_prompt_value(facts))
         ),
         paper_chunks_json=paper_context,
     )
@@ -232,17 +234,17 @@ def load_or_create_scientific_architecture(
     prompt = pipeline.prompt_book.render(
         "design_scientific_architecture.md",
         engineering_facts_json=wrap_untrusted(
-            "engineering_facts_json", pretty_json(facts)
+            "engineering_facts_json", pretty_json(scientific_prompt_value(facts))
         ),
-        repro_tasks_json=wrap_untrusted("repro_tasks_json", pretty_json(tasks)),
+        repro_tasks_json=wrap_untrusted("repro_tasks_json", pretty_json(scientific_prompt_value(tasks))),
         paper_thesis_json=wrap_untrusted(
-            "paper_thesis_json", pretty_json(paper_thesis or {})
+            "paper_thesis_json", pretty_json(scientific_prompt_value(paper_thesis or {}))
         ),
         experiment_index_json=wrap_untrusted(
-            "experiment_index_json", pretty_json(experiment_index)
+            "experiment_index_json", pretty_json(scientific_prompt_value(experiment_index))
         ),
         execution_plan_json=wrap_untrusted(
-            "execution_plan_json", pretty_json(execution_plan)
+            "execution_plan_json", pretty_json(scientific_prompt_value(execution_plan))
         ),
         host_capabilities_json=wrap_untrusted(
             "host_capabilities_json",

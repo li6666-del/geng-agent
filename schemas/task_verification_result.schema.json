@@ -13,7 +13,8 @@
           "enum": [
             "supported",
             "unsupported",
-            "unassessable_missing_information"
+            "unassessable_missing_information",
+            "not_applicable"
           ],
           "title": "Status",
           "type": "string"
@@ -29,6 +30,19 @@
           },
           "title": "Evidence Files",
           "type": "array"
+        },
+        "basis_review": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Basis Review"
         }
       },
       "title": "CoreConclusionAssessment",
@@ -86,6 +100,82 @@
           "default": "",
           "title": "Unavailable Reason",
           "type": "string"
+        },
+        "comparison_status": {
+          "default": "comparable",
+          "title": "Comparison Status",
+          "type": "string"
+        },
+        "metric": {
+          "default": "",
+          "title": "Metric",
+          "type": "string"
+        },
+        "unit": {
+          "default": "",
+          "title": "Unit",
+          "type": "string"
+        },
+        "regime": {
+          "default": "",
+          "title": "Regime",
+          "type": "string"
+        },
+        "local_metric": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Local Metric"
+        },
+        "local_unit": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Local Unit"
+        },
+        "local_regime": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Local Regime"
+        },
+        "incompatible_dimensions": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Incompatible Dimensions",
+          "type": "array"
+        },
+        "basis_review": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Basis Review"
         }
       },
       "required": [
@@ -272,6 +362,19 @@
       },
       "title": "Remaining Uncertainties",
       "type": "array"
+    },
+    "verified_facts": {
+      "items": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "title": "Verified Facts",
+      "type": "array"
+    },
+    "provenance_base": {
+      "default": "",
+      "title": "Provenance Base",
+      "type": "string"
     },
     "schema_version": {
       "const": "2.0",

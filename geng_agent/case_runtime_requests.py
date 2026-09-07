@@ -189,14 +189,15 @@ def _lock_satisfies_requirement(
 def environment_request_prompt(runtime: CaseRuntime) -> str:
     return f"""The host has selected the case Python interpreter `{runtime.python_executable}`.
 Do not run pip, conda, apt, curl, or any installer. Use only dependencies proven by
-`{runtime.lock_path.name}`. If faithful implementation needs another Python package,
+the host's verified dependency inventory or lock. If faithful implementation needs another Python package,
 write `{WRITER_ENVIRONMENT_REQUEST_FILENAME}` as JSON with a `requirements` array.
 Each item may contain only `requirement`, `import_names`, and `reason`; use an ordinary
 PEP 508 name/version constraint. URLs, VCS/path references, index options, and shell
 commands are forbidden. Stop after writing the request. The host will resolve it from
 a trusted source, update the dynamic case lock, verify real capability, and restart
-this writer in a clean sandbox. Never downgrade the paper's framework or algorithm
-merely because the current lock lacks a package."""
+this writer with the updated environment while preserving completed implementation.
+Never downgrade the paper's framework or algorithm merely because the current lock
+lacks a package. Verified lock path (host-owned): `{runtime.lock_path}`."""
 
 def _persisted_host_requests(path: Path) -> tuple[RequirementRequest, ...]:
     try:

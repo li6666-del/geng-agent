@@ -218,8 +218,8 @@ class IsolatedTaskReporterTests(unittest.TestCase):
 
         self.assertIn("navigation aid", prompt)
         self.assertIn("never reject merely for missing structure", prompt)
-        self.assertIn("Do not select new key quantities", prompt)
-        self.assertIn("the host owns the paper target and arithmetic", prompt)
+        self.assertIn("The host computes ratios", prompt)
+        self.assertIn("Designer criteria and numeric anchors are provisional", prompt)
         self.assertIn("invalid_run", prompt)
         self.assertIn("core_conclusion_failed", prompt)
         self.assertIn("key_numeric_ratio_ge_10", prompt)
@@ -230,7 +230,7 @@ class IsolatedTaskReporterTests(unittest.TestCase):
         self.assertIn("CSV, JSON, PDF", prompt)
         self.assertEqual(
             TASK_REPORTER_PROMPT_VERSION,
-            "isolated_task_reporter_v9_lossless_scientific_observations",
+            "isolated_task_reporter_v10_paper_basis_and_observable_trace",
         )
         self.assertNotIn('"verdict"', prompt)
         self.assertNotIn('"revision_target"', prompt)
@@ -500,7 +500,7 @@ class IsolatedTaskReporterTests(unittest.TestCase):
 
             self.assertEqual(first, touched)
             self.assertNotEqual(first, second)
-            self.assertNotEqual(second, third)
+            self.assertEqual(second, third)  # An unrelated thesis field is not sent to this Reporter.
 
     def test_workflow_terminal_success_is_cacheable_without_images(self) -> None:
         with TemporaryDirectory() as temp:

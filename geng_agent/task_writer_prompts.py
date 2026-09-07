@@ -15,34 +15,19 @@ from .task_writer_contracts import WRITER_PAPER_FIDELITY_POLICY
 from .task_writer_units import _public_execution_unit
 
 
-LONG_RUNNING_FULL_RUN_PROTOCOL = """## Durable long-running full protocol
-"No arbitrary wall-clock limit" applies to the scientific run, not to one
-interactive terminal/tool call. When a full run may be long or its duration is
-uncertain, do not keep one foreground tool call open until the experiment ends.
-
-- Launch the full as one durable background subprocess, using the active case
-  Python and the sandbox as its working directory. Use the native Windows or
-  POSIX process mechanism for the current host; do not assume one shell syntax
-  works on both systems. On Windows, detach a wrapper with PowerShell
-  `Start-Process ... -WindowStyle Hidden`; on POSIX, use `setsid`/`nohup` or an
-  equivalent detached wrapper with explicit log redirection.
-- Give every attempt a unique directory under
-  `writer_progress/live_runs/<run-id>/`. Persist the scientific command, wrapper
-  PID and scientific child PID, stdout log, stderr log, start time, and an
-  atomic exit-code/completion marker there. A detached wrapper may wait for the
-  scientific child and atomically publish its real return code after it exits.
-- Return from the launch call promptly, then observe with short, bounded status
-  checks: verify the recorded PID/process identity, inspect incremental logs and
-  output freshness, and check the completion marker. Short polling bounds an
-  observation call; it is not an end-to-end deadline for the scientific run.
-- A terminal/tool return code 124 describes that observation call, not
-  necessarily the scientific child. Re-check the recorded child before acting.
-  Never kill, replace, or launch a duplicate full while the recorded child is
-  still alive.
-- Claim completion only when the child is no longer running, the real exit code
-  is known, and expected outputs pass content validation. If the PID disappears
-  without a trustworthy completion marker, report an external/unknown failure;
-  do not invent return code 0. Do not add a fixed end-to-end timeout.
+LONG_RUNNING_FULL_RUN_PROTOCOL = """## Host-owned scientific execution
+Use the provided `run_task.py` launcher and selected case Python. For a long run,
+add `--submit` to return promptly, then use `python run_task.py --task TASK_ID --status`
+for short status checks. Submission is not completion. The host owns the scientific
+process, exit status, stdout/stderr logs and execution receipts; their current
+locations appear in the status response. Do not create another PID tracker,
+completion marker, or execution receipt. After a tool timeout, inspect status and
+wait for an in-flight run instead of submitting another scientific execution.
+Launcher exit code 75 means an in-flight conflict; inspect status and wait. It is
+not the scientific process's exit code and does not justify a scientific rerun.
+Claim completion only from the host's completed result and real exit code.
+Diagnose an execution failure using the referenced log; never invent return code 0.
+There is no fixed end-to-end scientific timeout.
 """
 
 
@@ -68,15 +53,26 @@ def _build_task_writer_continuation_brief(
     module: str,
     session_round: int,
     review_feedback: dict[str, Any] | None = None,
+    recovery_context: dict[str, Any] | None = None,
+    run_repro: bool = True,
 ) -> str:
     feedback_text = pretty_json(review_feedback) if review_feedback else "None"
+    if not run_repro:
+        return (f"# Continue preparation for `{task_id}` (session {session_round})\n"
+                + pretty_json(recovery_context or {"reason": "resume_preparation"})
+                + "\nFull execution is disabled. Continue existing implementation and configs without claiming scientific completion.\n\n"
+                + base_prompt)
     return f"""# Mandatory continuation: session {session_round}
 
-The previous Codex session for `{task_id}` ended without a valid `ready_for_review` delivery, or the independent reporter reported a possible material paper mismatch. Continue in the existing sandbox; do not restart the implementation and do not merely rewrite the previous explanation.
+Continue the existing implementation using the current recovery reason below.
+Do not infer a new scientific defect merely from an interruption or environment update.
+```json
+{pretty_json(recovery_context or {'reason': 'resume_existing_delivery'})}
+```
 
-{WRITER_PAPER_FIDELITY_POLICY}
+{WRITER_PAPER_FIDELITY_POLICY if WRITER_PAPER_FIDELITY_POLICY not in base_prompt else ''}
 
-{CORE_RESULT_STOP_POLICY}
+{CORE_RESULT_STOP_POLICY if CORE_RESULT_STOP_POLICY not in base_prompt else ''}
 
 Before acting:
 1. Read the existing task code, configs, outputs, and `writer_progress/` archives.
@@ -119,7 +115,7 @@ def _build_execution_unit_writer_brief(
     task_commands = [
         {
             "task_id": str(task.get("task_id") or entry.get("task_id") or ""),
-            "full": f"python run_task.py --task {entry.get('task_id')} --config configs/{entry.get('module')}_config.json --mode full",
+            **({"full": f"python run_task.py --task {entry.get('task_id')} --config configs/{entry.get('module')}_config.json --mode full"} if run_repro else {}),
             "smoke": f"python run_task.py --task {entry.get('task_id')} --config configs/{entry.get('module')}_config_smoke.json --mode smoke",
             "result_json": f"outputs/{entry.get('output_subdir')}/task_agent_result.json",
         }
@@ -147,7 +143,7 @@ def _build_execution_unit_writer_brief(
         if run_repro
         else "Prepare all phases but do not run full experiments because --run-repro is disabled."
     )
-    return f"""# Role: autonomous Codex compound execution-unit Writer
+    prompt = f"""# Role: autonomous Codex compound execution-unit Writer
 
 You own one scientific execution unit containing multiple logical reproduction tasks. The tasks remain separately accepted and separately reviewed, but they must be implemented and executed together because splitting them would change the scientific comparison, shared state, random realization, data partition, or artifact flow.
 
@@ -235,12 +231,12 @@ Treat Reporter feedback as evidence to investigate. One material defect in share
 
 ## Experiment index
 ```json
-{pretty_json(experiment_index)[:12000]}
+{pretty_json(_task_experiment_index(experiment_index, tasks_payload, unit))}
 ```
 
 ## Task-scoped fact navigation
 ```json
-{pretty_json({str(task.get('task_id') or entry.get('task_id') or ''): facts_for_task(facts, task) for _, task, entry in members})[:16000]}
+{pretty_json(_unit_fact_navigation(facts, tasks_payload))}
 ```
 
 ## Paper-context preview
@@ -259,6 +255,11 @@ Treat Reporter feedback as evidence to investigate. One material defect in share
 
 Mandatory complete inputs are under `paper_evidence/`: the original paper, finalized analysis artifacts (including execution_plan.json and scientific_architecture.json), and all rendered paper pages. Read them directly whenever the preview is incomplete.
 """
+    if not run_repro:
+        start = prompt.index("For each logical task, write")
+        end = prompt.index("## Scientific architecture bindings", start)
+        prompt = prompt[:start] + "Full execution is disabled. Prepare the task modules, configs and producer/consumer artifact paths. Describe unresolved requirements in README.md; do not claim completed runs or write final scientific results.\n\n" + prompt[end:]
+    return prompt
 
 def _build_execution_unit_continuation_brief(
     *,
@@ -266,10 +267,22 @@ def _build_execution_unit_continuation_brief(
     unit_id: str,
     session_round: int,
     review_feedback: dict[str, Any],
+    recovery_context: dict[str, Any] | None = None,
+    run_repro: bool = True,
 ) -> str:
+    if not run_repro:
+        return (f"# Continue unit preparation `{unit_id}` (round {session_round})\n"
+                + pretty_json(recovery_context or {"reason": "resume_preparation"})
+                + "\nFull execution is disabled. Preserve the implementation and artifact plan; do not claim scientific completion.\n\n"
+                + base_prompt)
     return f"""# Continue compound execution unit `{unit_id}` (round {session_round})
 
-One or more independent task Reporters supplied a paper-grounded causal rerun request:
+Current recovery reason and existing work:
+```json
+{pretty_json(recovery_context or {'reason': 'resume_existing_delivery'})}
+```
+
+Current independent feedback, if any (an interruption is not a rerun request):
 ```json
 {pretty_json(review_feedback)}
 ```
@@ -342,10 +355,7 @@ The resolved component contract for this task is:
 - Consume the listed `module` / `callable` implementations in the real computation that produces the submitted CSV, summary, and figure. A task may import a declared component itself or import a shared Foundation composition entrypoint whose local `src/**/*.py` import graph reaches it.
 - Every component with `execution.shared_implementation=true` must be reported as `in_scientific_path`. An audit-only call, shape check, reference comparison, or unused import does not count.
 - Do not mirror or rewrite a shared trainable model under `tasks/`. Reuse its Foundation model/trainer/checkpoint path so all bound tasks execute the same implementation.
-- Add `component_usage` to `task_agent_result.json`, with one exact entry per bound component:
-```json
-{pretty_json(component_usage_example)}
-```
+- Add `component_usage` to `task_agent_result.json`, with one exact entry per bound component as shown once in the final result example.
 '''
         hardware_instruction = (
             'Follow each bound component execution.primary_framework and execution.device_policy exactly. '
@@ -369,7 +379,7 @@ The resolved component contract for this task is:
         runtime_policy=case_runtime.manifest if case_runtime is not None else None,
         runtime_lock=case_runtime.lock if case_runtime is not None else None,
     )
-    return f"""# Role: autonomous Codex task writer
+    prompt = f"""# Role: autonomous Codex task writer
 
 You own exactly one reproduction task. Write the code, run the assigned full experiment, compare the result directly with the complete paper, and keep revising and rerunning while a paper-grounded material scientific blocker remains. Your handoff is `ready_for_review`; only the independent reporter may grant final `matched`.
 
@@ -517,6 +527,55 @@ If feedback is present, investigate every reported difference against the paper'
 
 ## Experiment index
 ```json
-{pretty_json(experiment_index)[:8000]}
+{pretty_json(_task_experiment_index(experiment_index, [task]))}
 ```
 """
+    if not run_repro:
+        prompt = prompt.replace(
+            "Write the code, run the assigned full experiment, compare the result directly with the complete paper, and keep revising and rerunning while a paper-grounded material scientific blocker remains. Your handoff is `ready_for_review`; only the independent reporter may grant final `matched`.",
+            "Prepare the paper-faithful implementation and configs. Full execution is disabled; do not claim a scientific result.",
+        )
+        start = prompt.index("## Self-iteration protocol")
+        end = prompt.index("## Independent reporter feedback", start)
+        prompt = prompt[:start] + "## Preparation handoff\nKeep the implementation and configs ready for a later full run. Describe unresolved requirements in README.md; do not write a final task result.\n\n" + prompt[end:]
+    return prompt
+
+
+def _task_experiment_index(index: dict[str, Any], tasks: list[dict[str, Any]],
+                           unit: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Select complete matching experiments and explicit related tasks, never text slices."""
+    task_ids = {str(task.get('task_id') or '') for task in tasks}
+    experiment_ids = {str(task.get('experiment_id') or '') for task in tasks}
+    if unit:
+        task_ids.update(map(str, unit.get('task_ids', [])))
+        for relation in unit.get('relationships', []):
+            if isinstance(relation, dict):
+                task_ids.update(map(str, relation.get('task_ids', [])))
+                task_ids.update(map(str, relation.get('consumer_task_ids', [])))
+                task_ids.update(str(relation.get(k) or '') for k in ('producer_task_id', 'consumer_task_id'))
+    selected = [experiment for experiment in index.get('experiments', [])
+                if isinstance(experiment, dict) and (
+                    str(experiment.get('task_id') or '') in task_ids - {''}
+                    or str(experiment.get('experiment_id') or '') in experiment_ids - {''}
+                    or bool(set(map(str, experiment.get('task_ids', []))) & task_ids))]
+    return {"experiments": selected,
+            "complete_index": "paper_evidence/analysis_artifacts/experiment_index.json"}
+
+
+def _unit_fact_navigation(facts: dict[str, Any], tasks: list[dict[str, Any]]) -> dict[str, Any]:
+    """Emit shared fact records once while retaining each task's selected evidence."""
+    records: list[dict[str, Any]] = []
+    by_content: dict[str, int] = {}
+    task_indexes: dict[str, list[int]] = {}
+    for task in tasks:
+        indexes = []
+        for fact in facts_for_task(facts, task).get("engineering_facts", []):
+            key = json.dumps(fact, ensure_ascii=False, sort_keys=True)
+            if key not in by_content:
+                by_content[key] = len(records)
+                records.append(fact)
+            indexes.append(by_content[key])
+        task_indexes[str(task.get("task_id") or "")] = indexes
+    return {"engineering_facts": records, "task_fact_indexes_zero_based": task_indexes,
+            "missing_information": facts.get("missing_information", []),
+            "complete_facts": "paper_evidence/analysis_artifacts/engineering_facts.json"}

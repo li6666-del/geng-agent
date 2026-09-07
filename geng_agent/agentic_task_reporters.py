@@ -18,6 +18,8 @@ from .task_reporter_context import (
     REPORTER_CONVERGENCE_POLICY,
     TASK_VERIFICATION_FILE,
     _build_task_reporter_brief,
+    _canonicalize_reporter_paper_evidence,
+    _reporter_attachment_visibility,
     _copy_task_figure_candidates,
     _experiment_for_task,
     _load_task_reporter_cache,
@@ -99,6 +101,7 @@ def run_codex_task_reporter_workflow(
     figure_index: dict[str, Any] | None = None,
     round_no: int = 1,
     include_all_paper_pages: bool = False,
+    repair_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Verify one task in a workspace that contains no other writer output."""
 
@@ -121,6 +124,9 @@ def run_codex_task_reporter_workflow(
         figure_candidates=figure_candidates,
         writer_output_max_file_bytes=_WRITER_OUTPUT_MAX_FILE_BYTES,
         writer_output_max_total_bytes=_WRITER_OUTPUT_MAX_TOTAL_BYTES,
+        paper_images=paper_images,
+        paper=paper,
+        output_dir=output_dir,
     )
     status_path = task_audit_dir / "status.json"
     if resume:
@@ -156,6 +162,7 @@ def run_codex_task_reporter_workflow(
             paper_thesis=None,
             full_paper_images=paper_images,
         )
+        _canonicalize_reporter_paper_evidence(workspace)
         copied_figure_candidates = _copy_task_figure_candidates(
             workspace=workspace,
             output_dir=output_dir,
@@ -173,10 +180,24 @@ def run_codex_task_reporter_workflow(
             writer_output_max_total_bytes=_WRITER_OUTPUT_MAX_TOTAL_BYTES,
         )
         write_json(inputs_dir / "task_report_input.json", report_input)
+        if repair_context:
+            previous = Path(str(repair_context.get("workspace") or "")) / TASK_VERIFICATION_FILE
+            previous_note = ""
+            if previous.is_file() and not _path_is_link_like(previous) and previous.stat().st_size <= 1024 * 1024:
+                previous_note = previous.read_text(encoding="utf-8-sig", errors="replace")
+            write_text(inputs_dir / "previous_reporter_note.txt", previous_note)
+            write_json(inputs_dir / "reporter_repair.json", {
+                "kind": "structure_recovery",
+                "issues": repair_context.get("validation_issues") or [repair_context.get("error") or "No readable evidence note was produced"],
+                "previous_note": "inputs/previous_reporter_note.txt",
+                "evidence": "inputs/task_report_input.json",
+                "instruction": "Preserve existing scientific observations; repair only the stated delivery problem.",
+            })
         prompt = _build_task_reporter_brief(
             task_id=task_id,
             report_asset_dir=report_input["report_asset_dir"],
             include_all_paper_pages=include_all_paper_pages,
+            repair=bool(repair_context),
         )
         write_text(
             task_audit_dir / f"round_{reporter_round_no:03d}_brief.md",
@@ -201,6 +222,10 @@ def run_codex_task_reporter_workflow(
         figure_candidates=report_input.get("figure_candidates", []),
         include_all_paper_pages=include_all_paper_pages,
     )
+    attachment_manifest, visibility_note = _reporter_attachment_visibility(workspace, image_paths)
+    write_json(inputs_dir / "attachment_manifest.json", attachment_manifest)
+    prompt += visibility_note
+    write_text(task_audit_dir / f"round_{reporter_round_no:03d}_brief.md", prompt)
     immutable_inputs = trusted_input_snapshot(workspace, ("inputs", "paper_evidence"))
     codex_status = run_codex_subprocess(
         role="task_reporter",
@@ -224,6 +249,7 @@ def run_codex_task_reporter_workflow(
             error_kind="evidence_snapshot_modified")
     run_valid_hint = _task_record_run_valid_hint(task_record)
     raw_verification = _read_json_object(verification_path)
+    raw_note_available = bool(raw_verification)
     raw_verification, observation_evidence_warnings = normalize_reporter_observation_evidence(
         raw_verification, workspace, host_execution=task_record.get("host_execution")
     )
@@ -249,6 +275,7 @@ def run_codex_task_reporter_workflow(
         task_id,
         task=task,
         run_valid_hint=run_valid_hint,
+        evidence_workspace=workspace,
     )
     schema_warnings = [
         f"{issue.path}: {issue.message}"
@@ -265,7 +292,7 @@ def run_codex_task_reporter_workflow(
         + observation_evidence_warnings
         + _evidence_path_issues(verification, workspace)
     )
-    process_usable = bool(codex_status.get("ok")) or bool(raw_verification)
+    process_usable = raw_note_available
     scientific_terminal = (
         process_usable
         and not validation_issues
@@ -396,6 +423,7 @@ def run_codex_task_reporter_workflow(
         ),
         "task_verification": verification,
         "validation_issues": validation_issues,
+        "recovery_kind": "structure" if not raw_note_available or validation_issues else None,
         "validation_warnings": validation_warnings,
         "asset_issues": asset_issues,
         "asset_paths": copied_assets,
@@ -410,6 +438,7 @@ def run_codex_task_reporter_workflow(
         "error": (
             None
             if ok
+            else "Reporter did not produce a readable evidence note" if not raw_note_available
             else _task_reporter_reason(codex_status, validation_issues, [])
         ),
     }

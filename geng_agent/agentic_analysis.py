@@ -12,7 +12,11 @@ from .codex_runner import run_codex_subprocess
 from .json_utils import parse_json_object
 from .llm import LLMImage
 from .outputs import write_json, write_text
-from .pipeline_helpers import build_json_inline_retry_prompt
+from .pipeline_helpers import (
+    build_json_inline_retry_prompt, build_json_scientific_retry_prompt,
+    build_json_preservation_retry_prompt,
+)
+from .analysis_repair import preserved_science_issues, scientific_correction_paths
 from .schema_models import model_for_stage
 from .schemas import ValidationIssue, format_issues, validate_stage
 
@@ -50,6 +54,8 @@ def run_codex_json_stage(
     current_prompt = prompt
     last_errors = ""
     repair_mode = False
+    scientific_repair = False
+    authorized_paths: list[str] = []
     repair_baseline: dict[str, Any] | None = None
 
     for attempt in range(1, attempts + 1):
@@ -71,7 +77,7 @@ def run_codex_json_stage(
             label=label,
             sandbox="read-only",
             command_override=get_config_value("GENG_CODEX_ANALYSIS_CMD"),
-            image_paths=[] if repair_mode else image_paths,
+            image_paths=[] if repair_mode and not scientific_repair else image_paths,
         )
         if not status.get("ok"):
             last_errors = status.get("error") or "Codex analysis subprocess failed"
@@ -86,6 +92,7 @@ def run_codex_json_stage(
             if repair_baseline is None:
                 current_prompt = prompt
                 repair_mode = False
+                scientific_repair = False
             continue
 
         try:
@@ -118,6 +125,7 @@ def run_codex_json_stage(
                     issues=[ValidationIssue("$", last_errors)],
                 )
                 repair_mode = True
+                scientific_repair = False
                 continue
             parsed = recovered
 
@@ -136,7 +144,9 @@ def run_codex_json_stage(
         # preservation/scientific finding instead of stopping at the first
         # non-empty category.
         if not schema_issues and repair_baseline is not None and repair_preservation_validator is not None:
-            preservation_issues = repair_preservation_validator(repair_baseline, parsed)
+            preservation_issues = preserved_science_issues(
+                repair_preservation_validator, repair_baseline, parsed, authorized_paths,
+            )
         if not schema_issues and extra_validation is not None:
             scientific_issues = extra_validation(parsed)
         issues = [
@@ -188,11 +198,29 @@ def run_codex_json_stage(
                     "repair_will_retry": attempt < attempts,
                 },
             )
-        current_prompt = build_json_inline_retry_prompt(
-            candidate_text=json.dumps(parsed, ensure_ascii=False, indent=2),
-            schema_text=schema_text,
-            issues=issues,
-        )
+        scientific_repair = bool(scientific_issues or normalization_issues)
+        if scientific_repair:
+            authorized_paths = list(dict.fromkeys([
+                *authorized_paths,
+                *scientific_correction_paths([*scientific_issues, *normalization_issues], parsed, repair_baseline),
+            ]))
+            current_prompt = build_json_scientific_retry_prompt(
+                candidate_text=json.dumps(parsed, ensure_ascii=False, indent=2),
+                schema_text=schema_text, issues=issues, original_task=prompt,
+                authorized_paths=authorized_paths,
+                preservation_baseline_text=(json.dumps(repair_baseline, ensure_ascii=False, indent=2) if preservation_issues else None),
+            )
+        elif preservation_issues:
+            current_prompt = build_json_preservation_retry_prompt(
+                candidate_text=json.dumps(parsed, ensure_ascii=False, indent=2),
+                baseline_text=json.dumps(repair_baseline, ensure_ascii=False, indent=2),
+                schema_text=schema_text, issues=issues, authorized_paths=authorized_paths,
+            )
+        else:
+            current_prompt = build_json_inline_retry_prompt(
+                candidate_text=json.dumps(parsed, ensure_ascii=False, indent=2),
+                schema_text=schema_text, issues=issues,
+            )
         repair_mode = True
 
     error_doc = {

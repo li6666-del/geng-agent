@@ -39,6 +39,7 @@ from .task_writer_state import (
 from .task_writer_support import PAPER_EVIDENCE_DIR, _restore_trusted_files
 from .task_writer_units import _execution_unit_sandbox, _public_execution_unit
 from .verification_result import rerun_evidence_path_issues, task_verification_issues, writer_revision_allowed
+from .writer_recovery import localize_writer_feedback, writer_recovery_context, archive_satisfied_environment_request
 
 
 def _external_writer_rerun_budget() -> int:
@@ -153,7 +154,7 @@ def _run_one_execution_unit_writer(
         paper_thesis=paper_thesis,
         bindings=bindings,
         run_repro=run_repro,
-        review_feedback=review_feedback,
+        review_feedback={},
         foundation_enabled=foundation is not None,
         case_runtime=case_runtime,
     )
@@ -167,6 +168,7 @@ def _run_one_execution_unit_writer(
         for task_id, value in review_feedback.items()
         if task_id in {str(task.get("task_id") or entry.get("task_id") or "") for _, task, entry in members}
     }
+    recovery_reason = "environment_or_runtime_refresh" if runtime_refresh_required else "resume_incomplete_delivery"
 
     if reuse_existing:
         existing_records: list[dict[str, Any]] = []
@@ -216,6 +218,7 @@ def _run_one_execution_unit_writer(
                 )
                 evidence_based_reruns = 1
                 current_feedback = requested
+                recovery_reason = "reporter_causal_revision"
             elif not current_feedback:
                 return existing_records
             required_change_baseline = _writer_source_config_fingerprint(sandbox)
@@ -244,12 +247,15 @@ def _run_one_execution_unit_writer(
         label_base = f"03c_execution_unit_{int(unit.get('unit_index') or 1):02d}_{safe_label(unit_id)}"
         prompt = (
             base_prompt
-            if session_round == 1
+            if session_round == 1 and not current_feedback
             else _build_execution_unit_continuation_brief(
                 base_prompt=base_prompt,
                 unit_id=unit_id,
                 session_round=session_round,
                 review_feedback=current_feedback,
+                run_repro=run_repro,
+                recovery_context=writer_recovery_context(sandbox, reason=recovery_reason,
+                    task_ids=[str(task.get("task_id") or entry.get("task_id") or "") for _, task, entry in members]),
             )
         )
         # Some case volumes expose sub-second mtimes with a coarse rounding
@@ -400,6 +406,7 @@ def _run_one_execution_unit_writer(
         seen_rerun_requests.update(fingerprints)
         evidence_based_reruns += 1
         current_feedback = requested_feedback
+        recovery_reason = "reporter_causal_revision"
         required_change_baseline = _writer_source_config_fingerprint(sandbox)
         _archive_execution_unit_delivery(
             sandbox=sandbox,
@@ -489,7 +496,7 @@ def _run_one_task_writer(
         paper_context_json=paper_context_json,
         paper_thesis=paper_thesis,
         run_repro=run_repro,
-        review_feedback=review_feedback,
+        review_feedback=None,
         foundation_enabled=foundation is not None,
         execution_binding=execution_binding,
         case_runtime=case_runtime,
@@ -500,6 +507,7 @@ def _run_one_task_writer(
     evidence_based_reruns = 0
     rerun_budget = _external_writer_rerun_budget()
     required_change_baseline: str | None = None
+    recovery_reason = "environment_or_runtime_refresh" if runtime_refresh_required else "resume_incomplete_delivery"
     if reuse_existing:
         archive_round = _next_writer_progress_round(sandbox)
         if runtime_refresh_required:
@@ -545,6 +553,7 @@ def _run_one_task_writer(
                     seen_rerun_requests.add(_rerun_evidence_fingerprint(evidence, _writer_progress_fingerprint(sandbox)))
                     evidence_based_reruns = 1
                     review_feedback = returned_feedback
+                    recovery_reason = "reporter_causal_revision"
                     required_change_baseline = _record_source_config_fingerprint(
                         existing_record,
                         sandbox,
@@ -562,13 +571,15 @@ def _run_one_task_writer(
         label = base_label if session_round == 1 else f"{base_label}_continue_{session_round:03d}"
         prompt = (
             base_prompt
-            if session_round == 1
+            if session_round == 1 and not review_feedback
             else _build_task_writer_continuation_brief(
                 base_prompt=base_prompt,
                 task_id=task_id,
                 module=module,
                 session_round=session_round,
                 review_feedback=review_feedback,
+                run_repro=run_repro,
+                recovery_context=writer_recovery_context(sandbox, reason=recovery_reason, task_ids=[task_id]),
             )
         )
         session_started_at = time.time()
@@ -706,6 +717,7 @@ def _run_one_task_writer(
             seen_rerun_requests.add(rerun_fingerprint)
             evidence_based_reruns += 1
             review_feedback = returned_feedback
+            recovery_reason = "reporter_causal_revision"
             required_change_baseline = _record_source_config_fingerprint(
                 record,
                 sandbox,
@@ -797,7 +809,12 @@ def _attach_task_reporter_review(
                 record["foundation_revision_request"] = request
                 record["task_reporter_terminal"] = False
                 return "terminal", None
-            return "writer_revision", verification
+            feedback = localize_writer_feedback(
+                verification, reporter_root=Path(str(task_reporter.get("workspace") or "")),
+                sandbox=Path(str(record.get("sandbox") or "")),
+                output_subdir=str(record.get("output_subdir") or expected_task_id),
+            )
+            return "writer_revision", feedback
         else:
             # A malformed rerun request is not a reason to burn another full run.
             _terminalize_rerun_request(
@@ -863,6 +880,15 @@ def _run_task_writer_codex_session(
     request_source: str = "task_writer",
     require_execution_receipt: bool = True,
 ) -> dict[str, Any]:
+    if case_runtime is not None:
+        try:
+            resolved_request = archive_satisfied_environment_request(sandbox, case_runtime)
+        except (ValueError, OSError, EnvironmentPolicyError) as exc:
+            return {"ok": False, "error_kind": "environment_request_invalid",
+                    "blocked_reason": f"Could not safely restore dependency request state: {exc}"}
+        if resolved_request:
+            prompt += (f"\nThe host verified and archived the previous dependency request at `{resolved_request}`. "
+                       "Continue the preserved implementation with the updated environment; do not request the same installed dependencies again.\n")
     write_text(audit_dir / f"{label}_brief.md", prompt)
     selected_python = (
         case_runtime.python_executable if case_runtime is not None else Path(sys.executable).absolute()
@@ -877,15 +903,19 @@ def _run_task_writer_codex_session(
         runtime_env["VIRTUAL_ENV"] = str(case_runtime.venv_dir)
     evidence_before = trusted_input_snapshot(sandbox, (PAPER_EVIDENCE_DIR,))
     with ExecutionBroker(sandbox, audit_dir, selected_python,
-                         environment_hash=case_runtime.environment_hash if case_runtime else "") as broker:
+                         environment_hash=case_runtime.environment_hash if case_runtime else "",
+                         allow_full=require_execution_receipt) as broker:
         runtime_env["GENG_EXECUTION_BROKER"] = broker.session_id
-        prompt += ("\n\nHost-observed execution: use `$GENG_PYTHON run_task.py --task TASK_ID --config configs/TASK_ID.full.json --mode full` "
-                   "(use your actual manifest config path). Invoke the selected Python using your shell's syntax. "
-                   "Smoke uses --mode smoke. Declare consumed persistent checkpoint/data files with repeatable --input RELATIVE_PATH. "
+        prompt += ("\n\nHost-observed execution: invoke the selected Python using your shell's syntax and use the task's actual config path. "
+                   "Use `run_task.py --task TASK_ID --status` to inspect an in-flight or completed execution, "
+                   "including its host-owned log paths. Add --submit to a launch command for prompt return. "
+                   "Declare consumed persistent checkpoint/data files with repeatable --input RELATIVE_PATH. "
                    "The host records the real process exit, source/config/input/output hashes; raw Python executions are exploratory "
                    "and cannot establish delivery provenance. Wait for an in-flight execution; do not launch it again after a CLI polling timeout. "
                    "If the observed execution fails, inspect its stderr_tail and repair before submitting another run. "
                    "Do not write execution_receipt.json yourself. Final notes may be added after the run; changing source/config/results requires a new receipt.\n")
+        if not require_execution_receipt:
+            prompt += "Full execution is disabled for this preparation session. Do not submit a full experiment.\n"
         status = run_codex_subprocess(
             role="task_writer", work_dir=sandbox, prompt=prompt, audit_dir=audit_dir,
             label=label, sandbox="workspace-write",

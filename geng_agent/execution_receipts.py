@@ -185,9 +185,10 @@ def validate_receipt(root: Path, receipt: dict[str, Any], *, task_id: str) -> di
 class ExecutionBroker:
     """One serial scientific execution queue per isolated Writer workspace."""
 
-    def __init__(self, root: Path, audit_dir: Path, python: Path, *, environment_hash: str = ""):
+    def __init__(self, root: Path, audit_dir: Path, python: Path, *, environment_hash: str = "", allow_full: bool = True):
         self.root, self.audit_dir, self.python = root.resolve(), audit_dir.resolve(), python
         self.environment_hash = environment_hash
+        self.allow_full = allow_full
         self.session_id = uuid.uuid4().hex
         self.queue = self.root / ".geng_execution" / self.session_id
         manifest_path = _inside(self.root, "tasks_manifest.json")
@@ -196,6 +197,8 @@ class ExecutionBroker:
         # can request an environment, but cannot launch an undeclared task.
         self.entries = {str(t["task_id"]): dict(t) for t in manifest.get("tasks", [])}
         self.receipts: list[dict[str, Any]] = []
+        self.task_status: dict[str, dict[str, Any]] = {}
+        self.completed_pending: dict[str, dict[str, Any]] = {}
         self.process: subprocess.Popen | None = None
         self.cancelled = threading.Event()
         self.stopped = threading.Event()
@@ -203,6 +206,7 @@ class ExecutionBroker:
 
     def __enter__(self):
         self.queue.mkdir(parents=True, exist_ok=True)
+        self._publish_response(self.queue / "status.json", {"tasks": {}})
         self.thread.start()
         return self
 
@@ -246,20 +250,105 @@ class ExecutionBroker:
                     continue
                 handled.add(path.name)
                 result_path = path.with_name(path.name.replace(".request.", ".result."))
+                task_id = ""
                 try:
                     request = json.loads(_inside(self.root, path.relative_to(self.root).as_posix()).read_text(encoding="utf-8"))
+                    task_id = str(request.get("task_id") or "")
+                    completed = self.completed_pending.pop(path.name, None)
+                    if completed is not None and (
+                        # Enumerate only when consuming an actual pending result:
+                        # adding an optional module can change execution as well
+                        # as modifying an existing source file.
+                        self._request_identity(request)
+                        == completed["request_identity"]
+                        and self._observed_identity_is_current(completed["receipt"])
+                    ):
+                        # A second client submitted while this task was still running.
+                        # Return the original observation instead of duplicating science.
+                        self._publish_response(result_path, completed["receipt"])
+                        continue
+                    self._set_status(task_id, {"state": "starting", "request_id": path.name.removesuffix(".request.json")})
+                    request_sources = source_hashes(self.root)
+                    request_identity = self._request_identity(request, source_snapshot=request_sources)
                     receipt = self.execute(request)
                     self.receipts.append(receipt)
+                    # Snapshot already queued requests while the just-completed
+                    # execution is still current. Do not infer ordering from
+                    # filesystem mtimes (some case volumes round them forward).
+                    for pending in self.queue.glob("*.request.json"):
+                        if pending.name in handled:
+                            continue
+                        try:
+                            queued = json.loads(_inside(self.root, pending.relative_to(self.root).as_posix()).read_text(encoding="utf-8"))
+                            if self._request_identity(queued, source_snapshot=self._current_recorded_hashes(request_sources)) == request_identity:
+                                self.completed_pending[pending.name] = {
+                                    "request_identity": request_identity,
+                                    "receipt": receipt,
+                                }
+                        except (OSError, ValueError):
+                            pass  # Normal request handling will report the malformed entry.
+                    self._set_status(task_id, {"state": "completed", "result": {
+                        key: receipt[key] for key in ("run_id", "task_id", "returncode") if key in receipt},
+                        "receipt_path": f"outputs/{self.entries[task_id].get('output_subdir') or task_id}/execution_receipt.json"})
                     self._publish_response(result_path, receipt)
                 except Exception as exc:
                     try:
-                        self._publish_response(result_path, {"returncode": 1, "error": f"{type(exc).__name__}: {exc}"})
+                        failure = {"returncode": 1, "error": f"{type(exc).__name__}: {exc}"}
+                        if task_id:
+                            self._set_status(task_id, {"state": "failed", "result": failure})
+                        self._publish_response(result_path, failure)
                     except (ValueError, OSError):
                         # An unsafe Writer-controlled response path must never
                         # redirect a host write outside the sandbox.
                         write_json(self.audit_dir / "execution_runs" / f"rejected_{uuid.uuid4().hex}.json",
                                    {"error": "unsafe execution request or response path"})
             self.stopped.wait(0.15)
+
+    def _set_status(self, task_id: str, update: dict[str, Any]) -> None:
+        _inside(self.root, self.queue.relative_to(self.root).as_posix()).mkdir(parents=True, exist_ok=True)
+        if update.get("state") == "starting":
+            self.task_status.pop(task_id, None)
+        self.task_status[task_id] = {**self.task_status.get(task_id, {}), **update, "task_id": task_id}
+        self._publish_response(self.queue / "status.json", {"tasks": self.task_status})
+
+    def _current_recorded_hashes(self, recorded: dict[str, Any]) -> dict[str, Any]:
+        """Recheck known files without enumerating the project again."""
+        current = {}
+        for relative in recorded:
+            try:
+                current[relative] = file_hash(_inside(self.root, relative))
+            except (OSError, ValueError):
+                current[relative] = None
+        return current
+
+    def _observed_identity_is_current(self, receipt: dict[str, Any]) -> bool:
+        """Include hard-coded reads captured by the process, not only CLI inputs."""
+        if receipt.get("inputs_stable") is not True:
+            return False
+        for key in ("source_hashes", "input_hashes"):
+            recorded = receipt.get(key)
+            if not isinstance(recorded, dict) or self._current_recorded_hashes(recorded) != recorded:
+                return False
+        return True
+
+    def _request_identity(self, request: dict[str, Any], *, source_snapshot: dict[str, Any] | None = None) -> str:
+        """Only identical science requests may reuse an in-flight observation."""
+        task_id = str(request.get("task_id") or "")
+        mode = str(request.get("mode") or "full")
+        entry = self.entries[task_id]
+        config_name = str(request.get("config") or entry.get("config_smoke" if mode == "smoke" else "config_full") or "config.json")
+        config = _inside(self.root, config_name)
+        input_names = set(map(str, request.get("inputs", [])))
+        if config.is_file():
+            input_names.update(_configuration_file_inputs(self.root, json.loads(config.read_text(encoding="utf-8-sig"))))
+        inputs = sorted({_inside(self.root, path).resolve().relative_to(self.root).as_posix()
+                         for path in input_names})
+        identity = {"task_id": task_id, "mode": mode,
+            "config": config.resolve().relative_to(self.root).as_posix(),
+            "config_hash": file_hash(config) if config.is_file() else None,
+            "inputs": {path: file_hash(_inside(self.root, path)) if _inside(self.root, path).is_file() else None for path in inputs},
+            "source_hashes": source_snapshot if source_snapshot is not None else source_hashes(self.root)}
+        return hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()
 
     def _publish_response(self, path: Path, value: dict[str, Any]) -> None:
         relative = path.relative_to(self.root).as_posix()
@@ -271,12 +360,14 @@ class ExecutionBroker:
         temporary.replace(target)
 
     def execute(self, request: dict[str, Any]) -> dict[str, Any]:
+        if not self.allow_full and str(request.get("mode") or "full") == "full":
+            raise ValueError("full execution is disabled for this preparation session; smoke remains available")
         from .codex_runner import _FOUNDATION_UNITTEST_GUARD, _foundation_unittest_guard_config
         from .security_env import build_safe_env
 
         task_id = str(request.get("task_id") or "")
         entry = self.entries[task_id]
-        config_rel = str(request.get("config") or entry.get("config_full") or "config.json")
+        config_rel = str(request.get("config") or entry.get("config_smoke" if request.get("mode") == "smoke" else "config_full") or "config.json")
         config = _inside(self.root, config_rel)
         if not config.is_file() or config.suffix.lower() != ".json":
             raise ValueError("execution requires an existing project JSON configuration")
@@ -347,6 +438,10 @@ class ExecutionBroker:
             process = subprocess.Popen(launch["command"], cwd=self.root, env=launch["env"], stdout=stdout, stderr=stderr,
                 start_new_session=os.name != "nt", creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0)
             self.process = process
+            self._set_status(task_id, {"state": "running", "run_id": run_id,
+                "pid": process.pid, "pid_kind": "os_sandbox_supervisor",
+                "stdout_log": str(run_dir / "stdout.log"), "stderr_log": str(run_dir / "stderr.log"),
+                "started_at": started})
             if self.cancelled.is_set():
                 self._stop_process()
             returncode = process.wait()

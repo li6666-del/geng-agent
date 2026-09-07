@@ -13,7 +13,7 @@ from .pipeline_helpers import _read_json_file
 from .schemas import ValidationIssue, validate_stage
 
 
-STAGE_CACHE_FORMAT_VERSION = "semantic_inputs_v2"
+STAGE_CACHE_FORMAT_VERSION = "scientific_inputs_and_contract_v3"
 
 
 def _sha256_file(path: Path) -> str:
@@ -39,6 +39,7 @@ def build_stage_cache_metadata(
 ) -> dict[str, str]:
     """Build an explicit content-addressed resume key without adding a stage gate."""
     from .schema_models import model_for_stage
+    from .prompt_identity import scientific_cache_value, text_identity
 
     schema_hash = _canonical_sha256(model_for_stage(schema_stage).model_json_schema())
     identity = {
@@ -46,13 +47,11 @@ def build_stage_cache_metadata(
         "stage_label": stage_label,
         "schema_stage": schema_stage,
         "policy_version": policy_version,
-        "inputs_sha256": _canonical_sha256(inputs),
-    }
-    diagnostics = {
-        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "inputs_sha256": _canonical_sha256(scientific_cache_value(inputs)),
+        "prompt_sha256": text_identity(prompt),
         "schema_sha256": schema_hash,
     }
-    return {**identity, **diagnostics, "fingerprint": _canonical_sha256(identity)}
+    return {**identity, "fingerprint": _canonical_sha256(identity)}
 
 
 def _load_result_review_document(output_dir: Path, result_review_result: dict[str, Any]) -> dict[str, Any]:

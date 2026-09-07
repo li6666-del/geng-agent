@@ -62,6 +62,7 @@ CoreConclusionStatus = Literal[
     "supported",
     "unsupported",
     "unassessable_missing_information",
+    "not_applicable",
 ]
 NumericEvidenceQuality = Literal[
     "paper_explicit",
@@ -126,6 +127,7 @@ class CoreConclusionAssessment(StrictModel):
     status: CoreConclusionStatus = "unassessable_missing_information"
     local_observation: str = ""
     evidence_files: list[str] = Field(default_factory=list)
+    basis_review: dict[str, Any] | None = None
 
 
 class KeyNumericComparison(StrictModel):
@@ -135,6 +137,15 @@ class KeyNumericComparison(StrictModel):
     local_magnitude: float | None = Field(allow_inf_nan=False)
     symmetric_ratio: float | None = Field(default=None, ge=1, allow_inf_nan=False)
     unavailable_reason: str = ""
+    comparison_status: str = "comparable"
+    metric: str = ""
+    unit: str = ""
+    regime: str = ""
+    local_metric: str | None = None
+    local_unit: str | None = None
+    local_regime: str | None = None
+    incompatible_dimensions: list[str] = Field(default_factory=list)
+    basis_review: dict[str, Any] | None = None
 
 
 class ReporterRerunEvidence(StrictModel):
@@ -563,6 +574,8 @@ class TaskVerificationResult(StrictModel):
     feedback: list[str] = Field(default_factory=list)
     confidence: Confidence = "medium"
     remaining_uncertainties: list[str] = Field(default_factory=list)
+    verified_facts: list[dict[str, Any]] = Field(default_factory=list)
+    provenance_base: str = ""
 
 
 class IsolatedTaskVerificationDocument(TaskVerificationResult):

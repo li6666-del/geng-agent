@@ -658,8 +658,8 @@ def _protected_item_issues(
         if str(item.get("id") or "")
     }
     issues: list[ValidationIssue] = []
-    after_by_task_id = {
-        str(item.get("task_id") or ""): item
+    after_by_binding_id = {
+        (str(item.get("task_id") or ""), str(item.get("experiment_id") or "")): item
         for item in after_items
         if str(item.get("task_id") or "")
     }
@@ -678,9 +678,9 @@ def _protected_item_issues(
                 continue
         elif (
             list_name == "bindings"
-            and str(prior_item.get("task_id") or "") in after_by_task_id
+            and (str(prior_item.get("task_id") or ""), str(prior_item.get("experiment_id") or "")) in after_by_binding_id
         ):
-            current_item = after_by_task_id[str(prior_item.get("task_id") or "")]
+            current_item = after_by_binding_id[(str(prior_item.get("task_id") or ""), str(prior_item.get("experiment_id") or ""))]
         elif index < len(after_items):
             current_item = after_items[index]
         if current_item is None:

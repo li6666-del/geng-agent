@@ -69,8 +69,9 @@ class PaperThesisPromptTests(unittest.TestCase):
             "JSON object",
         ):
             self.assertIn(needle, prompt)
-        # the mechanism must be prose, NOT a transcribed bound (that was the round-1 noise trap)
-        self.assertIn("不要转写", prompt)
+        self.assertIn("理论界", prompt)
+        self.assertIn("不得把决定结论的条件", prompt)
+        self.assertIn("不要强迫总排序", prompt)
 
 
 class ThesisOrderingMatchTests(unittest.TestCase):

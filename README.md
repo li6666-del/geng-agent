@@ -9,6 +9,8 @@ Case 工作流只接受 `workflow_version: "2"`。已有阶段产物但缺少有
 
 本轮通用复现整改的实现范围和实际验证记录见 [实施计划](docs/reproduction_remediation_plan.md) 与 [验证记录](docs/remediation_validation_20260906.md)。
 
+提示词与调用上下文的后续整改见 [修改计划](docs/prompt_context_remediation_plan.md) 和 [本地回归及 21 次静态模型对照](docs/prompt_context_validation_20260906.md)。后者明确区分科学判断、实际 token/缓存用量与完整论文复现的验证边界。
+
 
 ## 当前能力
 

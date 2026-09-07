@@ -6,6 +6,7 @@
 3. 输出必须是一个 JSON object，不要 Markdown 或解释文字。
 
 刷新要求：
+0. Preserve each proposed method and baseline's scientific identity: essential operations or learned modules, equation validity conditions, tensor/complex-valued conventions, units and power/noise normalization, side information, train/test separation, checkpoint selection, and comparison resource budgets. Resolve only what the evidence supports in the existing specification fields. A disclosed proxy remains a proxy; do not rename it as the paper's method or remove the resulting uncertainty.
 1. 保持当前任务的 task_id 和实验覆盖范围稳定，不得因为措辞不同重复创建任务。
 2. 用新事实完善公式链、参数矩阵、baseline 定义、统计协议和图像验收锚点。
 3. 只有新事实暴露出会改变任务是否存在、任务合并/拆分、算法公式、系统/数据模型、baseline 身份、坐标轴或参数扫描范围的未知信息时，才创建新的 missing_fact_request。

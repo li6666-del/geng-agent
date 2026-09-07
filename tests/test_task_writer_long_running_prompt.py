@@ -8,21 +8,14 @@ from geng_agent.task_writer_prompts import (
 
 def _assert_durable_long_run_protocol(prompt: str) -> None:
     flattened = " ".join(prompt.split())
-    assert prompt.count("## Durable long-running full protocol") == 1
-    assert "not to one interactive terminal/tool call" in flattened
-    assert "Windows or POSIX" in flattened
-    assert "Start-Process ... -WindowStyle Hidden" in flattened
-    assert "`setsid`/`nohup`" in flattened
-    assert "`writer_progress/live_runs/<run-id>/`" in flattened
-    assert "wrapper PID and scientific child PID" in flattened
-    assert "stdout log" in flattened
-    assert "stderr log" in flattened
-    assert "atomic exit-code/completion marker" in flattened
-    assert "short, bounded status checks" in flattened
-    assert "return code 124" in flattened
-    assert "Never kill, replace, or launch a duplicate full" in flattened
-    assert "do not invent return code 0" in flattened
-    assert "Do not add a fixed end-to-end timeout" in flattened
+    assert prompt.count("## Host-owned scientific execution") == 1
+    assert "--submit" in flattened and "--status" in flattened
+    assert "Submission is not completion" in flattened
+    assert "host owns the scientific process" in flattened
+    assert "wait for an in-flight run" in flattened
+    assert "never invent return code 0" in flattened
+    assert "Start-Process" not in flattened
+    assert "writer_progress/live_runs" not in flattened
 
 
 def test_single_task_writer_uses_durable_long_run_protocol() -> None:

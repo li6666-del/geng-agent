@@ -32,6 +32,7 @@
 6. impact 仅作为兼容性描述，不是程序继续回补的门禁；是否继续由后续任务专家根据能否负责任地交给 Writer 判断。
 
 任务规格原则：
+0. For each proposed method and baseline, retain the details that determine scientific identity or comparability in the existing specification fields: essential operations or learned modules, equation validity conditions, tensor and complex-valued conventions, units and power/noise normalization, available side information, training/test separation, checkpoint selection, and the comparison's resource budget. Preserve uncertainty instead of substituting a convenient proxy under the original method name. Do not add generic placeholder requirements when they do not affect this experiment.
 1. 只填写会改变实现、运行或核心结论验收的 formula_chain、parameter_matrix、baseline_definitions、statistical_protocol 和 validation_anchors；不适用的部分可省略或留空，不得用通用占位文本凑结构。
 2. 实际填写的规格项标记 `evidenced|assumed|unresolved` 并尽量引用 evidence_facts；引用暂时无法精确解析时保留内容并标记 unresolved。
 3. 无法从当前证据确定的规格可以保留 unresolved 或空数组，不要为了填满格式而发明内容。

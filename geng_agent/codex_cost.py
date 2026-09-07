@@ -36,12 +36,13 @@ def parse_codex_usage(transcript: str) -> dict[str, int] | None:
 
 def record_codex_invocation(audit_dir: Path, status: dict[str, Any], transcript: str,
                             *, started_at: float) -> dict[str, Any]:
-    event = {"schema_version": "1.0", "invocation_id": uuid.uuid4().hex,
+    event = {"schema_version": "1.0", "invocation_id": status.get("invocation_id") or uuid.uuid4().hex,
              "started_at": started_at, "finished_at": time.time(),
              "role": status.get("role"), "model": status.get("model"),
              "ok": bool(status.get("ok")), "duration_s": status.get("duration_s"),
              "usage": parse_codex_usage(transcript), "cost_usd": None,
-             "usage_complete": bool(status.get("ok"))}
+             "usage_complete": bool(status.get("ok")),
+             "input_manifest": status.get("input_manifest")}
     case_audit = next((path for path in (audit_dir, *audit_dir.parents) if path.name == "audit"), audit_dir)
     directory = case_audit / "codex_usage_events"
     directory.mkdir(parents=True, exist_ok=True)

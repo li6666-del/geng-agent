@@ -6,6 +6,7 @@
 3. 只输出一个 JSON object，不要 Markdown 或解释文字。
 
 字段级回补要求：
+0. 先核对 evidence_inventory。本轮文本是针对请求从全部已加载文本重新选择的片段，仍可能不是全文。只有实际完成相关原文范围的搜索后才使用 not_found_in_paper；若遗漏块或未收到的图像可能包含答案，保留该字段未完成（省略 field_result，使其保持 open），并在 missing_information 说明尚未检查的范围。API 不具备读取本地路径的能力；Codex 可只读提供的原文入口。不得把“当前材料没显示”写成“论文未披露”。
 1. 逐一尝试处理 targeted_requests 中每个 request_id 的 required_fields；能够可靠判断的字段各输出一个 field_result，论文未披露时明确使用 not_found_in_paper。若上下文或输出容量不足，宁可保留已完成的合法字段，也不要改写 ID、拼凑残缺条目或编造答案。
 2. 找到论文明确证据时使用 `resolved_explicit`，并引用 `evidence_kind="paper_explicit"` 的事实。
 3. 能从论文公式确定性推导时使用 `resolved_derived`，事实写 `evidence_kind="paper_derived"` 并在 derivation 中说明推导链。

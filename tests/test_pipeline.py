@@ -843,33 +843,22 @@ class PipelineTests(unittest.TestCase):
             audit.mkdir(parents=True)
             candidate = fact_doc(fact("channel_model", "AWGN"))
             cache_inputs = {"paper_source_sha256": "a" * 64}
-            candidate["_meta"] = {
-                "cache": build_stage_cache_metadata(
-                    stage_label="probe",
-                    schema_stage="engineering_facts",
-                    prompt="must not run",
-                    policy_version=SCIENTIFIC_POLICY_ID,
-                    inputs=cache_inputs,
-                )
-            }
+            stage_options = dict(
+                output_path=output / "engineering_facts.json", output_dir=output, audit_dir=audit,
+                prompt="must not run", stage_label="probe", cleanup_stage="facts",
+                schema_stage="engineering_facts", max_attempts=1,
+                candidate_normalizer=lambda value: value, salvage_failed_candidates=True,
+                cache_inputs=cache_inputs, backend=CODEX_ANALYSIS_BACKEND,
+            )
+            # Obtain a real stage cache envelope through the mocked generation
+            # boundary. Contract additions must not make this test call an LLM.
+            with patch("geng_agent.pipeline.run_codex_json_stage", return_value=candidate):
+                candidate = ReviewPipeline()._load_or_create_stage_json(resume=False, **stage_options)
             candidate_path = audit / "normalized_probe_attempt_1.json"
             write_json(candidate_path, candidate)
-
-            result = ReviewPipeline()._load_or_create_stage_json(
-                output_path=output / "engineering_facts.json",
-                output_dir=output,
-                audit_dir=audit,
-                prompt="must not run",
-                stage_label="probe",
-                cleanup_stage="facts",
-                schema_stage="engineering_facts",
-                max_attempts=1,
-                resume=True,
-                candidate_normalizer=lambda value: value,
-                salvage_failed_candidates=True,
-                cache_inputs=cache_inputs,
-                backend=CODEX_ANALYSIS_BACKEND,
-            )
+            (output / "engineering_facts.json").unlink()
+            with patch("geng_agent.pipeline.run_codex_json_stage", side_effect=AssertionError("salvage must never call an LLM")):
+                result = ReviewPipeline()._load_or_create_stage_json(resume=True, **stage_options)
 
             self.assertEqual(result["engineering_facts"][0]["name"], "AWGN")
             self.assertEqual(result["_meta"]["analysis_resume_source"], candidate_path.name)

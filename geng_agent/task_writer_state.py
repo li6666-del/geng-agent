@@ -847,7 +847,7 @@ def _archive_nonterminal_writer_delivery(
         progress_dir / "session_status.json",
         {
             "terminal": False,
-            "reason": "writer session ended without ready_for_review",
+            "reason": session_status.get("source") or session_status.get("error_kind") or "delivery_archived_for_continuation",
             "session_status": session_status,
         },
     )

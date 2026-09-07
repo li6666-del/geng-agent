@@ -72,13 +72,12 @@ def _render_fallback_review(
             )
             + " |"
         )
-    verdict = _compact_value(risk_report.get("reproducibility_verdict"))
     lines.extend(
         [
             "",
             "## 总体结论",
             "",
-            verdict or f"共 {len(task_packets)} 个任务已形成可报告终态，详细参数、结构化证据和可用图像见另外两份报告。",
+            f"共 {len(task_packets)} 个任务已形成可报告终态。各项结论及不确定性见宿主终态表与两份详细报告。",
             "",
             "- [本地复现报告](reproduction_report.md)",
             "- [论文复现结果对比报告](result_review.md)",
@@ -97,16 +96,15 @@ def _render_fallback_reproduction(task_packets: list[dict[str, Any]]) -> str:
                 "",
                 f"- 任务标识：`{packet.get('task_id') or 'task'}`",
                 f"- 终态：{_packet_outcome_label(packet)}",
-                f"- Writer 摘要：{_compact_value(packet.get('writer_summary')) or '未提供'}",
-                f"- 执行信息：{_compact_value(packet.get('execution_summary')) or '未提供'}",
-                "- 参数来源与处理：",
+                "- 已核实的实现、参数与假设：",
             ]
         )
-        values = packet.get("parameter_resolution") if isinstance(packet.get("parameter_resolution"), list) else []
+        verification = packet.get("verification") or {}
+        values = verification.get("verified_facts") if isinstance(verification.get("verified_facts"), list) else []
         if values:
-            lines.extend(f"  - {_compact_value(item)}" for item in values[:24])
+            lines.extend(f"  - {_compact_value(item.get('text'))}（来源：{_compact_value(item.get('source'))}）" for item in values if isinstance(item, dict))
         else:
-            lines.append("  - 未提供额外参数解析记录。")
+            lines.append("  - 未提供经过独立核实的额外实现或参数记录。")
         uncertainties = packet.get("remaining_uncertainties")
         lines.extend(["- 剩余不确定性：", *_markdown_bullets(uncertainties)])
     return "\n".join(lines) + "\n"
@@ -134,14 +132,9 @@ def _render_fallback_result_review(task_packets: list[dict[str, Any]]) -> str:
             label = "本地复现图" if local else "论文原图"
             lines.extend([f"![{label}]({local or paper_asset})", ""])
         else:
-            structured = packet.get("structured_evidence") if isinstance(packet.get("structured_evidence"), dict) else {}
-            evidence_files = structured.get("evidence_files") if isinstance(structured.get("evidence_files"), list) else []
             lines.extend(
                 [
-                    "**证据形式：** 本任务未提供可用的成对图像，以下结论来自结构化结果、表格、CSV、summary 或文本证据。",
-                    "",
-                    "**结构化证据文件：**",
-                    *_markdown_bullets(evidence_files),
+                    "**证据形式：** 本任务未提供可用的成对图像，以下内容转述独立 Reporter 的结构化观察；原始测量文件未在编辑阶段重新核验。",
                     "",
                 ]
             )

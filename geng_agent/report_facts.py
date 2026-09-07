@@ -29,6 +29,15 @@ def terminal_fact_block(packets: list[dict[str, Any]]) -> str:
         outcome = str(packet.get("terminal_outcome") or verification.get("outcome") or "unclassified_terminal_result")
         lines.append("| " + " | ".join(_cell(x) for x in (packet.get("task_id"), task.get("figure_or_claim") or task.get("title"),
                                                          LABELS.get(outcome, outcome), observed)) + " |")
+    lines += ["", "### 宿主执行记录", "",
+              "末次执行与产物有效只记录执行和产物是否有效（0/1，未知留空），不代表支持论文结论；科学支持仅由上方科学终态表达。", "",
+              "| 任务 | 有凭据的完整尝试 | 末次执行与产物有效（0/1） |", "| --- | --- | --- |"]
+    for packet in packets:
+        execution = packet.get("execution_summary") or {}
+        def count(key: str) -> str:
+            value = execution.get(key)
+            return str(value) if isinstance(value, int) and not isinstance(value, bool) else ""
+        lines.append("| " + " | ".join((_cell(packet.get("task_id")), count("observed_full_attempt_count"), count("latest_valid_execution_count"))) + " |")
     lines += ["", END, ""]
     return "\n".join(lines)
 

@@ -163,6 +163,19 @@ def normalize_reporter_observation_evidence(
                 "the finding is retained, but cannot authorize a scientific rerun"
             )
     rerun = document.get("rerun_evidence")
+    verified_facts = []
+    for fact in document.get("verified_facts", []) if isinstance(document.get("verified_facts"), list) else []:
+        if not isinstance(fact, dict) or not str(fact.get("text") or "").strip():
+            continue
+        paths = [path for value in fact.get("evidence_files", [])
+                 if (path := _verified_reporter_evidence_path(value, workspace)) is not None] if isinstance(fact.get("evidence_files"), list) else []
+        paper_roots = [workspace.resolve() / "paper_evidence" / part for part in ("source", "full_paper_pages", "mineru_figure_candidates")]
+        paper_evidence = [p for p in paths if any(p.is_relative_to(root) for root in paper_roots)]
+        if not (paper_evidence if fact.get("source") == "paper" else local_evidence(fact)):
+            warnings.append("Omitted report fact without verified original-paper or copied local evidence: " + str(fact["text"])[:120])
+            continue
+        verified_facts.append({key: fact[key] for key in ("category", "text", "source", "evidence_files") if key in fact})
+    document["verified_facts"] = verified_facts
     if isinstance(rerun, dict) and rerun.get("rerun_reason") == "core_conclusion_failed":
         affected = rerun.get("contract_item_ids")
         if isinstance(affected, list) and missing_local_ids.intersection(map(str, affected)):
@@ -421,6 +434,10 @@ def _normalize_verification_paths(
         except ValueError:
             stable_evidence.append(str(source))
     normalized["evidence_files"] = stable_evidence
+    try:
+        normalized["provenance_base"] = workspace.resolve().relative_to(output_dir.resolve()).as_posix()
+    except ValueError:
+        normalized["provenance_base"] = str(workspace.resolve())
     for key in ("local_assets", "paper_assets"):
         normalized[key] = list(published_assets.get(key, []))
     return normalized

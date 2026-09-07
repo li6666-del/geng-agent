@@ -128,7 +128,7 @@ class FinalReportEditorTests(unittest.TestCase):
             self.assertTrue((editor_assets / "task_1" / "local_result.png").is_file())
             self.assertFalse((editor_assets / "stale_task").exists())
 
-    def test_full_run_count_is_only_attempt_count_and_iteration_records_are_available(self) -> None:
+    def test_writer_attempt_counts_cannot_become_host_verified_counts(self) -> None:
         with TemporaryDirectory() as temp:
             root = Path(temp)
             output = root / "case"
@@ -157,14 +157,17 @@ class FinalReportEditorTests(unittest.TestCase):
                     encoding="utf-8"
                 )
             )
-            self.assertEqual(report_input["task_packets"][0]["iteration_records"], iterations)
+            packet = report_input["task_packets"][0]
+            self.assertNotIn("iteration_records", packet)
+            self.assertIsNone(packet["execution_summary"]["observed_full_attempt_count"])
+            self.assertIsNone(packet["execution_summary"]["latest_valid_execution_count"])
             brief = (output / "audit" / "04b_report_editor_brief.md").read_text(encoding="utf-8")
-            self.assertIn("is the number of full-run attempts", brief)
-            self.assertIn("Never describe that field by itself as `有效完整运行次数`", brief)
+            self.assertIn("Use only host `execution_summary` counts", brief)
+            self.assertIn("Unknown counts are unavailable, not zero", brief)
             self.assertIn("return code 124", brief)
             self.assertEqual(
                 REPORT_EDITOR_PROMPT_VERSION,
-                "final_report_editor_v4_run_attempt_semantics",
+                "final_report_editor_v5_verified_facts_only",
             )
 
     def test_human_readable_task_headings_do_not_require_machine_task_ids(self) -> None:

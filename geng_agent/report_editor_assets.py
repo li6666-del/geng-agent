@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 import shutil
 from typing import Any
@@ -37,36 +38,64 @@ def _build_task_packets(
     for task_id, task in task_by_id.items():
         record = record_by_id.get(task_id, {})
         verification = verification_by_id.get(task_id, {})
-        writer_result = record.get("result_json") if isinstance(record.get("result_json"), dict) else {}
         terminal_outcome = _task_terminal_outcome(verification)
         packets.append(
             {
                 "task_id": task_id,
-                "task": task,
-                "task_facts": facts_for_task(facts, task),
-                "writer_summary": writer_result.get("summary"),
-                "parameter_resolution": writer_result.get("parameter_resolution", []),
-                "detail_comparison": writer_result.get("detail_comparison", {}),
-                "writer_differences": writer_result.get("differences", []),
-                "remaining_uncertainties": writer_result.get("remaining_uncertainties", []),
-                "iteration_records": writer_result.get(
-                    "iteration_records",
-                    record.get("iteration_records", []),
-                ),
-                "execution_summary": writer_result.get("execution_summary", record.get("execution_summary", {})),
-                "verification": verification,
+                "task": {key: task[key] for key in ("task_id", "title", "target", "figure_or_claim", "metric") if key in task},
+                "remaining_uncertainties": verification.get("remaining_uncertainties", []),
+                "execution_summary": _host_report_execution(record, verification),
+                "verification": {key: verification[key] for key in (
+                    "task_id", "outcome", "host_action", "run_valid", "core_conclusions", "key_numeric_comparisons",
+                    "comparison_summary", "differences", "non_material_differences", "evidence_files", "confidence",
+                    "verified_facts", "provenance_base") if key in verification},
                 "terminal_outcome": terminal_outcome,
-                "structured_evidence": {
-                    "core_conclusions": verification.get("core_conclusions", []),
-                    "key_numeric_comparisons": verification.get("key_numeric_comparisons", []),
-                    "evidence_files": verification.get("evidence_files", []),
-                    "writer_artifacts": writer_result.get("artifacts", []),
-                },
                 "local_assets": _editor_asset_paths(task_id, verification.get("local_assets")),
                 "paper_assets": _editor_asset_paths(task_id, verification.get("paper_assets")),
             }
         )
     return packets
+
+
+def _host_report_execution(record: dict[str, Any], verification: dict[str, Any]) -> dict[str, Any]:
+    """Separate observed attempts and valid execution from scientific support.
+
+    Old Writer summaries are never a substitute for host receipts. Earlier
+    receipts prove process completion, not support for the paper's conclusions.
+    """
+    host = record.get("host_execution") if isinstance(record.get("host_execution"), dict) else {}
+    latest = host.get("receipt") if isinstance(host.get("receipt"), dict) else {}
+    receipts: dict[str, dict[str, Any]] = {}
+    writer_status = record.get("writer_status") or {}
+    audit = writer_status.get("execution_audit_dir") if isinstance(writer_status, dict) else None
+    if audit:
+        for path in (Path(audit) / "execution_runs").glob("*/execution_receipt.json"):
+            try:
+                receipt = json.loads(path.read_text(encoding="utf-8"))
+                if (receipt.get("observer") == "orchestration_host" and receipt.get("task_id") == record.get("task_id")
+                        and receipt.get("mode") == "full" and receipt.get("run_id")):
+                    receipts[str(receipt["run_id"])] = receipt
+            except (OSError, ValueError, TypeError):
+                continue
+    if latest.get("observer") == "orchestration_host" and latest.get("mode") == "full" and latest.get("run_id"):
+        receipts[str(latest["run_id"])] = latest
+    latest_observed = (latest.get("run_id") in receipts and latest.get("observer") == "orchestration_host"
+                       and latest.get("mode") == "full")
+    valid_latest = None
+    if latest_observed and (host.get("passed") is False or verification.get("run_valid") is False):
+        valid_latest = 0
+    elif latest_observed and host.get("passed") is True and verification.get("run_valid") is True:
+        valid_latest = 1
+    return {
+        "source": "host_execution_receipts" if receipts else "unavailable",
+        "observed_full_attempt_count": len(receipts) if receipts else None,
+        "observed_process_completed_count": sum(r.get("returncode") == 0 and not r.get("cancelled") for r in receipts.values()) if receipts else None,
+        "latest_valid_execution_count": valid_latest,
+        "valid_count_scope": "latest execution and artifact validity only (0 or 1; unknown is null); scientific support is given only by the task outcome",
+        "latest_run_id": latest.get("run_id") if receipts else None,
+        "latest_returncode": latest.get("returncode") if receipts else None,
+        "unavailable_reason": "" if receipts else "No host-observed execution receipt supplied; Writer counts are unverified",
+    }
 
 
 def _task_terminal_outcome(verification: dict[str, Any]) -> str:

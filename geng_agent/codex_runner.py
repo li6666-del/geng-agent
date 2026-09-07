@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import gzip
+import hashlib
 import os
 import site
 import shlex
@@ -10,6 +12,7 @@ import sys
 import sysconfig
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -586,6 +589,29 @@ def run_codex_subprocess(
         "transcript": None,
         "duration_s": None,
     }
+    # Record at the transport boundary, after every caller's dynamic additions.
+    # Immutable per-invocation copies retain history when a stage label is reused.
+    invocation_id = uuid.uuid4().hex
+    input_dir = audit_dir / "prompt_inputs" / invocation_id
+    input_dir.mkdir(parents=True, exist_ok=True)
+    prompt_bytes = prompt.encode("utf-8")
+    (input_dir / "brief.md").write_bytes(prompt_bytes)
+    (audit_dir / f"{label}_brief.md").write_bytes(prompt_bytes)
+    from .prompt_identity import file_identity
+    input_manifest = {
+        "invocation_id": invocation_id, "role": role, "label": label,
+        "work_dir": str(work_dir.resolve()), "sandbox": sandbox,
+        "model": model, "reasoning_effort": resolved_reasoning_effort,
+        "prompt_path": str(input_dir / "brief.md"),
+        "prompt_sha256": hashlib.sha256(prompt_bytes).hexdigest(),
+        "prompt_characters": len(prompt), "prompt_utf8_bytes": len(prompt_bytes),
+        "images": [file_identity(Path(path)) for path in image_paths or []],
+        "output_schema": file_identity(output_schema) if output_schema is not None else None,
+        "context_boundary": "Records project-provided stdin and attachments; CLI system instructions, tools and dynamic reads are not implied by this manifest.",
+    }
+    write_json(input_dir / "input.json", input_manifest)
+    write_json(audit_dir / f"{label}_input.json", input_manifest)
+    status.update(invocation_id=invocation_id, input_manifest=str(input_dir / "input.json"))
     if not argv or resolved is None:
         status["error_kind"] = "missing_cli"
         status["error"] = f"codex CLI not found: {raw_cmd!r} (install it or set GENG_CODEX_CMD)"
@@ -677,7 +703,14 @@ def run_codex_subprocess(
     except OSError as exc:
         status["cost_warning"] = f"Invocation accounting unavailable: {type(exc).__name__}"
     transcript_path = audit_dir / f"{label}_transcript.txt"
-    write_text(transcript_path, redact_text(transcript)[-MAX_TRANSCRIPT_CHARS:])
+    redacted_transcript = redact_text(transcript)
+    write_text(transcript_path, redacted_transcript[-MAX_TRANSCRIPT_CHARS:])
+    full_transcript_path = input_dir / "transcript.txt.gz"
+    with gzip.open(full_transcript_path, "wt", encoding="utf-8", newline="") as stream:
+        stream.write(redacted_transcript)
+    status["full_transcript"] = str(full_transcript_path)
+    status["transcript_characters"] = len(redacted_transcript)
+    status["transcript_tail_truncated"] = len(redacted_transcript) > MAX_TRANSCRIPT_CHARS
     status["transcript"] = str(transcript_path)
     write_json(audit_dir / f"{label}.json", status)
     return status

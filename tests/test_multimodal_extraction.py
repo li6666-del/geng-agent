@@ -46,11 +46,16 @@ class CompleteMaybeMultimodalTests(unittest.TestCase):
     def test_text_only_when_no_images(self) -> None:
         self.assertEqual(self._call(MultimodalClient(), []), ["complete"])
 
-    def test_text_only_when_client_has_no_multimodal(self) -> None:
-        self.assertEqual(self._call(TextOnlyClient(), ONE_IMAGE), ["complete"])
+    def test_supplied_images_are_not_silently_dropped_for_text_client(self) -> None:
+        client = TextOnlyClient()
+        self._call(client, ONE_IMAGE)
+        self.assertEqual(client.calls, ["complete"])
 
-    def test_falls_back_to_text_when_multimodal_raises(self) -> None:
-        self.assertEqual(self._call(MultimodalClient(fail=True), ONE_IMAGE), ["multimodal", "complete"])
+    def test_multimodal_failure_remains_visible(self) -> None:
+        client = MultimodalClient(fail=True)
+        with self.assertRaisesRegex(RuntimeError, "multimodal endpoint boom"):
+            self._call(client, ONE_IMAGE)
+        self.assertEqual(client.calls, ["multimodal"])
 
 
 class RenderPaperImagesTests(unittest.TestCase):

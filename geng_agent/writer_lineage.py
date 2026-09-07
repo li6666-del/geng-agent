@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import importlib.metadata
+import inspect
 import json
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ from .foundation_snapshot import file_sha256, path_is_foundation_link, scan_foun
 from .task_writer_support import WRITER_HANDOFF_POLICY_VERSION, WRITER_ANALYSIS_SCHEMA_VERSION
 from .task_writer_units import _execution_unit_sandbox, _execution_unit_work_items, _public_execution_unit
 from .paper_evidence import safe_label, thesis_comparisons_for_task
+from .prompt_identity import model_identity, scientific_cache_value, text_identity
 
 
 WRITER_LINEAGE_VERSION = "unit-scientific-inputs-v1"
@@ -25,13 +27,23 @@ WRITER_LINEAGE_VERSION = "unit-scientific-inputs-v1"
 
 def writer_policy_content_hashes() -> dict[str, str]:
     """Changes to the actual execution contract must enter the cache key."""
+    from .case_runtime_requests import environment_request_prompt
+    from .task_writer_runner import _run_task_writer_codex_session
+
     root = Path(__file__).parent
-    return {name: file_sha256(root / name) for name in (
+    policies = {name: text_identity((root / name).read_text(encoding="utf-8")) for name in (
         "task_writer_prompts.py", "task_writer_execution_binding.py",
-        "task_writer_contracts.py", "task_writer_support.py",
+        "task_writer_contracts.py", "task_writer_support.py", "writer_recovery.py",
         "scientific_materiality.py", "execution_receipts.py", "execution_client.py", "execution_sandbox.py",
         "writer_lineage.py",
     )}
+    # These instructions are appended outside the main Writer templates. Hash
+    # their actual implementation without invalidating on unrelated role edits.
+    policies.update({
+        "host_execution_session": text_identity(inspect.getsource(_run_task_writer_codex_session)),
+        "environment_request_prompt": text_identity(inspect.getsource(environment_request_prompt)),
+    })
+    return policies
 
 
 def _objects(value: Any) -> list[dict[str, Any]]:
@@ -39,7 +51,7 @@ def _objects(value: Any) -> list[dict[str, Any]]:
 
 
 def _digest(value: Any) -> str:
-    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return hashlib.sha256(json.dumps(scientific_cache_value(value), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def _json(path: Path) -> dict[str, Any]:
@@ -278,7 +290,7 @@ def foundation_cache_projection(
     selected_facts = [item for item in _objects(facts.get("engineering_facts"))
                       if not refs or (str(item.get("type")), str(item.get("name")).casefold()) in refs]
     module_root = Path(__file__).parent
-    policy = {name: file_sha256(module_root / name) for name in (
+    policy = {name: text_identity((module_root / name).read_text(encoding="utf-8")) for name in (
         "foundation_prompt_cache.py", "foundation_scope.py", "foundation_revision.py", "writer_lineage.py",
     )}
     analysis_hash = _digest({"paper_sha256": file_sha256(paper_path) if paper_path.is_file() else None,
@@ -378,6 +390,7 @@ def build_writer_unit_lineage(
             libraries.update(map(str, execution.get("supporting_libraries") or []))
         payload = {
             "policy": [WRITER_LINEAGE_VERSION, WRITER_HANDOFF_POLICY_VERSION, WRITER_ANALYSIS_SCHEMA_VERSION],
+            "model": model_identity("task_writer"),
             "policy_content_hashes": policy_hashes,
             "paper_sha256": paper_hash,
             "tasks": unit_tasks,

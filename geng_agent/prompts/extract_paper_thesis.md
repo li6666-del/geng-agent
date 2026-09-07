@@ -11,9 +11,9 @@
 提炼要求：
 1. central_claim：用一句话写出论文的**头号结论**（提出的方法相对基线带来的核心好处）。
 2. proposed_method：论文主推的方法/方案名称（“主角”）。
-3. mechanism：**最关键的一项**——用散文说清楚“这个方法为什么 work”的因果/物理机制（例：空时/多普勒维度让用户去相关 → 等效信道更良态 → 压过预对数损失）。**只用散文描述机制，不要转写附录里的上界/下界公式或常数**（那是噪声，且容易抄错）。
+3. mechanism：用简洁散文说明因果/物理机制，保留该机制成立所需的假设、公式适用条件和理论界的作用。若上界/下界或其条件本身是论文贡献，明确保留其主张并引用 Equation/Section/Appendix；无需重复长推导，但不得把决定结论的条件当作噪声省略。
 4. comparisons：把论文做的每一组“方法对比”列出来。每组：
-   - methods_best_to_worst：参与对比的方法名，**按论文预期性能从好到差排序**（这是后续校验“复现有没有抓住论文结论”的核心依据，顺序必须反映论文主张）。
+   - methods_best_to_worst：仅在该 metric 和 regime 中有证据支持完整严格排序时，按论文预期性能列出方法。存在交叉、并列或部分关系时允许空数组，并在 expected_ordering 中明确有证据的成对关系、并列和未知关系；不要强迫总排序。
    - expected_ordering：把上面的排序写成一句话（如 “STAB > ZF > MRT”），并点明在什么区间成立。
    - metric：该排序针对的指标（如 sum rate / 和速率）。
    - regime：该排序成立的条件/区间（如 “密集用户 / 高多普勒 / 高功率区”）。
@@ -34,13 +34,13 @@
   "mechanism": "",
   "comparisons": [
     {
-      "claim_id": "stab_beats_zf_dense",
-      "methods_best_to_worst": ["STAB", "ZF", "MRT"],
-      "expected_ordering": "密集/高多普勒区 STAB > ZF > MRT",
-      "metric": "average sum rate",
-      "regime": "用户密集、高多普勒、高发射功率",
-      "figure_ref": "Fig.4",
-      "mechanism_note": "空时维度去相关用户，使等效信道更良态，压过 1/L 预对数损失"
+      "claim_id": "stable_supported_comparison",
+      "methods_best_to_worst": [],
+      "expected_ordering": "只陈述论文在指定区间支持的关系，包括交叉或并列",
+      "metric": "论文的实际比较指标",
+      "regime": "关系成立的实际条件或区间",
+      "figure_ref": "实际图表或留空",
+      "mechanism_note": "将该比较与论文机制及其适用条件联系起来"
     }
   ],
   "headline_shape": "",

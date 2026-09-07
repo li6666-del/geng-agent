@@ -471,6 +471,7 @@ class ReviewPipeline:
         schema_stage: str,
         images: list[Any] | None,
         client: Any = None,
+        input_observer: Callable[[str, list[Any], dict[str, Any]], None] | None = None,
     ) -> str:
         return _complete_maybe_multimodal_impl(
             self,
@@ -479,6 +480,7 @@ class ReviewPipeline:
             images=images,
             client=client,
             system_message=SYSTEM_MESSAGE,
+            input_observer=input_observer,
         )
 
     def _call_validated_json(
@@ -492,6 +494,7 @@ class ReviewPipeline:
         extra_validation: Callable[[dict[str, Any]], list[ValidationIssue]] | None = None,
         request_timeout: float | None = None,
         candidate_normalizer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        repair_preservation_validator: Callable[[dict[str, Any], dict[str, Any]], list[ValidationIssue]] | None = None,
         truncation_recovery: Callable[[str], dict[str, Any] | None] | None = None,
         images: list[Any] | None = None,
         client: Any = None,
@@ -507,6 +510,7 @@ class ReviewPipeline:
             extra_validation=extra_validation,
             request_timeout=request_timeout,
             candidate_normalizer=candidate_normalizer,
+            repair_preservation_validator=repair_preservation_validator,
             truncation_recovery=truncation_recovery,
             images=images,
             client=client,

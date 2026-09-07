@@ -33,7 +33,7 @@ class RuntimeStatusCacheTests(unittest.TestCase):
             paper.write_bytes(b"replacement payload")
             self.assertFalse(_paper_cache_matches(cached, paper))
 
-    def test_stage_cache_identity_ignores_prompt_wording_but_tracks_policy_and_inputs(self) -> None:
+    def test_stage_cache_identity_tracks_prompt_policy_and_inputs(self) -> None:
         base = build_stage_cache_metadata(
             stage_label="tasks",
             schema_stage="repro_tasks",
@@ -63,9 +63,9 @@ class RuntimeStatusCacheTests(unittest.TestCase):
             inputs={"paper_sha256": "b" * 64, "task_contract": {"claim_id": "c1"}},
         )
 
-        self.assertEqual(base["format_version"], "semantic_inputs_v2")
+        self.assertEqual(base["format_version"], "scientific_inputs_and_contract_v3")
         self.assertEqual(len(base["schema_sha256"]), 64)
-        self.assertEqual(base["fingerprint"], prompt_changed["fingerprint"])
+        self.assertNotEqual(base["fingerprint"], prompt_changed["fingerprint"])
         self.assertNotEqual(base["fingerprint"], policy_changed["fingerprint"])
         self.assertNotEqual(base["fingerprint"], inputs_changed["fingerprint"])
 

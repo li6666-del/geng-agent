@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import json
+import gzip
+import hashlib
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol
+from uuid import uuid4
 
 
 @dataclass(frozen=True)
@@ -47,6 +52,35 @@ class OpenAICompatibleClient:
     # Cumulative per-call token usage as reported by the API (one entry per request).
     # Used by the pipeline to write run_cost.json; never affects request behaviour.
     usage_log: list[dict[str, Any]] = field(default_factory=list)
+    _request_audit_context: tuple[Path, str] | None = field(default=None, init=False, repr=False)
+    _latest_request_audit: str | None = field(default=None, init=False, repr=False)
+
+    @contextmanager
+    def audit_requests(self, directory: Path, label: str):
+        previous = self._request_audit_context
+        self._request_audit_context = (directory, label)
+        try:
+            yield
+        finally:
+            self._request_audit_context = previous
+
+    def _audit_request_body(self, body: bytes) -> None:
+        self._latest_request_audit = None
+        if self._request_audit_context is None:
+            return
+        directory, label = self._request_audit_context
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{label}_{uuid4().hex}_request.json.gz"
+        # This is the exact HTTP body (including system, output format and
+        # images), never the Authorization header or credentials.
+        with path.open("xb") as stream:
+            stream.write(gzip.compress(body, mtime=0))
+        from .outputs import write_json
+        write_json(path.with_suffix(".meta.json"), {
+            "payload_path": str(path), "body_sha256": hashlib.sha256(body).hexdigest(),
+            "body_bytes": len(body),
+        })
+        self._latest_request_audit = str(path)
 
     def complete(
         self,
@@ -118,7 +152,7 @@ class OpenAICompatibleClient:
         if response_format:
             payload["response_format"] = response_format
 
-        raw = self._post_chat_completion(payload, allow_response_format_fallback=False)
+        raw = self._post_chat_completion(payload)
         data = json.loads(raw)
         self._record_usage(data, kind="multimodal")
         try:
@@ -132,6 +166,8 @@ class OpenAICompatibleClient:
         a provider omits the usage block."""
         usage = data.get("usage") if isinstance(data, dict) else None
         entry: dict[str, Any] = {"model": self.model, "kind": kind}
+        if self._latest_request_audit:
+            entry["request_audit"] = self._latest_request_audit
         if isinstance(usage, dict):
             entry["prompt_tokens"] = usage.get("prompt_tokens")
             entry["completion_tokens"] = usage.get("completion_tokens")
@@ -140,6 +176,7 @@ class OpenAICompatibleClient:
 
     def _post_chat_completion(self, payload: dict[str, Any], *, allow_response_format_fallback: bool = True) -> str:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self._audit_request_body(body)
         request = urllib.request.Request(
             self._chat_completions_url(),
             data=body,
@@ -162,13 +199,13 @@ class OpenAICompatibleClient:
                 exc.code in {400, 422}
                 and isinstance(response_format, dict)
                 and response_format.get("type") == "json_schema"
+                and any(token in detail.lower() for token in ("response_format", "json_schema", "schema"))
             ):
                 fallback_payload = dict(payload)
                 fallback_payload["response_format"] = {"type": "json_object"}
-                try:
-                    return self._post_chat_completion(fallback_payload)
-                except RuntimeError:
-                    pass
+                # Only the output constraint changes. Preserve all messages
+                # and images; a transport/vision failure is never text success.
+                return self._post_chat_completion(fallback_payload, allow_response_format_fallback=False)
             raise RuntimeError(f"LLM request failed: HTTP {exc.code}: {detail}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"LLM request failed: {exc}") from exc

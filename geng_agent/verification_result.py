@@ -22,8 +22,40 @@ TASK_REPORTER_RERUN_INVALID_RUN = "invalid_run"
 TASK_REPORTER_WRITER_RERUN_REASONS = WRITER_RERUN_REASONS
 
 _CORE_STATUSES = frozenset(
-    {"supported", "unsupported", "unassessable_missing_information"}
+    {"supported", "unsupported", "unassessable_missing_information", "not_applicable"}
 )
+
+
+def _paper_basis_review(item: dict[str, Any], workspace: Path | None) -> dict[str, Any] | None:
+    """Accept a Reporter's scope correction only with copied original-paper evidence.
+
+    Writer accounts, Designer navigation JSON and a model-supplied 'verified'
+    flag cannot authorize a correction. This is an optional scientific note,
+    never a required schema gate.
+    """
+    review = item.get("basis_review")
+    if not isinstance(review, dict):
+        return None
+    status = str(review.get("status") or "")
+    reason = str(review.get("reason") or "").strip()
+    paths = _string_list(review.get("paper_evidence_files"))
+    verified = bool(workspace is not None and reason and paths)
+    for raw in paths:
+        relative = Path(raw)
+        try:
+            root = Path(workspace).resolve() if workspace is not None else Path()
+            path = root / relative
+            resolved = path.resolve(strict=True)
+            roots = [root / "paper_evidence" / part for part in ("source", "full_paper_pages", "mineru_figure_candidates")]
+            verified = verified and not relative.is_absolute() and ".." not in relative.parts and resolved.is_file()
+            verified = verified and any(resolved.is_relative_to(base) for base in roots)
+            verified = verified and not any(p.is_symlink() or (hasattr(p, "is_junction") and p.is_junction()) for p in (path, *path.parents) if p != root.parent)
+        except (OSError, ValueError, TypeError):
+            verified = False
+    if status not in {"not_applicable", "disputed", "corrected"}:
+        return None
+    return {**review, "status": status, "reason": reason,
+            "paper_evidence_files": paths, "paper_evidence_verified": bool(verified)}
 
 
 def _string_list(value: Any) -> list[str]:
@@ -52,9 +84,11 @@ def _normalize_core_item(
     claim_id: str,
     fallback_observation: str = "",
     force_claim_id: bool = False,
+    evidence_workspace: Path | None = None,
 ) -> dict[str, Any]:
     item = raw if isinstance(raw, dict) else {}
     status = str(item.get("status") or "").strip()
+    basis = _paper_basis_review(item, evidence_workspace)
     if status not in _CORE_STATUSES:
         supported = item.get("supported")
         if supported is True:
@@ -63,6 +97,13 @@ def _normalize_core_item(
             status = "unsupported"
         else:
             status = "unassessable_missing_information"
+    # Resolve supported:false before basis review so legacy negative observations
+    # survive just like an explicit unsupported status.
+    if status != "unsupported" and basis:
+        status = ("not_applicable" if basis["paper_evidence_verified"] and basis["status"] == "not_applicable"
+                  else "unassessable_missing_information")
+    if status == "not_applicable" and not (basis and basis["paper_evidence_verified"] and basis["status"] == "not_applicable"):
+        status = "unassessable_missing_information"
     observation = str(
         item.get("local_observation")
         or item.get("evidence")
@@ -82,6 +123,7 @@ def _normalize_core_item(
         # considered an observation that supports a scientific conclusion.
         "local_observation": observation or fallback_observation,
         "evidence_files": evidence_files,
+        **({"basis_review": basis} if basis else {}),
     }
 
 
@@ -94,7 +136,7 @@ def _combine_core_observations(items: list[dict[str, Any]]) -> dict[str, Any]:
         "unsupported" if "unsupported" in statuses
         else "unassessable_missing_information"
         if "unassessable_missing_information" in statuses
-        else "supported"
+        else "supported" if "supported" in statuses else "not_applicable"
     )
     result["local_observation"] = "\n".join(dict.fromkeys(
         str(item.get("local_observation") or "") for item in items
@@ -109,6 +151,7 @@ def _combine_core_observations(items: list[dict[str, Any]]) -> dict[str, Any]:
 def _normalize_core_conclusions(
     raw: dict[str, Any],
     task: dict[str, Any] | None,
+    evidence_workspace: Path | None = None,
 ) -> list[dict[str, Any]]:
     raw_items = raw.get("core_conclusions")
     candidates = [item for item in raw_items if isinstance(item, dict)] if isinstance(raw_items, list) else []
@@ -140,6 +183,7 @@ def _normalize_core_conclusions(
                 observation,
                 claim_id=claim_id,
                 force_claim_id=True,
+                evidence_workspace=evidence_workspace,
                 fallback_observation=(
                     "Reporter did not provide a conclusion assessment; "
                     "recorded as missing information rather than blocking the flow."
@@ -154,7 +198,7 @@ def _normalize_core_conclusions(
     for index, candidate in enumerate(candidates):
         if index in consumed:
             continue
-        item = _normalize_core_item(candidate, claim_id=f"reported_claim_{index + 1}")
+        item = _normalize_core_item(candidate, claim_id=f"reported_claim_{index + 1}", evidence_workspace=evidence_workspace)
         position = by_id.get(item["claim_id"])
         if position is None:
             by_id[item["claim_id"]] = len(normalized)
@@ -171,79 +215,70 @@ def _normalize_core_conclusions(
             fallback_observation="No itemized conclusion was available.",
         )
     ]
+def _normalize_numeric_item(target: dict[str, Any], candidate: dict[str, Any], *,
+                            target_id: str, workspace: Path | None) -> dict[str, Any]:
+    paper_value = _finite_number(target.get("paper_magnitude"))
+    if paper_value is None:
+        paper_value = _finite_number(candidate.get("paper_magnitude"))
+    local_value = _finite_number(candidate.get("local_magnitude"))
+    basis = _paper_basis_review(candidate, workspace)
+    comparison_status = "comparable"
+    corrected_basis: dict[str, Any] = {}
+    if basis:
+        comparison_status = "disputed"
+        if basis["paper_evidence_verified"] and basis["status"] == "not_applicable":
+            comparison_status = "not_applicable"
+        elif basis["paper_evidence_verified"] and basis["status"] == "corrected":
+            corrected = _finite_number(basis.get("corrected_paper_magnitude"))
+            if corrected is not None:
+                paper_value = corrected
+                corrected_basis = basis
+                comparison_status = "comparable"
+    dimensions = {key: str(corrected_basis.get(key) or target.get(key) or candidate.get(key) or "")
+                  for key in ("metric", "unit", "regime")}
+    mismatched = [key for key in dimensions if candidate.get("local_" + key) is not None
+                  and dimensions[key] and str(candidate["local_" + key]).strip() != dimensions[key].strip()]
+    if mismatched and comparison_status != "not_applicable":
+        comparison_status = "incompatible"
+    return {
+        "target_id": target_id,
+        "name": str(target.get("name") or candidate.get("name") or target_id),
+        "paper_magnitude": paper_value,
+        "local_magnitude": local_value,
+        "symmetric_ratio": symmetric_magnitude_ratio(paper_value, local_value) if comparison_status == "comparable" else None,
+        "comparison_status": comparison_status,
+        **dimensions,
+        **{"local_" + key: candidate["local_" + key] for key in dimensions if "local_" + key in candidate},
+        **({"basis_review": basis} if basis else {}),
+        **({"incompatible_dimensions": mismatched} if mismatched else {}),
+        "unavailable_reason": str(candidate.get("unavailable_reason") or ("Incompatible comparison dimensions: " + ", ".join(mismatched) if mismatched else "")).strip(),
+    }
+
+
 def _normalize_numeric_comparisons(
-    raw: dict[str, Any],
-    task: dict[str, Any] | None,
+    raw: dict[str, Any], task: dict[str, Any] | None, evidence_workspace: Path | None = None,
 ) -> list[dict[str, Any]]:
     raw_items = raw.get("key_numeric_comparisons")
     candidates = [item for item in raw_items if isinstance(item, dict)] if isinstance(raw_items, list) else []
-    targets = [
-        item
-        for item in _scientific_acceptance(task).get("key_numeric_targets", [])
-        if isinstance(item, dict)
-    ]
+    targets = [item for item in _scientific_acceptance(task).get("key_numeric_targets", []) if isinstance(item, dict)]
     normalized: list[dict[str, Any]] = []
     consumed: set[int] = set()
     for index, target in enumerate(targets):
         target_id = str(target.get("target_id") or f"numeric_{index + 1}").strip()
-        candidate_index = next(
-            (
-                item_index
-                for item_index, item in enumerate(candidates)
-                if item_index not in consumed
-                and str(item.get("target_id") or "").strip() == target_id
-            ),
-            None,
-        )
+        candidate_index = next((i for i, item in enumerate(candidates) if i not in consumed
+                                and str(item.get("target_id") or "").strip() == target_id), None)
         if candidate_index is None:
-            candidate_index = next(
-                (
-                    item_index
-                    for item_index, item in enumerate(candidates)
-                    if item_index not in consumed
-                    and not str(item.get("target_id") or "").strip()
-                ),
-                None,
-            )
+            candidate_index = next((i for i, item in enumerate(candidates) if i not in consumed
+                                    and not str(item.get("target_id") or "").strip()), None)
         candidate = candidates[candidate_index] if candidate_index is not None else {}
         if candidate_index is not None:
             consumed.add(candidate_index)
-        candidate = candidate if isinstance(candidate, dict) else {}
-        paper_value = _finite_number(target.get("paper_magnitude"))
-        if paper_value is None:
-            paper_value = _finite_number(candidate.get("paper_magnitude"))
-        local_value = _finite_number(candidate.get("local_magnitude"))
-        normalized.append(
-            {
-                "target_id": target_id,
-                "name": str(target.get("name") or candidate.get("name") or target_id),
-                "paper_magnitude": paper_value,
-                "local_magnitude": local_value,
-                "symmetric_ratio": symmetric_magnitude_ratio(paper_value, local_value),
-                "unavailable_reason": str(candidate.get("unavailable_reason") or "").strip(),
-            }
-        )
-
-    # Task-Designer IDs are navigation aids, not authority to erase material
-    # evidence. Preserve Reporter comparisons that were not consumed above.
-    for candidate_index, candidate in enumerate(candidates):
-        if candidate_index in consumed:
-            continue
-        target_id = str(
-            candidate.get("target_id") or f"reported_numeric_{candidate_index + 1}"
-        ).strip()
-        paper_value = _finite_number(candidate.get("paper_magnitude"))
-        local_value = _finite_number(candidate.get("local_magnitude"))
-        normalized.append(
-            {
-                "target_id": target_id,
-                "name": str(candidate.get("name") or target_id),
-                "paper_magnitude": paper_value,
-                "local_magnitude": local_value,
-                "symmetric_ratio": symmetric_magnitude_ratio(paper_value, local_value),
-                "unavailable_reason": str(candidate.get("unavailable_reason") or "").strip(),
-            }
-        )
+        normalized.append(_normalize_numeric_item(target, candidate, target_id=target_id, workspace=evidence_workspace))
+    # Additional independent observations survive, including conflicting duplicate IDs.
+    for index, candidate in enumerate(candidates):
+        if index not in consumed:
+            target_id = str(candidate.get("target_id") or f"reported_numeric_{index + 1}").strip()
+            normalized.append(_normalize_numeric_item({}, candidate, target_id=target_id, workspace=evidence_workspace))
     return normalized
 
 
@@ -430,13 +465,15 @@ def _derive_outcome(
         return "not_reproduced", "rerun_writer"
     if run_valid is not True:
         return "execution_failed", "complete"
-    statuses = {str(item.get("status") or "") for item in core}
+    statuses = {str(item.get("status") or "") for item in core if item.get("status") != "not_applicable"}
     if "unsupported" in statuses:
         return "not_reproduced", "complete"
-    if "unassessable_missing_information" in statuses or not core:
+    if "unassessable_missing_information" in statuses or not statuses:
         return "inconclusive_missing_information", "complete"
     if any(
-        item.get("paper_magnitude") is not None and item.get("local_magnitude") is None
+        item.get("comparison_status") != "not_applicable" and (
+            item.get("comparison_status") in {"disputed", "incompatible"}
+            or (item.get("paper_magnitude") is not None and item.get("local_magnitude") is None))
         for item in numeric
     ):
         return "inconclusive_missing_information", "complete"
@@ -454,6 +491,7 @@ def normalize_task_verification(
     *,
     task: dict[str, Any] | None = None,
     run_valid_hint: bool | None = None,
+    evidence_workspace: Path | None = None,
 ) -> dict[str, Any]:
     """Normalize a Reporter note and let the host derive action and outcome.
 
@@ -461,8 +499,8 @@ def normalize_task_verification(
     """
 
     raw = result if isinstance(result, dict) else {}
-    core = _normalize_core_conclusions(raw, task)
-    numeric = _normalize_numeric_comparisons(raw, task)
+    core = _normalize_core_conclusions(raw, task, evidence_workspace)
+    numeric = _normalize_numeric_comparisons(raw, task, evidence_workspace)
     remaining_uncertainties = _string_list(raw.get("remaining_uncertainties"))
     run_valid = _derive_run_valid(raw, run_valid_hint)
     rerun_evidence = _normalize_rerun_evidence(raw)
@@ -514,6 +552,7 @@ def normalize_task_verification(
         "rerun_evidence": rerun_evidence,
         "local_assets": _string_list(raw.get("local_assets")),
         "paper_assets": _string_list(raw.get("paper_assets")),
+        "verified_facts": [dict(item) for item in raw.get("verified_facts", []) if isinstance(item, dict)] if isinstance(raw.get("verified_facts"), list) else [],
     }
 def partition_writer_delivery_issues(
     result: Any,

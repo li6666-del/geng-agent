@@ -210,6 +210,8 @@ def run_codex_foundation_writer_workflow(
         audit_dir / "03b_foundation_writer_deliveries" / input_hash
     )
 
+    repair_delivery = None
+    repair_validation = None
     if resume:
         revised = _load_current_foundation_revision(
             audit_dir=audit_dir,
@@ -305,6 +307,8 @@ def run_codex_foundation_writer_workflow(
                 case_runtime=case_runtime,
             )
         if writer_delivery is not None:
+            repair_delivery = writer_delivery
+            repair_validation = validation_record
             write_json(
                 audit_dir / "03b_foundation_writer_resume.json",
                 {
@@ -321,16 +325,22 @@ def run_codex_foundation_writer_workflow(
                 },
             )
 
-    for path in (sandbox, snapshot_dir):
-        if path.exists():
-            shutil.rmtree(path)
-    sandbox.mkdir(parents=True, exist_ok=True)
+    if repair_delivery is not None:
+        restore_foundation_writer_delivery(
+            delivery_dir=writer_delivery_dir, receipt=repair_delivery, sandbox=sandbox,
+        )
+    else:
+        for path in (sandbox, snapshot_dir):
+            if path.exists():
+                shutil.rmtree(path)
+        sandbox.mkdir(parents=True, exist_ok=True)
     if previous_foundation is not None and revision_request is not None:
         install_foundation_snapshot(sandbox, previous_foundation)
-    write_text(
-        sandbox / "requirements.txt",
-        _initial_foundation_requirements(scientific_architecture, case_runtime=case_runtime),
-    )
+    if repair_delivery is None:
+        write_text(
+            sandbox / "requirements.txt",
+            _initial_foundation_requirements(scientific_architecture, case_runtime=case_runtime),
+        )
     inject_io_runtime(sandbox)
     _write_paper_evidence_bundle(
         repro_project_dir=sandbox,
@@ -349,6 +359,21 @@ def run_codex_foundation_writer_workflow(
     )
     trusted_before = _trusted_hashes(sandbox)
     prompt = _foundation_brief(scientific_architecture, case_runtime=case_runtime)
+    if repair_delivery is not None:
+        validation = repair_validation or {}
+        write_json(sandbox / "foundation_validation_feedback.json", validation)
+        tests = validation.get("tests") or {}
+        prompt = (
+            "# Repair the installed Foundation delivery\n"
+            "The host restored the completed implementation. Repair the failures below; "
+            "do not regenerate unchanged modules. Full diagnostics are in "
+            "`foundation_validation_feedback.json`. Re-run the shared contract tests "
+            "after the smallest causal correction.\n"
+            + pretty_json({"issues": validation.get("issues", []),
+                           "returncode": tests.get("returncode"),
+                           "stderr_tail": str(tests.get("stderr") or tests.get("error") or "")[-4000:]})
+            + "\n\n" + prompt
+        )
     if revision_request is not None:
         prompt += (
             "\n## Serialized scientific revision\n"

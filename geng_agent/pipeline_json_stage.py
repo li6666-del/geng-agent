@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+from copy import deepcopy
+from contextlib import nullcontext
+import hashlib
+import json
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 from .agentic_analysis import CODEX_ANALYSIS_BACKEND
 from .json_utils import parse_json_object, pretty_json
@@ -10,11 +15,15 @@ from .pipeline_helpers import (
     _is_non_retryable_llm_error,
     _read_json_file,
     _temporary_client_timeout,
-    build_json_retry_prompt,
-    summarize_bad_output,
+    build_json_inline_retry_prompt,
+    build_json_scientific_retry_prompt,
+    build_json_preservation_retry_prompt,
+    build_text_only_evidence_prompt,
 )
+from .analysis_repair import preserved_science_issues, scientific_correction_paths
+from .prompt_identity import analysis_contract_identity, scientific_cache_value
 from .runtime_status import _load_valid_stage_cache, build_stage_cache_metadata
-from .schema_models import response_format_for_stage
+from .schema_models import model_for_stage, response_format_for_stage
 from .schemas import ValidationIssue, format_issues, validate_stage
 from .scientific_materiality import SCIENTIFIC_POLICY_ID
 from .stage_cleanup import _clear_stage_outputs
@@ -54,7 +63,16 @@ def load_or_create_stage_json(
         schema_stage=schema_stage,
         prompt=prompt,
         policy_version=SCIENTIFIC_POLICY_ID,
-        inputs=cache_inputs if cache_inputs is not None else {},
+        inputs={
+            "scientific_inputs": scientific_cache_value(cache_inputs if cache_inputs is not None else {}),
+            "contract": analysis_contract_identity(
+                stage_label=stage_label, schema_stage=schema_stage,
+                backend=backend, prompt=prompt, client=client or getattr(pipeline, "client", None),
+            ),
+            "images": [{"label": image.label, "mime_type": image.mime_type,
+                        "sha256": hashlib.sha256(image.data_b64.encode("ascii")).hexdigest()}
+                       for image in images or []],
+        },
     )
 
     def _normalize_and_bind_cache(candidate: dict[str, Any]) -> dict[str, Any]:
@@ -212,6 +230,7 @@ def load_or_create_stage_json(
                 extra_validation=extra_validation,
                 request_timeout=request_timeout,
                 candidate_normalizer=_normalize_and_bind_cache,
+                repair_preservation_validator=repair_preservation_validator,
                 truncation_recovery=truncation_recovery,
                 images=images,
                 client=client,
@@ -270,21 +289,43 @@ def complete_maybe_multimodal(
     images: list[Any] | None,
     client: Any = None,
     system_message: str,
+    input_observer: Callable[[str, list[Any], dict[str, Any]], None] | None = None,
 ) -> str:
     client = client or pipeline.client
     if client is None:
         raise RuntimeError("LLM client is required for analysis_backend='llm'")
     response_format = response_format_for_stage(schema_stage)
-    if images and hasattr(client, "complete_multimodal"):
-        try:
-            return client.complete_multimodal(
-                prompt,
-                images=images,
-                system=system_message,
-                response_format=response_format,
-            )
-        except Exception:
-            pass
+    def observe(actual_prompt: str, actual_images: list[Any], **visibility: Any) -> None:
+        if input_observer is not None:
+            input_observer(actual_prompt, actual_images, {
+                "system_message": system_message, "response_format": response_format,
+                **visibility,
+            })
+
+    if images:
+        if hasattr(client, "complete_multimodal"):
+            observe(prompt, images, mode="multimodal")
+            try:
+                return client.complete_multimodal(
+                    prompt, images=images, system=system_message,
+                    response_format=response_format,
+                )
+            except Exception as exc:
+                detail = str(exc).lower()
+                unsupported = any(signature in detail for signature in (
+                    "unsupported image", "does not support image", "image input is not supported",
+                    "vision is not supported", "image_url is not supported",
+                ))
+                if not unsupported or _is_non_retryable_llm_error(detail):
+                    raise
+                reason = "The provider explicitly rejected image input."
+        else:
+            reason = "The configured client has no multimodal completion capability."
+        image_labels = [str(getattr(image, "label", "")) for image in images]
+        prompt = build_text_only_evidence_prompt(prompt, image_labels, reason)
+        observe(prompt, [], mode="text_only_downgrade", omitted_image_labels=image_labels, reason=reason)
+    else:
+        observe(prompt, [], mode="text")
     return client.complete(
         prompt,
         system=system_message,
@@ -303,6 +344,7 @@ def call_validated_json(
     extra_validation: Callable[[dict[str, Any]], list[ValidationIssue]] | None = None,
     request_timeout: float | None = None,
     candidate_normalizer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    repair_preservation_validator: Callable[[dict[str, Any], dict[str, Any]], list[ValidationIssue]] | None = None,
     truncation_recovery: Callable[[str], dict[str, Any] | None] | None = None,
     images: list[Any] | None = None,
     client: Any = None,
@@ -310,14 +352,49 @@ def call_validated_json(
     client = client or pipeline.client
     current_prompt = prompt
     last_errors = ""
-    for attempt in range(1, max_attempts + 1):
+    schema_text = pretty_json(model_for_stage(schema_stage).model_json_schema())
+    repair_baseline = None
+    authorized_paths: list[str] = []
+    format_repair = False
+    attempts = max(1, int(max_attempts or 1))
+    delivered_visibility: dict[str, Any] = {}
+    for attempt in range(1, attempts + 1):
+        active_images = [] if format_repair else images
+        def record_input(actual_prompt: str, actual_images: list[Any], visibility: dict[str, Any]) -> None:
+            if not format_repair:
+                # Formatting/restoration does not re-extract science, so its
+                # lack of attachments must not erase the reasoning call's
+                # actual visual coverage from the resulting document.
+                delivered_visibility.clear()
+                delivered_visibility.update({key: value for key, value in visibility.items() if key not in {"system_message", "response_format"}})
+                delivered_visibility["supplied_image_labels"] = [image.label for image in actual_images]
+            snapshot = audit_dir / "api_prompt_inputs" / uuid4().hex
+            snapshot.mkdir(parents=True, exist_ok=True)
+            write_text(snapshot / "brief.md", actual_prompt)
+            write_text(audit_dir / f"{stage_label}_llm_attempt_{attempt}_brief.md", actual_prompt)
+            manifest = {
+                "backend": "llm", "prompt_sha256": hashlib.sha256(actual_prompt.encode("utf-8")).hexdigest(),
+                "mode": "format_repair" if format_repair else "evidence_reasoning",
+                "visibility": visibility,
+                "prompt_path": str(snapshot / "brief.md"),
+                "images": [{"label": image.label, "mime_type": image.mime_type,
+                            "sha256": hashlib.sha256(image.data_b64.encode("ascii")).hexdigest()}
+                           for image in actual_images or []],
+            }
+            write_json(snapshot / "input.json", manifest)
+            write_json(audit_dir / f"{stage_label}_llm_attempt_{attempt}_input.json", manifest)
         try:
-            with _temporary_client_timeout(client, request_timeout):
+            request_audit = (
+                client.audit_requests(audit_dir / "api_requests", f"{stage_label}_attempt_{attempt}")
+                if hasattr(client, "audit_requests") else nullcontext()
+            )
+            with _temporary_client_timeout(client, request_timeout), request_audit:
                 raw = pipeline._complete_maybe_multimodal(
                     current_prompt,
                     schema_stage=schema_stage,
-                    images=images,
+                    images=active_images,
                     client=client,
+                    input_observer=record_input,
                 )
         except Exception as exc:
             last_errors = f"LLM request error: {type(exc).__name__}: {exc}"
@@ -333,7 +410,6 @@ def call_validated_json(
                 raise RuntimeError(
                     f"{stage_label} LLM request failed: {last_errors}"
                 ) from exc
-            current_prompt = prompt
             continue
         write_text(audit_dir / f"raw_{stage_label}_attempt_{attempt}.txt", raw)
         write_text(audit_dir / f"raw_{stage_label}.txt", raw)
@@ -353,22 +429,32 @@ def call_validated_json(
                         "errors": [{"path": "$", "message": last_errors}],
                     },
                 )
-                current_prompt = build_json_retry_prompt(
-                    prompt, summarize_bad_output(raw), last_errors
+                current_prompt = build_json_inline_retry_prompt(
+                    candidate_text=raw, schema_text=schema_text,
+                    issues=[ValidationIssue("$", last_errors)],
                 )
+                format_repair = True
                 continue
             parsed = recovered
 
         if candidate_normalizer is not None:
             parsed = candidate_normalizer(parsed)
+        if repair_baseline is None:
+            repair_baseline = deepcopy(parsed)
 
         normalization_issues = (
             pre_validation(parsed) if pre_validation is not None else []
         )
-        issues = normalization_issues or validate_stage(schema_stage, parsed)
-        if not issues and extra_validation is not None:
-            issues.extend(extra_validation(parsed))
+        schema_issues = validate_stage(schema_stage, parsed)
+        preservation_issues = [] if schema_issues else preserved_science_issues(
+            repair_preservation_validator, repair_baseline, parsed, authorized_paths,
+        )
+        scientific_issues = extra_validation(parsed) if not schema_issues and extra_validation is not None else []
+        issues = [*normalization_issues, *schema_issues, *preservation_issues, *scientific_issues]
         if not issues:
+            meta = dict(parsed.get("_meta", {})) if isinstance(parsed.get("_meta"), dict) else {}
+            meta["evidence_visibility"] = dict(delivered_visibility)
+            parsed["_meta"] = meta
             write_json(
                 audit_dir / f"validation_{stage_label}_attempt_{attempt}.json",
                 {"ok": True, "errors": []},
@@ -378,15 +464,37 @@ def call_validated_json(
         last_errors = format_issues(issues)
         write_json(
             audit_dir / f"validation_{stage_label}_attempt_{attempt}.json",
-            {"ok": False, "errors": [issue.as_dict() for issue in issues]},
+            {"ok": False, "errors": [issue.as_dict() for issue in issues],
+             "categories": {
+                 "normalization": [issue.as_dict() for issue in normalization_issues],
+                 "schema": [issue.as_dict() for issue in schema_issues],
+                 "preservation": [issue.as_dict() for issue in preservation_issues],
+                 "scientific": [issue.as_dict() for issue in scientific_issues],
+             }},
         )
-        if normalization_issues:
-            raise RuntimeError(
-                f"{stage_label} deterministic normalization conflict: {last_errors}"
+        write_json(audit_dir / f"normalized_{stage_label}_attempt_{attempt}.json", parsed)
+        if normalization_issues or scientific_issues:
+            authorized_paths = list(dict.fromkeys([
+                *authorized_paths,
+                *scientific_correction_paths([*scientific_issues, *normalization_issues], parsed, repair_baseline),
+            ]))
+            current_prompt = build_json_scientific_retry_prompt(
+                candidate_text=pretty_json(parsed), schema_text=schema_text,
+                issues=issues, original_task=prompt, authorized_paths=authorized_paths,
+                preservation_baseline_text=pretty_json(repair_baseline) if preservation_issues else None,
             )
-        current_prompt = build_json_retry_prompt(
-            prompt, summarize_bad_output(pretty_json(parsed)), last_errors
-        )
+            format_repair = False
+        elif preservation_issues:
+            current_prompt = build_json_preservation_retry_prompt(
+                candidate_text=pretty_json(parsed), baseline_text=pretty_json(repair_baseline),
+                schema_text=schema_text, issues=issues, authorized_paths=authorized_paths,
+            )
+            format_repair = True
+        else:
+            current_prompt = build_json_inline_retry_prompt(
+                candidate_text=pretty_json(parsed), schema_text=schema_text, issues=issues,
+            )
+            format_repair = True
 
     raise RuntimeError(
         f"{stage_label} did not pass JSON validation after {max_attempts} "

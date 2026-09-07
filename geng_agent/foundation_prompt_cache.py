@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,7 @@ from .foundation_snapshot import (
 )
 from .json_utils import pretty_json
 from .scientific_architecture import foundation_module_paths
+from .prompt_identity import model_identity, text_identity
 
 
 FOUNDATION_RESULT_STATUS = "ready_for_tasks"
@@ -89,15 +91,7 @@ def _foundation_brief(
         "remaining_uncertainties": ["explicit unresolved items only"],
     }
     if execution_contract_required:
-        result_template["execution_contracts"] = [
-            {
-                "component_id": item["component_id"],
-                "module": item["module"],
-                "callable": item["callable"],
-                "execution": item["execution"],
-            }
-            for item in component_contracts
-        ]
+        result_template["execution_contracts"] = []
         capability_templates: list[dict[str, str]] = []
         for component in _architecture_components(architecture):
             execution = component.get("execution") if isinstance(component.get("execution"), dict) else {}
@@ -132,8 +126,9 @@ def _foundation_brief(
     execution_result_note = (
         """
 6. Because this is scientific architecture schema 1.1 or newer, `foundation_result.json`
-   must use the single complete template above. Keep one `execution_contracts`
-   record for every component, copy its architecture `execution` object without
+   uses the example above. Populate the empty `execution_contracts` array with one
+   record per component using component_id, module, callable, and the complete
+   execution object from the single per-component contract above. Copy it without
    weakening it, and replace every capability `test` placeholder with the real
    delivered test method. Every capability record must retain the component's
    exact `module` and `callable`, and its test must construct/call that public
@@ -323,6 +318,9 @@ def _foundation_input_hash(
         "architecture": architecture,
         "environment_lock_hash": environment_hash,
         "role": "foundation_writer",
+        "model_identity": model_identity("foundation_writer"),
+        "prompt_contract": text_identity(inspect.getsource(_foundation_brief)),
+        "environment_request_contract": text_identity(inspect.getsource(environment_request_prompt)),
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
