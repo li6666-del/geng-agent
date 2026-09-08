@@ -265,11 +265,11 @@ class AutonomousTaskWriterTests(unittest.TestCase):
         self.assertIn("may never overwrite higher-priority evidence", prompt)
         self.assertIn("An assumed algorithm is acceptable only", prompt)
         self.assertIn("Core-result stopping policy", prompt)
-        self.assertIn("Missing or imperfect structure is not itself a scientific failure", prompt)
-        self.assertIn("A ratio below 10 is non-material", prompt)
-        self.assertIn("Another Writer execution is allowed only", prompt)
+        self.assertIn("Incomplete handoff", prompt)
+        self.assertIn("never a universal acceptance threshold", prompt)
+        self.assertIn("Another Writer run requires", prompt)
         self.assertIn("core_conclusion_failed", prompt)
-        self.assertIn("key_numeric_ratio_ge_10", prompt)
+        self.assertIn("material_numeric_discrepancy", prompt)
         self.assertIn("invalid_run", prompt)
         self.assertIn("ready_for_review", prompt)
         self.assertNotIn("stopping_assessment", prompt)
@@ -289,7 +289,7 @@ class AutonomousTaskWriterTests(unittest.TestCase):
         self.assertIn("Never rerun unchanged code solely to answer non-blocking feedback", prompt)
         self.assertIn("Investigate the causal rerun note", prompt)
         self.assertIn("failure of any assigned core conclusion", prompt)
-        self.assertIn("numerical mismatch below a factor of 10", prompt)
+        self.assertIn("a numerical or statistical difference assessed by the Reporter", prompt)
         self.assertIn("permitted by the mandatory stopping policy", prompt)
         self.assertIn("do not change any assumption, seed, dataset filter, configuration, or epoch count", prompt)
     def test_analysis_warnings_are_collected_as_optional_writer_evidence(self) -> None:
@@ -699,7 +699,7 @@ class AutonomousTaskWriterTests(unittest.TestCase):
                 "outcome_counts": {"reproduced": 1},
                 "tasks": [{
                     "task_id": "task_1",
-                    "outcome": "reproduced",
+                    "outcome": "reproduced", "engineering_status": "verified",
                     "host_action": "complete",
                     "rerun_reason": "none",
                     "run_valid": True,
@@ -742,7 +742,7 @@ class AutonomousTaskWriterTests(unittest.TestCase):
                 "tasks": [
                     {
                         "task_id": "task_1",
-                        "outcome": "reproduced",
+                        "outcome": "reproduced", "engineering_status": "verified",
                         "host_action": "complete",
                         "rerun_reason": "none",
                         "run_valid": True,

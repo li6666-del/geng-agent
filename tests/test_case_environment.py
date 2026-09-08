@@ -912,7 +912,7 @@ class CaseEnvironmentResolutionTests(unittest.TestCase):
         real_replace = os.replace
 
         def recording_replace(source, destination):
-            replace_destinations.append(Path(destination))
+            replace_destinations.append(Path(destination).resolve())
             real_replace(source, destination)
 
         def runner(argv, *, cwd=None, timeout=None):
@@ -954,7 +954,9 @@ class CaseEnvironmentResolutionTests(unittest.TestCase):
                 resolution.paths.lock,
                 resolution.paths.report,
             }
-            self.assertEqual(set(replace_destinations), expected)
+            self.assertEqual(len(replace_destinations), len(expected))
+            for path in expected:
+                self.assertEqual(sum(path.samefile(actual) for actual in replace_destinations), 1)
             for path in expected:
                 self.assertIsInstance(json.loads(path.read_text(encoding="utf-8")), dict)
             self.assertEqual(list(Path(temp_dir).glob(".*.tmp")), [])

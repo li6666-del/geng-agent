@@ -102,8 +102,13 @@
           "type": "string"
         },
         "comparison_status": {
-          "default": "comparable",
+          "default": "unavailable",
           "title": "Comparison Status",
+          "type": "string"
+        },
+        "comparison_reason": {
+          "default": "",
+          "title": "Comparison Reason",
           "type": "string"
         },
         "metric": {
@@ -194,16 +199,58 @@
           "type": "string"
         },
         "outcome": {
-          "default": "inconclusive_missing_information",
+          "default": "review_incomplete",
           "enum": [
             "reproduced",
             "reproduced_with_assumptions",
             "inconclusive_missing_information",
             "not_reproduced",
-            "execution_failed"
+            "execution_failed",
+            "review_incomplete"
           ],
           "title": "Outcome",
           "type": "string"
+        },
+        "decision_reason": {
+          "default": "",
+          "title": "Decision Reason",
+          "type": "string"
+        },
+        "decision_authority": {
+          "default": "reporter",
+          "title": "Decision Authority",
+          "type": "string"
+        },
+        "reporter_action": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reporter Action"
+        },
+        "engineering_status": {
+          "default": "unverified_execution",
+          "title": "Engineering Status",
+          "type": "string"
+        },
+        "engineering_issues": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Engineering Issues",
+          "type": "array"
+        },
+        "handoff_issues": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Handoff Issues",
+          "type": "array"
         },
         "host_action": {
           "default": "complete",
@@ -220,6 +267,7 @@
             "none",
             "core_conclusion_failed",
             "key_numeric_ratio_ge_10",
+            "material_numeric_discrepancy",
             "invalid_run"
           ],
           "title": "Rerun Reason",
@@ -326,6 +374,13 @@
           "default": "",
           "title": "Provenance Base",
           "type": "string"
+        },
+        "asset_notes": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Asset Notes",
+          "type": "array"
         }
       },
       "title": "TaskVerificationResult",
@@ -335,8 +390,8 @@
   "additionalProperties": false,
   "properties": {
     "schema_version": {
-      "const": "2.0",
-      "default": "2.0",
+      "const": "3.0",
+      "default": "3.0",
       "title": "Schema Version",
       "type": "string"
     },

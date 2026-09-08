@@ -783,14 +783,8 @@ def _terminalize_rerun_request(
     terminal = dict(verification or {})
     terminal["host_action"] = "complete"
     terminal["rerun_reason"] = "none"
-    terminal["outcome"] = (
-        "execution_failed" if terminal.get("run_valid") is False else "not_reproduced"
-    )
-    uncertainties = terminal.get("remaining_uncertainties")
-    if not isinstance(uncertainties, list):
-        uncertainties = []
-        terminal["remaining_uncertainties"] = uncertainties
-    uncertainties.append(uncertainty)
+    terminal.setdefault("outcome", "review_incomplete")
+    terminal.setdefault("engineering_issues", []).append(uncertainty)
     record["task_verification"] = terminal
     if isinstance(record.get("task_reporter"), dict):
         record["task_reporter"]["task_verification"] = terminal

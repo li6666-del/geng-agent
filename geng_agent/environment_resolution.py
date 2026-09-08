@@ -109,7 +109,10 @@ def subprocess_argv_runner(
                 "PIP_NO_INPUT": "1",
             }
         )
-        command = normalized
+        # Isolated Python ignores PYTHONIOENCODING. Select UTF-8 in argv so
+        # Chinese paths/probe output cannot kill the pipe reader thread.
+        command = ([normalized[0], "-X", "utf8", *normalized[1:]]
+                   if is_pip or is_python_probe else normalized)
         process_cwd = runtime_home if is_pip else (str(cwd) if cwd is not None else None)
         setpriv = shutil.which("setpriv")
         if (
@@ -132,7 +135,7 @@ def subprocess_argv_runner(
                 "--no-new-privs",
                 "--pdeathsig=KILL",
                 "--",
-                *normalized,
+                *command,
             ]
             process_cwd = runtime_home
         process = subprocess.Popen(
@@ -143,6 +146,8 @@ def subprocess_argv_runner(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             shell=False,
             close_fds=True,
             start_new_session=True,

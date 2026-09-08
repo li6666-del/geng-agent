@@ -18,6 +18,13 @@ class ScientificCalibrationTests(unittest.TestCase):
             case = cases[label["case_id"]]
             with self.subTest(case_id=case["case_id"]):
                 raw = copy.deepcopy(label["reference_reporter_note"])
+                # This is a handoff regression, not an evaluation of an actual
+                # Reporter's scientific ability. The reference label is supplied.
+                raw.update(schema_version="3.0", task_id=case["task_id"], outcome=label["expected_outcome"], run_valid=True,
+                           decision_reason="Reference human-labeled calibration decision.",
+                           host_action="rerun_writer" if label["expected_rerun_allowed"] else "complete")
+                for item in raw.get("key_numeric_comparisons", []):
+                    item.update(comparison_status="comparable", comparison_reason="Reference comparable numeric observation.")
                 rerun_claim_id = raw.pop("rerun_claim_id", None)
                 if rerun_claim_id:
                     raw["rerun_evidence"] = {

@@ -357,6 +357,7 @@ def run_codex_foundation_writer_workflow(
         sandbox / "README.foundation.md",
         "# Frozen scientific foundation\n\nGenerated once before isolated task writers.\n",
     )
+    write_json(sandbox / PAPER_EVIDENCE_DIR / "analysis_artifacts" / "foundation_context.json", cache_architecture)
     trusted_before = _trusted_hashes(sandbox)
     prompt = _foundation_brief(scientific_architecture, case_runtime=case_runtime)
     if repair_delivery is not None:

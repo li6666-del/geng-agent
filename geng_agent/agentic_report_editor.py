@@ -35,7 +35,7 @@ from .report_editor_fallback import (
 )
 
 REPORT_EDITOR_POLICY_VERSION = f"{SCIENTIFIC_POLICY_ID}:terminal-report-v2-host-facts"
-REPORT_EDITOR_PROMPT_VERSION = "final_report_editor_v5_verified_facts_only"
+REPORT_EDITOR_PROMPT_VERSION = "final_report_editor_v6_reporter_reasons_and_independent_images"
 
 
 def run_codex_report_editor_workflow(
@@ -315,7 +315,7 @@ You receive {task_count} terminal, reportable, isolated task packets. A packet m
 - You may create only `review.md`, `reproduction_report.md`, and `result_review.md`.
 - Do not access the network, install packages, edit images, or create new scientific evidence.
 - Do not expose raw JSON, paths, transcripts, commands, chain-of-thought, Writer logs, or an iteration appendix.
-- The host publishes an immutable task-outcome and criterion table in each report. Explain the supplied evidence; do not write a competing global or task verdict. Do not derive a new reproducibility verdict or validate a method from the images.
+- The host publishes an immutable Reporter decision, direct decision_reason, engineering status and criterion table in each report. Explain the supplied evidence; do not write a competing global or task verdict. Do not derive a new reproducibility verdict or validate a method from the images.
 
 ## Input
 - `inputs/report_editor_input.json` contains terminal task packets, host execution counts, criterion observations, Reporter-verified facts, selected assets, and non-blocking asset warnings. Original evidence paths are provenance references, not proof you read those files.
@@ -332,10 +332,10 @@ Write exactly three Markdown files in Chinese.
 Give a concise overview of the supplied task decisions and remaining uncertainties, and links to the two detailed reports. The host supplies the outcome table. Preserve its terminal outcomes without writing another global verdict.
 
 ### `reproduction_report.md`
-Create one compact section per task. State the target, then explain implementation, parameters, assumptions and measurements only from `verification.verified_facts` or explicit criterion observations. Preserve each fact's source (paper, derived, assumed, observed). If details or provenance were not verified upstream, state they were not provided; do not reconstruct them from a task plan or fill missing fields. Refer to the host terminal decision.
+Create one compact section per task. State the target, then explain implementation, parameters, assumptions and measurements only from `verification.verified_facts` or explicit criterion observations. Preserve each fact's source (paper, derived, assumed, observed). If details or provenance were not verified upstream, state they were not provided; do not reconstruct them from a task plan or fill missing fields. Refer to the Reporter decision and its direct decision_reason. Remaining uncertainties are separate; never infer a verdict cause from them. Engineering/handoff/evidence-delivery failures do not establish omissions in the paper.
 
 ### `result_review.md`
-Start directly with task 1. When both images exist, include a two-column Markdown image table with the final local result on the left and the paper crop on the right. When images are unavailable, explain the supplied criterion observations and verified facts and state the packaging limitation briefly. Do not claim to have inspected a CSV merely because its path is listed. A missing crop, styling difference, or pixel-level mismatch is never a scientific failure. Preserve supplied material differences and uncertainty. Never show raw filesystem paths.
+Start directly with task 1. When both images exist, include a two-column Markdown image table with the final local result on the left and the paper crop on the right. When only a local result or only a paper crop exists, show it independently. Preserve asset_notes, including images supplied as unreviewed presentation attachments. When images are unavailable, explain the supplied criterion observations and verified facts and state the packaging limitation briefly. Do not claim to have inspected a CSV merely because its path is listed. A missing crop, styling difference, or pixel-level mismatch is never a scientific failure. Preserve supplied material differences and uncertainty. Never show raw filesystem paths.
 
 ## Layout
 - Use short headings, compact tables, and restrained prose suitable for Word rendering.

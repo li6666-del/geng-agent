@@ -11,6 +11,48 @@ import uuid
 from pathlib import Path
 
 
+def _io_path(path: Path) -> Path:
+    if os.name != "nt":
+        return path
+    value = str(path.absolute())
+    if value.startswith("\\\\?\\"):
+        return path
+    return Path("\\\\?\\UNC\\" + value[2:] if value.startswith("\\\\") else "\\\\?\\" + value)
+
+
+def _wait_for_result(queue: Path, request_id: str, task_id: str, *, heartbeat_timeout: float = 30.0) -> dict:
+    result_path = queue / (request_id + ".result.json")
+    started = time.time()
+    while True:
+        if result_path.is_file():
+            return json.loads(result_path.read_text(encoding="utf-8"))
+        try:
+            status = json.loads((queue / "status.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            status = {}
+        request = status.get("requests", {}).get(request_id, {})
+        if request.get("task_id") == task_id and request.get("request_id") == request_id:
+            receipt = request.get("receipt")
+            if request.get("state") == "completed" and isinstance(receipt, dict):
+                if receipt.get("task_id") == task_id and receipt.get("observer") == "orchestration_host":
+                    return receipt  # Same host receipt through an independent delivery path.
+            if request.get("state") == "failed":
+                return request.get("result") or {"returncode": 1, "error": "Host execution failed"}
+        try:
+            heartbeat = json.loads((queue / "heartbeat.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            heartbeat = status
+        if heartbeat.get("broker_state") == "stopped":
+            return {"returncode": 1, "error_kind": "host_unavailable", "error": "Host stopped before delivering this request"}
+        try:
+            updated = float(heartbeat.get("updated_at", started))
+        except (ValueError, TypeError):
+            updated = started
+        if time.time() - updated > heartbeat_timeout:
+            return {"returncode": 1, "error_kind": "host_unavailable", "error": "Host heartbeat expired; inspect existing receipts before resubmitting"}
+        time.sleep(0.2)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run one task with its scientific configuration")
     parser.add_argument("--task", required=True)
@@ -29,7 +71,7 @@ def main():
     if session:
         if not session.isalnum():
             raise ValueError("invalid execution session")
-        queue = root / ".geng_execution" / session
+        queue = _io_path(root / ".geng_execution" / session)
         status_path = queue / "status.json"
         status = {}
         if status_path.is_file():
@@ -51,10 +93,7 @@ def main():
             print(json.dumps({"task_id": args.task, "state": "submitted", "request_id": run_id,
                               "status_command": f"python run_task.py --task {args.task} --status"}))
             return 0
-        result_path = queue / (run_id + ".result.json")
-        while not result_path.exists():
-            time.sleep(0.2)
-        result = json.loads(result_path.read_text(encoding="utf-8"))
+        result = _wait_for_result(queue, run_id, args.task)
         print(json.dumps(result, ensure_ascii=True))
         return int(result.get("returncode", 1))
     if args.status or args.submit:

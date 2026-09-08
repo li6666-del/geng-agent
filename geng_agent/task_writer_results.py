@@ -223,14 +223,15 @@ def apply_verified_result(
         if not isinstance(task_outcome, dict):
             raise ValueError(f"missing terminal outcome for {task_id}")
         outcome = str(task_outcome.get("outcome") or "inconclusive_missing_information")
+        from .verification_result import verification_scientifically_successful
         record["task_writer_status"] = (
             FINAL_MATCHED_STATUS
-            if outcome in {"reproduced", "reproduced_with_assumptions"}
+            if verification_scientifically_successful(task_outcome)
             else WRITER_REVIEW_STATUS
         )
         record["scientific_outcome"] = outcome
         record["verification_result"] = task_outcome
-        record["verification_verified"] = True
+        record["verification_verified"] = task_outcome.get("engineering_status") == "verified" and not task_outcome.get("handoff_issues")
 
     previous_runtime = _read_optional_json_object(output_dir / "runtime_result.json")
     runtime_result = _task_writer_runtime_result(
@@ -256,8 +257,8 @@ def apply_verified_result(
             else []
         ),
     )
-    runtime_result["verification_verified"] = True
-    runtime_result["verification_mode"] = "host_derived_core_conclusion_outcomes"
+    runtime_result["verification_verified"] = all(record.get("verification_verified") for record in task_records)
+    runtime_result["verification_mode"] = "reporter_decisions_with_host_evidence"
     runtime_result["scientific_all_terminal"] = True
     runtime_result["scientific_all_successful"] = bool(
         verification_result.get("all_successful")
@@ -285,7 +286,7 @@ def apply_verified_result(
                     "task_id": record.get("task_id"),
                     "status": record.get("task_writer_status"),
                     "scientific_outcome": record.get("scientific_outcome"),
-                    "verification_verified": True,
+                    "verification_verified": record.get("verification_verified", False),
                 }
                 for record in task_records
             ],
@@ -302,7 +303,7 @@ def apply_verified_result(
         str(record.get("task_id")): str(record.get("scientific_outcome") or "")
         for record in task_records
     }
-    config["verification_verified"] = True
+    config["verification_verified"] = runtime_result["verification_verified"]
     write_json(config_path, config)
 
     # Reporter terminalization is the last mutation inside the portable project.

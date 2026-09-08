@@ -35,6 +35,7 @@ def build_terminal_review_summary(
     elif outcome_counts.get("not_reproduced", 0) and not (
         outcome_counts.get("inconclusive_missing_information", 0)
         or outcome_counts.get("execution_failed", 0)
+        or outcome_counts.get("review_incomplete", 0)
     ):
         terminal_alignment = "mismatch"
         terminal_credibility = "high"
@@ -44,11 +45,11 @@ def build_terminal_review_summary(
         terminal_credibility = "low"
         terminal_summary = (
             "No positive reproduction conclusion is available because task "
-            "evidence is inconclusive or execution failed."
+            "evidence is inconclusive, review handoff is incomplete, or execution failed."
         )
 
     writer_review_document = {
-        "_meta": {"mode": "host_derived_core_conclusion_outcomes"},
+        "_meta": {"mode": "reporter_decisions_with_host_evidence"},
         "passed": True,
         "overall_alignment": terminal_alignment,
         "overall_result_credibility": terminal_credibility,
@@ -61,7 +62,7 @@ def build_terminal_review_summary(
         "scientific_all_successful": all_successful,
         "all_terminal": bool(verification_result.get("all_terminal")),
         "outcome_counts": outcome_counts,
-        "mode": "host_derived_core_conclusion_outcomes",
+        "mode": "reporter_decisions_with_host_evidence",
         "overall_alignment": terminal_alignment,
         "overall_result_credibility": terminal_credibility,
         "verification_result": verification_result,

@@ -73,6 +73,7 @@ def _record(root: Path) -> dict:
     (sandbox / "config_smoke.json").write_text('{"run_profile": "smoke"}\n', encoding="utf-8")
     (sandbox / "requirements.txt").write_text("numpy\n", encoding="utf-8")
     return {
+        "host_execution": {"passed": True, "returncode": 0},
         "task_id": "task_a",
         "sandbox": str(sandbox),
         "output_subdir": "task_a",
@@ -89,9 +90,10 @@ def _record(root: Path) -> dict:
     }
 
 
-def _supported_raw(*, local_magnitude: float = 5.0) -> dict:
+def _supported_raw(*, local_magnitude: float = 5.0, outcome: str = "reproduced") -> dict:
     return {
-        "schema_version": "2.0",
+        "schema_version": "3.0",
+        "outcome": outcome, "decision_reason": "Independent Reporter assessed the observed result.", "host_action": "complete",
         "task_id": "task_a",
         "run_valid": True,
         "core_conclusions": [{
@@ -104,6 +106,7 @@ def _supported_raw(*, local_magnitude: float = 5.0) -> dict:
             "target_id": "target_scale",
             "local_magnitude": local_magnitude,
             "symmetric_ratio": 1.0,
+            "comparison_status": "comparable", "comparison_reason": "Same declared metric and conditions.",
         }],
         "comparison_summary": "the core ordering is supported",
         "confidence": "high",
@@ -112,10 +115,13 @@ def _supported_raw(*, local_magnitude: float = 5.0) -> dict:
 
 def _rerun_raw(*, paper_evidence: str, claim_id: str = "claim_order") -> dict:
     return {
-        "schema_version": "2.0",
+        "schema_version": "3.0", "outcome": "not_reproduced",
+        "decision_reason": "The recorded method ordering is reversed.", "host_action": "rerun_writer",
+        "key_numeric_comparisons": [{"target_id": "target_scale", "local_magnitude": None,
+            "comparison_status": "unavailable", "comparison_reason": "The failed ordering is decisive in this fixture."}],
         "task_id": "task_a",
         "run_valid": True,
-        "core_conclusions": [{
+        "core_conclusions": ([] if claim_id == "claim_order" else _supported_raw()["core_conclusions"]) + [{
             "claim_id": claim_id,
             "status": "unsupported",
             "local_observation": "the full result reverses the paper ordering",
@@ -218,11 +224,11 @@ class IsolatedTaskReporterTests(unittest.TestCase):
 
         self.assertIn("navigation aid", prompt)
         self.assertIn("never reject merely for missing structure", prompt)
-        self.assertIn("The host computes ratios", prompt)
+        self.assertIn("The host may compute diagnostic ratios", prompt)
         self.assertIn("Designer criteria and numeric anchors are provisional", prompt)
         self.assertIn("invalid_run", prompt)
         self.assertIn("core_conclusion_failed", prompt)
-        self.assertIn("key_numeric_ratio_ge_10", prompt)
+        self.assertIn("material_numeric_discrepancy", prompt)
         self.assertIn("not_reproduced", prompt)
         self.assertIn("inconclusive_missing_information", prompt)
         self.assertIn("Visual packaging is independent of the scientific outcome", prompt)
@@ -230,24 +236,18 @@ class IsolatedTaskReporterTests(unittest.TestCase):
         self.assertIn("CSV, JSON, PDF", prompt)
         self.assertEqual(
             TASK_REPORTER_PROMPT_VERSION,
-            "isolated_task_reporter_v10_paper_basis_and_observable_trace",
+            "isolated_task_reporter_v11_explicit_scientific_decision",
         )
         self.assertNotIn('"verdict"', prompt)
         self.assertNotIn('"revision_target"', prompt)
 
-    def test_missing_structure_becomes_terminal_inconclusive(self) -> None:
-        result = normalize_task_verification(
-            {"task_id": "wrong_task", "comparison_summary": "no itemized evidence"},
-            "task_a",
-            task=_task(),
-            run_valid_hint=True,
-        )
-
-        self.assertEqual(result["task_id"], "task_a")
-        self.assertEqual(result["host_action"], "complete")
-        self.assertEqual(result["outcome"], "inconclusive_missing_information")
-        self.assertEqual(result["core_conclusions"][0]["status"], "unassessable_missing_information")
-        self.assertEqual(task_verification_issues(result, "task_a"), [])
+    def test_missing_structure_is_reporter_handoff_failure(self):
+        result = normalize_task_verification({"task_id": "wrong_task"}, "task_a", task=_task(), run_valid_hint=True)
+        self.assertEqual(result["outcome"], "review_incomplete")
+        self.assertEqual(result["engineering_status"], "handoff_failed")
+        self.assertTrue(result["handoff_issues"])
+        self.assertEqual(result["core_conclusions"], [])
+        self.assertFalse(writer_revision_allowed(result, "task_a"))
 
     def test_host_recomputes_numeric_ratio_and_ignores_reporter_ratio(self) -> None:
         task = _task()
@@ -263,7 +263,7 @@ class IsolatedTaskReporterTests(unittest.TestCase):
 
     def test_order_of_magnitude_gap_is_terminal_without_causal_plan(self) -> None:
         result = normalize_task_verification(
-            _supported_raw(local_magnitude=10.0),
+            _supported_raw(local_magnitude=10.0, outcome="not_reproduced"),
             "task_a",
             task=_task(),
             run_valid_hint=True,
@@ -276,9 +276,10 @@ class IsolatedTaskReporterTests(unittest.TestCase):
 
     def test_uncontracted_reporter_numeric_gap_is_preserved(self) -> None:
         task = _task()
-        raw = _supported_raw(local_magnitude=1.0)
+        raw = _supported_raw(local_magnitude=1.0, outcome="not_reproduced")
         raw["key_numeric_comparisons"].append({
             "target_id": "reporter_discovered_scale",
+            "comparison_status": "comparable", "comparison_reason": "Independent extra anchor from the paper.",
             "name": "paper-discovered scale",
             "paper_magnitude": 2.0,
             "local_magnitude": 20.0,
@@ -328,21 +329,13 @@ class IsolatedTaskReporterTests(unittest.TestCase):
         self.assertTrue(writer_revision_allowed(result, "task_a"))
         self.assertEqual(result["core_conclusions"][1]["claim_id"], "invented_claim")
 
-    def test_wrong_numeric_target_id_cannot_be_counted_as_success(self) -> None:
+    def test_wrong_numeric_target_id_requires_handoff_repair_without_rewriting_science(self):
         raw = _supported_raw(local_magnitude=1.0)
         raw["key_numeric_comparisons"][0]["target_id"] = "invented_target"
-
-        result = normalize_task_verification(
-            raw,
-            "task_a",
-            task=_task(),
-            run_valid_hint=True,
-        )
-
-        comparison = result["key_numeric_comparisons"][0]
-        self.assertEqual(comparison["target_id"], "target_scale")
-        self.assertIsNone(comparison["local_magnitude"])
-        self.assertEqual(result["outcome"], "inconclusive_missing_information")
+        result = normalize_task_verification(raw, "task_a", task=_task(), run_valid_hint=True)
+        self.assertEqual(result["outcome"], "reproduced")
+        self.assertEqual(result["engineering_status"], "handoff_failed")
+        self.assertEqual(result["key_numeric_comparisons"][0]["target_id"], "invented_target")
         self.assertEqual(result["host_action"], "complete")
 
     def test_aggregate_accepts_mixed_reportable_terminal_outcomes(self) -> None:
@@ -353,6 +346,9 @@ class IsolatedTaskReporterTests(unittest.TestCase):
         failed_task["task_id"] = "task_b"
         failed_task["scientific_acceptance"]["core_conclusions"][0]["claim_id"] = "claim_b"
         failed_raw = {
+            "schema_version": "3.0", "outcome": "not_reproduced", "host_action": "complete",
+            "decision_reason": "The ordering reversal is observed.",
+            "key_numeric_comparisons": _supported_raw()["key_numeric_comparisons"],
             "task_id": "task_b",
             "run_valid": True,
             "core_conclusions": [{
@@ -528,6 +524,7 @@ class IsolatedTaskReporterTests(unittest.TestCase):
             writer_image = Path(record["sandbox"]) / "outputs" / "task_a" / "local_plot.png"
             writer_image.write_bytes(b"local-png")
             raw = _supported_raw()
+            raw["outcome"] = "not_reproduced"
             raw["core_conclusions"][0]["status"] = "unsupported"
             raw["core_conclusions"][0]["local_observation"] = "A falls below B"
             raw["local_assets"] = ["inputs/writer_output/outputs/local_plot.png"]
@@ -853,7 +850,7 @@ class IsolatedTaskReporterTests(unittest.TestCase):
             [{"name": "core normalization", "impact": "high"}],
         )
 
-    def test_only_material_core_assumptions_downgrade_scientific_outcome(self) -> None:
+    def test_host_does_not_infer_outcome_from_assumption_labels(self) -> None:
         task = _task()
         task["assumptions"] = [{"name": "plot color", "risk": "low"}]
         low_risk = normalize_task_verification(
@@ -865,7 +862,7 @@ class IsolatedTaskReporterTests(unittest.TestCase):
         )
 
         self.assertEqual(low_risk["outcome"], "reproduced")
-        self.assertEqual(high_risk["outcome"], "reproduced_with_assumptions")
+        self.assertEqual(high_risk["outcome"], "reproduced")  # Only Reporter can assess materiality.
 
 
 if __name__ == "__main__":

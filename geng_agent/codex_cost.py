@@ -38,7 +38,7 @@ def record_codex_invocation(audit_dir: Path, status: dict[str, Any], transcript:
                             *, started_at: float) -> dict[str, Any]:
     event = {"schema_version": "1.0", "invocation_id": status.get("invocation_id") or uuid.uuid4().hex,
              "started_at": started_at, "finished_at": time.time(),
-             "role": status.get("role"), "model": status.get("model"),
+             "role": status.get("role"), "label": status.get("label"), "model": status.get("model"),
              "ok": bool(status.get("ok")), "duration_s": status.get("duration_s"),
              "usage": parse_codex_usage(transcript), "cost_usd": None,
              "usage_complete": bool(status.get("ok")),
@@ -53,19 +53,24 @@ def record_codex_invocation(audit_dir: Path, status: dict[str, Any], transcript:
     return event
 
 
-def summarize_codex_usage(audit_dir: Path, *, since: float | None = None) -> dict[str, Any]:
+def summarize_codex_usage(audit_dir: Path, *, since: float | None = None,
+                          completed_after: float | None = None, completed_before: float | None = None) -> dict[str, Any]:
     events: dict[str, dict[str, Any]] = {}
     for path in audit_dir.rglob("codex_usage_events/*.json") if audit_dir.exists() else []:
         try:
             event = json.loads(path.read_text(encoding="utf-8"))
             if since is not None and float(event["started_at"]) < since:
                 continue
+            if completed_after is not None and float(event.get("finished_at", event["started_at"])) <= completed_after:
+                continue
+            if completed_before is not None and float(event.get("finished_at", event["started_at"])) > completed_before:
+                continue
             events[str(event["invocation_id"])] = event
         except (OSError, ValueError, KeyError, TypeError):
             continue
     # Pre-ledger transcripts establish that work occurred, but cannot establish
     # complete historical usage. Do not show a historical Codex case as 0 tokens.
-    if since is None and audit_dir.exists():
+    if since is None and completed_after is None and completed_before is None and audit_dir.exists():
         for path in audit_dir.rglob("*_transcript.txt"):
             status_path = path.with_name(path.name.removesuffix("_transcript.txt") + ".json")
             try:
@@ -83,8 +88,31 @@ def summarize_codex_usage(audit_dir: Path, *, since: float | None = None) -> dic
             "observed_tokens": {key: sum(event["usage"].get(key, 0) for event in known) for key in TOKEN_FIELDS},
             **{key: sum(event["usage"].get(key, 0) for event in known) if complete else None for key in TOKEN_FIELDS},
             "cost_usd": None, "currency_note": "No token price is inferred for account-based Codex usage.",
+            "session_seconds": round(sum(float(event.get("duration_s") or 0) for event in events.values()), 3),
+            "sessions": [{key: event.get(key) for key in ("invocation_id", "role", "label", "duration_s", "usage", "usage_complete")}
+                         for event in sorted(events.values(), key=lambda value: float(value.get("started_at") or 0))],
             "by_role": {role: sum(event.get("role") == role for event in events.values())
                         for role in sorted({str(event.get("role") or "unknown") for event in events.values()})}}
+
+
+def summarize_execution_time(audit_dir: Path, *, since: float | None = None) -> dict[str, Any]:
+    receipts = {}
+    for path in audit_dir.rglob("execution_runs/*/execution_receipt.json") if audit_dir.exists() else []:
+        try:
+            receipt = json.loads(path.read_text(encoding="utf-8"))
+            if receipt.get("observer") != "orchestration_host" or not receipt.get("run_id"):
+                continue
+            if since is not None and float(receipt["started_at"]) < since:
+                continue
+            duration = max(0.0, float(receipt["finished_at"]) - float(receipt["started_at"]))
+            receipts[receipt["run_id"]] = {"mode": receipt.get("mode"), "seconds": duration}
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return {"executions": len(receipts), "process_seconds": round(sum(x["seconds"] for x in receipts.values()), 3),
+        "by_mode": {mode: {"executions": sum(x["mode"] == mode for x in receipts.values()),
+                           "process_seconds": round(sum(x["seconds"] for x in receipts.values() if x["mode"] == mode), 3)}
+                    for mode in ("smoke", "full")},
+        "note": "Receipt durations include process supervision; parallel durations overlap model sessions and must not be added to wall time. No receipts means no observed execution, not proof no computation occurred."}
 
 
 def persist_pipeline_cost(output_dir: Path, run_cost: dict[str, Any], *, run_id: str, started_at: float) -> None:

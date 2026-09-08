@@ -411,6 +411,10 @@ def _literal_path_issues(
     line: int | None = None,
 ) -> list[dict[str, Any]]:
     issues: list[dict[str, Any]] = []
+    # Bare Windows namespace prefixes are portable path-building syntax. A
+    # prefix followed by a drive or server/share must still be checked below.
+    if value in {"\\\\?\\", "\\\\?\\UNC\\"}:
+        return issues
     if _URL.match(value.strip()):
         return issues
     matched_paths: set[str] = set()

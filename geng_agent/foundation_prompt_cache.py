@@ -177,10 +177,11 @@ Build the shared scientific foundation for all reproduction tasks. The architect
 ## Implementation ownership
 {scope_instruction}
 
-## Mandatory inputs
-- `paper_evidence/analysis_artifacts/scientific_architecture.json`
-- all other finalized artifacts in `paper_evidence/analysis_artifacts/`
-- copied source paper and rendered pages under `paper_evidence/`
+## Reading scope
+- Start with `paper_evidence/analysis_artifacts/foundation_context.json`: the shared component contract, quantities, invariants and consuming interfaces.
+- Follow its evidence references into the canonical facts and original source/pages under `paper_evidence/` as needed to implement those components faithfully.
+- The complete architecture and finalized artifacts remain available for resolving an actual ambiguity. Do not repeatedly read all task plans or unrelated private components; read the needed section once and refer back to its path.
+- The explicit component interfaces below are an implementation checklist, not a request for another full architecture analysis.
 
 ## Required modules
 Create every module below and implement the interfaces assigned by the architecture:
@@ -239,10 +240,10 @@ not create Foundation work.
   downgrade the framework/capability and do not claim `ready_for_tasks`.
 
 ## Verification
-1. Read the complete scientific architecture; implement each component and exposed binding output. Treat acceptance mappings only as output-routing hints.
+1. Read the scoped Foundation context and relevant paper evidence; implement each owned component and exposed binding output. Treat acceptance mappings only as output-routing hints.
 2. Implement the required modules, using package `__init__.py` files where needed.
 3. Add focused `unittest` tests under `tests/` for dimensions, units/normalization, deterministic seeds, component composition, and applicable cross-task interface invariants. Do not test the paper-result verdict.
-4. Run `python -m unittest discover -s tests -v` and fix every failure.
+4. Run `python -m unittest discover -s tests -v` and fix every failure. Repeat only after relevant source, test, configuration or environment changes; writing the result note alone does not require repeating the suite. The host independently validates the frozen delivery once.
 5. Write `foundation_result.json` only after tests pass:
 ```json
 {pretty_json(result_template)}

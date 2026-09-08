@@ -167,7 +167,7 @@ class FinalReportEditorTests(unittest.TestCase):
             self.assertIn("return code 124", brief)
             self.assertEqual(
                 REPORT_EDITOR_PROMPT_VERSION,
-                "final_report_editor_v5_verified_facts_only",
+                "final_report_editor_v6_reporter_reasons_and_independent_images",
             )
 
     def test_human_readable_task_headings_do_not_require_machine_task_ids(self) -> None:

@@ -21,6 +21,29 @@ from .task_writer_files import _read_optional_json_object, _task_owned_files, _t
 from .task_writer_support import PAPER_EVIDENCE_DIR, _manifest_from_project, _prune_unexpected_files
 
 
+def _runtime_validation_identity(project: Path) -> dict[str, str]:
+    """Bind installation/relocation checks to executable inputs, not report prose."""
+    inventory = build_source_inventory(project)
+    entries = inventory.get("files", [])
+    paths = [item["path"] for item in entries] if isinstance(entries, list) else list(entries)
+    identity = {}
+    for name in paths:
+        path = project / name
+        if name in {"README.md", "README.foundation.md", "review.md", "result_review.md", "reproduction_report.md"}:
+            continue
+        if name in {"source_inventory.json", "execution_evidence.json", "reproducibility_manifest.json"} or name.startswith(("execution_records/", "task_notes/", "report_assets/")):
+            continue
+        if name == "config.json":
+            value = _read_optional_json_object(path)
+            for key in ("task_statuses", "scientific_outcomes", "verification_verified"):
+                value.pop(key, None)
+            payload = json.dumps(value, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        else:
+            payload = path.read_bytes()
+        identity[name] = hashlib.sha256(payload).hexdigest()
+    return identity
+
+
 def _freeze_repro_project_package(
     *,
     repro_project_dir: Path,
@@ -43,6 +66,8 @@ def _freeze_repro_project_package(
 
     from .delivery_environment import export_installation
     expected_paths.update(export_installation(repro_project_dir, python_executable=python_executable))
+    runtime_identity = _runtime_validation_identity(repro_project_dir)
+    previous_checks = _read_optional_json_object(output_dir / "audit" / "03c_project_portability.json")
     source_inventory = build_source_inventory(repro_project_dir)
     write_json(repro_project_dir / "source_inventory.json", source_inventory)
     portability = validate_repro_project_portability(
@@ -74,6 +99,19 @@ def _freeze_repro_project_package(
                 "code": "clean_environment_unverified", "severity": "warning",
                 "message": "Clean-environment delivery was not verified; retain the independent scientific results.",
             })
+    portability["runtime_validation_identity"] = runtime_identity
+    if not run_smoke:
+        if previous_checks.get("runtime_validation_identity") == runtime_identity:
+            for key in ("clean_environment", "smoke"):
+                if key in previous_checks:
+                    portability[key] = previous_checks[key]
+            portability["validation_reused"] = True
+        else:
+            portability["clean_environment"] = {"verified": False, "reason": "Runtime inputs changed or no matching prior validation exists"}
+            portability["validation_reused"] = False
+        if not portability.get("clean_environment", {}).get("verified"):
+            portability.setdefault("warnings", []).append({"code": "clean_environment_unverified",
+                "severity": "warning", "message": "Final runtime inputs have no matching clean-environment validation; science is preserved."})
     # Persist the full smoke diagnostics before failing.  Relocation uses a
     # temporary copy, so otherwise task-level errors disappear with that copy
     # and callers receive only the aggregate return code.

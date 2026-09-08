@@ -258,18 +258,7 @@ def run_codex_task_reporter_workflow(
         workspace,
     )
     if rerun_path_issues:
-        raw_verification = json.loads(
-            json.dumps(raw_verification, ensure_ascii=False)
-        )
-        raw_verification["rerun_evidence"] = None
-        uncertainties = raw_verification.get("remaining_uncertainties")
-        if not isinstance(uncertainties, list):
-            uncertainties = []
-            raw_verification["remaining_uncertainties"] = uncertainties
-        uncertainties.append(
-            "A requested rerun referenced untrusted or missing paper evidence; "
-            "the host declined the rerun and retained a terminal outcome."
-        )
+        raw_verification.setdefault("_engineering_issues", []).extend(rerun_path_issues)
     verification = normalize_task_verification(
         raw_verification,
         task_id,
@@ -298,10 +287,8 @@ def run_codex_task_reporter_workflow(
         and not validation_issues
         and verification.get("host_action") == "complete"
     )
-    scientific_successful = verification.get("outcome") in {
-        "reproduced",
-        "reproduced_with_assumptions",
-    }
+    from .verification_result import verification_scientifically_successful
+    scientific_successful = verification_scientifically_successful(verification)
     crop_result: dict[str, Any] = {"status": "not_applicable", "issues": []}
     asset_issues: list[str] = []
     copied_assets: list[str] = []
@@ -316,6 +303,13 @@ def run_codex_task_reporter_workflow(
         else []
         for key in ("local_assets", "paper_assets")
     }
+    if scientific_terminal and not asset_candidates["local_assets"]:
+        # Do not silently lose generated figures. These are presentation
+        # attachments, explicitly not an additional scientific assessment.
+        asset_candidates["local_assets"] = list(report_input.get("local_image_paths") or [])
+        if asset_candidates["local_assets"]:
+            verification.setdefault("asset_notes", []).append(
+                "已有本地图作为展示附件交付；Reporter 未主动选图，这些附件不增加科学支持证据。")
     if scientific_terminal:
         try:
             crop_result = finalize_paper_target(

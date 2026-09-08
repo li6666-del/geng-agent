@@ -832,13 +832,8 @@ def _attach_task_reporter_review(
         if isinstance(warnings, list):
             warnings.extend(issues)
     final_verification = record.get("task_verification")
-    record["task_reporter_successful"] = (
-        isinstance(final_verification, dict)
-        and final_verification.get("outcome") in {
-            "reproduced",
-            "reproduced_with_assumptions",
-        }
-    )
+    from .verification_result import verification_scientifically_successful
+    record["task_reporter_successful"] = isinstance(final_verification, dict) and verification_scientifically_successful(final_verification)
     record["task_reporter_terminal"] = True
     return "terminal", None
 

@@ -30,6 +30,9 @@ def _task() -> dict:
 def _rerun_note(*, claim_id: str = "claim.real", reason: str = "core_conclusion_failed") -> dict:
     status = "unsupported" if reason == "core_conclusion_failed" else "unassessable_missing_information"
     return {
+        "schema_version": "3.0", "task_id": "task_a", "host_action": "rerun_writer",
+        "outcome": "not_reproduced" if reason != "invalid_run" else "execution_failed",
+        "decision_reason": "The recorded observation requires the proposed correction.",
         "run_valid": reason != "invalid_run",
         "core_conclusions": [{"claim_id": claim_id, "status": status}],
         "rerun_evidence": {
@@ -61,7 +64,8 @@ class ScientificStateMachineSafetyTests(unittest.TestCase):
             task=_task(),
             run_valid_hint=True,
         )
-        self.assertEqual(result["core_conclusions"][0]["claim_id"], "claim.real")
+        self.assertEqual(result["core_conclusions"][0]["claim_id"], "claim.made_up")
+        self.assertEqual(result["engineering_status"], "handoff_failed")
         self.assertEqual(result["host_action"], "complete")
         self.assertFalse(writer_revision_allowed(result, "task_a"))
 

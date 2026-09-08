@@ -33,10 +33,12 @@ if 'isolated scientific task reporter' in prompt:
     values=[float(row['capacity']) for row in rows]
     source=(root/'inputs/writer_output/source/tasks/sample.py').read_text()
     supported=values == [1.0,2.0] and 'math.log2' in source
-    note={'task_id':'sample','run_valid':True,'core_conclusions':[{'claim_id':'capacity_trend',
+    note={'schema_version':'3.0','outcome':'reproduced' if supported else 'not_reproduced','host_action':'complete',
+      'decision_reason':'Measured values and inspected formula agree' if supported else 'Measured values or method differ',
+      'task_id':'sample','run_valid':True,'core_conclusions':[{'claim_id':'capacity_trend',
       'status':'supported' if supported else 'unsupported','local_observation':str(values),
       'evidence_files':['inputs/writer_output/outputs/results.csv','inputs/writer_output/source/tasks/sample.py']}],
-      'key_numeric_comparisons':[{'target_id':'capacity_3','local_magnitude':values[-1]}],
+      'key_numeric_comparisons':[{'target_id':'capacity_3','local_magnitude':values[-1],'comparison_status':'comparable','comparison_reason':'Same capacity metric and SNR'}],
       'comparison_summary':'Independent CSV and method inspection','evidence_files':['inputs/writer_output/outputs/results.csv']}
     (root/'task_verification_result.json').write_text(json.dumps(note))
 elif 'final report editor' in prompt:

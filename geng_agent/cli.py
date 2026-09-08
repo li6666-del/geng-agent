@@ -96,6 +96,7 @@ def main(argv: list[str] | None = None) -> int:
         output_dir = _resolve_case_path_or_error(args.out, parser)
         _warn_if_environment_incomplete()
         from .pipeline import ReviewPipeline
+        from .progress import ConsoleProgressReporter
 
         if args.analysis_backend == "llm":
             client = _build_client_or_error(args, parser)
@@ -114,6 +115,7 @@ def main(argv: list[str] | None = None) -> int:
             analysis_fallback=not args.no_analysis_fallback,
             analysis_backend=args.analysis_backend,
             analysis_only=args.analysis_only,
+            progress=ConsoleProgressReporter(),
         )
         if args.analysis_only:
             print(f"前两阶段完成：{result.output_dir}")

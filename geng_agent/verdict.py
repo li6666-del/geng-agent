@@ -161,7 +161,7 @@ def _verdict_from_terminal_task_outcomes(
     result_review: dict[str, Any],
     risk_level: str,
 ) -> dict[str, Any] | None:
-    """Make host-derived task outcomes authoritative when they are complete.
+    """Summarize Reporter decisions with separate execution-evidence eligibility.
 
     This prevents a generic medium-credibility summary from turning a purely
     inconclusive or negative reproduction into a positive "partial" label.
@@ -189,14 +189,16 @@ def _verdict_from_terminal_task_outcomes(
         "reproduced_with_assumptions",
         "inconclusive_missing_information",
         "not_reproduced",
-        "execution_failed",
+        "execution_failed", "review_incomplete",
     }
-    outcomes = [str(item.get("outcome") or "") for item in raw_tasks]
+    from .verification_result import effective_task_outcome
+    outcomes = [effective_task_outcome(item) if verification.get("schema_version") == "3.0"
+                else str(item.get("outcome") or "") for item in raw_tasks]
     if any(outcome not in known_outcomes for outcome in outcomes):
         return None
     counts = {outcome: outcomes.count(outcome) for outcome in sorted(known_outcomes)}
     reasons = [
-        "host-derived terminal task outcomes: "
+        "Reporter task decisions with separate host evidence eligibility: "
         + ", ".join(
             f"{outcome}={count}" for outcome, count in counts.items() if count
         )
@@ -229,6 +231,9 @@ def _verdict_from_terminal_task_outcomes(
             "Report reproduction task by task; do not generalize successful tasks to unresolved or negative ones.",
         )
 
+    if counts["review_incomplete"]:
+        reasons.append("Review handoff or execution evidence is incomplete; this is not a paper-information or scientific failure")
+        return _result("inconclusive", "low", reasons, "Report the engineering limitation and preserve each original Reporter decision.")
     inconclusive_count = counts["inconclusive_missing_information"]
     if inconclusive_count:
         reasons.append("no task produced positive reproduction evidence and decisive information remains missing")

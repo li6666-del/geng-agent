@@ -162,6 +162,7 @@ class SchemaTests(unittest.TestCase):
                         "none",
                         "core_conclusion_failed",
                         "key_numeric_ratio_ge_10",
+                        "material_numeric_discrepancy",
                         "invalid_run",
                     ],
                 )

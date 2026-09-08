@@ -4,10 +4,11 @@ import math
 from typing import Any
 
 
-SCIENTIFIC_POLICY_ID = "core-conclusion-v2"
+SCIENTIFIC_POLICY_ID = "reporter-decision-v3"
+# Legacy diagnostic API only; no host decision or rerun uses this threshold.
 KEY_NUMERIC_RATIO_THRESHOLD = 10.0
 WRITER_RERUN_REASONS = frozenset(
-    {"invalid_run", "core_conclusion_failed", "key_numeric_ratio_ge_10"}
+    {"invalid_run", "core_conclusion_failed", "key_numeric_ratio_ge_10", "material_numeric_discrepancy"}
 )
 TERMINAL_SCIENTIFIC_OUTCOMES = frozenset(
     {
@@ -16,6 +17,7 @@ TERMINAL_SCIENTIFIC_OUTCOMES = frozenset(
         "inconclusive_missing_information",
         "not_reproduced",
         "execution_failed",
+        "review_incomplete",  # Engineering terminal, never missing paper information.
     }
 )
 
@@ -31,7 +33,8 @@ def symmetric_magnitude_ratio(paper_value: Any, local_value: Any) -> float | Non
     local = float(local_value)
     if not math.isfinite(paper) or not math.isfinite(local) or paper == 0.0 or local == 0.0:
         return None
-    return max(abs(local) / abs(paper), abs(paper) / abs(local))
+    ratio = max(abs(local) / abs(paper), abs(paper) / abs(local))
+    return ratio if math.isfinite(ratio) else None
 
 
 def is_material_numeric_ratio(value: Any) -> bool:
@@ -43,12 +46,12 @@ def is_material_numeric_ratio(value: Any) -> bool:
     )
 
 
-CORE_RESULT_STOP_POLICY = f"""## Core-result stopping policy
-- Judge the paper at the level of its scientific conclusion: method identity, ordering, trend, crossing or threshold region, scaling, gain/loss region, mechanism, or an explicitly claimed absolute level.
-- `scientific_acceptance` IDs are navigation aids shared by Task Designer, Writer, and Reporter. Missing or imperfect structure is not itself a scientific failure: recover the intended claim from the task and paper, record uncertainty, and continue.
-- For finite non-zero key magnitudes, the host computes `max(abs(local)/abs(paper), abs(paper)/abs(local))`. A ratio below {KEY_NUMERIC_RATIO_THRESHOLD:g} is non-material unless tighter accuracy is itself an explicit core conclusion. Zero and near-zero cases are judged by the core claim, sign, and natural scale, not by an arbitrary epsilon.
-- Another Writer execution is allowed only for `invalid_run`, `core_conclusion_failed`, or `key_numeric_ratio_ge_10`, and only when paper evidence plus a concrete causal code/config change and predicted effect are available.
-- Pixel alignment, typography, crop quality, plotting style, unspecified seeds/sample counts/solvers, and reasonable choices in paper-silent space never reopen the Writer.
-- A valid faithful run with an unsupported conclusion but no evidence-based next change ends as `not_reproduced`. A conclusion that cannot be assessed because the paper omits necessary information ends as `inconclusive_missing_information`. Both are normal reportable outcomes, not reasons for an endless loop.
-- Once the latest valid full supports the core conclusions and every available key numeric ratio is below {KEY_NUMERIC_RATIO_THRESHOLD:g}, stop immediately and disclose remaining assumptions and uncertainty.
+CORE_RESULT_STOP_POLICY = """## Core-result stopping policy
+- The Reporter owns scientific decisions: method identity, ordering, trend, thresholds, scaling, mechanism and absolute accuracy. The host records the explicit decision and routes the next action.
+- `scientific_acceptance` IDs are navigation aids, not scientific authority. Check the original paper and account for each ID, correcting mistaken criteria with cited evidence and retaining independent findings.
+- Judge comparability and materiality using the metric, units, conditions, sign, natural scale and uncertainty. Explain equivalent expressions and any conversion. A magnitude ratio is optional diagnostic arithmetic, never a universal acceptance threshold: below 10 can be material, above 10 can be irrelevant to a particular claim. Do not apply ratios to zero, signed or logarithmic scales without scientific justification.
+- For probabilities/BER, inspect bounds, trial counts, zero-event uncertainty and confidence intervals; for rankings and training, inspect sampling variability, seeds, convergence and evaluation protocol. Do not tune seeds or select runs until a desired ordering appears.
+- Another Writer run requires `invalid_run`, `core_conclusion_failed`, or `material_numeric_discrepancy`, with cited paper/local evidence, a concrete causal change and a predicted effect. Incomplete handoff, missing images, style and communication failure never request another scientific run.
+- A faithful valid run with an unsupported conclusion and no justified next change ends as `not_reproduced`; decisive missing paper information ends as `inconclusive_missing_information`. Disclose material assumptions as `reproduced_with_assumptions`. Engineering/evidence-access failures are separate from paper omissions.
+- Stop when the evidence supports the assigned conclusions at scientifically justified accuracy and uncertainty. Preserve failures and limitations rather than tuning toward a pass.
 """

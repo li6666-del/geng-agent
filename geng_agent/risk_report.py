@@ -123,10 +123,21 @@ def _build_run_cost(
     }
     if audit_dir is not None:
         import time
-        from .codex_cost import summarize_codex_usage
+        from .codex_cost import summarize_codex_usage, summarize_execution_time
         delta = summarize_codex_usage(Path(audit_dir), since=codex_since if codex_since is not None else time.time() - total_wall_s)
         cumulative = summarize_codex_usage(Path(audit_dir))
         result["codex"] = {"delta": delta, "cumulative": cumulative}
+        result["observed_execution"] = summarize_execution_time(Path(audit_dir), since=codex_since)
+        origin = codex_since if codex_since is not None else time.time() - total_wall_s
+        for entry, prev, cur in zip(by_stage, marks, marks[1:]):
+            entry["llm_api_usage"] = {key: entry[key] for key in keys}
+            usage = summarize_codex_usage(Path(audit_dir), since=origin,
+                completed_after=origin + float(prev.get("elapsed_s", 0)),
+                completed_before=origin + float(cur.get("elapsed_s", 0)))
+            entry["codex_usage"] = usage
+            entry["attribution"] = "Codex calls completing within this stage interval; concurrent/nested sessions remain individually listed"
+            for key in keys:
+                entry[key] = entry[key] + usage[key] if usage.get(key) is not None else None
         result["llm_api_totals"] = dict(result["totals"])
         for key in keys:
             value = delta.get(key)
@@ -268,6 +279,8 @@ def build_risk_report(
     all_terminal = bool((result_review_result or {}).get("all_terminal")) or (
         bool(repro_tasks) and terminal_count >= len(repro_tasks)
     )
+    if outcome_counts.get("review_incomplete"):
+        findings.append({"type": "review_incomplete", "message": "审查交接或执行证据未完成，不能据此推断论文信息不足。", "count": outcome_counts["review_incomplete"]})
     if outcome_counts.get("inconclusive_missing_information"):
         findings.append(
             {
@@ -335,7 +348,7 @@ def _terminal_outcome_counts(result_review_result: dict[str, Any]) -> dict[str, 
         "reproduced_with_assumptions",
         "inconclusive_missing_information",
         "not_reproduced",
-        "execution_failed",
+        "execution_failed", "review_incomplete",
     )}
     nested = result_review_result.get("verification_result")
     source = nested if isinstance(nested, dict) else result_review_result
@@ -363,6 +376,9 @@ def _terminal_outcome_counts(result_review_result: dict[str, Any]) -> dict[str, 
             if value:
                 outcome = value
                 break
+        if source.get("schema_version") == "3.0":
+            from .verification_result import effective_task_outcome
+            outcome = effective_task_outcome(item)
         if outcome in counts:
             counts[outcome] += 1
     return counts
@@ -500,7 +516,7 @@ def _result_alignment_level(
         return "high"
     if outcome_counts.get("not_reproduced"):
         return "high"
-    if outcome_counts.get("inconclusive_missing_information"):
+    if outcome_counts.get("inconclusive_missing_information") or outcome_counts.get("review_incomplete"):
         return "medium"
     if result_review_enabled and not result_review_passed and not all_terminal:
         return "high"
@@ -541,7 +557,7 @@ def _scientific_risk_level(
     outcomes = _terminal_outcome_counts(result_review_result)
     if outcomes["not_reproduced"] or outcomes["execution_failed"]:
         return "high"
-    if outcomes["inconclusive_missing_information"] or outcomes["reproduced_with_assumptions"]:
+    if outcomes["inconclusive_missing_information"] or outcomes["reproduced_with_assumptions"] or outcomes["review_incomplete"]:
         return "medium"
     if sum(outcomes.values()):
         return "low"

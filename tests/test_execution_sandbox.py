@@ -79,11 +79,12 @@ for name,path in [('output',root/'outputs'/'result.txt'),('source',root/'science
         if descriptor>=0: api.close(descriptor)
 print(json.dumps(result))
 """
-            env = {"HOME": str(runtime), "USERPROFILE": str(runtime), "TEMP": str(runtime), "TMP": str(runtime)}
-            launch = scientific_sandbox_launch([sys.executable, "-I", "-c", script], work_dir=root,
+            env = {"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8", "HOME": str(runtime), "USERPROFILE": str(runtime), "TEMP": str(runtime), "TMP": str(runtime)}
+            # -I ignores PYTHON* environment variables; select pipe encoding explicitly.
+            launch = scientific_sandbox_launch([sys.executable, "-I", "-X", "utf8", "-c", script], work_dir=root,
                 write_roots=[output, runtime], env=env)
             result = subprocess.run(launch["command"], cwd=root, env=launch["env"], capture_output=True,
-                                    text=True, timeout=40)
+                                    text=True, encoding="utf-8", timeout=40)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             observed = json.loads(result.stdout.strip().splitlines()[-1])
             self.assertEqual(observed, {"python_output": True, "native_output": True,

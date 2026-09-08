@@ -19,7 +19,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from .outputs import write_json
+from .outputs import write_json, _io_path
 
 
 def file_hash(path: Path) -> str:
@@ -198,6 +198,9 @@ class ExecutionBroker:
         self.entries = {str(t["task_id"]): dict(t) for t in manifest.get("tasks", [])}
         self.receipts: list[dict[str, Any]] = []
         self.task_status: dict[str, dict[str, Any]] = {}
+        self.request_status: dict[str, dict[str, Any]] = {}
+        self.status_lock = threading.RLock()
+        self.heartbeat_thread = threading.Thread(target=self._heartbeat, daemon=True)
         self.completed_pending: dict[str, dict[str, Any]] = {}
         self.process: subprocess.Popen | None = None
         self.cancelled = threading.Event()
@@ -205,8 +208,9 @@ class ExecutionBroker:
         self.thread = threading.Thread(target=self._serve, daemon=True)
 
     def __enter__(self):
-        self.queue.mkdir(parents=True, exist_ok=True)
-        self._publish_response(self.queue / "status.json", {"tasks": {}})
+        _io_path(self.queue).mkdir(parents=True, exist_ok=True)
+        self._publish_status()
+        self.heartbeat_thread.start()
         self.thread.start()
         return self
 
@@ -219,11 +223,50 @@ class ExecutionBroker:
             self._stop_process()
         try:
             self.thread.join()
+            self.heartbeat_thread.join(timeout=2)
         except KeyboardInterrupt:
             self.cancelled.set()
             self._stop_process()
             self.thread.join(timeout=5)
             raise
+
+    def _publish_status(self) -> None:
+        _io_path(_inside(self.root, self.queue.relative_to(self.root).as_posix())).mkdir(parents=True, exist_ok=True)
+        with self.status_lock:
+            self._publish_response(self.queue / "status.json", {"tasks": self.task_status,
+                "requests": self.request_status, "broker_state": "stopped" if self.stopped.is_set() else "running",
+                "updated_at": time.time()})
+
+    def _heartbeat(self) -> None:
+        while not self.stopped.wait(1.0):
+            try:
+                self._publish_response(self.queue / "heartbeat.json", {"updated_at": time.time(), "broker_state": "running"})
+            except OSError:
+                pass  # Client detects stale heartbeat; no science is relaunched.
+        try:
+            self._publish_response(self.queue / "heartbeat.json", {"updated_at": time.time(), "broker_state": "stopped"})
+        except OSError:
+            pass
+
+    def _queue_requests(self):
+        return sorted(self.queue / path.name for path in _io_path(self.queue).glob("*.request.json"))
+
+    def _deliver_receipt(self, task_id: str, request_id: str, path: Path, receipt: dict[str, Any]) -> None:
+        # The receipt already exists in the host audit. Delivery cannot turn a
+        # successful scientific execution into a failed one.
+        self._set_status(task_id, {"state": "completed", "request_id": request_id,
+            "result": {key: receipt[key] for key in ("run_id", "task_id", "returncode") if key in receipt},
+            "receipt": receipt, "transport_state": "pending"})
+        try:
+            self._publish_response(path, receipt)
+        except OSError as exc:
+            self._set_status(task_id, {"state": "completed", "request_id": request_id,
+                "transport_state": "failed", "transport_error": f"{type(exc).__name__}: {exc}"})
+            write_json(self.audit_dir / "execution_runs" / f"delivery_{request_id}.json",
+                {"error_kind": "result_delivery_failed", "request_id": request_id,
+                 "run_id": receipt.get("run_id"), "error": str(exc)})
+        else:
+            self._set_status(task_id, {"transport_state": "delivered", "request_id": request_id})
 
     def _stop_process(self) -> None:
         """Cancel the sandbox supervisor and science child as one execution."""
@@ -245,14 +288,15 @@ class ExecutionBroker:
     def _serve(self):
         handled: set[str] = set()
         while not self.stopped.is_set():
-            for path in sorted(self.queue.glob("*.request.json")):
+            for path in self._queue_requests():
                 if path.name in handled:
                     continue
                 handled.add(path.name)
                 result_path = path.with_name(path.name.replace(".request.", ".result."))
                 task_id = ""
+                receipt = None
                 try:
-                    request = json.loads(_inside(self.root, path.relative_to(self.root).as_posix()).read_text(encoding="utf-8"))
+                    request = json.loads(_io_path(_inside(self.root, path.relative_to(self.root).as_posix())).read_text(encoding="utf-8"))
                     task_id = str(request.get("task_id") or "")
                     completed = self.completed_pending.pop(path.name, None)
                     if completed is not None and (
@@ -265,7 +309,7 @@ class ExecutionBroker:
                     ):
                         # A second client submitted while this task was still running.
                         # Return the original observation instead of duplicating science.
-                        self._publish_response(result_path, completed["receipt"])
+                        self._deliver_receipt(task_id, path.name.removesuffix(".request.json"), result_path, completed["receipt"])
                         continue
                     self._set_status(task_id, {"state": "starting", "request_id": path.name.removesuffix(".request.json")})
                     request_sources = source_hashes(self.root)
@@ -275,11 +319,11 @@ class ExecutionBroker:
                     # Snapshot already queued requests while the just-completed
                     # execution is still current. Do not infer ordering from
                     # filesystem mtimes (some case volumes round them forward).
-                    for pending in self.queue.glob("*.request.json"):
+                    for pending in self._queue_requests():
                         if pending.name in handled:
                             continue
                         try:
-                            queued = json.loads(_inside(self.root, pending.relative_to(self.root).as_posix()).read_text(encoding="utf-8"))
+                            queued = json.loads(_io_path(_inside(self.root, pending.relative_to(self.root).as_posix())).read_text(encoding="utf-8"))
                             if self._request_identity(queued, source_snapshot=self._current_recorded_hashes(request_sources)) == request_identity:
                                 self.completed_pending[pending.name] = {
                                     "request_identity": request_identity,
@@ -287,11 +331,13 @@ class ExecutionBroker:
                                 }
                         except (OSError, ValueError):
                             pass  # Normal request handling will report the malformed entry.
-                    self._set_status(task_id, {"state": "completed", "result": {
-                        key: receipt[key] for key in ("run_id", "task_id", "returncode") if key in receipt},
-                        "receipt_path": f"outputs/{self.entries[task_id].get('output_subdir') or task_id}/execution_receipt.json"})
-                    self._publish_response(result_path, receipt)
+                    self._deliver_receipt(task_id, path.name.removesuffix(".request.json"), result_path, receipt)
                 except Exception as exc:
+                    if receipt is not None:
+                        write_json(self.audit_dir / "execution_runs" / f"delivery_{uuid.uuid4().hex}.json",
+                            {"error_kind": "result_delivery_failed", "run_id": receipt.get("run_id"),
+                             "error": f"{type(exc).__name__}: {exc}"})
+                        continue
                     try:
                         failure = {"returncode": 1, "error": f"{type(exc).__name__}: {exc}"}
                         if task_id:
@@ -301,15 +347,20 @@ class ExecutionBroker:
                         # An unsafe Writer-controlled response path must never
                         # redirect a host write outside the sandbox.
                         write_json(self.audit_dir / "execution_runs" / f"rejected_{uuid.uuid4().hex}.json",
-                                   {"error": "unsafe execution request or response path"})
+                                   {"error_kind": "request_or_status_failure", "error": f"{type(exc).__name__}: {exc}"})
             self.stopped.wait(0.15)
 
     def _set_status(self, task_id: str, update: dict[str, Any]) -> None:
-        _inside(self.root, self.queue.relative_to(self.root).as_posix()).mkdir(parents=True, exist_ok=True)
-        if update.get("state") == "starting":
-            self.task_status.pop(task_id, None)
-        self.task_status[task_id] = {**self.task_status.get(task_id, {}), **update, "task_id": task_id}
-        self._publish_response(self.queue / "status.json", {"tasks": self.task_status})
+        with self.status_lock:
+            previous = self.task_status.get(task_id, {})
+            request_id = str(update.get("request_id") or previous.get("request_id") or "")
+            if request_id != previous.get("request_id"):
+                previous = {}
+            current = {**previous, **update, "task_id": task_id, "request_id": request_id}
+            self.task_status[task_id] = current
+            if request_id:
+                self.request_status[request_id] = current
+            self._publish_status()
 
     def _current_recorded_hashes(self, recorded: dict[str, Any]) -> dict[str, Any]:
         """Recheck known files without enumerating the project again."""
@@ -353,11 +404,14 @@ class ExecutionBroker:
     def _publish_response(self, path: Path, value: dict[str, Any]) -> None:
         relative = path.relative_to(self.root).as_posix()
         target = _inside(self.root, relative)
-        temporary = _inside(self.root, relative + "." + uuid.uuid4().hex + ".tmp")
-        with temporary.open("x", encoding="utf-8") as handle:
-            json.dump(value, handle, ensure_ascii=True)
-        _inside(self.root, relative)
-        temporary.replace(target)
+        temporary = _inside(self.root, (path.parent / (uuid.uuid4().hex[:12] + ".tmp")).relative_to(self.root).as_posix())
+        try:
+            with _io_path(temporary).open("x", encoding="utf-8") as handle:
+                json.dump(value, handle, ensure_ascii=True)
+            _inside(self.root, relative)
+            _io_path(temporary).replace(_io_path(target))
+        finally:
+            _io_path(temporary).unlink(missing_ok=True)
 
     def execute(self, request: dict[str, Any]) -> dict[str, Any]:
         if not self.allow_full and str(request.get("mode") or "full") == "full":

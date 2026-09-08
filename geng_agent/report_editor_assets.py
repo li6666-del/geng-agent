@@ -46,7 +46,8 @@ def _build_task_packets(
                 "remaining_uncertainties": verification.get("remaining_uncertainties", []),
                 "execution_summary": _host_report_execution(record, verification),
                 "verification": {key: verification[key] for key in (
-                    "task_id", "outcome", "host_action", "run_valid", "core_conclusions", "key_numeric_comparisons",
+                    "task_id", "outcome", "host_action", "run_valid",
+                    "decision_reason", "decision_authority", "engineering_status", "engineering_issues", "asset_notes", "core_conclusions", "key_numeric_comparisons",
                     "comparison_summary", "differences", "non_material_differences", "evidence_files", "confidence",
                     "verified_facts", "provenance_base") if key in verification},
                 "terminal_outcome": terminal_outcome,

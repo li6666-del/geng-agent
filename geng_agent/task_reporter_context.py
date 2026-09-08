@@ -31,12 +31,12 @@ from .prompt_identity import role_contract_identity
 
 
 TASK_VERIFICATION_FILE = "task_verification_result.json"
-TASK_REPORTER_PROMPT_VERSION = "isolated_task_reporter_v10_paper_basis_and_observable_trace"
+TASK_REPORTER_PROMPT_VERSION = "isolated_task_reporter_v11_explicit_scientific_decision"
 REPORTER_CONVERGENCE_POLICY = """## Convergence and materiality
 - Enforce paper-explicit scientific facts. Accept reasonable, disclosed choices where the paper is silent.
 - `host_execution.unobserved_artifacts` lists files added or changed after the observed run. They may illustrate the report, but cannot alone establish scientific support; inspect the observed measurements and implementation.
-- A numerical difference below a factor of 10, plotting style, crop quality, seed/sample-count choice, or merely possible alternative implementation is non-material unless the paper explicitly makes it a core conclusion.
-- Recommend another Writer run only for `invalid_run`, `core_conclusion_failed`, or `key_numeric_ratio_ge_10`, and only with paper evidence plus a concrete causal code/config change and predicted effect.
+- Decide numerical materiality from the claim, metric scale and statistical uncertainty, and explain your reasoning. There is no universal factor-of-10 acceptance rule. Separate missing paper information from unavailable execution or review evidence.
+- Recommend another Writer run only for `invalid_run`, `core_conclusion_failed`, or `material_numeric_discrepancy`, and only with paper evidence plus a concrete causal code/config change and predicted effect.
 - Do not speculate. Unsupported but faithfully implemented results without a justified next change are reportable `not_reproduced`; unavailable decisive information is reportable `inconclusive_missing_information`.
 - Separate population or mechanism claims from the appearance of one illustrative realization. If its exact geometry, random state, or data sample is unavailable, a different peak location or envelope alone does not refute the mechanism. Explain that limitation; never request geometry/seed selection or coordinate relabeling to imitate the example. Preserve strict peak/threshold/accuracy/trend checks when the paper actually claims them.
 """
@@ -122,8 +122,9 @@ def _prepare_task_reporter_input(
     local_images = (
         [
             path.relative_to(inputs_dir.parent).as_posix()
-            for path in sorted((writer_dir / "outputs").rglob("*.png"))
+            for path in sorted((writer_dir / "outputs").rglob("*"))
             if path.is_file()
+            and path.suffix.lower() in {".png", ".jpg", ".jpeg"}
             and not path.name.lower().startswith("paper_target")
         ]
         if (writer_dir / "outputs").exists()
@@ -220,7 +221,7 @@ Trace paper-explicit equations, models, algorithms, baselines, parameters, and m
 - `unsupported`; or
 - `unassessable_missing_information` when the paper or available evidence is insufficient.
 
-For each usable Task-Designer numeric target, report the observed local magnitude in the same metric, unit and regime; use null when unavailable. The host computes ratios. Do not force a comparison across incompatible dimensions or invent a value to complete the example.
+For each usable Task-Designer numeric target, report the observed local magnitude in the same metric, unit and regime; use null when unavailable. You decide comparison_status and explain comparison_reason, including equivalent expressions and conversions. The host may compute diagnostic ratios but cannot decide comparability or materiality. Do not force a comparison across incompatible dimensions or invent a value to complete the example.
 
 Designer criteria and numeric anchors are provisional. If a criterion is not a paper claim, use `status: not_applicable` and an optional `basis_review` with `status: not_applicable`, a concrete `reason`, and `paper_evidence_files` pointing to copied original source/pages. An unresolved interpretation uses `basis_review.status: disputed` and remains inconclusive. For a numeric anchor explicitly corrected by the paper, use `basis_review.status: corrected`, `corrected_paper_magnitude`, and the corrected `metric`, `unit`, `regime`. Include `local_metric`, `local_unit`, `local_regime` when needed to expose incompatibility. Writer prose and Designer navigation JSON cannot authorize a basis change. Keep independently observed method failures as separate unsupported observations; a disputed target never erases them.
 
@@ -229,10 +230,13 @@ Designer criteria and numeric anchors are provisional. If a criterion is not a p
 {CORE_RESULT_STOP_POLICY}
 
 ## Output
-Write `{TASK_VERIFICATION_FILE}` as one JSON object. This is deliberately a small evidence note, not a format gate:
+Write `{TASK_VERIFICATION_FILE}` as one JSON object. Submit an explicit scientific decision and routing instruction. Missing decision fields cause a Reporter-only handoff repair, never a Writer rerun:
 ```json
 {{
-  "schema_version": "2.0",
+  "schema_version": "3.0",
+  "outcome": "reproduced|reproduced_with_assumptions|not_reproduced|inconclusive_missing_information|execution_failed",
+  "decision_reason": "direct scientific reason, tied to the cited evidence; separate remaining uncertainty",
+  "host_action": "complete|rerun_writer",
   "task_id": "{task_id}",
   "run_valid": null,
   "core_conclusions": [
@@ -247,13 +251,15 @@ Write `{TASK_VERIFICATION_FILE}` as one JSON object. This is deliberately a smal
     {{
       "target_id": "target id from task.scientific_acceptance",
       "local_magnitude": null,
+      "comparison_status": "comparable|incompatible|disputed|not_applicable|unavailable",
+      "comparison_reason": "why this comparison is scientifically valid, invalid or unavailable",
       "unavailable_reason": ""
     }}
   ],
   "rerun_evidence": null,
   "comparison_summary": "direct paper-versus-local conclusion",
   "differences": ["material scientific differences"],
-  "non_material_differences": ["style or sub-order-of-magnitude differences"],
+  "non_material_differences": ["differences you judged non-material, with scientific justification"],
   "evidence_files": ["existing relative evidence path"],
   "feedback": [],
   "confidence": "low|medium|high",
@@ -266,7 +272,7 @@ Write `{TASK_VERIFICATION_FILE}` as one JSON object. This is deliberately a smal
 Only when another Writer run has a concrete scientific basis, replace `rerun_evidence: null` with:
 ```json
 {{
-  "rerun_reason": "invalid_run|core_conclusion_failed|key_numeric_ratio_ge_10",
+  "rerun_reason": "invalid_run|core_conclusion_failed|material_numeric_discrepancy",
   "contract_item_ids": ["affected claim_id or target_id"],
   "paper_evidence_files": ["paper evidence path"],
   "causal_change": "specific code or configuration change",
@@ -287,6 +293,7 @@ or Writer account. These facts support explanation, not a competing verdict.
 Visual packaging is independent of the scientific outcome. A valid terminal `not_reproduced` or inconclusive task may still include comparison images, while a task with no usable images remains fully reportable.
 
 - `local_assets` and `paper_assets` are display-image publication lists only. Put only ordinary, non-link PNG/JPG/JPEG files no larger than 20 MB in them.
+- Local result images and paper crops are independent: select useful existing local images even if no paper crop exists. Read the image inventory in `inputs/task_report_input.json`; account for omitted images with an explanation in `asset_notes` when useful. A poor axis layout may be noted for presentation repair from the existing data, never a new full run.
 - Before listing an image, copy it under `{report_asset_dir}/` and list that exact workspace-relative path. The host may safely materialize a declared image from the copied Writer outputs or paper evidence, but never rely on an absolute path or a path outside this workspace.
 - Put CSV, JSON, PDF, tables, summaries, and other non-image evidence only in `evidence_files`, never in the two asset lists.
 - Missing or unusable visual assets are advisory packaging limitations: they never change the scientific conclusion, request another Writer run, or make a terminal task invalid.
@@ -521,22 +528,13 @@ def _reporter_scientific_policy_texts() -> list[str]:
     from . import scientific_materiality as materiality
     from . import task_reporter_validation as evidence
     from . import verification_result as verification
-    functions = [
-        (verification, ("_string_list", "_finite_number", "_scientific_acceptance", "_paper_basis_review",
-            "_normalize_core_item", "_combine_core_observations", "_normalize_core_conclusions",
-            "_normalize_numeric_item", "_normalize_numeric_comparisons", "_normalize_rerun_evidence",
-            "rerun_evidence_path_issues", "_rerun_reason_if_actionable", "_derive_run_valid",
-            "_has_material_core_assumption", "_derive_outcome", "normalize_task_verification",
-            "task_verification_issues", "partition_task_verification_issues")),
-        (evidence, ("_task_record_run_valid_hint", "_evidence_path_issues", "_verified_reporter_evidence_path",
-            "_path_has_link_component", "_path_is_link_like", "normalize_reporter_observation_evidence")),
-        (materiality, ("symmetric_magnitude_ratio", "is_material_numeric_ratio")),
-    ]
-    return [inspect.getsource(getattr(module, name)) for module, names in functions for name in names] + [
-        json.dumps({"core_statuses": sorted(verification._CORE_STATUSES),
-                    "numeric_ratio_threshold": materiality.KEY_NUMERIC_RATIO_THRESHOLD,
-                    "rerun_reasons": sorted(materiality.WRITER_RERUN_REASONS),
-                    "terminal_outcomes": sorted(materiality.TERMINAL_SCIENTIFIC_OUTCOMES)}, sort_keys=True)]
+    functions = (
+        verification.normalize_task_verification, verification.verification_scientifically_successful,
+        verification._normalize_numeric_item, verification._rerun_reason_if_actionable,
+        evidence.normalize_reporter_observation_evidence, evidence._task_record_run_valid_hint,
+    )
+    return [inspect.getsource(module) for module in (verification, materiality)] + [inspect.getsource(fn) for fn in functions]
+
 
 
 def _reporter_attachment_visibility(workspace: Path, image_paths: list[Path]) -> tuple[dict[str, Any], str]:

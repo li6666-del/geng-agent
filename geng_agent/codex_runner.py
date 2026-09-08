@@ -611,7 +611,7 @@ def run_codex_subprocess(
     }
     write_json(input_dir / "input.json", input_manifest)
     write_json(audit_dir / f"{label}_input.json", input_manifest)
-    status.update(invocation_id=invocation_id, input_manifest=str(input_dir / "input.json"))
+    status.update(label=label, invocation_id=invocation_id, input_manifest=str(input_dir / "input.json"))
     if not argv or resolved is None:
         status["error_kind"] = "missing_cli"
         status["error"] = f"codex CLI not found: {raw_cmd!r} (install it or set GENG_CODEX_CMD)"

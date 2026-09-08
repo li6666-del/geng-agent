@@ -45,6 +45,7 @@ ReporterRerunReason = Literal[
     "none",
     "core_conclusion_failed",
     "key_numeric_ratio_ge_10",
+    "material_numeric_discrepancy",
     "invalid_run",
 ]
 CoreConclusionKind = Literal[
@@ -81,6 +82,7 @@ TaskScientificOutcome = Literal[
     "inconclusive_missing_information",
     "not_reproduced",
     "execution_failed",
+    "review_incomplete",
 ]
 MissingImpact = Literal["low", "medium", "high"]
 EvidenceKind = Literal["paper_explicit", "paper_derived", "visual_estimate"]
@@ -137,7 +139,8 @@ class KeyNumericComparison(StrictModel):
     local_magnitude: float | None = Field(allow_inf_nan=False)
     symmetric_ratio: float | None = Field(default=None, ge=1, allow_inf_nan=False)
     unavailable_reason: str = ""
-    comparison_status: str = "comparable"
+    comparison_status: str = "unavailable"
+    comparison_reason: str = ""
     metric: str = ""
     unit: str = ""
     regime: str = ""
@@ -560,7 +563,13 @@ class ScientificArchitectureDocument(StrictModel):
 
 class TaskVerificationResult(StrictModel):
     task_id: str = ""
-    outcome: TaskScientificOutcome = "inconclusive_missing_information"
+    outcome: TaskScientificOutcome = "review_incomplete"
+    decision_reason: str = ""
+    decision_authority: str = "reporter"
+    reporter_action: str | None = None
+    engineering_status: str = "unverified_execution"
+    engineering_issues: list[str] = Field(default_factory=list)
+    handoff_issues: list[str] = Field(default_factory=list)
     host_action: Literal["complete", "rerun_writer"] = "complete"
     rerun_reason: ReporterRerunReason = "none"
     run_valid: bool | None = None
@@ -576,17 +585,18 @@ class TaskVerificationResult(StrictModel):
     remaining_uncertainties: list[str] = Field(default_factory=list)
     verified_facts: list[dict[str, Any]] = Field(default_factory=list)
     provenance_base: str = ""
+    asset_notes: list[str] = Field(default_factory=list)
 
 
 class IsolatedTaskVerificationDocument(TaskVerificationResult):
-    schema_version: Literal["2.0"] = "2.0"
+    schema_version: Literal["3.0"] = "3.0"
     rerun_evidence: ReporterRerunEvidence | None = None
     local_assets: list[str] = Field(default_factory=list)
     paper_assets: list[str] = Field(default_factory=list)
 
 
 class VerificationResultDocument(StrictModel):
-    schema_version: Literal["2.0"] = "2.0"
+    schema_version: Literal["3.0"] = "3.0"
     all_terminal: bool = False
     all_successful: bool = False
     outcome_counts: dict[str, int] = Field(default_factory=dict)

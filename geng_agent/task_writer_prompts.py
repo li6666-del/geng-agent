@@ -77,7 +77,7 @@ Do not infer a new scientific defect merely from an interruption or environment 
 Before acting:
 1. Read the existing task code, configs, outputs, and `writer_progress/` archives.
 2. Inspect the latest local CSV/summary/PNG against the complete paper evidence.
-3. Classify every reporter item before editing: (a) a paper-grounded violation of an explicit fact, failure of any assigned core conclusion, or a key numerical mismatch by a factor of 10 or more; (b) a reasonable choice inside paper-silent or ambiguous space; or (c) a numerical mismatch below a factor of 10 or another non-material statistical, visual, or presentation difference.
+3. Classify every reporter item before editing: (a) a paper-grounded violation of an explicit fact, failure of any assigned core conclusion, or a scientifically material numerical mismatch identified by the Reporter; (b) a reasonable choice inside paper-silent or ambiguous space; or (c) a numerical or statistical difference assessed by the Reporter as non-material, or a visual/presentation difference.
 4. Create a concrete modification plan only for category (a). For category (b), keep or revise the explicit assumption according to evidence only before the mandatory stop condition is met. For category (c), record the caveat without changing faithful code merely to satisfy the reporter. Once the stop condition is met, do not change any assumption, seed, dataset filter, configuration, or epoch count.
 5. Run a fresh full with `python run_task.py --task {task_id} --config config.json --mode full` only after a meaningful change that is permitted by the mandatory stopping policy. Never rerun unchanged code solely to answer non-blocking feedback.
 6. Keep iterating only while a permitted paper-grounded material blocker remains and a new concrete causal change is available. If the result is still unsupported or unassessable but no such change exists, stop scientific modification and submit it for an honest terminal report.
@@ -166,7 +166,7 @@ You own one scientific execution unit containing multiple logical reproduction t
 - A shared model/trainer source file is not a shared checkpoint. Persist every required learned state, fitted transform, split, or realization using the execution plan's producer/consumer artifact IDs, and have consumers load that exact artifact.
 - A strong same-run relationship may use one shared driver/helper called by the task entry points. Still emit one honest result note and output directory per logical task.
 - Read the complete copied paper and finalized analysis artifacts. Do not optimize pixels, colors, typography, or layout.
-- Numerical differences below a factor of 10 are non-material unless the paper makes a tighter level part of its core conclusion.
+- Numerical materiality depends on the claim, metric scale and uncertainty. Follow the Reporter decision and its cited causal correction; no universal factor-of-10 rule applies.
 - There is no arbitrary wall-clock limit. Rerun only after a paper-grounded material blocker and a concrete causal source/config change.
 
 ## Execution unit
@@ -412,7 +412,7 @@ You own exactly one reproduction task. Write the code, run the assigned full exp
 ## Paper-faithful core objective
 Use `task.scientific_acceptance` as a short navigation list, not a format gate. Recover any missing intended claim from the task and paper. Prioritize paper-explicit models, equations, algorithms, baselines, regimes, axes, and statistics, then decide whether the scientific conclusion is supported. Do not spend runs reproducing pixels, typography, colors, crop boundaries, private code identity, or other presentation details.
 
-The core conclusion is normally a method identity, comparison direction, ordering, trend, crossing/threshold region, scaling behavior, gain/loss region, mechanism, or an explicitly claimed absolute level. Numerical agreement below a factor of 10 is non-material unless the paper itself makes tighter accuracy a core conclusion.
+The core conclusion is normally a method identity, comparison direction, ordering, trend, crossing/threshold region, scaling behavior, gain/loss region, mechanism, or an explicitly claimed absolute level. Numerical agreement must be judged against the claim, natural metric scale and statistical uncertainty; a magnitude ratio is diagnostic only.
 
 ## Self-iteration protocol
 You are the coder, runner, and first reviewer. You should compare and improve your own implementation, but another full run must have a scientific reason and a concrete causal change.
@@ -422,8 +422,8 @@ For each cycle:
 2. Search the complete paper before filling a missing parameter. If still absent, make and disclose a scientifically plausible assumption; do not relabel it as a paper fact.
 3. Implement the paper-faithful task, run smoke when useful, then run full with `python run_task.py --task {task_id} --config config.json --mode full`.
 4. Compare explicit scientific facts, each core conclusion, and Task-Designer key numeric targets. Record material and non-material differences separately.
-5. Rerun only for `invalid_run`, `core_conclusion_failed`, or `key_numeric_ratio_ge_10`, and only after recording paper evidence, the specific code/config change, its target, and predicted effect.
-6. Stop changing the science immediately when the conclusions are supported and available key ratios are below 10. Also stop when a valid faithful result remains unsupported or unassessable but there is no new evidence-based causal change. In that case, hand the result to the Reporter; do not loop forever or tune toward the picture.
+5. Rerun only for `invalid_run`, `core_conclusion_failed`, or `material_numeric_discrepancy`, and only after recording paper evidence, the specific code/config change, its target, and predicted effect.
+6. Stop changing the science immediately when the Reporter concludes that the evidence supports the assigned conclusions. Also stop when a valid faithful result remains unsupported or unassessable but there is no new evidence-based causal change. In that case, hand the result to the Reporter; do not loop forever or tune toward the picture.
 7. Never rerun unchanged code. A repeated ineffective plan, seed fishing, broad hyperparameter sweep, extra epochs without a causal hypothesis, or report-only change is not progress.
 
 Your normal handoff is always `ready_for_review` after the latest full and honest comparison. It does not assert final success: the independent Reporter may classify it as reproduced, reproduced with assumptions, inconclusive, or not reproduced. Only the Reporter plus host may request another Writer run, and only with a complete causal rerun note.
@@ -448,7 +448,7 @@ Always write the handoff after the latest full attempt, including when the run f
   "iteration_records": [
     {{
       "full_run_index": 1,
-      "scientific_reason": "initial_run|invalid_run|core_conclusion_failed|key_numeric_ratio_ge_10",
+      "scientific_reason": "initial_run|invalid_run|core_conclusion_failed|material_numeric_discrepancy",
       "comparison": ["local observation versus the paper conclusion"],
       "causal_change": "specific change made before this run, or empty for initial run",
       "outcome": "supported|unsupported|unassessable|invalid"

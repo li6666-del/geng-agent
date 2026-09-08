@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 import re
 import subprocess
@@ -45,7 +46,26 @@ def _observed_version_mismatches(project: Path, versions: dict[str, str]) -> lis
     return mismatches
 
 
+INSTALLATION_FILES = {"README.md", "installation.json", "requirements.repro.txt", "constraints.repro.txt"}
+
+
+def _installation_inputs(project: Path) -> dict[str, str]:
+    return {name: hashlib.sha256((project / name).read_bytes()).hexdigest()
+            for name in ("requirements.txt", "environment.lock.json", "tasks_manifest.json")
+            if (project / name).is_file()}
+
+
 def export_installation(project: Path, *, python_executable: Path | None = None) -> set[str]:
+    inputs = _installation_inputs(project)
+    previous = _read(project / "installation.json")
+    exported = previous.get("exported_hashes") or {}
+    if (previous.get("export_inputs") == inputs and exported
+        and set(exported) == INSTALLATION_FILES - {"installation.json"}
+        and all((project / name).is_file() and not (project / name).is_symlink()
+                and hashlib.sha256((project / name).read_bytes()).hexdigest() == digest
+                for name, digest in exported.items())
+        and (previous.get("metadata_dependency_closure") or python_executable is None)):
+        return set(INSTALLATION_FILES)
     lock = _read(project / "environment.lock.json")
     installed = {canonicalize_name(str(item.get("distribution", ""))): item
                  for item in lock.get("installed_distributions", []) if isinstance(item, dict)}
@@ -188,4 +208,8 @@ def export_installation(project: Path, *, python_executable: Path | None = None)
     if warnings:
         lines += ["## Installation limitations", "", *[f"- {warning}" for warning in warnings], ""]
     (project / "README.md").write_text("\n".join(lines), encoding="utf-8")
-    return {"README.md", "installation.json", "requirements.repro.txt", "constraints.repro.txt"}
+    document["export_inputs"] = inputs
+    document["exported_hashes"] = {name: hashlib.sha256((project / name).read_bytes()).hexdigest()
+                                  for name in sorted(INSTALLATION_FILES - {"installation.json"})}
+    (project / "installation.json").write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return set(INSTALLATION_FILES)

@@ -71,6 +71,21 @@ class ProgressReporter(Protocol):
     def check_cancelled(self) -> None: ...
 
 
+class ConsoleProgressReporter:
+    """Expose existing pipeline events on stderr without changing stage routing."""
+    def emit(self, event_type: str, *, phase: str, step: str | None = None,
+             message: str | None = None, data: dict[str, Any] | None = None) -> None:
+        import datetime
+        import sys
+        if event_type.startswith(("step.", "phase.")):
+            timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+            print(f"[{timestamp}] {event_type} {step or phase}" + (f" {message}" if message else ""),
+                  file=sys.stderr, flush=True)
+
+    def check_cancelled(self) -> None:
+        return None
+
+
 class NullProgressReporter:
     def emit(
         self,

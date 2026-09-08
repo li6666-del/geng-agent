@@ -114,7 +114,7 @@ MinerU 缺失、超时、非零退出或未识别到目标图时，流程不会�
 
 系统会把原始论文文件、全论文页面图以及最终定稿的 `engineering_facts.json`、`repro_tasks.json`、`execution_plan.json`、`experiment_index.json`、v2 的 `scientific_architecture.json`、可选 `paper_thesis.json` 和 `analysis_warnings.json` 复制到每个 writer sandbox。确需共享科学层的 sandbox 安装同一份只读 Foundation snapshot。所有论文页面图直接随 Codex writer 会话发送，不再执行任务页筛选；任务相关事实摘要只用于文本导航，不构成信息边界。
 
-每个 writer 交付后，专属 task reporter 在独立上下文中读取该任务的 `task_agent_result.json`、执行摘要、本地 PNG/CSV/summary 和完整论文证据，按稳定 criterion ID 提交观察。宿主统一计算关键数值的对称倍率：两个有限、非零同号量的倍率小于 10 时，单纯参数差异不构成重跑理由；零值、符号、阈值或更严格数值准确性只有在任务把它明确写成核心结论时才按该结论裁决。裁图或证据定位问题只重跑对应 Reporter，绝不重跑 Writer。所有任务进入终态后，Final Report Editor 汇总生成三份最终报告。
+每个 Writer 交付后，专属 Reporter 在独立上下文中对照原文、实际代码和宿主 full 收据，按 v3 协议提交科学结论、直接理由、比较条件与下一步动作。Reporter 判断语义等价、数值可比性、材料性与假设影响；宿主只校验交接身份、结构和证据文件，记录原判并调度，不按文字差异或通用十倍阈值重判。交接不完整由已有 Reporter 修复，修复仍失败则记录 review_incomplete；这不是论文信息不足，也不触发 Writer 重跑。所有任务到达可报告终态后生成三份最终报告。
 
 对 PDF，系统优先把 MinerU 的整图候选连同 caption、页码和归一化 bbox 交给 task reporter。Reporter 可在候选父图内部标注目标子图，Python 再从原 PDF 确定性裁切；任一边界不确定时使用完整父图。图像不是全局必需产物：图类任务应有可读结果图或等价的 CSV、表格、summary、文本证据，无图任务和信息不足终态可直接用结构化证据成文。
 
@@ -159,7 +159,7 @@ task writer 采用全任务并发：有多少复现任务就同时启动多少�
 
 Writer 必须先读取 `repro_tasks.json` 的 `_meta.fact_gap_handoff`，再从抽取事实、原论文 PDF、caption、正文、公式、表格和附录中补找缺失参数；前两阶段的未解决记录只是导航，不是停止依据。论文明确给出的数据、模型、公式、算法和实验协议不可为了贴图而改动；仍找不到的值或实现细节才允许成为可追踪、可调整的科学假设。对 Monte Carlo、批量矩阵运算和分钟级 CPU full，CUDA 可用时应优先实现真实 Torch CUDA 计算路径；仅调用 backend selector 或在报告中写 GPU 名称不算使用 GPU。
 
-Writer 使用直接的对比迭代：运行 full 后逐项核验 `scientific_acceptance`。只有 `invalid_run`、`core_conclusion_failed` 或 `key_numeric_ratio_ge_10` 三类材料性原因，且存在论文证据、受影响 criterion ID、具体修改目标和可预测影响时，才修改并重新 full；配色、字体、线宽、布局、像素、裁图紧凑度及其他呈现差异不得触发重跑。若运行有效但结论不支持，或论文信息不足且没有证据支持的下一步修正，Writer 应立即交给 Reporter 形成 `not_reproduced` 或 `inconclusive_missing_information`，不无限自改。
+Writer 实现论文并提交 full 结果，Reporter 决定科学结论和是否需要继续。再次执行需要 invalid_run、core_conclusion_failed 或 material_numeric_discrepancy，以及论文和本地证据、受影响观察 ID、具体因果修改及预期效果。key_numeric_ratio_ge_10 仅保留为旧接口名称，不再代表宿主阈值规则。样式、裁图、交接和通信问题不重跑科学实验。没有有据可查的下一步修改时，保留未复现或信息不足等终态。
 
 恢复缓存采用内容寻址：论文 PDF 内容、最终任务契约、相关输入、schema、prompt 与宿主策略版本任一变化都会使对应缓存失效。同一路径替换 PDF 不会复用旧解析；旧 case 无迁移兼容承诺。
 
@@ -322,7 +322,7 @@ case_001/
 - `review.md/docx`：主报告，概述事实、任务、运行、风险和结果审查状态。
 - `reproduction_report.md/docx`：逐任务记录本地代码实际采用的关键参数、随机种子、后端、统计设置和显式假设。
 - `result_review.md/docx`：逐任务展示可用的本地复现图、论文原图或等价结构化证据，并给出 criterion 级终态、原因与不确定性；不包含 writer 自我迭代附录。
-- `verification_result.json`：Reporter 观察和宿主派生的逐任务终态；`inconclusive_missing_information` 与 `not_reproduced` 是正常可报告结果。
+- `verification_result.json`：Reporter 原始科学结论、直接理由和独立的工程状态；review_incomplete 表示审查交接或证据未完成，inconclusive_missing_information 表示 Reporter 判断缺少决定性的论文信息。
 - `runtime_result.json`：执行摘要、产物汇总和最终独立验收状态；所有任务进入终态即可报告，只有全部成功复现才计为 matched。
 - `analysis_warnings.json`：前两阶段来源、引用、证据契约和缺失字段的非阻断诊断，供 Writer 继续核对全文。
 - `risk_report.json`：可复现性风险、缺失信息、前两阶段兜底、运行异常和审计摘要。
@@ -337,7 +337,7 @@ case_001/
 3. 在 `--run-repro` 开启时按 execution plan 的依赖顺序运行 smoke/full；共享数据、检查点和状态写入稳定的 unit 命名空间。
 4. 先核验论文明确的数据、模型、公式、核心算法和实验协议，再按稳定 ID 对照核心结论和关键数值目标。
 5. 只在论文未披露或确有歧义处提出显式合理假设；三类材料性原因之一成立且存在具体因果修正方向时修改并重跑，其他差异只记录。
-6. 核心结论得到支持且关键数值倍率小于 10 时立即输出 `ready_for_review`；运行有效但忠实结果失败或无法判断时也应停止自改并提交 Reporter。Writer 不能输出最终 matched。
+6. 有可审查的 full 结果后交付 ready_for_review，由 Reporter 结合原文、指标尺度与统计不确定性决定科学结论。Writer 不输出最终 matched，也不凭通用倍率门槛调参至通过。
 
 主持人同时启动所有 execution-unit Writers。每个逻辑任务仍有且仅有一个 task reporter；compound unit 中任一 Reporter 指出共享科学的材料性缺陷时，整个 unit 才在原 sandbox 中作一次有因果依据的续跑，其余 unit 不受影响。所有任务进入终态后，宿主冻结包含源码、配置、数据/检查点、环境锁、artifact lineage 和 source inventory 的便携项目，再由 Final Report Editor 负责三份人工报告的语言组织与排版。
 
@@ -348,8 +348,12 @@ case_001/
 - 静态扫描会检查高风险文件操作、系统命令、网络行为等。
 - 每个 writer 使用独立 sandbox 隔离任务文件；运行权限和资源决策由 writer 自己负责。
 - 主持人会确定性清理 Python BOM；静态扫描发现语法错误时 runtime 不得显示通过。
-- `matched` 要求全部任务的有效 full 支持核心结论，所有可比较关键数值的宿主计算倍率小于 10；论文未披露部分允许采用公开、合理的假设。样式、像素和裁图差异不参与该结论。
+- `matched` 要求 Reporter 明确给出 reproduced 或 reproduced_with_assumptions，且宿主检查执行证据有效、交接完整。数值差异、符号、对数尺度、概率边界与统计波动由 Reporter 按论文主张解释；没有统一的十倍通过规则。
 
 ## 项目定位
 
-耿同学 agent 的目标是提供忠于论文证据并能检验核心观点的复现结果，不是替代人工科研判断。`matched` 只表示明确事实、核心观点和宿主管理的材料性数值门槛通过；`inconclusive_missing_information` 与 `not_reproduced` 则如实保留信息不足或忠实失败的科学结果。任何终态都不表示恢复了作者未公开代码。
+耿同学 agent 的目标是提供忠于论文证据并能检验核心观点的复现结果，不是替代人工科研判断。`matched` 只表示Reporter 认可相应科学结论且宿主执行证据有效；`inconclusive_missing_information` 与 `not_reproduced` 则如实保留信息不足或忠实失败的科学结果。任何终态都不表示恢复了作者未公开代码。
+
+### 实际运行问题整改（2026-09-08）
+
+[整改计划](docs/remediation_plan_20260908.md)记录职责、改动与验证范围。IPC 使用短临时文件和 Windows 长路径 I/O；客户端可从匹配请求状态接收原始收据，通信失败不会覆盖实验成功。最终冻结保留依赖闭包，仅复用运行相关文件身份一致的环境验证。报告固定展示科学判决理由和工程状态，本地图不依赖论文裁图交付；未被 Reporter 选取的图片标为展示附件，不增加科学证据。Foundation 优先读取共享组件上下文，完整原文与架构按需读取；CLI 在 stderr 输出阶段进度，run_cost 分列阶段模型用量及收据执行耗时。

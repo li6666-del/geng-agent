@@ -27,9 +27,20 @@ def write_text(path: Path, text: str) -> None:
     _atomic_write_text(path, text)
 
 
+def _io_path(path: Path) -> Path:
+    """Windows I/O spelling; callers remain responsible for path ownership."""
+    if os.name != "nt":
+        return path
+    value = str(path.absolute())
+    if value.startswith("\\\\?\\"):
+        return path
+    return Path("\\\\?\\UNC\\" + value[2:] if value.startswith("\\\\") else "\\\\?\\" + value)
+
+
 def _atomic_write_text(path: Path, text: str) -> None:
     """Commit UTF-8 text without exposing a partially written destination."""
 
+    path = _io_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None
     try:
@@ -38,7 +49,7 @@ def _atomic_write_text(path: Path, text: str) -> None:
             encoding="utf-8",
             newline="\n",
             dir=path.parent,
-            prefix=f".{path.name}.",
+            prefix=".geng-",
             suffix=".tmp",
             delete=False,
         ) as handle:

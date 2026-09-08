@@ -38,23 +38,7 @@ def _task_record_run_valid_hint(
     if isinstance(host_returncode, int) and not isinstance(host_returncode, bool):
         return host_returncode == 0
 
-    execution = (
-        task_record.get("execution_summary")
-        if isinstance(task_record.get("execution_summary"), dict)
-        else {}
-    )
-    try:
-        full_run_count = int(execution.get("full_run_count"))
-    except (TypeError, ValueError):
-        return None
-    last_returncode = execution.get("last_returncode")
-    if (
-        full_run_count >= 1
-        and isinstance(last_returncode, int)
-        and not isinstance(last_returncode, bool)
-    ):
-        return last_returncode == 0
-    return None
+    return None  # Writer self-reported execution counts are not host evidence.
 
 
 def _evidence_path_issues(
@@ -108,6 +92,7 @@ def normalize_reporter_observation_evidence(
 
     document = json.loads(json.dumps(raw, ensure_ascii=False))
     warnings = _evidence_path_issues(document, workspace)
+    engineering_issues = list(warnings)
     local_root = (workspace / "inputs" / "writer_output").resolve()
     unobserved_paths: set[Path] = set()
     if isinstance(host_execution, dict):
@@ -152,10 +137,10 @@ def normalize_reporter_observation_evidence(
                 else "unassessable_missing_information"
             )
         if status == "supported":
-            item["status"] = "unassessable_missing_information"
+            engineering_issues.append(f"claim {claim_id} lacks verified local evidence")
             warnings.append(
                 f"claim {claim_id} has no verifiable copied local output or source evidence; "
-                "support was retained as unassessable rather than certified"
+                "Reporter assessment is preserved but evidence is not certified"
             )
         elif status == "unsupported":
             warnings.append(
@@ -176,17 +161,11 @@ def normalize_reporter_observation_evidence(
             continue
         verified_facts.append({key: fact[key] for key in ("category", "text", "source", "evidence_files") if key in fact})
     document["verified_facts"] = verified_facts
-    if isinstance(rerun, dict) and rerun.get("rerun_reason") == "core_conclusion_failed":
+    if isinstance(rerun, dict):
         affected = rerun.get("contract_item_ids")
         if isinstance(affected, list) and missing_local_ids.intersection(map(str, affected)):
-            document["rerun_evidence"] = None
-    if warnings:
-        uncertainties = document.get("remaining_uncertainties")
-        if not isinstance(uncertainties, list):
-            uncertainties = []
-        document["remaining_uncertainties"] = list(dict.fromkeys([
-            *map(str, uncertainties), *warnings,
-        ]))
+            engineering_issues.append("Rerun observations lack verified local evidence")
+    document["_engineering_issues"] = list(dict.fromkeys(engineering_issues))
     return document, warnings
 
 

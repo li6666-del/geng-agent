@@ -32,6 +32,7 @@ def test_paper_can_retire_wrong_criterion_without_retiring_independent_failure(t
     accepted = normalize_task_verification(raw, "task_a", task=task, run_valid_hint=True, evidence_workspace=tmp_path)
     assert accepted["outcome"] == "reproduced"
     raw["core_conclusions"].append({"claim_id": "method_substitution", "status": "unsupported", "local_observation": "Output was projected onto the desired curve", "evidence_files": ["inputs/writer_output/source/task.py"]})
+    raw.update(outcome="not_reproduced", host_action="rerun_writer", decision_reason="Independent method substitution invalidates the result.")
     raw["rerun_evidence"] = {"rerun_reason": "core_conclusion_failed", "contract_item_ids": ["method_substitution"],
         "paper_evidence_files": [_paper(tmp_path)], "causal_change": "Remove the projection", "change_targets": ["task.py:observable"], "predicted_effect": "Evaluate the defined observable"}
     failed = normalize_task_verification(raw, "task_a", task=task, run_valid_hint=True, evidence_workspace=tmp_path)
@@ -47,7 +48,8 @@ def test_writer_or_designer_prose_cannot_authorize_basis_change(tmp_path):
         raw = _supported_raw()
         raw["core_conclusions"][0].update(status="not_applicable", basis_review=_basis(path, paper_evidence_verified=True))
         result = normalize_task_verification(raw, "task_a", task=_task(), run_valid_hint=True, evidence_workspace=tmp_path)
-        assert result["outcome"] == "inconclusive_missing_information"
+        assert result["outcome"] == "reproduced"
+        assert result["engineering_status"] == "evidence_invalid"
         assert result["core_conclusions"][0]["basis_review"]["paper_evidence_verified"] is False
 
 
@@ -65,7 +67,8 @@ def test_incompatible_dimensions_cannot_create_numeric_rerun(tmp_path):
     for dimension, paper, local in (("unit", "mW", "MW"), ("metric", "BER", "NMSE"), ("regime", "20 dB", "30 dB")):
         task = _task()
         task["scientific_acceptance"]["key_numeric_targets"][0][dimension] = paper
-        raw = _supported_raw(local_magnitude=100)
+        raw = _supported_raw(local_magnitude=100, outcome="inconclusive_missing_information")
+        raw["key_numeric_comparisons"][0].update(comparison_status="incompatible", comparison_reason="Reporter confirmed the quantities cannot be compared.")
         raw["key_numeric_comparisons"][0]["local_" + dimension] = local
         result = normalize_task_verification(raw, "task_a", task=task, run_valid_hint=True, evidence_workspace=tmp_path)
         assert result["max_key_numeric_ratio"] is None
@@ -75,14 +78,14 @@ def test_incompatible_dimensions_cannot_create_numeric_rerun(tmp_path):
 
 def test_not_applicable_numeric_target_does_not_demand_an_invented_value(tmp_path):
     raw = _supported_raw()
-    raw["key_numeric_comparisons"][0].update(local_magnitude=None, basis_review=_basis(_paper(tmp_path)))
+    raw["key_numeric_comparisons"][0].update(comparison_status="not_applicable", local_magnitude=None, basis_review=_basis(_paper(tmp_path)))
     result = normalize_task_verification(raw, "task_a", task=_task(), run_valid_hint=True, evidence_workspace=tmp_path)
     assert result["outcome"] == "reproduced"
     assert result["key_numeric_comparisons"][0]["comparison_status"] == "not_applicable"
 
 
 def test_disputed_basis_and_duplicate_id_do_not_erase_failure(tmp_path):
-    raw = _supported_raw()
+    raw = _supported_raw(outcome="not_reproduced")
     raw["core_conclusions"][0].update(status="unsupported", basis_review=_basis(_paper(tmp_path), "disputed"))
     raw["core_conclusions"].append({"claim_id": "claim_order", "status": "not_applicable", "basis_review": _basis(_paper(tmp_path))})
     result = normalize_task_verification(raw, "task_a", task=_task(), run_valid_hint=True, evidence_workspace=tmp_path)
@@ -96,8 +99,8 @@ def test_legacy_supported_false_survives_a_basis_dispute(tmp_path):
     claim.pop("status")
     claim.update(supported=False, basis_review=_basis(_paper(tmp_path)))
     result = normalize_task_verification(raw, "task_a", task=_task(), run_valid_hint=True, evidence_workspace=tmp_path)
-    assert result["core_conclusions"][0]["status"] == "unsupported"
-    assert result["outcome"] == "not_reproduced"
+    assert result["core_conclusions"][0]["supported"] is False
+    assert result["engineering_status"] == "handoff_failed"
 
 
 def test_verified_report_facts_require_original_evidence_not_writer_account(tmp_path):
@@ -128,7 +131,7 @@ def test_reporter_structure_recovery_sees_old_note_and_canonical_inputs(tmp_path
         else:
             recovery = json.loads((workspace / "inputs/reporter_repair.json").read_text(encoding="utf-8"))
             assert recovery["kind"] == "structure_recovery"
-            assert "readable evidence note" in recovery["issues"][0]
+            assert "v3 decision protocol" in recovery["issues"][0]
             assert (workspace / "inputs/previous_reporter_note.txt").read_text(encoding="utf-8") == '{"core_conclusions": ['
             (workspace / "task_verification_result.json").write_text(json.dumps(_supported_raw()), encoding="utf-8")
         return {"ok": True, "role": "task_reporter"}
@@ -239,7 +242,7 @@ def test_reporter_cache_tracks_host_scientific_code_without_bumping_versions(tmp
     def changed_outcome(**values):
         return "not_reproduced", "complete"
     with monkeypatch.context() as scoped:
-        scoped.setattr(verification, "_derive_outcome", changed_outcome)
+        scoped.setattr(verification, "verification_scientifically_successful", changed_outcome)
         assert context.TASK_REPORTER_PROMPT_VERSION == version
         assert context._task_reporter_input_hash(**kwargs) != before
     def changed_assets(**values):

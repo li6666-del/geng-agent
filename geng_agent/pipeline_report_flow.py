@@ -66,28 +66,17 @@ def run_report_flow(
         if verification:
             task_reporter_results.append(existing)
             continue
-        execution_summary = (
-            record.get("execution_summary")
-            if isinstance(record.get("execution_summary"), dict)
-            else {}
-        )
-        try:
-            full_run_count = int(execution_summary.get("full_run_count") or 0)
-        except (TypeError, ValueError):
-            full_run_count = 0
-        run_valid_hint = (
-            full_run_count >= 1
-            and execution_summary.get("last_returncode") == 0
-        )
+        from .task_reporter_validation import _task_record_run_valid_hint
+        run_valid_hint = _task_record_run_valid_hint(record)
         verification = normalize_task_verification(
             {},
             task_id,
             task=task_by_id.get(task_id),
             run_valid_hint=run_valid_hint,
         )
-        verification.setdefault("remaining_uncertainties", []).append(
+        verification.setdefault("engineering_issues", []).append(
             "The isolated Reporter did not produce a usable note; the host "
-            "retained a conservative terminal outcome."
+            "recorded an incomplete review, not missing paper information."
         )
         synthetic = {
             "ok": True,
@@ -120,12 +109,8 @@ def run_report_flow(
                 continue
             verification["host_action"] = "complete"
             verification["rerun_reason"] = "none"
-            verification["outcome"] = (
-                "execution_failed"
-                if verification.get("run_valid") is False
-                else "not_reproduced"
-            )
-            verification.setdefault("remaining_uncertainties", []).append(
+            verification.setdefault("outcome", "review_incomplete")
+            verification.setdefault("engineering_issues", []).append(
                 "A requested causal rerun could not be completed; recorded as "
                 "a terminal outcome."
             )

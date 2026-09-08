@@ -1199,6 +1199,12 @@ class FoundationExecutionContractTests(unittest.TestCase):
                 source=_external_runtime_source(),
                 requirements="",
             )
+            # This external-runtime fixture does not use the default torch test suite.
+            (sandbox / "tests/test_model.py").write_text(
+                "import unittest\nfrom src.model import Encoder\nclass ModelTests(unittest.TestCase):\n"
+                "    def test_external_runtime_available(self):\n        self.assertFalse(Encoder().runtime_available())\n"
+                "    def test_external_runtime_invocation(self):\n        with self.assertRaises(RuntimeError): Encoder().forward(1)\n",
+                encoding="utf-8")
             (sandbox / "foundation_result.json").write_text(
                 json.dumps(_result(architecture, capability_tests)),
                 encoding="utf-8",
