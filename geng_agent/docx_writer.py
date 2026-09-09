@@ -23,21 +23,6 @@ from .docx_markdown import (
     _parse_markdown_image_table,
     _split_markdown_table_row,
 )
-from .docx_reports import (
-    ALIGNMENT_LABELS,
-    DIMENSION_RATING_LABELS,
-    RESULT_REVIEW_DIMENSION_LABELS,
-    RISK_LABELS,
-    SCIENTIFIC_VERDICT_LABELS,
-    _join_items,
-    _join_named_files,
-    _label_with_raw,
-    _ordered_dimension_reviews,
-    _runtime_requirement_warning_count,
-    _runtime_requirement_warnings,
-    populate_result_review_document,
-    populate_review_document,
-)
 from .docx_styles import (
     ACCENT,
     BODY_FONT,
@@ -68,66 +53,6 @@ from .docx_styles import (
     _setup_document,
     _shade_cell,
 )
-
-
-def write_review_docx(
-    path: Path,
-    *,
-    paper: dict[str, Any],
-    facts: dict[str, Any],
-    tasks: dict[str, Any],
-    risk_report: dict[str, Any],
-    validation: dict[str, Any],
-    runtime_result: dict[str, Any],
-    result_review_result: dict[str, Any],
-    repro_project_dir: Path,
-) -> Path:
-    """Create the main engineering reproducibility review report."""
-
-    document = Document()
-    _setup_document(document)
-    _add_title(
-        document,
-        "耿同学agent 论文工程复现审查报告",
-        "面向通信论文的工程事实抽取、复现代码生成与复现风险评估",
-    )
-    populate_review_document(
-        document,
-        paper=paper,
-        facts=facts,
-        tasks=tasks,
-        risk_report=risk_report,
-        validation=validation,
-        runtime_result=runtime_result,
-        result_review_result=result_review_result,
-        repro_project_dir=repro_project_dir,
-    )
-    _add_disclaimer(document)
-    return _save(document, path)
-
-
-def write_result_review_docx(
-    path: Path,
-    *,
-    result_review: dict[str, Any],
-    status: dict[str, Any] | None = None,
-) -> Path:
-    """Create the result-level multimodal review report."""
-
-    document = Document()
-    _setup_document(document)
-    _add_title(
-        document,
-        "复现结果二次审查报告",
-        "基于本地复现数据、图像与原论文页面图的结果级差异分析",
-    )
-    populate_result_review_document(
-        document,
-        result_review=result_review,
-        status=status,
-    )
-    _add_disclaimer(document)
-    return _save(document, path)
 
 
 def write_result_review_markdown_docx(

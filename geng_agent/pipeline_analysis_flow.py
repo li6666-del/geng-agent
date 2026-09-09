@@ -42,6 +42,7 @@ from .task_evidence_backfill import (
 )
 from .tasks_normalize import finalize_repro_tasks, recover_truncated_repro_tasks
 from .workflow_policy import _execution_plan_requires_shared_science
+from .consolidated_analysis import load_paper_understanding, load_experiment_plan
 
 
 TARGETED_BACKFILL_MAX_ROUNDS = 3
@@ -103,45 +104,12 @@ def run_analysis_flow(
         if label.startswith("paper_page:") and label.split(":", 1)[1].isdigit():
             valid_pages.add(int(label.split(":", 1)[1]))
 
-    prompt_1 = pipeline.prompt_book.render(
-        "extract_engineering_facts.md",
-        paper_chunks_json=paper_context,
-    )
-    initial_facts = pipeline._load_or_create_analysis_stage_json(
-        output_path=output_dir / "engineering_facts_initial.json",
-        output_dir=output_dir,
-        audit_dir=audit_dir,
-        prompt=prompt_1,
-        stage_label="01_extract_engineering_facts",
-        cleanup_stage="facts",
-        schema_stage="engineering_facts",
-        max_attempts=options.json_repair_attempts + 1,
-        resume=options.resume,
-        images=paper_images,
-        candidate_normalizer=lambda parsed: finalize_engineering_facts(
-            parsed, valid_chunk_ids, valid_pages
-        ),
-        truncation_recovery=recover_truncated_engineering_facts,
-        backend=options.analysis_backend,
-        cache_inputs={
-            "paper_source_sha256": paper.get("source_sha256"),
-            "figure_index": figure_index_prompt_summary(figure_index),
-            "visible_figure_pages": sorted(valid_pages),
-        },
-        fallback_factory=(
-            (
-                lambda exc: build_fallback_engineering_facts(
-                    paper=paper,
-                    reason=(
-                        f"{options.analysis_backend} engineering fact extraction "
-                        f"failed after format repair: {exc}"
-                    ),
-                )
-            )
-            if options.analysis_fallback
-            else None
-        ),
-    )
+    understanding = load_paper_understanding(pipeline, context, paper=paper, paper_context=paper_context,
+        paper_images=paper_images, valid_chunk_ids=valid_chunk_ids, valid_pages=valid_pages)
+    analysis_stage_invocations = int(not understanding.get("_meta", {}).get("cache_reused"))
+    initial_facts = understanding["facts"]
+    paper_thesis = understanding.get("paper_thesis")
+    write_json(output_dir / "paper_thesis.json", paper_thesis)
     initial_facts = finalize_engineering_facts(
         initial_facts, valid_chunk_ids, valid_pages
     )
@@ -164,6 +132,7 @@ def run_analysis_flow(
     )
     write_json(output_dir / "engineering_facts_initial.json", initial_facts)
     context.mark("facts_initial")
+    context.mark("thesis")
 
     fact_coverage = compute_fact_coverage(
         paper.get("chunks", []) if isinstance(paper, dict) else [],
@@ -190,6 +159,7 @@ def run_analysis_flow(
             fact_coverage["declared_complete_conflicts_with_coverage"]
         ),
     }
+    facts_initial_meta["paper_understanding_limitations"] = understanding.get("limitations", [])
     initial_facts["_meta"] = facts_initial_meta
     write_json(output_dir / "engineering_facts_initial.json", initial_facts)
     write_json(
@@ -198,52 +168,13 @@ def run_analysis_flow(
     )
 
     context.begin("tasks_preliminary")
-    prompt_2 = pipeline.prompt_book.render(
-        "build_repro_tasks.md",
-        engineering_facts_json=wrap_untrusted(
-            "engineering_facts_json", pretty_json(scientific_prompt_value(initial_facts))
-        ),
-        fact_coverage_json=wrap_untrusted(
-            "fact_coverage_json", pretty_json(fact_coverage)
-        ),
-        paper_context_json=_evidence_context(images=[]),
-    )
-    preliminary_tasks = pipeline._load_or_create_analysis_stage_json(
-        output_path=output_dir / "repro_tasks_preliminary.json",
-        output_dir=output_dir,
-        audit_dir=audit_dir,
-        prompt=prompt_2,
-        stage_label="02a_build_preliminary_repro_tasks",
-        cleanup_stage="tasks",
-        schema_stage="repro_tasks",
-        max_attempts=options.json_repair_attempts + 1,
-        resume=options.resume,
-        candidate_normalizer=lambda parsed: finalize_repro_tasks(
-            parsed, initial_facts
-        ),
-        truncation_recovery=recover_truncated_repro_tasks,
-        request_timeout=options.tasks_timeout,
-        backend=options.analysis_backend,
-        cache_inputs={
-            "paper_source_sha256": paper.get("source_sha256"),
-            "facts": initial_facts,
-            "fact_coverage": fact_coverage,
-        },
-        fallback_factory=(
-            (
-                lambda exc: build_fallback_repro_tasks(
-                    facts=initial_facts,
-                    paper=paper,
-                    reason=(
-                        f"{options.analysis_backend} reproduction task generation "
-                        f"failed after format repair: {exc}"
-                    ),
-                )
-            )
-            if options.analysis_fallback
-            else None
-        ),
-    )
+    from .preflight import architecture_capability_inventory
+    host_capabilities = architecture_capability_inventory()
+    current_plan = load_experiment_plan(pipeline, context, facts=initial_facts, paper_thesis=paper_thesis,
+        paper=paper, paper_context=paper_context, paper_images=paper_images, figure_index=figure_index,
+        host_capabilities=host_capabilities)
+    analysis_stage_invocations += int(not current_plan.get("_meta", {}).get("cache_reused"))
+    preliminary_tasks = current_plan["tasks"]
     preliminary_meta = (
         preliminary_tasks.get("_meta", {})
         if isinstance(preliminary_tasks.get("_meta"), dict)
@@ -310,6 +241,7 @@ def run_analysis_flow(
         current_tasks: dict[str, Any],
         search_ledger: dict[str, Any],
     ) -> dict[str, Any]:
+        nonlocal analysis_stage_invocations
         label = f"02b_round_{round_index:02d}_targeted_fact_backfill"
         prompt = pipeline.prompt_book.render(
             "targeted_fact_backfill.md",
@@ -376,74 +308,21 @@ def run_analysis_flow(
                 ),
             },
         )
+        analysis_stage_invocations += int(not backfill.get("_meta", {}).get("cache_reused"))
         return backfill
 
     def _refresh_tasks_after_round(
-        round_index: int,
-        current_tasks: dict[str, Any],
-        current_facts: dict[str, Any],
-        cumulative_resolution: dict[str, Any],
-        search_ledger: dict[str, Any],
+        round_index: int, current_tasks: dict[str, Any], current_facts: dict[str, Any],
+        cumulative_resolution: dict[str, Any], search_ledger: dict[str, Any],
     ) -> dict[str, Any]:
-        label = f"02c_round_{round_index:02d}_refresh_repro_tasks"
-        prompt = pipeline.prompt_book.render(
-            "finalize_repro_tasks.md",
-            round_index=str(round_index),
-            current_tasks_json=wrap_untrusted(
-                "current_tasks_json", pretty_json(scientific_prompt_value(current_tasks, resolution_supplied=True))
-            ),
-            final_engineering_facts_json=wrap_untrusted(
-                "final_engineering_facts_json", pretty_json(scientific_prompt_value(current_facts))
-            ),
-            backfill_resolution_json=wrap_untrusted(
-                "backfill_resolution_json", pretty_json(resolution_for_prompt(cumulative_resolution))
-            ),
-            search_ledger_json=wrap_untrusted(
-                "search_ledger_json", pretty_json(ledger_for_prompt(search_ledger))
-            ),
-            paper_thesis_json=wrap_untrusted("paper_thesis_json", "{}"),
-            paper_context_json=paper_context,
-        )
-        refreshed = pipeline._load_or_create_analysis_stage_json(
-            output_path=(
-                audit_dir
-                / f"02b_backfill_round_{round_index:02d}_task_refresh.json"
-            ),
-            output_dir=output_dir,
-            audit_dir=audit_dir,
-            prompt=prompt,
-            stage_label=label,
-            cleanup_stage="tasks_finalize",
-            schema_stage="repro_tasks",
-            max_attempts=options.json_repair_attempts + 1,
-            resume=options.resume,
-            images=paper_images,
-            candidate_normalizer=lambda parsed: finalize_repro_tasks(
-                parsed, current_facts
-            ),
-            truncation_recovery=recover_truncated_repro_tasks,
-            request_timeout=options.tasks_timeout,
-            backend=options.analysis_backend,
-            cache_inputs={
-                "paper_source_sha256": paper.get("source_sha256"),
-                "round_index": round_index,
-                "tasks": current_tasks,
-                "facts": current_facts,
-                "backfill_resolution": cumulative_resolution,
-                "search_ledger": search_ledger,
-            },
-        )
-        write_analysis_warnings(
-            output_dir=output_dir,
-            audit_dir=audit_dir,
-            stage=label,
-            groups={
-                "task_fact_reference": validate_task_fact_refs(
-                    refreshed, current_facts
-                )
-            },
-        )
-        return refreshed
+        nonlocal current_plan, analysis_stage_invocations
+        candidate = load_experiment_plan(pipeline, context, facts=current_facts, paper_thesis=paper_thesis,
+            paper=paper, paper_context=paper_context, paper_images=paper_images, figure_index=figure_index,
+            host_capabilities=host_capabilities, previous_plan={**current_plan, "tasks": current_tasks},
+            resolution=cumulative_resolution, ledger=search_ledger, round_index=round_index)
+        analysis_stage_invocations += int(not candidate.get("_meta", {}).get("cache_reused"))
+        current_plan = candidate
+        return candidate["tasks"]
 
     def _write_round_audit(round_index: int, summary: dict[str, Any]) -> None:
         write_json(
@@ -591,108 +470,13 @@ def run_analysis_flow(
     )
     context.mark("tasks")
 
-    paper_thesis = pipeline._load_or_create_paper_thesis(
-        output_dir=output_dir,
-        audit_dir=audit_dir,
-        facts=facts,
-        paper_context=paper_context,
-        paper_images=paper_images,
-        resume=options.resume,
-        paper_source_sha256=paper.get("source_sha256"),
-        max_attempts=options.json_repair_attempts + 1,
-        analysis_backend=options.analysis_backend,
-    )
-    context.mark("thesis")
-
-    final_task_prompt = pipeline.prompt_book.render(
-        "finalize_repro_tasks.md",
-        round_index="final",
-        current_tasks_json=wrap_untrusted(
-            "current_tasks_json", pretty_json(scientific_prompt_value(tasks, resolution_supplied=True))
-        ),
-        final_engineering_facts_json=wrap_untrusted(
-            "final_engineering_facts_json", pretty_json(scientific_prompt_value(facts))
-        ),
-        backfill_resolution_json=wrap_untrusted(
-            "backfill_resolution_json", pretty_json(resolution_for_prompt(resolution))
-        ),
-        search_ledger_json=wrap_untrusted(
-            "search_ledger_json", pretty_json(ledger_for_prompt(backfill_loop["ledger"]))
-        ),
-        paper_thesis_json=wrap_untrusted(
-            "paper_thesis_json", pretty_json(scientific_prompt_value(paper_thesis or {}))
-        ),
-        paper_context_json=paper_context,
-    )
-    previous_tasks = tasks
-    write_json(audit_dir / "02d_tasks_before_final_snapshot.json", previous_tasks)
-    try:
-        final_task_candidate = pipeline._load_or_create_analysis_stage_json(
-            output_path=audit_dir / "02d_final_scientific_acceptance.json",
-            output_dir=output_dir,
-            audit_dir=audit_dir,
-            prompt=final_task_prompt,
-            stage_label="02d_finalize_scientific_acceptance",
-            cleanup_stage="tasks_finalize",
-            schema_stage="repro_tasks",
-            max_attempts=options.json_repair_attempts + 1,
-            resume=options.resume,
-            candidate_normalizer=lambda parsed: finalize_repro_tasks(
-                parsed, facts
-            ),
-            truncation_recovery=recover_truncated_repro_tasks,
-            request_timeout=options.tasks_timeout,
-            images=paper_images,
-            backend=options.analysis_backend,
-            cache_inputs={
-                "paper_source_sha256": paper.get("source_sha256"),
-                "tasks": previous_tasks,
-                "facts": facts,
-                "paper_thesis": paper_thesis or {},
-                "backfill_resolution": resolution,
-                "search_ledger": backfill_loop["ledger"],
-            },
-        )
-        tasks, _ = semantic_merge_repro_tasks(
-            previous_tasks,
-            final_task_candidate,
-            merge_mode="snapshot",
-        )
-        write_json(
-            audit_dir / "02d_final_task_snapshot_changes.json",
-            tasks.get("_meta", {}).get("semantic_merge", {}),
-        )
-        tasks = finalize_repro_tasks(tasks, facts)
-    except Exception as exc:
-        tasks = finalize_repro_tasks(previous_tasks, facts)
-        write_json(
-            audit_dir / "02d_final_scientific_acceptance_warning.json",
-            {
-                "advisory": True,
-                "fallback": "normalized_pre_thesis_tasks",
-                "error": f"{type(exc).__name__}: {exc}",
-            },
-        )
-    tasks_meta = (
-        dict(tasks.get("_meta", {}))
-        if isinstance(tasks.get("_meta"), dict)
-        else {}
-    )
-    tasks_meta["scientific_acceptance_finalization"] = {
-        "paper_thesis_used": bool(paper_thesis),
-        "policy_id": SCIENTIFIC_POLICY_ID,
-        "structure_is_advisory": True,
-    }
-    tasks["_meta"] = tasks_meta
+    # Claims were supplied before planning. Re-publish canonical artifacts after
+    # downstream invalidation, without another thesis or acceptance model call.
+    write_json(output_dir / "paper_thesis.json", paper_thesis)
+    tasks.setdefault("_meta", {})["scientific_acceptance_finalization"] = {
+        "paper_thesis_used": bool(paper_thesis), "policy_id": SCIENTIFIC_POLICY_ID,
+        "decision_owner": "experiment_planner", "structure_is_advisory": True}
     write_json(output_dir / "repro_tasks.json", tasks)
-    write_json(
-        output_dir / "task_conflicts.json",
-        {"conflicts": semantic_conflicts(tasks, "task")},
-    )
-    write_json(
-        audit_dir / "02d_final_task_coverage.json",
-        compute_task_coverage(facts, tasks),
-    )
 
     try:
         execution_plan = compile_execution_plan(tasks)
@@ -738,73 +522,31 @@ def run_analysis_flow(
         resume=options.resume,
     )
     context.mark("experiment_index")
-    scientific_architecture: dict[str, Any] | None = None
-    try:
-        scientific_architecture = pipeline._load_or_create_scientific_architecture(
-            output_dir=output_dir,
-            audit_dir=audit_dir,
-            facts=facts,
-            tasks=tasks,
-            experiment_index=experiment_index,
-            execution_plan=execution_plan,
-            paper_thesis=paper_thesis,
-            paper_context=paper_context,
-            paper_images=paper_images,
-            resume=options.resume,
-            paper_source_sha256=paper.get("source_sha256"),
-            max_attempts=options.json_repair_attempts + 1,
-            analysis_backend=options.analysis_backend,
-        )
-    except Exception as exc:
+    scientific_architecture = current_plan.get("scientific_architecture")
+    from .preflight import architecture_execution_capability_gaps
+    from .scientific_architecture import partition_scientific_architecture_issues
+    if scientific_architecture is None:
         if _execution_plan_requires_shared_science(execution_plan):
-            write_json(
-                audit_dir / "02f_scientific_architecture_fallback.json",
-                {
-                    "policy": "preserve_material_task_relationships",
-                    "decision": "stop",
-                    "pipeline_can_continue": False,
-                    "fallback": None,
-                    "warning": f"{type(exc).__name__}: {exc}",
-                },
-            )
-            raise RuntimeError(
-                "scientific architecture failed for tasks that require shared "
-                "execution or a frozen cross-task definition"
-            ) from exc
-        scientific_architecture = None
-        write_json(
-            audit_dir / "02f_scientific_architecture_fallback.json",
-            {
-                "policy": "reproduction_first",
-                "decision": "fallback",
-                "pipeline_can_continue": True,
-                "fallback": "task_local_writers_without_foundation",
-                "warning": f"{type(exc).__name__}: {exc}",
-            },
-        )
+            raise RuntimeError("Experiment plan lacks the shared scientific architecture required by its task dependencies")
+        (output_dir / "scientific_architecture.json").unlink(missing_ok=True)
     else:
-        from .scientific_architecture_normalize import (
-            scientific_architecture_normalization_warnings,
-        )
-
-        analysis_warnings = write_analysis_warnings(
-            output_dir=output_dir,
-            audit_dir=audit_dir,
-            stage="02f_design_scientific_architecture",
-            groups={
-                "structural_normalization": (
-                    scientific_architecture_normalization_warnings(
-                        scientific_architecture
-                    )
-                )
-            },
-        )
+        blockers, warnings = partition_scientific_architecture_issues(scientific_architecture,
+            facts=facts, tasks=tasks, experiment_index=experiment_index, execution_plan=execution_plan)
+        if blockers and _execution_plan_requires_shared_science(execution_plan):
+            raise RuntimeError("Tasks and architecture are not a coherent executable plan: " + format_issues(blockers))
+        write_json(output_dir / "scientific_architecture.json", scientific_architecture)
+        write_analysis_warnings(output_dir=output_dir, audit_dir=audit_dir,
+            stage="02a_plan_experiments", groups={"architecture": [*warnings, *blockers]})
+        gaps = architecture_execution_capability_gaps(scientific_architecture, host_capabilities)
+        write_json(audit_dir / "02f_architecture_execution_capability_gaps.json",
+            {"ok": not gaps, "policy": "preserve_architecture_and_report_host_gap", "gap_count": len(gaps), "gaps": gaps})
+    write_json(audit_dir / "02f_architecture_host_capabilities_current.json", host_capabilities)
+    write_json(audit_dir / "02f_architecture_host_capabilities.json", host_capabilities)
+    write_json(output_dir / "experiment_plan.json", {"tasks": tasks, "scientific_architecture": scientific_architecture,
+        "_meta": {"planner_cache": current_plan.get("_meta", {}).get("cache"),
+                  "planning_complete": bool(backfill_loop.get("final_handoff", {}).get("ready_for_writer", True)),
+                  "backfill_stop_reason": backfill_loop["stop_reason"]}})
     context.mark("scientific_architecture")
-    analysis_stage_invocations = (
-        4
-        + (2 * backfill_round_count)
-        + (1 if scientific_architecture is not None else 0)
-    )
     return AnalysisFlowResult(
         paper_path=paper_path,
         paper=paper,
@@ -841,14 +583,14 @@ def finish_analysis_only(
         {
             "analysis_backend": options.analysis_backend,
             "analysis_only": True,
-            "analysis_agent_count": 1,
+            "analysis_agent_count": 2,
             "analysis_stage_invocations": analysis.analysis_stage_invocations,
             "analysis_warning_count": int(
                 analysis.analysis_warnings.get("warning_count") or 0
             ),
             "json_format_repair_limit": int(options.json_repair_attempts),
             "facts_stop_rule": "single_global_then_selected_blockers_max_3",
-            "tasks_stop_rule": "thesis_informed_core_conclusion_contract",
+            "tasks_stop_rule": "joint_experiment_plan_with_targeted_evidence",
             "mineru_layout": {
                 "ok": analysis.mineru_result.get("ok"),
                 "cached": analysis.mineru_result.get("cached"),

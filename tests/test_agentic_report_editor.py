@@ -123,7 +123,7 @@ class FinalReportEditorTests(unittest.TestCase):
             self.assertTrue(result["ok"], result)
             self.assertTrue((output / "result_review.md").is_file())
             brief = (output / "audit" / "04b_report_editor_brief.md").read_text(encoding="utf-8")
-            self.assertIn("not a scientific reviewer", brief)
+            self.assertIn("不要更改其终态", brief)
             editor_assets = Path(result["workspace"]) / "report_assets"
             self.assertTrue((editor_assets / "task_1" / "local_result.png").is_file())
             self.assertFalse((editor_assets / "stale_task").exists())
@@ -162,12 +162,12 @@ class FinalReportEditorTests(unittest.TestCase):
             self.assertIsNone(packet["execution_summary"]["observed_full_attempt_count"])
             self.assertIsNone(packet["execution_summary"]["latest_valid_execution_count"])
             brief = (output / "audit" / "04b_report_editor_brief.md").read_text(encoding="utf-8")
-            self.assertIn("Use only host `execution_summary` counts", brief)
-            self.assertIn("Unknown counts are unavailable, not zero", brief)
-            self.assertIn("return code 124", brief)
+            self.assertIn("execution_summary.observed_full_attempt_count", brief)
+            self.assertIn("未知保持未知", brief)
+            self.assertIn("不是科研成功次数", brief)
             self.assertEqual(
                 REPORT_EDITOR_PROMPT_VERSION,
-                "final_report_editor_v6_reporter_reasons_and_independent_images",
+                "final_report_editor_v8_task_comparison_and_human_followup",
             )
 
     def test_human_readable_task_headings_do_not_require_machine_task_ids(self) -> None:
@@ -281,43 +281,43 @@ class FinalReportEditorTests(unittest.TestCase):
             comparison = (output / "result_review.md").read_text(encoding="utf-8")
             self.assertIn("report_assets/task_1/local_result.png", comparison)
 
-    def test_missing_report_gets_deterministic_fallback_without_retry(self) -> None:
+    def test_missing_report_is_repaired_by_editor_without_host_prose(self):
         with TemporaryDirectory() as temp:
             root = Path(temp)
             output = root / "case"
+            inputs = _workflow_inputs(output)
             command = _editor_command(root, "partial.py", """
                 (root / "review.md").write_text("# 原始总览", encoding="utf-8")
                 (root / "result_review.md").write_text("## 原始对比", encoding="utf-8")
             """)
-            result = _run_with_command(command, **_workflow_inputs(output))
+            first = _run_with_command(command, **inputs)
+            self.assertFalse(first["ok"])
+            self.assertTrue(first["retryable"])
+            self.assertEqual(first["missing_outputs"], ["reproduction_report.md"])
+            self.assertEqual(first["fallback_files"], [])
+            self.assertFalse((output / "reproduction_report.md").exists())
+            repair = _editor_command(root, "repair.py", """
+                (root / "reproduction_report.md").write_text("# 智能体补写的工程细节", encoding="utf-8")
+                (root / "review.md").write_text("attempted unrelated rewrite", encoding="utf-8")
+            """)
+            second = _run_with_command(repair, **inputs, attempt_no=2, repair_context=first)
+            self.assertTrue(second["ok"], second)
+            self.assertEqual(second["completion_mode"], "passed_after_targeted_repair")
+            self.assertEqual((output / "review.md").read_text(encoding="utf-8"), "# 原始总览\n")
+            self.assertEqual((output / "result_review.md").read_text(encoding="utf-8"), "## 原始对比\n")
+            self.assertEqual((output / "reproduction_report.md").read_text(encoding="utf-8"), "# 智能体补写的工程细节\n")
 
-            self.assertTrue(result["ok"], result)
-            self.assertFalse(result["retryable"])
-            self.assertEqual(result["completion_mode"], "degraded_fallback")
-            self.assertEqual(result["missing_outputs"], [])
-            self.assertEqual(result["fallback_files"], ["reproduction_report.md"])
-            review = (output / "review.md").read_text(encoding="utf-8")
-            self.assertTrue(review.endswith("# 原始总览\n"))
-            self.assertIn("任务终态与核验记录", review)
-            self.assertTrue((output / "reproduction_report.md").is_file())
-
-    def test_empty_editor_output_gets_all_deterministic_reports(self) -> None:
+    def test_empty_editor_output_does_not_create_python_reports(self):
         with TemporaryDirectory() as temp:
             root = Path(temp)
             output = root / "case"
-            empty_command = _editor_command(root, "empty.py", "pass\n")
-            result = _run_with_command(empty_command, **_workflow_inputs(output))
-
-            self.assertTrue(result["ok"], result)
-            self.assertFalse(result["retryable"])
-            self.assertEqual(result["completion_mode"], "degraded_fallback")
-            self.assertTrue(result["degraded_report_generation"])
-            self.assertCountEqual(
-                result["fallback_files"],
-                ["review.md", "reproduction_report.md", "result_review.md"],
-            )
+            result = _run_with_command(_editor_command(root, "empty.py", "pass\n"), **_workflow_inputs(output))
+            self.assertFalse(result["ok"])
+            self.assertTrue(result["retryable"])
+            self.assertEqual(result["fallback_files"], [])
+            self.assertFalse(result["degraded_report_generation"])
             for name in ("review.md", "reproduction_report.md", "result_review.md"):
-                self.assertTrue((output / name).is_file())
+                self.assertFalse((output / name).exists())
 
     def test_complete_reports_survive_a_nonzero_editor_exit(self) -> None:
         with TemporaryDirectory() as temp:
@@ -351,7 +351,7 @@ class FinalReportEditorTests(unittest.TestCase):
             self.assertEqual(result["fallback_files"], [])
             self.assertGreater((output / "review.md").stat().st_size, 2 * 1024 * 1024)
 
-    def test_oversized_report_is_quarantined_and_replaced_with_fallback(self) -> None:
+    def test_oversized_report_is_quarantined_for_editor_repair(self) -> None:
         with TemporaryDirectory() as temp:
             root = Path(temp)
             output = root / "case"
@@ -364,15 +364,16 @@ class FinalReportEditorTests(unittest.TestCase):
             with patch("geng_agent.agentic_report_editor.REPORT_MARKDOWN_MAX_BYTES", 64 * 1024):
                 result = _run_with_command(command, **_workflow_inputs(output))
 
-            self.assertTrue(result["ok"], result)
-            self.assertEqual(result["completion_mode"], "degraded_fallback")
-            self.assertEqual(result["fallback_files"], ["review.md"])
+            self.assertFalse(result["ok"], result)
+            self.assertEqual(result["completion_mode"], "hard_failure")
+            self.assertEqual(result["fallback_files"], [])
+            self.assertEqual(result["missing_outputs"], ["review.md"])
             self.assertTrue(any("resource limit" in issue for issue in result["recovered_packaging_issues"]))
             discarded = Path(result["workspace"]) / "discarded_report_outputs" / "review.md"
             self.assertGreater(discarded.stat().st_size, 64 * 1024)
-            self.assertLess((output / "review.md").stat().st_size, 64 * 1024)
+            self.assertFalse((output / "review.md").exists())
 
-    def test_unsafe_report_shape_is_quarantined_and_replaced(self) -> None:
+    def test_unsafe_report_shape_is_quarantined_for_editor_repair(self) -> None:
         with TemporaryDirectory() as temp:
             root = Path(temp)
             output = root / "case"
@@ -384,13 +385,14 @@ class FinalReportEditorTests(unittest.TestCase):
 
             result = _run_with_command(command, **_workflow_inputs(output))
 
-            self.assertTrue(result["ok"], result)
-            self.assertFalse(result["retryable"])
-            self.assertEqual(result["completion_mode"], "degraded_fallback")
+            self.assertFalse(result["ok"], result)
+            self.assertTrue(result["retryable"])
+            self.assertEqual(result["completion_mode"], "hard_failure")
             self.assertEqual(result["hard_issues"], [])
-            self.assertEqual(result["fallback_files"], ["review.md"])
+            self.assertEqual(result["fallback_files"], [])
+            self.assertEqual(result["missing_outputs"], ["review.md"])
             self.assertTrue(any("regular file" in issue for issue in result["recovered_packaging_issues"]))
-            self.assertTrue((output / "review.md").is_file())
+            self.assertFalse((output / "review.md").exists())
             discarded = Path(result["workspace"]) / "discarded_report_outputs" / "review.md"
             self.assertTrue(discarded.is_dir())
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json
+import subprocess
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
@@ -10,9 +11,7 @@ from geng_agent.benchmark_quality import assess_quality_baseline
 from geng_agent.codex_cost import record_codex_invocation, summarize_codex_usage, persist_pipeline_cost
 from geng_agent.risk_report import _build_run_cost
 from geng_agent.delivery_environment import export_installation
-from geng_agent.environment_rebuild import verify_clean_environment
 from geng_agent.portability_inventory import build_source_inventory
-from geng_agent.report_facts import publish_terminal_facts
 
 
 class DeliveryQualityCostTests(unittest.TestCase):
@@ -144,19 +143,6 @@ class DeliveryQualityCostTests(unittest.TestCase):
             self.assertEqual(evidence["installation_version_mismatches"], [mismatch])
             self.assertIn("numpy 1.26 -> 2.0", (root / "README.md").read_text())
 
-    def test_host_facts_cover_omitted_failure_and_are_idempotent(self):
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            for name in ("review.md", "reproduction_report.md", "result_review.md"):
-                (root / name).write_text("# An editor omitted the failed task\n", encoding="utf-8")
-            packet = {"task_id": "failed_task", "terminal_outcome": "not_reproduced",
-                      "task": {"figure_or_claim": "ranking"},
-                      "verification": {"core_conclusions": [{"claim_id": "ranking", "status": "unsupported"}]}}
-            publish_terminal_facts(root, [packet])
-            self.assertEqual(publish_terminal_facts(root, [packet]), [])
-            for path in root.glob("*.md"):
-                self.assertIn("未复现", path.read_text(encoding="utf-8"))
-                self.assertIn("ranking: unsupported", path.read_text(encoding="utf-8"))
 
     def test_quality_counts_false_success_without_treating_missing_as_correct(self):
         with TemporaryDirectory() as temporary:
@@ -170,26 +156,7 @@ class DeliveryQualityCostTests(unittest.TestCase):
             self.assertEqual(result["false_success"], 1)
             self.assertEqual(result["unassessed"], 1)
 
-    def test_real_clean_venv_smoke_and_cached_environment(self):
-        # No package download: this exercises a real isolated venv and project run.
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            project = root / "project"
-            project.mkdir()
-            (project / "requirements.txt").write_text("# stdlib-only fixture\n", encoding="utf-8")
-            (project / "run_experiment.py").write_text(
-                "import sys,site\nassert sys.prefix != sys.base_prefix\nassert not site.ENABLE_USER_SITE\nprint('clean smoke')\n", encoding="utf-8")
-            (project / "reproducibility_manifest.json").write_text(json.dumps({
-                "smoke_command": ["python", "run_experiment.py", "config_smoke.json"]}), encoding="utf-8")
-            (project / "config_smoke.json").write_text('{"smoke":true}', encoding="utf-8")
-            export_installation(project)
-            (project / "source_inventory.json").write_text(json.dumps(build_source_inventory(project)), encoding="utf-8")
-            first = verify_clean_environment(project, cache_dir=root / "cache", python_executable=sys.executable)
-            self.assertTrue(first["verified"], first)
-            self.assertFalse(first["environment_reused"])
-            second = verify_clean_environment(project, cache_dir=root / "cache", python_executable=sys.executable)
-            self.assertTrue(second["verified"], second)
-            self.assertTrue(second["environment_reused"])
+
 
 
 if __name__ == "__main__":

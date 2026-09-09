@@ -1,0 +1,1351 @@
+{
+  "$defs": {
+    "ArchitectureAcceptanceBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "criterion_id": {
+          "default": "",
+          "title": "Criterion Id",
+          "type": "string"
+        },
+        "criterion_kind": {
+          "default": "core_conclusion",
+          "enum": [
+            "core_conclusion",
+            "key_numeric_target"
+          ],
+          "title": "Criterion Kind",
+          "type": "string"
+        },
+        "output_quantity_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Output Quantity Ids",
+          "type": "array"
+        }
+      },
+      "title": "ArchitectureAcceptanceBinding",
+      "type": "object"
+    },
+    "ArchitectureBasis": {
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "enum": [
+            "paper_explicit",
+            "paper_derived",
+            "assumed",
+            "unresolved"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "evidence_facts": {
+          "items": {
+            "$ref": "#/$defs/RequiredFactRef"
+          },
+          "title": "Evidence Facts",
+          "type": "array"
+        },
+        "assumption_refs": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Assumption Refs",
+          "type": "array"
+        },
+        "note": {
+          "default": "",
+          "title": "Note",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "title": "ArchitectureBasis",
+      "type": "object"
+    },
+    "ArchitectureBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "task_id": {
+          "minLength": 1,
+          "title": "Task Id",
+          "type": "string"
+        },
+        "experiment_id": {
+          "minLength": 1,
+          "title": "Experiment Id",
+          "type": "string"
+        },
+        "consistency_group": {
+          "minLength": 1,
+          "title": "Consistency Group",
+          "type": "string"
+        },
+        "components": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Components",
+          "type": "array"
+        },
+        "allowed_overrides": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Allowed Overrides",
+          "type": "array"
+        },
+        "overrides": {
+          "additionalProperties": true,
+          "title": "Overrides",
+          "type": "object"
+        },
+        "outputs": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Outputs",
+          "type": "array"
+        },
+        "acceptance_bindings": {
+          "items": {
+            "$ref": "#/$defs/ArchitectureAcceptanceBinding"
+          },
+          "title": "Acceptance Bindings",
+          "type": "array"
+        }
+      },
+      "required": [
+        "task_id",
+        "experiment_id",
+        "consistency_group",
+        "components"
+      ],
+      "title": "ArchitectureBinding",
+      "type": "object"
+    },
+    "ArchitectureComponent": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "kind": {
+          "minLength": 1,
+          "title": "Kind",
+          "type": "string"
+        },
+        "module": {
+          "minLength": 1,
+          "title": "Module",
+          "type": "string"
+        },
+        "callable": {
+          "default": "",
+          "title": "Callable",
+          "type": "string"
+        },
+        "execution": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArchitectureExecutionContract"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "inputs": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Inputs",
+          "type": "array"
+        },
+        "outputs": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Outputs",
+          "type": "array"
+        },
+        "parameters": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Parameters",
+          "type": "array"
+        },
+        "depends_on": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Depends On",
+          "type": "array"
+        },
+        "basis": {
+          "$ref": "#/$defs/ArchitectureBasis"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "module",
+        "basis"
+      ],
+      "title": "ArchitectureComponent",
+      "type": "object"
+    },
+    "ArchitectureConsistencyGroup": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "task_ids": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Task Ids",
+          "type": "array"
+        },
+        "shared_quantity_ids": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Shared Quantity Ids",
+          "type": "array"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "title": "ArchitectureConsistencyGroup",
+      "type": "object"
+    },
+    "ArchitectureExecutionContract": {
+      "additionalProperties": false,
+      "properties": {
+        "execution_kind": {
+          "minLength": 1,
+          "title": "Execution Kind",
+          "type": "string"
+        },
+        "primary_framework": {
+          "minLength": 1,
+          "title": "Primary Framework",
+          "type": "string"
+        },
+        "supporting_libraries": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Supporting Libraries",
+          "type": "array"
+        },
+        "device_policy": {
+          "enum": [
+            "cpu",
+            "framework_default",
+            "accelerator_preferred",
+            "accelerator_required",
+            "external_runtime"
+          ],
+          "title": "Device Policy",
+          "type": "string"
+        },
+        "precision": {
+          "title": "Precision",
+          "type": "string"
+        },
+        "trainable": {
+          "title": "Trainable",
+          "type": "boolean"
+        },
+        "gradient_mode": {
+          "enum": [
+            "required",
+            "not_required",
+            "not_applicable"
+          ],
+          "title": "Gradient Mode",
+          "type": "string"
+        },
+        "checkpoint_policy": {
+          "enum": [
+            "required",
+            "optional",
+            "not_applicable"
+          ],
+          "title": "Checkpoint Policy",
+          "type": "string"
+        },
+        "shared_implementation": {
+          "title": "Shared Implementation",
+          "type": "boolean"
+        },
+        "required_capabilities": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Required Capabilities",
+          "type": "array"
+        },
+        "rationale": {
+          "minLength": 1,
+          "title": "Rationale",
+          "type": "string"
+        }
+      },
+      "required": [
+        "execution_kind",
+        "primary_framework",
+        "supporting_libraries",
+        "device_policy",
+        "precision",
+        "trainable",
+        "gradient_mode",
+        "checkpoint_policy",
+        "shared_implementation",
+        "required_capabilities",
+        "rationale"
+      ],
+      "title": "ArchitectureExecutionContract",
+      "type": "object"
+    },
+    "ArchitectureInvariant": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "kind": {
+          "default": "other",
+          "enum": [
+            "reference",
+            "shape",
+            "unit",
+            "normalization",
+            "global_override",
+            "consistency",
+            "foundation_ownership",
+            "other"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "subjects": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Subjects",
+          "type": "array"
+        },
+        "task_ids": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Task Ids",
+          "type": "array"
+        },
+        "severity": {
+          "enum": [
+            "error",
+            "warning"
+          ],
+          "title": "Severity",
+          "type": "string"
+        },
+        "description": {
+          "default": "",
+          "title": "Description",
+          "type": "string"
+        },
+        "expression": {
+          "default": "",
+          "title": "Expression",
+          "type": "string"
+        },
+        "basis": {
+          "$ref": "#/$defs/ArchitectureBasis"
+        }
+      },
+      "required": [
+        "id",
+        "severity",
+        "basis"
+      ],
+      "title": "ArchitectureInvariant",
+      "type": "object"
+    },
+    "ArchitectureQuantity": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "role": {
+          "minLength": 1,
+          "title": "Role",
+          "type": "string"
+        },
+        "dtype": {
+          "default": "",
+          "title": "Dtype",
+          "type": "string"
+        },
+        "shape": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Shape",
+          "type": "array"
+        },
+        "unit": {
+          "default": "",
+          "title": "Unit",
+          "type": "string"
+        },
+        "scale": {
+          "default": "",
+          "title": "Scale",
+          "type": "string"
+        },
+        "normalization": {
+          "default": "",
+          "title": "Normalization",
+          "type": "string"
+        },
+        "scope": {
+          "enum": [
+            "global",
+            "consistency_group",
+            "experiment",
+            "runtime"
+          ],
+          "title": "Scope",
+          "type": "string"
+        },
+        "default": {
+          "default": null,
+          "title": "Default"
+        },
+        "basis": {
+          "$ref": "#/$defs/ArchitectureBasis"
+        }
+      },
+      "required": [
+        "id",
+        "role",
+        "scope",
+        "basis"
+      ],
+      "title": "ArchitectureQuantity",
+      "type": "object"
+    },
+    "Assumption": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "default_value": {
+          "title": "Default Value"
+        },
+        "reason": {
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        },
+        "risk": {
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "title": "Risk",
+          "type": "string"
+        },
+        "request_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Request Id"
+        },
+        "field_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Field Ids",
+          "type": "array"
+        },
+        "sensitivity_check": {
+          "default": "",
+          "title": "Sensitivity Check",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "default_value",
+        "reason",
+        "risk"
+      ],
+      "title": "Assumption",
+      "type": "object"
+    },
+    "Comparison": {
+      "additionalProperties": false,
+      "properties": {
+        "baselines": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Baselines",
+          "type": "array"
+        },
+        "curve_groups": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Curve Groups",
+          "type": "array"
+        },
+        "tolerance": {
+          "minLength": 1,
+          "title": "Tolerance",
+          "type": "string"
+        }
+      },
+      "required": [
+        "baselines",
+        "curve_groups",
+        "tolerance"
+      ],
+      "title": "Comparison",
+      "type": "object"
+    },
+    "ExpectedTrend": {
+      "additionalProperties": false,
+      "properties": {
+        "x_axis": {
+          "title": "X Axis",
+          "type": "string"
+        },
+        "y_axis": {
+          "title": "Y Axis",
+          "type": "string"
+        },
+        "direction": {
+          "enum": [
+            "decreasing",
+            "increasing",
+            "flat",
+            "unknown"
+          ],
+          "title": "Direction",
+          "type": "string"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "x_axis",
+        "y_axis",
+        "direction",
+        "reason"
+      ],
+      "title": "ExpectedTrend",
+      "type": "object"
+    },
+    "MissingFactRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "request_id": {
+          "minLength": 1,
+          "title": "Request Id",
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "channel_model",
+            "modulation",
+            "coding",
+            "metric",
+            "simulation_parameter",
+            "baseline",
+            "figure_claim",
+            "algorithm",
+            "dataset",
+            "topology",
+            "hardware",
+            "other"
+          ],
+          "title": "Type",
+          "type": "string"
+        },
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "why_needed": {
+          "minLength": 1,
+          "title": "Why Needed",
+          "type": "string"
+        },
+        "impact": {
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "title": "Impact",
+          "type": "string"
+        },
+        "search_targets": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Search Targets",
+          "type": "array"
+        },
+        "required_fields": {
+          "items": {
+            "$ref": "#/$defs/RequestedFactField"
+          },
+          "title": "Required Fields",
+          "type": "array"
+        }
+      },
+      "required": [
+        "request_id",
+        "type",
+        "name",
+        "why_needed",
+        "impact",
+        "search_targets"
+      ],
+      "title": "MissingFactRequest",
+      "type": "object"
+    },
+    "ReproTask": {
+      "additionalProperties": false,
+      "properties": {
+        "task_id": {
+          "minLength": 1,
+          "title": "Task Id",
+          "type": "string"
+        },
+        "target": {
+          "minLength": 1,
+          "title": "Target",
+          "type": "string"
+        },
+        "metric": {
+          "enum": [
+            "bit_error_rate",
+            "symbol_error_rate",
+            "throughput",
+            "delay",
+            "spectral_efficiency",
+            "outage_probability",
+            "energy_efficiency",
+            "accuracy",
+            "loss",
+            "other"
+          ],
+          "title": "Metric",
+          "type": "string"
+        },
+        "metric_formula": {
+          "minLength": 1,
+          "title": "Metric Formula",
+          "type": "string"
+        },
+        "figure_or_claim": {
+          "minLength": 1,
+          "title": "Figure Or Claim",
+          "type": "string"
+        },
+        "expected_artifacts": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Expected Artifacts",
+          "type": "array"
+        },
+        "output_columns": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Output Columns",
+          "type": "array"
+        },
+        "expected_trend": {
+          "$ref": "#/$defs/ExpectedTrend"
+        },
+        "comparison": {
+          "$ref": "#/$defs/Comparison"
+        },
+        "required_facts": {
+          "items": {
+            "$ref": "#/$defs/RequiredFactRef"
+          },
+          "title": "Required Facts",
+          "type": "array"
+        },
+        "missing_fact_requests": {
+          "items": {
+            "$ref": "#/$defs/MissingFactRequest"
+          },
+          "title": "Missing Fact Requests",
+          "type": "array"
+        },
+        "assumptions": {
+          "items": {
+            "$ref": "#/$defs/Assumption"
+          },
+          "title": "Assumptions",
+          "type": "array"
+        },
+        "risk_if_unreproducible": {
+          "minLength": 1,
+          "title": "Risk If Unreproducible",
+          "type": "string"
+        },
+        "formula_chain": {
+          "items": {
+            "$ref": "#/$defs/TaskSpecificationItem"
+          },
+          "title": "Formula Chain",
+          "type": "array"
+        },
+        "scientific_acceptance": {
+          "$ref": "#/$defs/ScientificAcceptance"
+        },
+        "parameter_matrix": {
+          "items": {
+            "$ref": "#/$defs/TaskSpecificationItem"
+          },
+          "title": "Parameter Matrix",
+          "type": "array"
+        },
+        "baseline_definitions": {
+          "items": {
+            "$ref": "#/$defs/TaskSpecificationItem"
+          },
+          "title": "Baseline Definitions",
+          "type": "array"
+        },
+        "statistical_protocol": {
+          "items": {
+            "$ref": "#/$defs/TaskSpecificationItem"
+          },
+          "title": "Statistical Protocol",
+          "type": "array"
+        },
+        "validation_anchors": {
+          "items": {
+            "$ref": "#/$defs/TaskSpecificationItem"
+          },
+          "title": "Validation Anchors",
+          "type": "array"
+        }
+      },
+      "required": [
+        "task_id",
+        "target",
+        "metric",
+        "metric_formula",
+        "figure_or_claim",
+        "expected_artifacts",
+        "output_columns",
+        "expected_trend",
+        "comparison",
+        "required_facts",
+        "assumptions",
+        "risk_if_unreproducible"
+      ],
+      "title": "ReproTask",
+      "type": "object"
+    },
+    "ReproTaskBackfillHandoff": {
+      "additionalProperties": false,
+      "description": "Task Designer advice; an inferred value keeps legacy output runnable.",
+      "properties": {
+        "ready_for_writer": {
+          "default": true,
+          "title": "Ready For Writer",
+          "type": "boolean"
+        },
+        "blocking_request_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Blocking Request Ids",
+          "type": "array"
+        },
+        "reason": {
+          "default": "",
+          "title": "Reason",
+          "type": "string"
+        },
+        "inferred": {
+          "default": false,
+          "title": "Inferred",
+          "type": "boolean"
+        }
+      },
+      "title": "ReproTaskBackfillHandoff",
+      "type": "object"
+    },
+    "ReproTasksDocument": {
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": "2.0",
+          "default": "2.0",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "backfill_handoff": {
+          "$ref": "#/$defs/ReproTaskBackfillHandoff"
+        },
+        "execution_relationships": {
+          "items": {
+            "$ref": "#/$defs/TaskExecutionRelationship"
+          },
+          "title": "Execution Relationships",
+          "type": "array"
+        },
+        "repro_tasks": {
+          "items": {
+            "$ref": "#/$defs/ReproTask"
+          },
+          "minItems": 1,
+          "title": "Repro Tasks",
+          "type": "array"
+        }
+      },
+      "required": [
+        "repro_tasks"
+      ],
+      "title": "ReproTasksDocument",
+      "type": "object"
+    },
+    "RequestedFactField": {
+      "additionalProperties": false,
+      "properties": {
+        "field_id": {
+          "minLength": 1,
+          "title": "Field Id",
+          "type": "string"
+        },
+        "description": {
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "affects": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Affects",
+          "type": "array"
+        }
+      },
+      "required": [
+        "field_id",
+        "description"
+      ],
+      "title": "RequestedFactField",
+      "type": "object"
+    },
+    "RequiredFactRef": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "enum": [
+            "channel_model",
+            "modulation",
+            "coding",
+            "metric",
+            "simulation_parameter",
+            "baseline",
+            "figure_claim",
+            "algorithm",
+            "dataset",
+            "topology",
+            "hardware",
+            "other"
+          ],
+          "title": "Type",
+          "type": "string"
+        },
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "name"
+      ],
+      "title": "RequiredFactRef",
+      "type": "object"
+    },
+    "ScientificAcceptance": {
+      "additionalProperties": false,
+      "description": "Small shared vocabulary, not a completeness gate.",
+      "properties": {
+        "contract_version": {
+          "const": "1.0",
+          "default": "1.0",
+          "title": "Contract Version",
+          "type": "string"
+        },
+        "core_conclusions": {
+          "items": {
+            "$ref": "#/$defs/ScientificCoreConclusion"
+          },
+          "title": "Core Conclusions",
+          "type": "array"
+        },
+        "key_numeric_targets": {
+          "items": {
+            "$ref": "#/$defs/ScientificNumericTarget"
+          },
+          "title": "Key Numeric Targets",
+          "type": "array"
+        },
+        "information_gaps": {
+          "items": {
+            "$ref": "#/$defs/ScientificInformationGap"
+          },
+          "title": "Information Gaps",
+          "type": "array"
+        }
+      },
+      "title": "ScientificAcceptance",
+      "type": "object"
+    },
+    "ScientificArchitectureDocument": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "schema_version": {
+                "const": "1.1"
+              }
+            },
+            "required": [
+              "schema_version"
+            ]
+          },
+          "then": {
+            "properties": {
+              "components": {
+                "items": {
+                  "properties": {
+                    "callable": {
+                      "minLength": 1,
+                      "pattern": "\\S",
+                      "type": "string"
+                    },
+                    "execution": {
+                      "not": {
+                        "type": "null"
+                      }
+                    }
+                  },
+                  "required": [
+                    "callable",
+                    "execution"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      ],
+      "properties": {
+        "schema_version": {
+          "enum": [
+            "1.0",
+            "1.1"
+          ],
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "workflow_version": {
+          "const": "2",
+          "default": "2",
+          "title": "Workflow Version",
+          "type": "string"
+        },
+        "quantities": {
+          "items": {
+            "$ref": "#/$defs/ArchitectureQuantity"
+          },
+          "title": "Quantities",
+          "type": "array"
+        },
+        "components": {
+          "items": {
+            "$ref": "#/$defs/ArchitectureComponent"
+          },
+          "minItems": 1,
+          "title": "Components",
+          "type": "array"
+        },
+        "consistency_groups": {
+          "items": {
+            "$ref": "#/$defs/ArchitectureConsistencyGroup"
+          },
+          "title": "Consistency Groups",
+          "type": "array"
+        },
+        "bindings": {
+          "items": {
+            "$ref": "#/$defs/ArchitectureBinding"
+          },
+          "minItems": 1,
+          "title": "Bindings",
+          "type": "array"
+        },
+        "invariants": {
+          "items": {
+            "$ref": "#/$defs/ArchitectureInvariant"
+          },
+          "title": "Invariants",
+          "type": "array"
+        }
+      },
+      "required": [
+        "schema_version",
+        "quantities",
+        "components",
+        "bindings"
+      ],
+      "title": "ScientificArchitectureDocument",
+      "type": "object"
+    },
+    "ScientificCoreConclusion": {
+      "additionalProperties": false,
+      "properties": {
+        "claim_id": {
+          "default": "",
+          "title": "Claim Id",
+          "type": "string"
+        },
+        "statement": {
+          "default": "",
+          "title": "Statement",
+          "type": "string"
+        },
+        "kind": {
+          "default": "other",
+          "enum": [
+            "ordering",
+            "trend",
+            "crossing",
+            "threshold",
+            "scaling",
+            "gain_loss",
+            "mechanism",
+            "absolute_level",
+            "other"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "regime": {
+          "default": "",
+          "title": "Regime",
+          "type": "string"
+        },
+        "paper_anchor": {
+          "default": "",
+          "title": "Paper Anchor",
+          "type": "string"
+        }
+      },
+      "title": "ScientificCoreConclusion",
+      "type": "object"
+    },
+    "ScientificInformationGap": {
+      "additionalProperties": false,
+      "properties": {
+        "gap_id": {
+          "default": "",
+          "title": "Gap Id",
+          "type": "string"
+        },
+        "description": {
+          "default": "",
+          "title": "Description",
+          "type": "string"
+        },
+        "affects_claim_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Affects Claim Ids",
+          "type": "array"
+        },
+        "disposition": {
+          "default": "assume_and_disclose",
+          "enum": [
+            "assume_and_disclose",
+            "single_sensitivity_if_core",
+            "terminal_inconclusive"
+          ],
+          "title": "Disposition",
+          "type": "string"
+        }
+      },
+      "title": "ScientificInformationGap",
+      "type": "object"
+    },
+    "ScientificNumericTarget": {
+      "additionalProperties": false,
+      "properties": {
+        "target_id": {
+          "default": "",
+          "title": "Target Id",
+          "type": "string"
+        },
+        "name": {
+          "default": "",
+          "title": "Name",
+          "type": "string"
+        },
+        "paper_magnitude": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Paper Magnitude"
+        },
+        "unit": {
+          "default": "",
+          "title": "Unit",
+          "type": "string"
+        },
+        "regime": {
+          "default": "",
+          "title": "Regime",
+          "type": "string"
+        },
+        "evidence_quality": {
+          "default": "unavailable",
+          "enum": [
+            "paper_explicit",
+            "paper_derived",
+            "visual_estimate",
+            "unavailable"
+          ],
+          "title": "Evidence Quality",
+          "type": "string"
+        }
+      },
+      "title": "ScientificNumericTarget",
+      "type": "object"
+    },
+    "TaskExecutionRelationship": {
+      "additionalProperties": false,
+      "description": "Scientific execution dependency between otherwise atomic reproduction tasks.",
+      "properties": {
+        "relationship_id": {
+          "minLength": 1,
+          "title": "Relationship Id",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "same_run_outputs",
+            "checkpoint_flow",
+            "shared_pretraining",
+            "shared_random_realization",
+            "shared_dataset_partition",
+            "shared_definition",
+            "other"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "strength": {
+          "enum": [
+            "strong",
+            "weak"
+          ],
+          "title": "Strength",
+          "type": "string"
+        },
+        "task_ids": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 2,
+          "title": "Task Ids",
+          "type": "array"
+        },
+        "producer_task_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Producer Task Id"
+        },
+        "consumer_task_ids": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Consumer Task Ids",
+          "type": "array"
+        },
+        "artifact_ids": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Artifact Ids",
+          "type": "array"
+        },
+        "rationale": {
+          "default": "",
+          "title": "Rationale",
+          "type": "string"
+        }
+      },
+      "required": [
+        "relationship_id",
+        "kind",
+        "strength",
+        "task_ids"
+      ],
+      "title": "TaskExecutionRelationship",
+      "type": "object"
+    },
+    "TaskSpecificationItem": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "value": {
+          "default": null,
+          "title": "Value"
+        },
+        "status": {
+          "enum": [
+            "evidenced",
+            "assumed",
+            "not_applicable",
+            "unresolved"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "evidence_facts": {
+          "items": {
+            "$ref": "#/$defs/RequiredFactRef"
+          },
+          "title": "Evidence Facts",
+          "type": "array"
+        },
+        "note": {
+          "default": "",
+          "title": "Note",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "status"
+      ],
+      "title": "TaskSpecificationItem",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "tasks": {
+      "$ref": "#/$defs/ReproTasksDocument"
+    },
+    "scientific_architecture": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ScientificArchitectureDocument"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "tasks",
+    "scientific_architecture"
+  ],
+  "title": "ExperimentPlanDocument",
+  "type": "object"
+}

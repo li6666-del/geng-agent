@@ -14,7 +14,7 @@ from .pipeline_helpers import _paper_context_for_prompt, wrap_untrusted
 
 _AUDIT_META_KEYS = {
     "cache", "analysis_backend", "analysis_stage_label", "analysis_attempt",
-    "analysis_resume_source", "generated_at", "created_at", "updated_at", "duration_s",
+    "analysis_resume_source", "generated_at", "created_at", "updated_at", "duration_s", "cache_reused",
 }
 
 

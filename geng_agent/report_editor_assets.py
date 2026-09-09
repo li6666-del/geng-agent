@@ -12,6 +12,45 @@ from .paper_evidence import facts_for_task, safe_label
 from .report_editor_workspace import REPORT_ASSETS_DIR
 
 
+def restore_report_assets(*, task_records: list[dict[str, Any]], output_dir: Path,
+                          audit_dir: Path) -> list[str]:
+    """Republish only images bound to the current Reporter's recorded digest."""
+    warnings: list[str] = []
+    target_root = output_dir / REPORT_ASSETS_DIR
+    for record in task_records:
+        task_id = safe_label(str(record.get("task_id") or "task"))
+        reporter = record.get("task_reporter") or {}
+        manifest = reporter.get("asset_manifest") or []
+        if not manifest:
+            continue
+        workspace = Path(str(reporter.get("workspace") or ""))
+        try:
+            expected_root = (audit_dir / "04a_task_reporters" / f"{int(record['index']):02d}_{task_id}").resolve()
+            if workspace.is_symlink() or not workspace.resolve().is_relative_to(expected_root):
+                raise ValueError("Reporter workspace is outside its task audit directory")
+            for item in manifest:
+                raw_path = item.get("path")
+                source = _resolve_report_asset(workspace / REPORT_ASSETS_DIR, task_id=task_id, raw_path=raw_path)
+                if source is None or _sha256_file(source[1]) != item.get("sha256"):
+                    warnings.append(f"{task_id}: cannot restore image with missing or changed provenance: {raw_path}")
+                    continue
+                relative, asset = source
+                destination = target_root / relative
+                if target_root.is_symlink() or destination.parent.is_symlink() or destination.is_symlink():
+                    raise ValueError("Report asset destination is a symbolic link")
+                if not destination.resolve().is_relative_to(output_dir.resolve()):
+                    raise ValueError("Report asset destination escapes the case")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if not destination.is_file() or _sha256_file(destination) != item["sha256"]:
+                    shutil.copy2(asset, destination)
+                    if _sha256_file(destination) != item["sha256"]:
+                        destination.unlink()
+                        raise ValueError("Report image changed while copying")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            warnings.append(f"{task_id}: asset restoration failed: {exc}")
+    return warnings
+
+
 def _build_task_packets(
     *,
     facts: dict[str, Any],
@@ -47,10 +86,11 @@ def _build_task_packets(
                 "execution_summary": _host_report_execution(record, verification),
                 "verification": {key: verification[key] for key in (
                     "task_id", "outcome", "host_action", "run_valid",
-                    "decision_reason", "decision_authority", "engineering_status", "engineering_issues", "asset_notes", "core_conclusions", "key_numeric_comparisons",
+                    "decision_reason", "decision_authority", "engineering_status", "engineering_issues", "asset_notes", "report_title", "report_explanation", "core_conclusions", "key_numeric_comparisons",
                     "comparison_summary", "differences", "non_material_differences", "evidence_files", "confidence",
                     "verified_facts", "provenance_base") if key in verification},
                 "terminal_outcome": terminal_outcome,
+                "asset_manifest": (record.get("task_reporter") or {}).get("asset_manifest", []),
                 "local_assets": _editor_asset_paths(task_id, verification.get("local_assets")),
                 "paper_assets": _editor_asset_paths(task_id, verification.get("paper_assets")),
             }
@@ -120,12 +160,14 @@ def _sanitize_task_packet_assets(task_packets: list[dict[str, Any]], root: Path)
     warnings: list[str] = []
     for packet in task_packets:
         task_id = safe_label(str(packet.get("task_id") or "task"))
+        expected = {item["path"]: item.get("sha256") for item in packet.get("asset_manifest", [])
+                    if isinstance(item, dict) and "path" in item}
         for key in ("local_assets", "paper_assets"):
             retained: list[str] = []
             values = packet.get(key) if isinstance(packet.get(key), list) else []
             for raw_path in values:
                 resolved = _resolve_report_asset(root, task_id=task_id, raw_path=raw_path)
-                if resolved is None:
+                if resolved is None or (expected and _sha256_file(resolved[1]) != expected.get(str(raw_path))):
                     warnings.append(f"{task_id}: ignored unavailable or unsafe {key[:-1]}: {raw_path}")
                     continue
                 relative, _ = resolved

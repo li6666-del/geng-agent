@@ -1,0 +1,347 @@
+{
+  "$defs": {
+    "EngineeringFact": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "enum": [
+            "channel_model",
+            "modulation",
+            "coding",
+            "metric",
+            "simulation_parameter",
+            "baseline",
+            "figure_claim",
+            "algorithm",
+            "dataset",
+            "topology",
+            "hardware",
+            "other"
+          ],
+          "title": "Type",
+          "type": "string"
+        },
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "value": {
+          "additionalProperties": true,
+          "title": "Value",
+          "type": "object"
+        },
+        "source": {
+          "$ref": "#/$defs/FactSource"
+        },
+        "confidence": {
+          "enum": [
+            "high",
+            "medium",
+            "low"
+          ],
+          "title": "Confidence",
+          "type": "string"
+        },
+        "used_for_reproduction": {
+          "title": "Used For Reproduction",
+          "type": "boolean"
+        },
+        "evidence_kind": {
+          "default": "paper_explicit",
+          "enum": [
+            "paper_explicit",
+            "paper_derived",
+            "visual_estimate"
+          ],
+          "title": "Evidence Kind",
+          "type": "string"
+        },
+        "derivation": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Derivation"
+        }
+      },
+      "required": [
+        "type",
+        "name",
+        "value",
+        "source",
+        "confidence",
+        "used_for_reproduction"
+      ],
+      "title": "EngineeringFact",
+      "type": "object"
+    },
+    "EngineeringFactsDocument": {
+      "additionalProperties": false,
+      "properties": {
+        "paper_domain": {
+          "const": "communication",
+          "title": "Paper Domain",
+          "type": "string"
+        },
+        "paper_repro_type": {
+          "enum": [
+            "signal_chain",
+            "modulation_recognition",
+            "channel_coding",
+            "mimo_ofdm",
+            "network_protocol",
+            "ml_communication",
+            "optimization_algorithm",
+            "hardware_dataset",
+            "other"
+          ],
+          "title": "Paper Repro Type",
+          "type": "string"
+        },
+        "engineering_facts": {
+          "items": {
+            "$ref": "#/$defs/EngineeringFact"
+          },
+          "title": "Engineering Facts",
+          "type": "array"
+        },
+        "missing_information": {
+          "items": {
+            "$ref": "#/$defs/MissingInformation"
+          },
+          "title": "Missing Information",
+          "type": "array"
+        }
+      },
+      "required": [
+        "paper_domain",
+        "paper_repro_type",
+        "engineering_facts",
+        "missing_information"
+      ],
+      "title": "EngineeringFactsDocument",
+      "type": "object"
+    },
+    "FactSource": {
+      "additionalProperties": false,
+      "properties": {
+        "source_kind": {
+          "enum": [
+            "text",
+            "figure"
+          ],
+          "title": "Source Kind",
+          "type": "string"
+        },
+        "chunk_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Chunk Id"
+        },
+        "page": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Page"
+        },
+        "section": {
+          "title": "Section",
+          "type": "string"
+        },
+        "quote": {
+          "minLength": 1,
+          "title": "Quote",
+          "type": "string"
+        },
+        "figure_ref": {
+          "title": "Figure Ref",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_kind",
+        "chunk_id",
+        "page",
+        "section",
+        "quote",
+        "figure_ref"
+      ],
+      "title": "FactSource",
+      "type": "object"
+    },
+    "MissingInformation": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "why_needed": {
+          "minLength": 1,
+          "title": "Why Needed",
+          "type": "string"
+        },
+        "impact": {
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "title": "Impact",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "why_needed",
+        "impact"
+      ],
+      "title": "MissingInformation",
+      "type": "object"
+    },
+    "PaperThesisDocument": {
+      "additionalProperties": false,
+      "properties": {
+        "central_claim": {
+          "minLength": 1,
+          "title": "Central Claim",
+          "type": "string"
+        },
+        "proposed_method": {
+          "minLength": 1,
+          "title": "Proposed Method",
+          "type": "string"
+        },
+        "mechanism": {
+          "minLength": 1,
+          "title": "Mechanism",
+          "type": "string"
+        },
+        "comparisons": {
+          "items": {
+            "$ref": "#/$defs/ThesisComparison"
+          },
+          "title": "Comparisons",
+          "type": "array"
+        },
+        "headline_shape": {
+          "title": "Headline Shape",
+          "type": "string"
+        },
+        "caveats": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Caveats",
+          "type": "array"
+        }
+      },
+      "required": [
+        "central_claim",
+        "proposed_method",
+        "mechanism",
+        "comparisons",
+        "headline_shape",
+        "caveats"
+      ],
+      "title": "PaperThesisDocument",
+      "type": "object"
+    },
+    "ThesisComparison": {
+      "additionalProperties": false,
+      "properties": {
+        "claim_id": {
+          "minLength": 1,
+          "title": "Claim Id",
+          "type": "string"
+        },
+        "methods_best_to_worst": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Methods Best To Worst",
+          "type": "array"
+        },
+        "expected_ordering": {
+          "minLength": 1,
+          "title": "Expected Ordering",
+          "type": "string"
+        },
+        "metric": {
+          "title": "Metric",
+          "type": "string"
+        },
+        "regime": {
+          "title": "Regime",
+          "type": "string"
+        },
+        "figure_ref": {
+          "title": "Figure Ref",
+          "type": "string"
+        },
+        "mechanism_note": {
+          "title": "Mechanism Note",
+          "type": "string"
+        }
+      },
+      "required": [
+        "claim_id",
+        "methods_best_to_worst",
+        "expected_ordering",
+        "metric",
+        "regime",
+        "figure_ref",
+        "mechanism_note"
+      ],
+      "title": "ThesisComparison",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "facts": {
+      "$ref": "#/$defs/EngineeringFactsDocument"
+    },
+    "paper_thesis": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PaperThesisDocument"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "limitations": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Limitations",
+      "type": "array"
+    }
+  },
+  "required": [
+    "facts",
+    "paper_thesis"
+  ],
+  "title": "PaperUnderstandingDocument",
+  "type": "object"
+}

@@ -262,6 +262,16 @@ def _clear_stage_outputs(
         "docx_generation_error.json",
     ]
     outputs = list(stage_outputs.get(stage, []))
+    if stage in {"paper", "facts", "paper_thesis"}:
+        outputs.append("paper_understanding.json")
+    if stage in {"paper", "facts", "paper_thesis", "tasks", "tasks_finalize", "scientific_architecture", "experiment_index"}:
+        outputs.append("experiment_plan.json")
+        # Explicit restarts invalidate the relevant combined reasoning cache.
+        # Normal publication retains stage-local caches in the audit tree.
+        if not preserve_audit:
+            for pattern in ("02a_plan_experiments.json", "02c_round_*_revise_experiment_plan.json"):
+                for cached in (output_dir / "audit").glob(pattern):
+                    _remove_path_inside(output_dir, cached)
     if stage in stage_outputs:
         outputs.extend(report_outputs)
     for rel_path in dict.fromkeys(outputs):

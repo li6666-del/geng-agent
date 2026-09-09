@@ -236,8 +236,9 @@ class IsolatedTaskReporterTests(unittest.TestCase):
         self.assertIn("CSV, JSON, PDF", prompt)
         self.assertEqual(
             TASK_REPORTER_PROMPT_VERSION,
-            "isolated_task_reporter_v11_explicit_scientific_decision",
+            "isolated_task_reporter_v13_chinese_reports",
         )
+        self.assertIn('"report_explanation"', prompt)
         self.assertNotIn('"verdict"', prompt)
         self.assertNotIn('"revision_target"', prompt)
 

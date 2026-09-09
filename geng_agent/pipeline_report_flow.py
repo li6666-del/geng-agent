@@ -190,8 +190,10 @@ def run_report_flow(
 
     context.mark("task_reporters")
     context.begin("report_editor")
+    report_mode = "model"
+    report_runner = run_codex_report_editor_workflow
     try:
-        report_editor_result = run_codex_report_editor_workflow(
+        report_editor_result = report_runner(
             paper=paper,
             facts=facts,
             tasks=tasks,
@@ -221,7 +223,7 @@ def run_report_flow(
         "retryable"
     ):
         try:
-            report_editor_result = run_codex_report_editor_workflow(
+            report_editor_result = report_runner(
                 paper=paper,
                 facts=facts,
                 tasks=tasks,
@@ -240,7 +242,6 @@ def run_report_flow(
                 resume=False,
                 attempt_no=2,
                 repair_context=report_editor_result,
-                allow_fallback=True,
             )
         except Exception as exc:
             report_editor_result = report_editor_exception_result(exc)
@@ -362,7 +363,8 @@ def run_report_flow(
     run_cost["analysis_backend"] = options.analysis_backend
     run_cost["project_backend"] = "codex"
     run_cost["codex_agent_mode"] = "task-writers"
-    run_cost["report_backend"] = "codex_task_reporters_plus_editor"
+    run_cost["report_backend"] = "codex_task_reporters_plus_" + report_mode
+    run_cost["report_mode"] = report_mode
     run_cost["task_reporter_count"] = len(task_records)
     run_cost["task_reporter_verification_rounds"] = verification_round
     run_cost["report_editor_invocations"] = report_editor_invocations
@@ -371,7 +373,7 @@ def run_report_flow(
     )
     run_cost["json_format_repair_limit"] = int(options.json_repair_attempts)
     run_cost["facts_stop_rule"] = "single_global_then_selected_blockers_max_3"
-    run_cost["tasks_stop_rule"] = "preliminary_or_refreshed_handoff_ready"
+    run_cost["tasks_stop_rule"] = "coupled_plan_or_revised_plan_handoff_ready"
     run_cost["mineru_layout"] = {
         "ok": analysis.mineru_result.get("ok"),
         "cached": analysis.mineru_result.get("cached"),
@@ -381,7 +383,7 @@ def run_report_flow(
     }
     if options.analysis_backend == "codex":
         run_cost["codex_session_policy"] = "unbounded_until_exit_or_user_stop"
-        run_cost["analysis_agent_count"] = 1
+        run_cost["analysis_agent_count"] = 2
         run_cost["analysis_stage_invocations"] = (
             analysis.analysis_stage_invocations
         )
@@ -399,7 +401,7 @@ def run_report_flow(
             agentic_status=agentic_result.get("status", {}),
             settings={
                 "analysis_backend": options.analysis_backend,
-                "analysis_agent_count": 1,
+                "analysis_agent_count": 2,
                 "facts_stop_rule": (
                     "single_global_then_selected_blockers_max_3"
                 ),

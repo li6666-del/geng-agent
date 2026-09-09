@@ -154,7 +154,7 @@ def _recover_unsafe_report_outputs(
     *,
     max_bytes: int = REPORT_MARKDOWN_MAX_BYTES,
 ) -> tuple[list[str], list[str], list[str]]:
-    """Quarantine packaging-shaped outputs so deterministic reports can replace them."""
+    """Quarantine unsafe outputs so the existing Editor can repair those files."""
 
     recovered: list[str] = []
     actions: list[str] = []

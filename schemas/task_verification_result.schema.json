@@ -432,6 +432,16 @@
       "title": "Asset Notes",
       "type": "array"
     },
+    "report_explanation": {
+      "default": "",
+      "title": "Report Explanation",
+      "type": "string"
+    },
+    "report_title": {
+      "default": "",
+      "title": "Report Title",
+      "type": "string"
+    },
     "schema_version": {
       "const": "3.0",
       "default": "3.0",

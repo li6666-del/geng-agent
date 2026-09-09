@@ -47,6 +47,8 @@ def reconcile_final_tasks(
     preliminary_tasks: dict[str, Any],
     candidate_tasks: dict[str, Any],
     resolution: dict[str, Any],
+    *,
+    relationship_snapshot: bool = False,
 ) -> dict[str, Any]:
     """Keep task identities stable while applying field-resolved evidence."""
     preliminary = [
@@ -144,7 +146,9 @@ def reconcile_final_tasks(
         task_id = str(raw_candidate.get("task_id") or "")
         if not task_id or task_id in final_task_ids:
             continue
-        if not _has_material_task_basis(raw_candidate):
+        # A coupled planner snapshot explicitly owns its task set. The host must
+        # not discard a new claim because its prose lacks a figure-number pattern.
+        if not relationship_snapshot and not _has_material_task_basis(raw_candidate):
             discarded_candidate_task_ids.append(task_id)
             continue
         final = copy.deepcopy(raw_candidate)
@@ -174,7 +178,7 @@ def reconcile_final_tasks(
 
     relationships, relationship_added, relationship_refreshed = (
         merge_execution_relationships(
-            preliminary_tasks.get("execution_relationships"),
+            [] if relationship_snapshot else preliminary_tasks.get("execution_relationships"),
             candidate_tasks.get("execution_relationships"),
         )
     )
@@ -203,6 +207,7 @@ def reconcile_final_tasks(
         "relationship_count": len(relationships),
         "relationship_added": relationship_added,
         "relationship_refreshed": relationship_refreshed,
+        "relationship_snapshot": relationship_snapshot,
     }
     return {
         "schema_version": schema_version,

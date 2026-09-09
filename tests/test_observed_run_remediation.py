@@ -18,7 +18,6 @@ from geng_agent.execution_receipts import ExecutionBroker, _io_path
 from geng_agent.execution_client import _wait_for_result
 from geng_agent.delivery_environment import export_installation
 from geng_agent.task_writer_packaging import _freeze_repro_project_package
-from geng_agent.report_facts import publish_terminal_facts
 from geng_agent.risk_report import _build_run_cost
 from geng_agent.progress import ConsoleProgressReporter
 from geng_agent.portability_reference_scan import _literal_path_issues
@@ -184,36 +183,20 @@ class PackagingTests(unittest.TestCase):
             kwargs = dict(repro_project_dir=project, output_dir=output, task_manifest={"tasks": []},
                 expected_paths=set(), analysis_snapshot_hash="a", foundation_snapshot_hash="f", environment_hash="e")
             with patch("geng_agent.task_writer_packaging.validate_repro_project_portability", return_value={"portable": True}), \
-                 patch("geng_agent.task_writer_packaging._manifest_from_project", side_effect=lambda **k: {"_meta": {}}), \
-                 patch("geng_agent.environment_rebuild.verify_clean_environment", return_value={"verified": True}):
+                 patch("geng_agent.task_writer_packaging._manifest_from_project", side_effect=lambda **k: {"_meta": {}}):
                 _freeze_repro_project_package(**kwargs, run_smoke=True, audit_path=output / "audit/03c_project_portability.json")
                 (project / "config.json").write_text('{"scientific_outcomes":{"bpsk":"reproduced"}}')
                 _, final = _freeze_repro_project_package(**kwargs, run_smoke=False, audit_path=output / "audit/final.json")
-                self.assertTrue(final["clean_environment"]["verified"])
+                self.assertNotIn("clean_environment", final)
+                self.assertTrue(final["validation_reused"])
                 self.assertEqual((project / "constraints.repro.txt").read_bytes(), original)
                 (project / "run_experiment.py").write_text('raise RuntimeError("changed")')
                 _, changed = _freeze_repro_project_package(**kwargs, run_smoke=False, audit_path=output / "audit/final.json")
-                self.assertFalse(changed["clean_environment"]["verified"])
+                self.assertNotIn("clean_environment", changed)
+                self.assertFalse(changed["validation_reused"])
 
 
 class ReportAndCostTests(unittest.TestCase):
-    def test_report_keeps_direct_reason_and_local_image_without_paper_crop(self):
-        with TemporaryDirectory() as tmp:
-            workspace = Path(tmp)
-            asset = workspace / "report_assets/bpsk/local.png"
-            asset.parent.mkdir(parents=True)
-            asset.write_bytes(b"image fixture")
-            for name in ("review.md", "result_review.md", "reproduction_report.md"):
-                (workspace / name).write_text("Existing explanation\n")
-            packets = [{"task_id": "bpsk", "verification": {**decision(), "engineering_status": "verified"},
-                        "local_assets": ["report_assets/bpsk/local.png"], "paper_assets": []}]
-            publish_terminal_facts(workspace, packets)
-            report = (workspace / "result_review.md").read_text(encoding="utf-8")
-            self.assertEqual(asset.read_bytes(), b"image fixture")
-            self.assertIn(decision()["decision_reason"], report)
-            self.assertIn("![bpsk 本地结果展示](report_assets/bpsk/local.png)", report)
-            publish_terminal_facts(workspace, packets)
-            self.assertEqual(report, (workspace / "result_review.md").read_text(encoding="utf-8"))
 
     def test_stage_cost_includes_codex_and_unknown_usage_remains_unknown(self):
         with TemporaryDirectory() as tmp:

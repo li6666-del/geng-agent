@@ -41,12 +41,12 @@
 科学验收契约原则：
 1. `scientific_acceptance` 是 Task Designer、Architecture、Writer 和 Reporter 共享的最小科学语义，`contract_version` 固定为 `1.0`。
 2. core_conclusions 只写论文核心科学结论，使用在本任务内稳定且唯一的 claim_id；kind 取 `ordering|trend|crossing|threshold|scaling|gain_loss|mechanism|absolute_level|other`。
-3. 像素、颜色、字体、线宽、marker、排版和绘图风格不得成为 core_conclusion。论文若明确要求比统一默认规则更紧的数值精度，必须把该精度本身写成 core_conclusion。
+3. 像素、颜色、字体、线宽、marker、排版和绘图风格不得成为 core_conclusion。论文若明确要求适用于当前指标和实验条件的数值精度，必须把该精度本身写成 core_conclusion。
 4. key_numeric_targets 只列会实质影响论文结论的关键量级；paper_magnitude 无法可靠取得时写 null 且 evidence_quality=`unavailable`，不要猜数。
 5. information_gaps 用稳定 gap_id，按实际影响选择 `assume_and_disclose|single_sensitivity_if_core|terminal_inconclusive`，并尽量关联 affects_claim_ids。
 6. 当前证据不足时允许列表为空、字段暂缺或转成 information_gap；不得为了结构完整性发明论文结论，后续本地 normalizer 会补最小可交接语义。
-7. 数值量级阈值和非阻塞视觉差异由宿主统一策略控制，不得在任务内自定义另一套阈值。
-8. expected_trend、comparison.tolerance 和 validation_anchors 继续保留为说明材料，但不覆盖 scientific_acceptance 的判定权威。
+7. 验收精度应来自论文主张、指标尺度与统计不确定性，并保留依据；不存在宿主统一数值倍率阈值。Reporter 独立判断科学可比性和偏差是否重大，程序只负责交接与工程证据。
+8. expected_trend、comparison.tolerance、validation_anchors 和 scientific_acceptance 都是基于原文的审查导航，不能取代 Reporter 对原始论文和实际执行证据的判断。
 9. 在 statement 或 regime 中简短说明判据为何影响论文主张，并区分总体/机制结论与某个示例实现的观察。论文没有披露某个随机实现、几何或数据样本时，不能仅凭该示例图的峰位置或包络外形，把它升级为所有合理替代实现必须满足的核心结论；保留为 validation_anchor 和信息缺口。若论文明确以峰位、阈值、精度或趋势本身提出主张，则仍应设为核心判据。
 10. 不得用筛选随机实现、移动坐标、调种子或挑选结果来满足示例图的外形。采用代表性替代实现时，优先检验论文方法、机制、方法排序和总体趋势；明确区分“未取得原始样本”与“核心科学结论失败”。
 

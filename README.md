@@ -15,43 +15,40 @@ Case 工作流只接受 `workflow_version: "2"`。已有阶段产物但缺少有
 ## 当前能力
 
 - 解析 PDF/TXT/Markdown 论文，保留全文分块、页面图像和带 caption/page/bbox 的图候选索引，供 Codex 直接查证。
-- 一个 Codex 事实专家只做一轮全局事实扫描，一个任务专家只做一轮初步设计并立即输出 `backfill_handoff`；只有明确点名的实验定义 blocker 才进入定向回补，通常 0–2 轮，第三轮仅作异常熔断。
-- 定向回补后抽取论文核心主张、作用机制、方法排序和限制，再由 Task Designer 生成最终任务；每个任务内嵌唯一的 `scientific_acceptance` 契约，以稳定 ID 描述核心结论、关键数值目标和信息缺口。
-- 将论文图表拆成可运行的复现实验任务；论文证据负责选择“什么结论重要”，宿主只执行统一的材料性策略和数值计算，不用像素、配色或版式替代科学判断。
-- 任务定稿后生成 `scientific_architecture.json`，统一约束跨任务共享的系统模型、数量形状、单位、归一化、组件接口、不变量及验收 criterion 到输出量的绑定。新契约会使旧 case 缓存失效，不提供旧结构兼容层。
-- `scientific_architecture/1.1` 由 Architecture Agent 按组件选择真实运行栈、设备策略、精度、训练/梯度/检查点能力和共享边界；类型与框架均不绑定通信领域或 PyTorch。宿主能力只决定“当前能否执行”，缺包、缺 GPU 或未启用的运行时会形成显式 capability gap，不能触发 NumPy/CPU/占位实现的静默降级。
+- 论文理解一次读取原文，同时产出工程事实和核心主张；分别保存 `engineering_facts_initial.json`、`paper_thesis.json`，组合缓存为 `paper_understanding.json`。
+- 实验规划同时生成任务、验收导航和科学架构。主张在初次规划前已可用；无缺口路径只有理解、规划两次主要分析调用，JSON 修复与定向回补另计。
+- 只有规划者明确选中的关键缺口才进入定向回补；理解角色按请求查证，规划者随后共同修订任务与架构。保留搜索台账、旧稿及信息不足，不再另调主张提炼、最终定稿或架构 Agent。
+- `scientific_acceptance` 是有来源、稳定 ID 的审查导航；独立 Reporter 以原论文、实际实现与执行证据判断科研结论，程序不按文字相似度或统一倍率阈值重判。
+- 联合计划保存为 `experiment_plan.json`，同时发布供下游使用的 `repro_tasks.json` 和可选 `scientific_architecture.json`。私有独立任务可以不单列架构；跨执行单元共享科学定义必须具备相应契约。
+- `scientific_architecture/1.1` 由实验规划者按组件选择真实运行栈、设备策略、精度、训练/梯度/检查点能力和共享边界；类型与框架均不绑定通信领域或 PyTorch。宿主能力只决定“当前能否执行”，缺包、缺 GPU 或未启用的运行时会形成显式 capability gap，不能触发 NumPy/CPU/占位实现的静默降级。
 - Task Designer 显式声明任务间的执行关系：`strong` 关系编译为同一个 execution unit、同一个 Codex Writer/sandbox/run；`weak` 关系保持独立 execution unit，只在跨 unit 时要求共享冻结的科学定义。逻辑任务始终保留独立验收与独立 Reporter。
 - Foundation Writer 仅为确需跨 execution unit 一致的组件及其依赖生成共享 `src/` 与契约测试，并形成按内容哈希冻结的 canonical snapshot；没有跨单元共享需求时直接跳过，任务私有实现保持可修改。
 - 第三阶段按 execution unit 启动自治 writer：互不相关的 unit 并行，compound Writer 在一个沙箱内按依赖顺序完成所有成员任务，并为每个逻辑任务分别交付结果。
-- 每个 writer 把论文明确事实和任务验收 ID 作为最高约束，只在论文未披露或确有歧义处作显式工程假设；它保留“运行—比较—修改—重跑”的自迭代，但只能因运行无效、核心结论失败或关键数值对称倍率达到 10 倍而重跑，且必须给出证据对应的因果修改计划。
+- 每个 writer 把论文明确事实和任务验收 ID 作为最高约束，只在论文未披露或确有歧义处作显式工程假设；它保留“运行—比较—修改—重跑”的自迭代，但只能根据 Reporter 指出的运行无效、核心结论失败或重大数值偏差重跑，且必须给出证据对应的因果修改计划。
 - 主持人只做任务覆盖、证据路径和基础代码健康检查，不参与科学结论。
-- 每个 writer 交付后立即启动对应的独立 Codex task reporter，按 criterion ID 核对论文与本地产物。宿主可得出 `reproduced`、`reproduced_with_assumptions`、`inconclusive_missing_information` 或 `not_reproduced`；后两者是可报告终态，不会被当作流水线故障或逼迫 Writer 无限重跑。所有任务进入终态后启动 Final Report Editor。
+- 每个 writer 交付后立即启动对应的独立 Codex task reporter，按 criterion ID 核对论文与本地产物。Reporter 给出 `reproduced`、`reproduced_with_assumptions`、`inconclusive_missing_information` 或 `not_reproduced`；后两者是可报告终态，不会被当作流水线故障或逼迫 Writer 无限重跑。所有任务进入终态后默认调用已有的报告编辑智能体撰写报告。
 - 固定生成主审查报告 `review.md/docx`、本地复现报告 `reproduction_report.md/docx` 和论文对比报告 `result_review.md/docx`；对比报告不附带 writer 迭代流水账。
 - 提供极简 Web UI，可上传 PDF 或填写 PDF 链接并实时查看阶段进度。
 
 ## 工作流
 
 ```text
-论文 PDF
-  -> 文本与页面图像解析；MinerU 可选预解析一次，生成带 caption/page/bbox 的整图候选索引
-  -> 生成 paper_chunks.json 与 paper_figure_index.json，不增加 Python 语义实体中间层
-  -> 单个 Codex 事实专家生成 engineering_facts_initial.json，建立高召回实验地图
-  -> 图中近似读数、视觉结构、附录公式和冲突观察均带来源/置信度保留，不做语义删除
-  -> 单个 Codex 任务专家生成 repro_tasks_preliminary.json，并提出结构化事实缺口
-  -> 程序按稳定请求键和 required_fields 跨任务合并去重；任务专家先选择真正阻塞 Writer 的 request_id
-  -> 每轮按字段记录论文证据、未找到位置或冲突，并把搜索结果写入累计台账
-  -> 有 blocker 时只回补选中项，同一未解字段最多搜索两次；没有 blocker 时直接进入主张提炼
-  -> Python 只硬验收 JSON/基本结构；来源、引用、证据类型和缺失字段写入 analysis_warnings.json，不触发科学内容重写
-  -> Codex analysis 基于最终事实抽取 paper_thesis.json；Task Designer 随后生成唯一、权威、带 scientific_acceptance 的最终任务契约
-  -> experiment_index v2 记录任务、图表、参数、baseline 和证据定位，不做运行前复现评级
-  -> Architecture Agent 生成 scientific_architecture.json，并由机器检查跨文档引用、形状/单位作用域和 task binding
-  -> 宿主把 strong 关系编译为 compound execution unit，把 weak 关系保留为可重叠但不传递闭包的共享定义组
-  -> 跨 unit 的 weak 关系由 Foundation Writer 生成共享科学模块与 tests；验证、哈希冻结后复制到相关 Writer sandbox
-  -> 为每个 execution unit 创建 sandbox；所有互不依赖的 unit Writer 同时启动，compound Writer 在同一 sandbox/run 中完成其成员任务
-  -> 每个 writer 按验收 ID 自行比较并迭代；只有运行无效、核心结论失败或关键数值倍率达到 10 倍才允许带因果计划重跑
-  -> 每个任务完成后立刻启动独立 task reporter，提交 criterion 级观察；宿主计算倍率并决定复现、带假设复现、信息不足或未复现
-  -> 可用时从原 PDF 高分辨率裁切；边界不可靠、无 crop 或无图任务直接使用父图或 CSV/表格/summary/文本证据，不回退 Writer
-  -> 全部任务进入可报告终态后，Final Report Editor 统一组织三份报告；只有全部成功复现时才授予 matched
+论文 PDF/TXT/Markdown
+  -> 文本分块、页面图；可选 MinerU 图定位
+  -> 论文理解：工程事实 + 核心主张（同一调用、分开文件）
+  -> 实验规划：任务 + 验收导航 + 科学架构（同一调用）
+       -> 有阻塞缺口：理解角色定向查证 -> 原规划角色联合修订
+          沿用字段搜索台账和最多三轮上限；搜索不足保留限制
+       -> 无阻塞缺口：发布联合计划及下游文档
+  -> 宿主编译 strong/weak 关系、实验索引，检查可执行依赖
+  -> 确需跨执行单元共享时：Foundation 编写共享模块并冻结
+  -> 每个执行单元的 Writer 实现论文并提交宿主观测的 full 结果
+  -> 每个逻辑任务的独立 Reporter 查原文、代码及执行证据，给出科学结论与解释
+       -> 有证据和因果修改方案：相应 Writer 迭代 -> 独立核验
+       -> 无可验证的下一步：保留未复现、信息不足或工程故障终态
+  -> 全部任务形成可报告终态：冻结与核验交付项目
+  -> 已有报告编辑智能体撰写中文报告，按任务解释事实、假设、结果图与差距、人工核查建议
+       -> 缺少报告文件时由同一编辑角色修复，Python 不补写报告正文
   -> 输出 review、reproduction_report、result_review 的 Markdown/Word 版本
 ```
 
@@ -65,7 +62,7 @@ Writer 使用生成项目的 `run_task.py --task <ID> --config <配置> --mode f
 
 Foundation 只冻结需要跨执行单元一致的共享组件与依赖。私有科学实现可由所属 Writer 修改；共享缺陷通过有论文证据的 `foundation_revision_request.json` 定点修订。共享训练产物必须有生产者和消费关系。缓存按执行单元的科学规格、相关组件与依赖版本判断；缺包、局部修订和一次无进展重试不再清空整个 case。
 
-交付包附安装文件、已记录的依赖版本、任务配置和执行证据，并分别验证目录搬移和独立虚拟环境运行。环境重建失败会明确记录，科学未复现也保留其真实终态。成本事件按调用保存并跨恢复累计；缺失的历史用量保持未知。
+交付包附安装文件、已记录的依赖版本、任务配置和执行证据，并保留现有运行环境下的目录搬移检查。交付阶段不新建独立环境、不重新安装依赖或执行独立环境验证。科学未复现保留其真实终态。成本事件按调用保存并跨恢复累计；缺失的历史用量保持未知。
 
 ## 安装
 
@@ -128,6 +125,16 @@ MinerU 缺失、超时、非零退出或未识别到目标图时，流程不会�
 set GENG_CODEX_CMD=codex
 ```
 
+最终报告默认使用已有的 Codex 报告编辑智能体（Report Editor）。旧 `GENG_REPORT_MODE` 选择开关已移除，Python 程序报告与模板补写路径已清理。Editor 沿用项目指定模型及推理强度；独立 Reporter 保留科学判断权。编辑失败或文件缺失时，只修复报告阶段，不重跑科学实验，不用程序文字伪装成智能体交付。
+
+两份详细报告正文均使用简体中文，由同一个最终 Editor 撰写：
+
+- `result_review.md/docx`：逐任务介绍复现目标与结论、核心事实和假设、本地结果图与原文结果图对照、仍存在的差距，以及具体的下一步人工核查建议。多图任务覆盖相关目标图，缺图明确说明，不能伪造原图或猜测配对。
+- `reproduction_report.md/docx`：集中保存完整参数及来源、实现与配置、依赖环境、入口命令、运行与迭代摘要、产物和证据索引、交付限制等详细信息。
+- `review.md/docx`：简短论文身份、任务结果摘要与两份报告的导航，不再重复大表。
+
+程序只整理材料、按 Reporter 记录的哈希恢复图片、检查文件、保存智能体产物和转换 Word 格式；不插入终态正文，不进行语义匹配或替 Editor 判定表达。来源事实与 Writer 自述明确区分，人工核查建议标为未执行的建议。语言修订不改变科学判决，也不构成 Writer 重跑理由。
+
 也可以按阶段覆盖：
 
 ```bash
@@ -138,21 +145,21 @@ set GENG_CODEX_TASK_REPORTER_CMD=codex
 set GENG_CODEX_REPORT_EDITOR_CMD=codex
 ```
 
-项目启动的 Codex 子智能体默认使用 `gpt-5.6-sol`，推理强度统一为 `xhigh`，不跟随桌面 Codex 的全局默认配置。需要临时覆盖时可设置：
+项目启动的 Codex 子智能体默认使用 GPT-6（`gpt-6-astra`），推理强度统一为 `medium`，不跟随桌面 Codex 的全局默认配置。需要显式指定时可设置：
 
 ```bash
-set GENG_CODEX_MODEL=gpt-5.6-luna
-set GENG_CODEX_REASONING_EFFORT=high
+set GENG_CODEX_MODEL=gpt-6-astra
+set GENG_CODEX_REASONING_EFFORT=medium
 ```
 
 需要针对不同角色调整推理强度时，可分别覆盖：
 
 ```bash
-set GENG_CODEX_ANALYSIS_REASONING_EFFORT=xhigh
-set GENG_CODEX_FOUNDATION_WRITER_REASONING_EFFORT=xhigh
-set GENG_CODEX_TASK_WRITER_REASONING_EFFORT=xhigh
-set GENG_CODEX_TASK_REPORTER_REASONING_EFFORT=xhigh
-set GENG_CODEX_REPORT_EDITOR_REASONING_EFFORT=xhigh
+set GENG_CODEX_ANALYSIS_REASONING_EFFORT=medium
+set GENG_CODEX_FOUNDATION_WRITER_REASONING_EFFORT=medium
+set GENG_CODEX_TASK_WRITER_REASONING_EFFORT=medium
+set GENG_CODEX_TASK_REPORTER_REASONING_EFFORT=medium
+set GENG_CODEX_REPORT_EDITOR_REASONING_EFFORT=medium
 ```
 
 task writer 采用全任务并发：有多少复现任务就同时启动多少个 writer。每个 writer 在自己的 sandbox 内直接调用当前 Python，自行探测 CPU/GPU、选择 backend、声明依赖并运行 smoke/full；主持人不做资源排队或科学判断。项目不对 Codex 推理会话设置 wall-clock 上限；会话只在正常完成、明确失败或用户停止时结束。后续迭代只在材料性原因成立且有具体因果修改方案时启动。
@@ -278,6 +285,8 @@ case_001/
   task_conflicts.json
   experiment_index.json
   paper_thesis.json
+  paper_understanding.json
+  experiment_plan.json
   scientific_architecture.json
   foundation_manifest.json
   repro_project_manifest.json
@@ -339,7 +348,7 @@ case_001/
 5. 只在论文未披露或确有歧义处提出显式合理假设；三类材料性原因之一成立且存在具体因果修正方向时修改并重跑，其他差异只记录。
 6. 有可审查的 full 结果后交付 ready_for_review，由 Reporter 结合原文、指标尺度与统计不确定性决定科学结论。Writer 不输出最终 matched，也不凭通用倍率门槛调参至通过。
 
-主持人同时启动所有 execution-unit Writers。每个逻辑任务仍有且仅有一个 task reporter；compound unit 中任一 Reporter 指出共享科学的材料性缺陷时，整个 unit 才在原 sandbox 中作一次有因果依据的续跑，其余 unit 不受影响。所有任务进入终态后，宿主冻结包含源码、配置、数据/检查点、环境锁、artifact lineage 和 source inventory 的便携项目，再由 Final Report Editor 负责三份人工报告的语言组织与排版。
+主持人同时启动所有 execution-unit Writers。每个逻辑任务仍有且仅有一个 task reporter；compound unit 中任一 Reporter 指出共享科学的材料性缺陷时，整个 unit 才在原 sandbox 中作一次有因果依据的续跑，其余 unit 不受影响。所有任务进入终态后，宿主冻结包含源码、配置、数据/检查点、环境锁、artifact lineage 和 source inventory 的便携项目，再由已有的最终 Editor 撰写中文报告：结果对比报告集中介绍核心事实、假设、成对结果图、差距和人工核查建议，运行与追溯细节放入本地复现报告。
 
 ## 安全边界
 

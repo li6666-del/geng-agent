@@ -29,6 +29,7 @@ def scientific_cache_value(value: Any) -> Any:
             item = {name: field for name, field in item.items() if name not in {
                 "cache", "analysis_backend", "analysis_stage_label", "analysis_attempt",
                 "generated_at", "created_at", "updated_at", "duration_s", "analysis_resume_source",
+                "cache_reused",
             }}
             if not item:
                 continue

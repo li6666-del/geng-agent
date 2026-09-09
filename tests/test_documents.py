@@ -7,7 +7,6 @@ from unittest.mock import patch
 from geng_agent.documents import load_paper, split_text
 from geng_agent.facts_normalize import finalize_engineering_facts, select_valid_engineering_facts
 from geng_agent.pipeline import build_risk_report
-from geng_agent.review_markdown import render_review_markdown
 
 
 class DocumentTests(unittest.TestCase):
@@ -224,17 +223,6 @@ class DocumentTests(unittest.TestCase):
         self.assertTrue(any(item["type"] == "dependency_warnings" for item in risk["findings"]))
         self.assertIn("requirements_warnings=1", risk["risk_dimensions"]["security_isolation"]["evidence"])
 
-        markdown = render_review_markdown(
-            paper={"source_path": "paper.md"},
-            facts=facts,
-            tasks=tasks,
-            risk_report=risk,
-            validation=validation,
-            runtime_result=runtime_result,
-            result_review_result={"enabled": False, "passed": None, "reason": "not run"},
-            repro_project_dir=Path("repro_project"),
-        )
-        self.assertIn("通过，有 1 条依赖告警", markdown)
 
     def test_unresolved_task_evidence_is_reported_without_pre_rating(self) -> None:
         facts = {"engineering_facts": [], "missing_information": []}

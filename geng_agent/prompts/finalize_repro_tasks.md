@@ -32,7 +32,7 @@
 4. core_conclusions 只包含排序、趋势、交点、阈值、缩放、增益/损失、机制或明确绝对量级等科学结论。像素、颜色、字体、线宽、marker、排版和绘图风格不得成为核心结论。
 5. key_numeric_targets 只保留会改变论文结论的关键量级。无法可靠取得 paper_magnitude 时写 null/evidence_quality=`unavailable`；不要猜数，也不要把像素坐标当数值目标。
 6. 无法确定的内容转入 information_gaps；按真实后果选择 `assume_and_disclose|single_sensitivity_if_core|terminal_inconclusive`。允许空列表和保守默认，不得因缺字段机械中断。
-7. 宿主统一负责数值量级阈值与非阻塞视觉差异；不要自定义另一套误差阈值。论文明确要求更紧数值精度时，把该精度本身写成 core_conclusion。
+7. 精度要求应以论文主张、指标尺度和统计不确定性为依据，不存在宿主统一的数值倍率阈值。Reporter 独立判断可比性、重大偏差及结论，程序只负责交接与工程证据。论文明确要求数值精度时，将其依据写入 core_conclusion。
 8. expected_trend、comparison.tolerance 和 validation_anchors 只作说明，不能覆盖 scientific_acceptance。
 9. 在 statement 或 regime 中简短说明判据为何影响论文主张，区分总体/机制结论与单个示例实现。若精确随机实现、几何或数据样本未披露，示例图的峰位或包络外形通常只保留为 validation_anchor 和信息缺口，不能自动要求所有代表性替代实现都满足；论文明确主张的峰位、阈值、严格精度和总体趋势仍是核心判据。
 10. 不要要求 Writer 通过筛选随机实现、改变坐标定义或调种子来追逐示例图外形。代表性替代实现应核验方法、机制、排序和总体趋势；原样本缺失不等于核心科学结论失败。

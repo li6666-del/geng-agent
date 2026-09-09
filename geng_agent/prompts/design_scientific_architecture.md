@@ -45,7 +45,7 @@ Your job is to turn the finalized paper evidence and reproduction tasks into one
     - `assumed` only when it references a declared task assumption;
     - `unresolved` when the paper and declared assumptions still do not determine it.
 17. Reference final facts and assumptions when resolvable. Preserve useful architecture content with an unresolved-reference warning when names differ or provenance is incomplete; never invent a matching fact merely for schema compliance.
-18. This contract maps the scientific components needed by every experiment. Mark their ownership through actual bindings and dependency edges; being listed here does not make a task-private evaluator or algorithm a Foundation module. Do not include figure styling, output directories, report prose, generated curves, incidental helpers, acceptance verdicts, or numeric pass/fail thresholds. The host policy owns acceptance; architecture only exposes measurable interfaces.
+18. This contract maps the scientific components needed by every experiment. Mark their ownership through actual bindings and dependency edges; being listed here does not make a task-private evaluator or algorithm a Foundation module. Do not include figure styling, output directories, report prose, generated curves, incidental helpers, acceptance verdicts, or numeric pass/fail thresholds. Reporter independently owns scientific acceptance; the host routes explicit decisions and checks execution evidence. Architecture only exposes measurable interfaces.
 
 ## Structural conventions
 

@@ -228,7 +228,10 @@ def run_targeted_backfill_loop(
         cumulative_resolution = cumulative_resolution_from_ledger(
             known_requests, facts, ledger
         )
-        tasks = reconcile_final_tasks(tasks, candidate_tasks, cumulative_resolution)
+        tasks = reconcile_final_tasks(
+            tasks, candidate_tasks, cumulative_resolution,
+            relationship_snapshot=bool(candidate_tasks.get("_meta", {}).get("experiment_plan_snapshot")),
+        )
         tasks["backfill_handoff"] = {
             key: value
             for key, value in candidate_handoff.items()

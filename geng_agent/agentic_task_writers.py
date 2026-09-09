@@ -586,7 +586,7 @@ def run_codex_task_writer_workflow(
         output_dir,
         "manifest",
         preserve_audit=bool(resume),
-        preserve_paths={"report_assets"} if preserve_cached_report_assets else None,
+        preserve_paths={"report_assets"} if preserve_cached_report_assets or resume_records else None,
     )
 
     task_root = audit_dir / "03c_task_writer_sandboxes"

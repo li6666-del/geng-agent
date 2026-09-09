@@ -23,13 +23,13 @@ from .security import build_safe_env, codex_safe_env, redact_text
 
 MAX_TRANSCRIPT_CHARS = 200_000
 CODEX_CLI_HELP_PROBE_TIMEOUT_SECONDS = 5.0
-DEFAULT_GENG_CODEX_MODEL = "gpt-5.6-sol"
+DEFAULT_GENG_CODEX_MODEL = "gpt-6-astra"
 DEFAULT_GENG_CODEX_REASONING_EFFORT = {
-    "analysis": "xhigh",
-    "foundation_writer": "xhigh",
-    "task_writer": "xhigh",
-    "task_reporter": "xhigh",
-    "report_editor": "xhigh",
+    "analysis": "medium",
+    "foundation_writer": "medium",
+    "task_writer": "medium",
+    "task_reporter": "medium",
+    "report_editor": "medium",
 }
 
 _EPHEMERAL_CAPABILITY_CACHE: dict[tuple[str, ...], dict[str, Any]] = {}

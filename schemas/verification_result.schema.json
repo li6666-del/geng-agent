@@ -381,6 +381,16 @@
           },
           "title": "Asset Notes",
           "type": "array"
+        },
+        "report_explanation": {
+          "default": "",
+          "title": "Report Explanation",
+          "type": "string"
+        },
+        "report_title": {
+          "default": "",
+          "title": "Report Title",
+          "type": "string"
         }
       },
       "title": "TaskVerificationResult",

@@ -111,6 +111,7 @@ def load_or_create_stage_json(
             expected_cache_metadata=cache_metadata,
         )
         if cached is not None:
+            cached.setdefault("_meta", {})["cache_reused"] = True
             return cached
 
     if (
@@ -266,6 +267,7 @@ def load_or_create_stage_json(
         else {}
     )
     meta["cache"] = cache_metadata
+    meta["cache_reused"] = False
     parsed["_meta"] = meta
     write_json(output_path, parsed)
     try:

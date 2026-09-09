@@ -47,6 +47,15 @@ def scientific_correction_paths(
                         path = f"$.{name}[{original_index}]{suffix}"
             aligned.append(path)
         paths = aligned
+    # The coupled planner nests the same architecture contract one level down.
+    # Apply exactly the existing field-level repair permissions there as well.
+    if isinstance((candidate or {}).get("scientific_architecture"), dict):
+        prefix = "$.scientific_architecture"
+        nested_issues = [ValidationIssue("$" + issue.path[len(prefix):], issue.message)
+                         for issue in issues if issue.path.startswith(prefix + ".")]
+        nested = scientific_correction_paths(nested_issues, candidate["scientific_architecture"],
+                                            (baseline or {}).get("scientific_architecture"))
+        paths.extend(prefix + path[1:] for path in nested)
     return list(dict.fromkeys(paths))
 
 

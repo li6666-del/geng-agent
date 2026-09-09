@@ -561,6 +561,27 @@ class ScientificArchitectureDocument(StrictModel):
         return self
 
 
+class PaperUnderstandingDocument(StrictModel):
+    facts: EngineeringFactsDocument
+    paper_thesis: PaperThesisDocument | None
+    limitations: list[str] = Field(default_factory=list)
+
+    @field_validator("facts", "paper_thesis", mode="before")
+    @classmethod
+    def component_metadata(cls, value: Any) -> Any:
+        return {k: v for k, v in value.items() if k != "_meta"} if isinstance(value, dict) else value
+
+
+class ExperimentPlanDocument(StrictModel):
+    tasks: ReproTasksDocument
+    scientific_architecture: ScientificArchitectureDocument | None
+
+    @field_validator("tasks", "scientific_architecture", mode="before")
+    @classmethod
+    def component_metadata(cls, value: Any) -> Any:
+        return {k: v for k, v in value.items() if k != "_meta"} if isinstance(value, dict) else value
+
+
 class TaskVerificationResult(StrictModel):
     task_id: str = ""
     outcome: TaskScientificOutcome = "review_incomplete"
@@ -586,6 +607,8 @@ class TaskVerificationResult(StrictModel):
     verified_facts: list[dict[str, Any]] = Field(default_factory=list)
     provenance_base: str = ""
     asset_notes: list[str] = Field(default_factory=list)
+    report_explanation: str = ""
+    report_title: str = ""
 
 
 class IsolatedTaskVerificationDocument(TaskVerificationResult):
@@ -657,6 +680,8 @@ class ReproducibilityVerdictDocument(StrictModel):
 
 
 SCHEMA_MODELS: dict[str, type[BaseModel]] = {
+    "paper_understanding": PaperUnderstandingDocument,
+    "experiment_plan": ExperimentPlanDocument,
     "engineering_facts": EngineeringFactsDocument,
     "targeted_fact_backfill": TargetedFactBackfillDocument,
     "repro_tasks": ReproTasksDocument,
@@ -671,6 +696,8 @@ SCHEMA_MODELS: dict[str, type[BaseModel]] = {
 
 
 SCHEMA_FILENAMES: dict[str, str] = {
+    "paper_understanding": "paper_understanding.schema.json",
+    "experiment_plan": "experiment_plan.schema.json",
     "engineering_facts": "engineering_facts.schema.json",
     "targeted_fact_backfill": "targeted_fact_backfill.schema.json",
     "repro_tasks": "repro_tasks.schema.json",

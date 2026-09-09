@@ -82,8 +82,20 @@ def task(task_id: str, figure_or_claim: str) -> dict:
     }
 
 
-def architecture_doc(output_dir: Path) -> dict:
-    index = json.loads((output_dir / "experiment_index.json").read_text(encoding="utf-8"))
+def thesis_doc() -> dict:
+    return {"central_claim": "BER decreases with SNR", "proposed_method": "test method",
+            "mechanism": "higher SNR improves decoding", "comparisons": [],
+            "headline_shape": "decreasing", "caveats": []}
+
+
+def understanding_doc(facts: dict) -> dict:
+    return {"facts": facts, "paper_thesis": thesis_doc(), "limitations": []}
+
+
+def architecture_doc(output_dir: Path, tasks: dict | None = None) -> dict:
+    index = ({"experiments": [{"task_id": item["task_id"], "experiment_id": f"exp_{item['task_id']}"}
+                             for item in tasks["repro_tasks"]]} if tasks is not None
+             else json.loads((output_dir / "experiment_index.json").read_text(encoding="utf-8")))
     basis = {"status": "unresolved", "evidence_facts": [], "assumption_refs": [], "note": "test fixture"}
     return {
         "schema_version": "1.1",
@@ -187,15 +199,10 @@ def _run_to_task_writer_boundary(
     }
 
     def fake_analysis_stage(**kwargs):
-        if kwargs["stage_label"] == "01_extract_engineering_facts":
-            document = initial
-        elif (
-            kwargs["stage_label"] == "02d_finalize_scientific_acceptance"
-            and isinstance(final_tasks_candidate, dict)
-        ):
-            document = final_tasks_candidate
+        if kwargs["stage_label"] == "01_understand_paper":
+            document = understanding_doc(initial)
         else:
-            document = preliminary
+            document = {"tasks": preliminary, "scientific_architecture": architecture_doc(output_dir, preliminary)}
         document = json.loads(json.dumps(document))
         write_json(kwargs["output_path"], document)
         return document
@@ -278,6 +285,7 @@ def _run_minimal_full_pipeline(
     report_editor_error: Exception | None = None,
     report_editor_result: dict | None = None,
     verdict_candidate: dict,
+    report_mode: str = "model",
 ):
     paper_path = root / "paper.md"
     paper_path.write_text(
@@ -297,7 +305,8 @@ def _run_minimal_full_pipeline(
     }
 
     def fake_analysis_stage(**kwargs):
-        document = initial if kwargs["stage_label"] == "01_extract_engineering_facts" else preliminary
+        document = (understanding_doc(initial) if kwargs["stage_label"] == "01_understand_paper"
+                    else {"tasks": preliminary, "scientific_architecture": None})
         document = json.loads(json.dumps(document))
         write_json(kwargs["output_path"], document)
         return document
@@ -390,6 +399,7 @@ def _run_minimal_full_pipeline(
             return_value={"enabled": True, "passed": True, "coverage": {}},
         ),
         editor_patch,
+        patch.dict("os.environ", {"GENG_REPORT_MODE": report_mode}),
         patch("geng_agent.pipeline.derive_reproducibility_verdict", return_value=verdict_candidate),
         patch.object(
             pipeline,
@@ -431,9 +441,9 @@ class PipelineTests(unittest.TestCase):
 
         def fake_analysis_stage(**kwargs):
             document = (
-                initial
-                if kwargs["stage_label"] == "01_extract_engineering_facts"
-                else preliminary
+                understanding_doc(initial)
+                if kwargs["stage_label"] == "01_understand_paper"
+                else {"tasks": preliminary, "scientific_architecture": None}
             )
             document = json.loads(json.dumps(document))
             write_json(kwargs["output_path"], document)
@@ -1014,7 +1024,7 @@ class PipelineTests(unittest.TestCase):
         self.assertNotIn("science_loop", run_params)
         facade_source = inspect.getsource(ReviewPipeline.run)
         analysis_source = inspect.getsource(run_analysis_flow)
-        self.assertIn("paper_thesis = pipeline._load_or_create_paper_thesis(", analysis_source)
+        self.assertIn("paper_thesis = understanding.get", analysis_source)
         self.assertNotIn("if science_loop", facade_source)
         self.assertLess(
             facade_source.index("run_analysis_flow("),
@@ -1031,7 +1041,8 @@ class PipelineTests(unittest.TestCase):
         self.assertNotIn("_augment_tasks_with_gap_finder", source)
         self.assertLess(source.index("engineering_facts_initial.json"), source.index("repro_tasks_preliminary.json"))
         self.assertLess(source.index("repro_tasks_preliminary.json"), source.index("targeted_fact_backfill.md"))
-        self.assertLess(source.index("targeted_fact_backfill.md"), source.index("finalize_repro_tasks.md"))
+        self.assertLess(source.index("targeted_fact_backfill.md"), source.index("previous_plan="))
+        self.assertNotIn("finalize_repro_tasks.md", source)
 
     def test_isolated_task_reporters_and_final_editor_follow_task_writers(self) -> None:
         facade_source = inspect.getsource(ReviewPipeline.run)
@@ -1051,11 +1062,11 @@ class PipelineTests(unittest.TestCase):
         self.assertNotIn("revision_target", execution_source + report_source)
         self.assertIn("apply_verified_result(", report_source)
         self.assertIn('not verification_result.get("all_terminal")', report_source)
-        self.assertIn("run_codex_report_editor_workflow(", report_source)
+        self.assertIn("report_runner = run_codex_report_editor_workflow", report_source)
         self.assertIn("writer_session_count", report_source)
         self.assertIn('report_editor_result.get(\n        "retryable"', report_source)
         self.assertIn("repair_context=report_editor_result", report_source)
-        self.assertIn("allow_fallback=True", report_source)
+        self.assertNotIn("allow_fallback=True", report_source)
         self.assertIn("report_editor_invocations += int(", report_source)
         self.assertNotIn("Report editor failed.", report_source)
         self.assertIn("04b_reproducibility_verdict_fallback.json", report_source)
@@ -1167,11 +1178,11 @@ class PipelineTests(unittest.TestCase):
                 }
 
                 def fake_analysis_stage(**kwargs):
-                    documents = {
-                        "01_extract_engineering_facts": initial,
-                        "02a_build_preliminary_repro_tasks": preliminary,
-                    }
-                    document = json.loads(json.dumps(documents.get(kwargs["stage_label"], preliminary)))
+                    architecture = architecture_doc(output_dir, preliminary)
+                    architecture["schema_version"] = schema_version
+                    document = (understanding_doc(initial) if kwargs["stage_label"] == "01_understand_paper"
+                                else {"tasks": preliminary, "scientific_architecture": architecture})
+                    document = json.loads(json.dumps(document))
                     write_json(kwargs["output_path"], document)
                     return document
 
@@ -1278,9 +1289,10 @@ class PipelineTests(unittest.TestCase):
             resume=True,
         )
 
-    def test_final_task_designer_snapshot_preserves_coverage_and_replaces_old_graph(self) -> None:
-        class WriterReached(RuntimeError):
-            pass
+    def test_planner_revision_preserves_targets_and_replaces_old_graph(self) -> None:
+        from types import SimpleNamespace
+        from geng_agent.consolidated_analysis import load_experiment_plan
+        from geng_agent.execution_plan import compile_execution_plan
 
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1314,48 +1326,24 @@ class PipelineTests(unittest.TestCase):
                     "artifact_ids": [],
                 }
             ]
-            task_writer = Mock(side_effect=WriterReached("writer reached"))
 
-            with self.assertRaises(WriterReached):
-                _run_to_task_writer_boundary(
-                    root,
-                    resume=False,
-                    environment_mock=Mock(
-                        return_value=case_runtime_fixture(root / "case", "0" * 64)
-                    ),
-                    foundation_mock=Mock(return_value=None),
-                    task_writer_mock=task_writer,
-                    tasks_document=base_tasks,
-                    final_tasks_candidate=final_candidate,
-                )
-
-            writer_tasks = task_writer.call_args.kwargs["tasks"]
-            writer_plan = task_writer.call_args.kwargs["execution_plan"]
-            prior_snapshot = json.loads(
-                (root / "case" / "audit" / "02d_tasks_before_final_snapshot.json").read_text(encoding="utf-8")
-            )
-            snapshot_changes = json.loads(
-                (root / "case" / "audit" / "02d_final_task_snapshot_changes.json").read_text(encoding="utf-8")
-            )
-
-        self.assertEqual(
-            [item["task_id"] for item in writer_tasks["repro_tasks"]],
-            ["task_a", "task_b", "task_c"],
-        )
-        self.assertEqual(
-            [
-                item["relationship_id"]
-                for item in writer_tasks["execution_relationships"]
-            ],
-            ["new_ac"],
-        )
-        self.assertEqual(writer_tasks["repro_tasks"][0]["figure_or_claim"], "Claim A refined")
-        self.assertEqual(prior_snapshot["repro_tasks"][0]["figure_or_claim"], "Claim A")
-        self.assertEqual(prior_snapshot["execution_relationships"][0]["relationship_id"], "existing_ab")
-        self.assertEqual(snapshot_changes["preserved_task_ids"], ["task_b"])
-        self.assertEqual(snapshot_changes["removed_relationship_ids"], ["existing_ab"])
-        self.assertEqual(writer_plan["logical_task_count"], 3)
-        self.assertEqual(writer_plan["execution_unit_count"], 2)
+            candidate = {"tasks": final_candidate, "scientific_architecture": architecture_doc(root, final_candidate)}
+            pipeline = ReviewPipeline()
+            context = SimpleNamespace(output_dir=root, audit_dir=root / "audit", options=SimpleNamespace(
+                json_repair_attempts=0, resume=False, tasks_timeout=1, analysis_backend="codex", analysis_fallback=False))
+            with patch.object(pipeline, "_load_or_create_analysis_stage_json",
+                              side_effect=lambda **kw: kw["candidate_normalizer"](candidate)):
+                result = load_experiment_plan(pipeline, context, facts=fact_doc(), paper_thesis=thesis_doc(),
+                    paper={}, paper_context="paper", paper_images=[], figure_index={}, host_capabilities={},
+                    previous_plan={"tasks": base_tasks, "scientific_architecture": None}, round_index=1)
+            final_tasks = result["tasks"]
+            plan = compile_execution_plan(final_tasks)
+            self.assertEqual([item["task_id"] for item in final_tasks["repro_tasks"]], ["task_a", "task_b", "task_c"])
+            self.assertEqual([item["relationship_id"] for item in final_tasks["execution_relationships"]], ["new_ac"])
+            self.assertEqual(final_tasks["repro_tasks"][0]["figure_or_claim"], "Claim A refined")
+            self.assertEqual(base_tasks["repro_tasks"][0]["figure_or_claim"], "Claim A")
+            self.assertEqual(plan["logical_task_count"], 3)
+            self.assertEqual(plan["execution_unit_count"], 2)
 
     def test_optional_foundation_environment_failure_falls_back(self) -> None:
         class WriterReached(RuntimeError):
@@ -1709,11 +1697,10 @@ class PipelineTests(unittest.TestCase):
                     write_json(kwargs["output_path"], document)
                     return document
                 documents = {
-                    "01_extract_engineering_facts": initial,
-                    "02a_build_preliminary_repro_tasks": preliminary,
+                    "01_understand_paper": understanding_doc(initial),
+                    "02a_plan_experiments": {"tasks": preliminary, "scientific_architecture": None},
                     "02b_round_01_targeted_fact_backfill": backfill,
-                    "02c_round_01_refresh_repro_tasks": finalized,
-                    "02d_finalize_scientific_acceptance": final_acceptance,
+                    "02c_round_01_revise_experiment_plan": {"tasks": final_acceptance, "scientific_architecture": architecture_doc(output_dir, final_acceptance)},
                 }
                 document = documents[label]
                 write_json(kwargs["output_path"], document)
@@ -1741,12 +1728,10 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(
                 calls,
                 [
-                    "01_extract_engineering_facts",
-                    "02a_build_preliminary_repro_tasks",
+                    "01_understand_paper",
+                    "02a_plan_experiments",
                     "02b_round_01_targeted_fact_backfill",
-                    "02c_round_01_refresh_repro_tasks",
-                    "02d_finalize_scientific_acceptance",
-                    "02f_design_scientific_architecture",
+                    "02c_round_01_revise_experiment_plan",
                 ],
             )
             final_facts = json.loads((output_dir / "engineering_facts.json").read_text(encoding="utf-8"))
@@ -1762,7 +1747,7 @@ class PipelineTests(unittest.TestCase):
             analysis_result = json.loads(
                 (output_dir / "analysis_result.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(analysis_result["analysis_stage_invocations"], 7)
+            self.assertEqual(analysis_result["analysis_stage_invocations"], 4)
             self.assertFalse((output_dir / "repro_project").exists())
             self.assertFalse((output_dir / "runtime_result.json").exists())
             host_capabilities = json.loads(
@@ -1873,13 +1858,12 @@ class PipelineTests(unittest.TestCase):
             }
 
             documents = {
-                "01_extract_engineering_facts": initial,
-                "02a_build_preliminary_repro_tasks": preliminary,
+                "01_understand_paper": understanding_doc(initial),
+                "02a_plan_experiments": {"tasks": preliminary, "scientific_architecture": None},
                 "02b_round_01_targeted_fact_backfill": round_1_backfill,
-                "02c_round_01_refresh_repro_tasks": round_1_task,
+                "02c_round_01_revise_experiment_plan": {"tasks": round_1_task, "scientific_architecture": None},
                 "02b_round_02_targeted_fact_backfill": round_2_backfill,
-                "02c_round_02_refresh_repro_tasks": round_2_task,
-                "02d_finalize_scientific_acceptance": round_2_task,
+                "02c_round_02_revise_experiment_plan": {"tasks": round_2_task, "scientific_architecture": architecture_doc(output_dir, round_2_task)},
             }
 
             def fake_analysis_stage(**kwargs):
@@ -1912,7 +1896,7 @@ class PipelineTests(unittest.TestCase):
             ):
                 pipeline.run(paper_path, output_dir, resume=False, analysis_only=True)
 
-            self.assertEqual(len(calls), 8)
+            self.assertEqual(len(calls), 6)
             summary = json.loads(
                 (output_dir / "audit" / "02b_targeted_fact_backfill_summary.json").read_text(encoding="utf-8")
             )
@@ -1922,7 +1906,7 @@ class PipelineTests(unittest.TestCase):
             analysis_result = json.loads(
                 (output_dir / "analysis_result.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(analysis_result["analysis_stage_invocations"], 9)
+            self.assertEqual(analysis_result["analysis_stage_invocations"], 6)
             diagnostics = json.loads(
                 (output_dir / "audit" / "02c_terminal_gap_diagnostics.json").read_text(encoding="utf-8")
             )

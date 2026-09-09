@@ -54,7 +54,7 @@ print(json.dumps({'type':'turn.completed','usage':{'input_tokens':10,'output_tok
 
 
 class DeliveryEndToEndTests(unittest.TestCase):
-    def test_codegen_broker_reporter_package_and_clean_runtime(self):
+    def test_codegen_broker_reporter_and_package_without_environment_rebuild(self):
         with TemporaryDirectory() as temporary:
             base = Path(temporary)
             case = base / "case"
@@ -96,7 +96,8 @@ class DeliveryEndToEndTests(unittest.TestCase):
                     runtime_result={}, risk_report={}, task_records=[record], task_verifications=[reporter["task_verification"]],
                     output_dir=case, audit_dir=case / "audit", resume=False)
             self.assertTrue(editor["ok"], editor)
-            self.assertIn("已复现", (case / "review.md").read_text(encoding="utf-8"))
+            self.assertEqual((case / "review.md").read_text(encoding="utf-8"),
+                             "# Explanation\nThe evidence is supplied separately.\n")
             project = case / "repro_project"
             expected = _merge_task_writer_deliveries(repro_project_dir=project, task_manifest=manifest,
                 expected_paths=set(), task_records=[record])
@@ -109,7 +110,7 @@ class DeliveryEndToEndTests(unittest.TestCase):
                 audit_path=case / "audit" / "portability.json", task_manifest=manifest, expected_paths=expected,
                 analysis_snapshot_hash="fixture", foundation_snapshot_hash="", environment_hash="", run_smoke=True,
                 python_executable=Path(sys.executable))
-            self.assertTrue(portability["clean_environment"]["verified"], portability)
+            self.assertNotIn("clean_environment", portability)
             self.assertTrue((project / "outputs" / "sample" / "execution_receipt.json").is_file())
             evidence = json.loads((project / "execution_evidence.json").read_text())
             self.assertTrue(evidence["tasks"][0]["all_bytes_available"], evidence)

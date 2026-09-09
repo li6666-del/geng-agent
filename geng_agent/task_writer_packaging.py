@@ -88,30 +88,15 @@ def _freeze_repro_project_package(
             "code": "execution_evidence_incomplete", "severity": "warning",
             "message": "Original execution bytes are unavailable for tasks: " + ", ".join(incomplete),
         })
-    if run_smoke:
-        from .environment_rebuild import verify_clean_environment
-        portability["clean_environment"] = verify_clean_environment(
-            repro_project_dir, cache_dir=output_dir / "audit" / "clean_environments",
-            python_executable=python_executable,
-        )
-        if not portability["clean_environment"].get("verified"):
-            portability.setdefault("warnings", []).append({
-                "code": "clean_environment_unverified", "severity": "warning",
-                "message": "Clean-environment delivery was not verified; retain the independent scientific results.",
-            })
     portability["runtime_validation_identity"] = runtime_identity
     if not run_smoke:
         if previous_checks.get("runtime_validation_identity") == runtime_identity:
-            for key in ("clean_environment", "smoke"):
+            for key in ("smoke",):
                 if key in previous_checks:
                     portability[key] = previous_checks[key]
             portability["validation_reused"] = True
         else:
-            portability["clean_environment"] = {"verified": False, "reason": "Runtime inputs changed or no matching prior validation exists"}
             portability["validation_reused"] = False
-        if not portability.get("clean_environment", {}).get("verified"):
-            portability.setdefault("warnings", []).append({"code": "clean_environment_unverified",
-                "severity": "warning", "message": "Final runtime inputs have no matching clean-environment validation; science is preserved."})
     # Persist the full smoke diagnostics before failing.  Relocation uses a
     # temporary copy, so otherwise task-level errors disappear with that copy
     # and callers receive only the aggregate return code.

@@ -3,11 +3,25 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from .review_markdown import _docx_error, _write_docx_error
+from .outputs import write_json
+
+
+def _docx_error(stage: str, exc: Exception) -> dict[str, str]:
+    return {"stage": stage, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _write_docx_error(output_dir: Path, errors: list[dict[str, str]]) -> None:
+    write_json(
+        output_dir / "docx_generation_error.json",
+        {
+            "passed": False,
+            "errors": errors,
+        },
+    )
 
 
 def report_editor_exception_result(exc: Exception) -> dict[str, Any]:
-    """Translate an unexpected editor failure into a reportable fallback result."""
+    """Record an editor failure without authoring substitute reports."""
 
     reason = f"{type(exc).__name__}: {exc}"
     return {
@@ -15,8 +29,8 @@ def report_editor_exception_result(exc: Exception) -> dict[str, Any]:
         "retryable": False,
         "mode": "isolated_report_editor",
         "cached": False,
-        "completion_mode": "exception_fallback",
-        "degraded_report_generation": True,
+        "completion_mode": "hard_failure",
+        "degraded_report_generation": False,
         "codex_status": {
             "ok": False,
             "error_kind": "report_editor_exception",

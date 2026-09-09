@@ -5,7 +5,6 @@ from pathlib import Path
 
 from geng_agent.agentic_task_reporters import run_codex_task_reporter_workflow
 from geng_agent.report_editor_assets import _build_task_packets
-from geng_agent.report_editor_fallback import _render_fallback_review
 from geng_agent.task_reporter_validation import normalize_reporter_observation_evidence
 from geng_agent.verification_result import normalize_task_verification, writer_revision_allowed
 from tests.test_agentic_task_reporters import _task, _record, _supported_raw
@@ -173,17 +172,9 @@ def test_editor_counts_and_facts_use_host_and_reporter_not_writer(tmp_path):
     assert packet["terminal_outcome"] == "not_reproduced"
     assert packet["execution_summary"]["observed_full_attempt_count"] == 1
     assert packet["execution_summary"]["latest_valid_execution_count"] == 1
-    from geng_agent.report_facts import terminal_fact_block
-    table = terminal_fact_block([packet])
-    assert "未复现" in table
-    assert "末次执行与产物有效（0/1）" in table
-    assert "科学有效完成" not in table
-    assert "| task_a | 1 | 1 |" in table
     assert "structured_evidence" not in packet and "writer_summary" not in packet
     assert "assumptions" not in packet["task"]
     assert "99" not in json.dumps(packet)
-    fallback = _render_fallback_review(paper={}, task_packets=[packet], risk_report={"reproducibility_verdict": "Unconditionally reproduced"})
-    assert "Unconditionally reproduced" not in fallback
 
 
 def test_editor_deduplicates_host_receipts_and_leaves_unknown_validity_unavailable(tmp_path):

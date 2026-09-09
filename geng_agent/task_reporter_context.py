@@ -28,10 +28,11 @@ from .task_reporter_validation import _task_assets_exist
 from .task_writer_support import PAPER_EVIDENCE_DIR
 from .verification_result import partition_task_verification_issues
 from .prompt_identity import role_contract_identity
+from .report_language import CHINESE_REPORT_RULES
 
 
 TASK_VERIFICATION_FILE = "task_verification_result.json"
-TASK_REPORTER_PROMPT_VERSION = "isolated_task_reporter_v11_explicit_scientific_decision"
+TASK_REPORTER_PROMPT_VERSION = "isolated_task_reporter_v13_chinese_reports"
 REPORTER_CONVERGENCE_POLICY = """## Convergence and materiality
 - Enforce paper-explicit scientific facts. Accept reasonable, disclosed choices where the paper is silent.
 - `host_execution.unobserved_artifacts` lists files added or changed after the observed run. They may illustrate the report, but cannot alone establish scientific support; inspect the observed measurements and implementation.
@@ -230,12 +231,16 @@ Designer criteria and numeric anchors are provisional. If a criterion is not a p
 {CORE_RESULT_STOP_POLICY}
 
 ## Output
+{CHINESE_REPORT_RULES}
+
+Include `report_explanation` as a short plain-text Chinese explanation for the final report, using only the evidence already independently verified in this review. Explain the tested claim, actual method and conditions, observations supporting the decision, and limitations. Do not run another experiment or repeat the review just to improve prose. Do not embed images or HTML in this text. The field is optional for older records.
+
 Write `{TASK_VERIFICATION_FILE}` as one JSON object. Submit an explicit scientific decision and routing instruction. Missing decision fields cause a Reporter-only handoff repair, never a Writer rerun:
 ```json
 {{
   "schema_version": "3.0",
   "outcome": "reproduced|reproduced_with_assumptions|not_reproduced|inconclusive_missing_information|execution_failed",
-  "decision_reason": "direct scientific reason, tied to the cited evidence; separate remaining uncertainty",
+  "decision_reason": "中文直接判决理由：对应所引证据，并单独说明不确定性",
   "host_action": "complete|rerun_writer",
   "task_id": "{task_id}",
   "run_valid": null,
@@ -243,7 +248,7 @@ Write `{TASK_VERIFICATION_FILE}` as one JSON object. Submit an explicit scientif
     {{
       "claim_id": "claim id from task.scientific_acceptance",
       "status": "supported|unsupported|unassessable_missing_information",
-      "local_observation": "what the full local result shows",
+      "local_observation": "用中文说明本地完整执行结果实际显示了什么",
       "evidence_files": ["existing relative evidence path"]
     }}
   ],
@@ -252,14 +257,16 @@ Write `{TASK_VERIFICATION_FILE}` as one JSON object. Submit an explicit scientif
       "target_id": "target id from task.scientific_acceptance",
       "local_magnitude": null,
       "comparison_status": "comparable|incompatible|disputed|not_applicable|unavailable",
-      "comparison_reason": "why this comparison is scientifically valid, invalid or unavailable",
+      "comparison_reason": "用中文解释该数值比较为何可比、不可比或无法判断",
       "unavailable_reason": ""
     }}
   ],
   "rerun_evidence": null,
-  "comparison_summary": "direct paper-versus-local conclusion",
-  "differences": ["material scientific differences"],
-  "non_material_differences": ["differences you judged non-material, with scientific justification"],
+  "comparison_summary": "中文论文与本地结果对比结论",
+  "report_title": "简短中文任务标题，可保留 BER、SNR 等术语及图号",
+  "report_explanation": "面向读者的简短中文解释：本任务验证什么，已核实的方法与条件，测量如何支持判决，以及假设与限制",
+  "differences": ["用中文说明重大科学差异"],
+  "non_material_differences": ["用中文说明非重大差异及其科学理由"],
   "evidence_files": ["existing relative evidence path"],
   "feedback": [],
   "confidence": "low|medium|high",
