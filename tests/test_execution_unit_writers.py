@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from threading import Barrier, Lock
 from types import SimpleNamespace
 
+import pytest
+
+from geng_agent.model_config import CodexModelConfig, get_current_model_config, model_config_scope
 from geng_agent.agentic_task_writers import (
     _build_artifact_lineage,
     _collect_task_writer_delivery,
@@ -751,6 +755,86 @@ def _two_task_compound_unit() -> tuple[dict, dict, list[dict]]:
     ]
     unit = {**plan["execution_units"][0], "unit_index": 1, "members": members}
     return tasks, unit, manifest["tasks"]
+
+
+@pytest.mark.parametrize("reuse_existing", [False, True])
+def test_compound_reporters_overlap_with_run_model_and_finish_before_attachment(
+    monkeypatch, tmp_path: Path, reuse_existing: bool,
+) -> None:
+    _tasks, unit, _entries = _two_task_compound_unit()
+    barrier = Barrier(len(unit["members"]))
+    lock = Lock()
+    completed: set[str] = set()
+    attached: list[str] = []
+    writer_calls: list[str] = []
+    profile = CodexModelConfig(provider="deepseek", model="deepseek-flash", reasoning_effort="max")
+
+    monkeypatch.setattr(
+        "geng_agent.task_writer_runner._prepare_execution_unit_writer_sandbox",
+        lambda **kwargs: Path(kwargs["sandbox"]).mkdir(parents=True, exist_ok=True),
+    )
+    monkeypatch.setattr(
+        "geng_agent.task_writer_runner._run_task_writer_codex_session",
+        lambda **kwargs: writer_calls.append(kwargs["label"]) or {"ok": True},
+    )
+    monkeypatch.setattr(
+        "geng_agent.task_writer_runner._collect_task_writer_delivery",
+        lambda **kwargs: _record(kwargs["index"], kwargs["task"], kwargs["manifest_entry"],
+                                kwargs["sandbox"], unit["unit_id"]),
+    )
+
+    def review(index, task, record, session_round):
+        assert get_current_model_config() is profile
+        barrier.wait(timeout=5)
+        with lock:
+            completed.add(task["task_id"])
+        return {"ok": True, "task_id": task["task_id"]}
+
+    def attach(**kwargs):
+        assert completed == {"train", "evaluate"}
+        result = kwargs["callback"](kwargs["index"], kwargs["task"], kwargs["record"], kwargs["session_round"])
+        assert result["task_id"] == kwargs["task"]["task_id"]
+        attached.append(result["task_id"])
+        return "terminal", None
+
+    monkeypatch.setattr("geng_agent.task_writer_runner._attach_task_reporter_review", attach)
+    with model_config_scope(profile):
+        records = _run_one_execution_unit_writer(
+            unit=unit, reuse_existing=reuse_existing, runtime_refresh_required=False,
+            facts={}, experiment_index={}, paper={}, paper_path=tmp_path / "paper.pdf",
+            paper_context_json="", paper_images=[], paper_thesis=None, foundation=None,
+            analysis_snapshot_hash="a" * 64, analysis_artifacts={},
+            task_root=tmp_path / "sandboxes", audit_dir=tmp_path / "audit",
+            run_repro=True, review_feedback={}, task_review_callback=review, case_runtime=None,
+        )
+    assert attached == ["train", "evaluate"]
+    assert [record["task_id"] for record in records] == attached
+    assert len(writer_calls) == (0 if reuse_existing else 1)
+
+
+def test_compound_reporter_failure_preserves_other_parallel_result() -> None:
+    from geng_agent.task_writer_runner import _review_execution_unit_tasks
+
+    _tasks, unit, _entries = _two_task_compound_unit()
+    records = [{"task_id": task["task_id"]} for _, task, _ in unit["members"]]
+    barrier = Barrier(2)
+
+    def review(index, task, record, session_round):
+        barrier.wait(timeout=5)
+        if task["task_id"] == "train":
+            raise RuntimeError("one provider request failed")
+        return {"ok": True, "task_verification": {
+            "schema_version": "3.0", "task_id": task["task_id"], "outcome": "not_reproduced",
+            "run_valid": True, "host_action": "complete", "decision_reason": "observed discrepancy",
+        }}
+
+    requested = _review_execution_unit_tasks(
+        members=unit["members"], records=records, callback=review, session_round=1,
+    )
+    assert requested == {}
+    assert records[0]["task_reporter_error_kind"] == "task_reporter_callback_failed"
+    assert records[1]["task_verification"]["outcome"] == "not_reproduced"
+    assert records[1]["task_reporter_terminal"] is True
 
 
 def test_resumed_compound_repeated_causal_request_runs_one_shared_continuation(

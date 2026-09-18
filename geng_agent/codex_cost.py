@@ -39,6 +39,7 @@ def record_codex_invocation(audit_dir: Path, status: dict[str, Any], transcript:
     event = {"schema_version": "1.0", "invocation_id": status.get("invocation_id") or uuid.uuid4().hex,
              "started_at": started_at, "finished_at": time.time(),
              "role": status.get("role"), "label": status.get("label"), "model": status.get("model"),
+             "provider": status.get("provider"), "model_config": status.get("model_config"),
              "ok": bool(status.get("ok")), "duration_s": status.get("duration_s"),
              "usage": parse_codex_usage(transcript), "cost_usd": None,
              "usage_complete": bool(status.get("ok")),
@@ -87,9 +88,9 @@ def summarize_codex_usage(audit_dir: Path, *, since: float | None = None,
             "calls_with_usage": len(known), "calls_missing_usage": missing,
             "observed_tokens": {key: sum(event["usage"].get(key, 0) for event in known) for key in TOKEN_FIELDS},
             **{key: sum(event["usage"].get(key, 0) for event in known) if complete else None for key in TOKEN_FIELDS},
-            "cost_usd": None, "currency_note": "No token price is inferred for account-based Codex usage.",
+            "cost_usd": None, "currency_note": "Provider billing is not inferred from Codex token usage; unknown cost remains unknown.",
             "session_seconds": round(sum(float(event.get("duration_s") or 0) for event in events.values()), 3),
-            "sessions": [{key: event.get(key) for key in ("invocation_id", "role", "label", "duration_s", "usage", "usage_complete")}
+            "sessions": [{key: event.get(key) for key in ("invocation_id", "role", "label", "provider", "model", "model_config", "duration_s", "usage", "usage_complete")}
                          for event in sorted(events.values(), key=lambda value: float(value.get("started_at") or 0))],
             "by_role": {role: sum(event.get("role") == role for event in events.values())
                         for role in sorted({str(event.get("role") or "unknown") for event in events.values()})}}

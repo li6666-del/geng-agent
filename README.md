@@ -119,6 +119,15 @@ MinerU 缺失、超时、非零退出或未识别到目标图时，流程不会�
 
 ## Codex 配置
 
+全流程使用一份统一模型配置：选定服务商、模型和推理强度后，Analysis、Foundation、Writer、Reporter、Editor 全部共用，运行时固定配置并纳入缓存和审计。参见 [模型配置说明](docs/model_configuration.md)、[配置示例](configs/models.example.json) 和 [DeepSeek V4.1 Flash / max 配置](configs/models.deepseek-v4.1-flash.json)。
+
+```powershell
+python -m geng_agent models --config configs/models.example.json
+python -m geng_agent review paper.pdf --out case_001 --run-repro --model-config configs/models.example.json
+```
+
+第一条命令只做离线配置检查。示例默认 GPT，切换 `default` 可选择 DeepSeek 或 GLM；第三方凭据和 Codex 模型目录需按说明配置，尚未进行真实第三方模型全流程验证。以下环境变量说明适用于未选择模型配置文件的兼容模式。
+
 默认全流程走 Codex CLI：
 
 ```bash
@@ -152,15 +161,7 @@ set GENG_CODEX_MODEL=gpt-6-astra
 set GENG_CODEX_REASONING_EFFORT=medium
 ```
 
-需要针对不同角色调整推理强度时，可分别覆盖：
-
-```bash
-set GENG_CODEX_ANALYSIS_REASONING_EFFORT=medium
-set GENG_CODEX_FOUNDATION_WRITER_REASONING_EFFORT=medium
-set GENG_CODEX_TASK_WRITER_REASONING_EFFORT=medium
-set GENG_CODEX_TASK_REPORTER_REASONING_EFFORT=medium
-set GENG_CODEX_REPORT_EDITOR_REASONING_EFFORT=medium
-```
+所有角色共用这份模型与推理设置，不再读取按角色设置的模型名或推理强度。使用 DeepSeek 等服务商时，通过一份项目模型配置统一切换，详见[模型配置说明](docs/model_configuration.md)。
 
 task writer 采用全任务并发：有多少复现任务就同时启动多少个 writer。每个 writer 在自己的 sandbox 内直接调用当前 Python，自行探测 CPU/GPU、选择 backend、声明依赖并运行 smoke/full；主持人不做资源排队或科学判断。项目不对 Codex 推理会话设置 wall-clock 上限；会话只在正常完成、明确失败或用户停止时结束。后续迭代只在材料性原因成立且有具体因果修改方案时启动。
 

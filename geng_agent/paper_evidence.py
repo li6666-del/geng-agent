@@ -150,14 +150,13 @@ def thesis_ordering_anchor_for_task(paper_thesis: dict[str, Any] | None, task: d
             segment += f"；机制：{note}"
         lines.append(segment)
     return (
-        "\n\n# 【论文断言的方法排序·重点核对｜优先级最高】\n"
-        "针对本图，论文主张的方法相对高低如下：\n"
+        "\n\n# 论文方法排序候选证据\n"
+        "以下内容按图号或指标检索得到，不代表都属于本任务验收目标：\n"
         + "\n".join(lines)
-        + "\n请把它当作核对基准：\n"
-        "- 本地曲线/数值的相对高低（谁在上、谁在下）是否与上面一致？\n"
-        "- 若相反或明显不一致：baseline_comparison 维度判 weak 或 missing，scientific_verdict 倾向 "
-        "does_not_support_paper_claim；并在 differences 写清“论文应是谁在上、本地实际谁在上”，"
-        "在 possible_causes 给出最可能的建模原因（例如空时/多普勒维度没建出条件数优势）。\n"
+        + "\n先由智能体结合原文判断与指定任务目标的关系：\n"
+        "- 仅当排序是本任务目标或检验目标的必要条件时，才纳入验收，并解释关联、实际观测及不确定性。\n"
+        "- 同图出现不等于属于同一验收范围；范围外发现记为 additional_observations，不改变任务结论，不触发重跑。\n"
+        "- 发现目标内排序偏离时保留证据；未知原因明确待核查，不猜测建模原因或按预设标签裁决。\n"
         "- regime 区分：若本地跑的是 smoke / 缩规模配置、并不落在该排序成立的区间，请在 limitations 注明，"
         "**不要据此判 mismatch**。\n"
     )

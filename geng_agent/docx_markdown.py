@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from docx.document import Document as DocumentObject
+from docx.shared import Inches
 
 from .docx_assets import (
     _add_image_comparison_table,
@@ -12,7 +13,6 @@ from .docx_assets import (
     _parse_markdown_image_cell,
 )
 from .docx_styles import (
-    _add_appendix_note,
     _add_bullets,
     _add_heading,
     _add_markdown_inline_runs,
@@ -25,15 +25,30 @@ def _add_markdown_body(
     markdown_text: str,
     *,
     base_dir: Path | None = None,
+    heading_offset: int = 0,
 ) -> None:
     lines = markdown_text.splitlines()
     index = 0
-    in_appendix = False
     while index < len(lines):
         raw_line = lines[index]
         line = raw_line.strip()
         if not line:
             index += 1
+            continue
+        fence = re.match(r"^(`{3,}|~{3,})(.*)$", line)
+        if fence:
+            marker = fence.group(1)
+            code_lines = []
+            index += 1
+            while index < len(lines):
+                closing = lines[index].strip()
+                if re.fullmatch(re.escape(marker[0]) + "{" + str(len(marker)) + r",}\s*", closing):
+                    index += 1
+                    break
+                code_lines.append(lines[index])
+                index += 1
+            paragraph = document.add_paragraph(style="Report Code")
+            paragraph.add_run("\n".join(code_lines))
             continue
         table = _parse_markdown_image_table(lines, index)
         if table:
@@ -47,7 +62,7 @@ def _add_markdown_body(
             continue
         table = _parse_markdown_table(lines, index)
         if table:
-            _add_table(document, table["headers"], table["rows"])
+            _add_table(document, table["headers"], table["rows"], alignments=table["alignments"])
             index += table["consumed"]
             continue
         image_match = re.fullmatch(r"!\[([^\]]*)\]\((.*)\)", line)
@@ -58,35 +73,24 @@ def _add_markdown_body(
                 image_match.group(2).strip(),
                 base_dir=base_dir,
             )
-        elif line.startswith("### "):
-            _add_heading(
-                document,
-                line[4:].strip(),
-                3 if not in_appendix else 3,
-            )
-        elif line.startswith("## "):
-            heading = line[3:].strip()
-            if heading.startswith("附录"):
-                document.add_page_break()
-                in_appendix = True
-                _add_heading(document, heading, 1)
-            else:
-                _add_heading(document, heading, 2 if not in_appendix else 3)
-        elif line.startswith("# "):
-            if in_appendix:
-                _add_appendix_note(document, line[2:].strip(), bold=True)
-            else:
-                _add_heading(document, line[2:].strip(), 1)
+        elif heading_match := re.match(r"^(#{1,6})\s+(.+?)\s*$", line):
+            heading = re.sub(r"\s+#+$", "", heading_match.group(2))
+            starts_appendix = heading.startswith("附录") and len(heading_match.group(1)) <= 2
+            _add_heading(document, heading, min(3, max(1, len(heading_match.group(1)) + heading_offset)))
+            if starts_appendix:
+                # A standalone page-break paragraph can overflow after a
+                # full-page image and create an empty page before the appendix.
+                document.paragraphs[-1].paragraph_format.page_break_before = True
         elif line.startswith(("- ", "* ")):
             _add_bullets(document, [line[2:].strip()])
-        elif line.startswith("```"):
-            pass
+        elif re.match(r"^\d+[.)]\s+", line):
+            paragraph = document.add_paragraph()
+            paragraph.paragraph_format.left_indent = Inches(0.2)
+            paragraph.paragraph_format.first_line_indent = Inches(-0.2)
+            _add_markdown_inline_runs(paragraph, line)
         else:
-            if in_appendix:
-                _add_appendix_note(document, line)
-            else:
-                paragraph = document.add_paragraph()
-                _add_markdown_inline_runs(paragraph, line)
+            paragraph = document.add_paragraph()
+            _add_markdown_inline_runs(paragraph, line)
         index += 1
 
 
@@ -126,6 +130,12 @@ def _parse_markdown_table(
     return {
         "headers": headers,
         "rows": rows,
+        "alignments": [
+            "center" if item.startswith(":") and item.endswith(":")
+            else "right" if item.endswith(":")
+            else "left" if item.startswith(":") else None
+            for item in separators
+        ],
         "consumed": index - start,
     }
 

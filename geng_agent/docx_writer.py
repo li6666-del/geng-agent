@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import Any
 
 from docx import Document
@@ -84,7 +85,16 @@ def write_markdown_report_docx(
 
     document = Document()
     _setup_document(document)
-    _add_title(document, title, subtitle)
-    _add_markdown_body(document, markdown_text, base_dir=base_dir)
-    _add_disclaimer(document)
+    # A Markdown title belongs to the editor's report.  The supplied title and
+    # subtitle are legacy fallbacks, not an additional cover or authored body.
+    lines = markdown_text.splitlines()
+    first = next((index for index, line in enumerate(lines) if line.strip()), None)
+    match = re.fullmatch(r"#\s+(.+?)\s*", lines[first].strip()) if first is not None else None
+    if match:
+        _add_title(document, re.sub(r"\s+#+$", "", match.group(1)), "")
+        del lines[first]
+        markdown_text = "\n".join(lines)
+    else:
+        _add_title(document, title, subtitle)
+    _add_markdown_body(document, markdown_text, base_dir=base_dir, heading_offset=-1 if match else 0)
     return _save(document, path)

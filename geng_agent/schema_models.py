@@ -128,6 +128,7 @@ class CoreConclusionAssessment(StrictModel):
     claim_id: str = ""
     status: CoreConclusionStatus = "unassessable_missing_information"
     local_observation: str = ""
+    goal_relation: str = ""
     evidence_files: list[str] = Field(default_factory=list)
     basis_review: dict[str, Any] | None = None
 
@@ -141,6 +142,7 @@ class KeyNumericComparison(StrictModel):
     unavailable_reason: str = ""
     comparison_status: str = "unavailable"
     comparison_reason: str = ""
+    goal_relation: str = ""
     metric: str = ""
     unit: str = ""
     regime: str = ""
@@ -596,8 +598,9 @@ class TaskVerificationResult(StrictModel):
     run_valid: bool | None = None
     core_conclusions: list[CoreConclusionAssessment] = Field(default_factory=list)
     key_numeric_comparisons: list[KeyNumericComparison] = Field(default_factory=list)
+    additional_observations: list[dict[str, Any]] = Field(default_factory=list)
     max_key_numeric_ratio: float | None = Field(default=None, ge=1, allow_inf_nan=False)
-    comparison_summary: str = ""
+    comparison_summary: str = ""  # Legacy prose: optional; new Reporter writes decision_reason once.
     differences: list[str] = Field(default_factory=list)
     non_material_differences: list[str] = Field(default_factory=list)
     evidence_files: list[str] = Field(default_factory=list)
@@ -607,7 +610,7 @@ class TaskVerificationResult(StrictModel):
     verified_facts: list[dict[str, Any]] = Field(default_factory=list)
     provenance_base: str = ""
     asset_notes: list[str] = Field(default_factory=list)
-    report_explanation: str = ""
+    report_explanation: str = ""  # Retained for historical case compatibility.
     report_title: str = ""
 
 

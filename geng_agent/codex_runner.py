@@ -17,20 +17,19 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .config import get_config_value
+from .agent_activity import session_finished, session_started
 from .outputs import write_json, write_text
 from .security import build_safe_env, codex_safe_env, redact_text
+from .model_config import DEFAULT_MODEL, resolve_model_config
+from .codex_provider import (
+    ACTIVE_CREDENTIAL_ENV, model_cli_options, provider_environment,
+    redact_provider_secrets, validate_model_use,
+)
 
 
 MAX_TRANSCRIPT_CHARS = 200_000
 CODEX_CLI_HELP_PROBE_TIMEOUT_SECONDS = 5.0
-DEFAULT_GENG_CODEX_MODEL = "gpt-6-astra"
-DEFAULT_GENG_CODEX_REASONING_EFFORT = {
-    "analysis": "medium",
-    "foundation_writer": "medium",
-    "task_writer": "medium",
-    "task_reporter": "medium",
-    "report_editor": "medium",
-}
+DEFAULT_GENG_CODEX_MODEL = DEFAULT_MODEL
 
 _EPHEMERAL_CAPABILITY_CACHE: dict[tuple[str, ...], dict[str, Any]] = {}
 _EPHEMERAL_CAPABILITY_LOCK = threading.Lock()
@@ -564,11 +563,11 @@ def run_codex_subprocess(
     image_paths: list[Path] | None = None,
     extra_env: dict[str, str] | None = None,
     path_prepend: list[Path | str] | None = None,
-    reasoning_effort: str | None = None,
 ) -> dict[str, Any]:
     raw_cmd = command_override or get_config_value("GENG_CODEX_CMD") or "codex"
-    model = get_config_value("GENG_CODEX_MODEL") or DEFAULT_GENG_CODEX_MODEL
-    resolved_reasoning_effort = _resolve_reasoning_effort(role, reasoning_effort)
+    model_config = resolve_model_config(role, getter=get_config_value)
+    model = model_config.model
+    resolved_reasoning_effort = model_config.reasoning_effort
     argv = split_command(raw_cmd)
     resolved = shutil.which(argv[0]) if argv else None
     status: dict[str, Any] = {
@@ -579,6 +578,8 @@ def run_codex_subprocess(
         "execution_policy": "unbounded_until_exit_or_user_stop",
         "ephemeral_capability": None,
         "model": model,
+        "provider": model_config.provider if model_config.managed else "inherited",
+        "model_config": model_config.identity(),
         "reasoning_effort": resolved_reasoning_effort,
         "command": None,
         "returncode": None,
@@ -602,6 +603,7 @@ def run_codex_subprocess(
         "invocation_id": invocation_id, "role": role, "label": label,
         "work_dir": str(work_dir.resolve()), "sandbox": sandbox,
         "model": model, "reasoning_effort": resolved_reasoning_effort,
+        "model_config": model_config.identity(),
         "prompt_path": str(input_dir / "brief.md"),
         "prompt_sha256": hashlib.sha256(prompt_bytes).hexdigest(),
         "prompt_characters": len(prompt), "prompt_utf8_bytes": len(prompt_bytes),
@@ -631,7 +633,20 @@ def run_codex_subprocess(
     if path_prepend:
         _prepend_path(env, path_prepend)
 
-    capability = _ephemeral_capability(command_prefix, env, work_dir)
+    try:
+        validate_model_use(model_config, images=bool(image_paths), schema=output_schema is not None,
+                           command_prefix=command_prefix, work_dir=work_dir)
+        env, provider_secrets = provider_environment(model_config, env, getter=get_config_value)
+    except ValueError as exc:
+        status.update(error_kind="invalid_model_config", error=str(exc), blocked_reason=str(exc))
+        write_json(audit_dir / f"{label}.json", status)
+        return status
+
+    probe_env = env
+    if model_config.managed:
+        probe_env = {key: value for key, value in env.items()
+                     if key.upper() not in {ACTIVE_CREDENTIAL_ENV, "OPENAI_API_KEY"}}
+    capability = _ephemeral_capability(command_prefix, probe_env, work_dir)
     status["ephemeral_capability"] = capability
     if not capability["supported"]:
         detail = str(capability.get("error") or "--ephemeral is absent from codex exec --help")
@@ -641,6 +656,12 @@ def run_codex_subprocess(
             "Codex CLI must support codex exec --ephemeral; run codex update "
             f"or upgrade the CLI, restart the project process, and retry. Detail: {detail}"
         )
+        write_json(audit_dir / f"{label}.json", status)
+        return status
+
+    if model_config.managed and not capability.get("ignore_user_config_supported"):
+        status.update(error_kind="unsupported_cli_feature",
+                      error="项目模型配置需要支持 --ignore-user-config 的 Codex CLI；请升级 CLI 后重试。")
         write_json(audit_dir / f"{label}.json", status)
         return status
 
@@ -660,18 +681,19 @@ def run_codex_subprocess(
         "--model",
         model,
     ]
-    if resolved_reasoning_effort:
-        command.extend(["--config", f'model_reasoning_effort="{resolved_reasoning_effort}"'])
+    command.extend(model_cli_options(model_config, env))
     if output_schema is not None:
         command.extend(["--output-schema", str(output_schema)])
     for image_path in image_paths or []:
         command.extend(["--image", str(image_path)])
     command.append("-")
-    status["command"] = command[:-1] + ["<brief via stdin>"]
+    status["command"] = [redact_text(redact_provider_secrets(arg, provider_secrets))
+                         for arg in command[:-1]] + ["<brief via stdin>"]
     status["last_message_path"] = str(last_message_path)
 
     started = time.monotonic()
     invocation_started_at = time.time()
+    activity = session_started(invocation_id=invocation_id, role=role, label=label, work_dir=work_dir)
     try:
         completed = subprocess.run(
             command,
@@ -686,15 +708,25 @@ def run_codex_subprocess(
         )
         status["returncode"] = completed.returncode
         status["ok"] = completed.returncode == 0
-        transcript = (completed.stdout or "") + ("\n--- stderr ---\n" + completed.stderr if completed.stderr else "")
+        transcript = redact_provider_secrets(
+            (completed.stdout or "") + ("\n--- stderr ---\n" + completed.stderr if completed.stderr else ""),
+            provider_secrets,
+        )
         if completed.returncode != 0:
             _annotate_codex_failure(status, transcript)
             status["error"] = f"codex exited with status {completed.returncode}"
     except Exception as exc:
         status["error_kind"] = "subprocess_error"
-        status["error"] = f"{type(exc).__name__}: {exc}"
+        status["error"] = redact_text(redact_provider_secrets(f"{type(exc).__name__}: {exc}", provider_secrets))
         transcript = ""
+    finally:
+        session_finished(activity, ok=bool(status["ok"]), error_kind=status.get("error_kind"))
     status["duration_s"] = round(time.monotonic() - started, 1)
+    if provider_secrets and last_message_path.is_file() and not last_message_path.is_symlink():
+        last_text = last_message_path.read_text(encoding="utf-8")
+        safe_last_text = redact_provider_secrets(last_text, provider_secrets)
+        if safe_last_text != last_text:
+            write_text(last_message_path, safe_last_text)
     from .codex_cost import record_codex_invocation
     try:
         status["cost_event"] = record_codex_invocation(
@@ -974,6 +1006,7 @@ def _probe_ephemeral_capability(
     help_text = (completed.stdout or "") + "\n" + (completed.stderr or "")
     result["returncode"] = completed.returncode
     result["supported"] = completed.returncode == 0 and "--ephemeral" in help_text
+    result["ignore_user_config_supported"] = completed.returncode == 0 and "--ignore-user-config" in help_text
     if not result["supported"]:
         result["error"] = (
             "codex exec --help did not advertise --ephemeral"
@@ -1020,29 +1053,3 @@ def _prepend_path(env: dict[str, str], entries: list[Path | str]) -> None:
 
 def split_command(raw: str) -> list[str]:
     return [token.strip('"') for token in shlex.split(raw, posix=False) if token.strip('"')]
-
-
-def _resolve_reasoning_effort(role: str, explicit: str | None) -> str | None:
-    value = explicit
-    if not value:
-        role_name = (
-            "TASK_WRITER"
-            if role == "task_writer"
-            else "FOUNDATION_WRITER"
-            if role == "foundation_writer"
-            else "TASK_REPORTER"
-            if role == "task_reporter"
-            else "REPORT_EDITOR"
-            if role == "report_editor"
-            else "ANALYSIS"
-            if role == "analysis"
-            else ""
-        )
-        if role_name:
-            value = get_config_value(f"GENG_CODEX_{role_name}_REASONING_EFFORT")
-    if not value:
-        value = get_config_value("GENG_CODEX_REASONING_EFFORT")
-    if not value:
-        value = DEFAULT_GENG_CODEX_REASONING_EFFORT.get(role)
-    normalized = str(value or "").strip().lower()
-    return normalized if normalized in {"minimal", "low", "medium", "high", "xhigh"} else None

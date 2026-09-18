@@ -161,13 +161,16 @@ class FinalReportEditorTests(unittest.TestCase):
             self.assertNotIn("iteration_records", packet)
             self.assertIsNone(packet["execution_summary"]["observed_full_attempt_count"])
             self.assertIsNone(packet["execution_summary"]["latest_valid_execution_count"])
+            writer_statement = report_input["technical_details"]["writer_statements"][0]
+            self.assertNotIn("execution_summary", writer_statement["reported"])
+            self.assertEqual(writer_statement["reported"]["iteration_records"], iterations)
             brief = (output / "audit" / "04b_report_editor_brief.md").read_text(encoding="utf-8")
             self.assertIn("execution_summary.observed_full_attempt_count", brief)
             self.assertIn("未知保持未知", brief)
             self.assertIn("不是科研成功次数", brief)
             self.assertEqual(
                 REPORT_EDITOR_PROMPT_VERSION,
-                "final_report_editor_v8_task_comparison_and_human_followup",
+                "final_report_editor_v12_comparison_wording",
             )
 
     def test_human_readable_task_headings_do_not_require_machine_task_ids(self) -> None:

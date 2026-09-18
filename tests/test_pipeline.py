@@ -417,7 +417,7 @@ def _run_minimal_full_pipeline(
     return result, output_dir
 
 class PipelineTests(unittest.TestCase):
-    def test_preliminary_task_cache_survives_host_deduplication(self) -> None:
+    def test_preliminary_task_cache_survives_snapshot_publication(self) -> None:
         expected_cache = {
             "stage_label": "02a_build_preliminary_repro_tasks",
             "fingerprint": "cache-fingerprint",
@@ -501,10 +501,7 @@ class PipelineTests(unittest.TestCase):
             )
             self.assertEqual(persisted["_meta"]["cache"], expected_cache)
             self.assertNotIn("untrusted", persisted["_meta"])
-            self.assertEqual(
-                persisted["_meta"]["semantic_merge"]["merge_version"],
-                4,
-            )
+            self.assertTrue(persisted["_meta"]["experiment_plan_snapshot"])
             self.assertEqual(validate_stage("repro_tasks", persisted), [])
             self.assertNotIn(
                 "cache",

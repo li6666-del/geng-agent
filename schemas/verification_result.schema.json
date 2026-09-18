@@ -24,6 +24,11 @@
           "title": "Local Observation",
           "type": "string"
         },
+        "goal_relation": {
+          "default": "",
+          "title": "Goal Relation",
+          "type": "string"
+        },
         "evidence_files": {
           "items": {
             "type": "string"
@@ -109,6 +114,11 @@
         "comparison_reason": {
           "default": "",
           "title": "Comparison Reason",
+          "type": "string"
+        },
+        "goal_relation": {
+          "default": "",
+          "title": "Goal Relation",
           "type": "string"
         },
         "metric": {
@@ -297,6 +307,14 @@
             "$ref": "#/$defs/KeyNumericComparison"
           },
           "title": "Key Numeric Comparisons",
+          "type": "array"
+        },
+        "additional_observations": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Additional Observations",
           "type": "array"
         },
         "max_key_numeric_ratio": {

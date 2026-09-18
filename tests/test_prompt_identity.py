@@ -34,7 +34,8 @@ def test_role_cache_tracks_actual_instruction_attachment_and_model(tmp_path):
         image.write_bytes(b"corrected page")
         c = role_contract_identity(role="task_reporter", prompt="Verify method", image_paths=[image])
     assert a != b and a != c
-    with patch("geng_agent.config.get_config_value", return_value="different-model"):
+    with patch("geng_agent.config.get_config_value",
+               side_effect=lambda name: "different-model" if name == "GENG_CODEX_MODEL" else None):
         d = role_contract_identity(role="task_reporter", prompt="Verify method", image_paths=[image])
     assert c["model"] != d["model"]
 

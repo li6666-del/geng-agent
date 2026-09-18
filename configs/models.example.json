@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "default": "gpt",
+  "profiles": {
+    "gpt": {
+      "provider": "openai",
+      "model": "gpt-6-astra",
+      "reasoning_effort": "medium",
+      "supports_images": true,
+      "supports_tools": true,
+      "supports_json_schema": true
+    },
+    "deepseek": {
+      "provider": "deepseek",
+      "model": "deepseek-flash",
+      "base_url": "https://api.deepseek.com",
+      "env_key": "DEEPSEEK_API_KEY",
+      "wire_api": "responses",
+      "reasoning_effort": "max",
+      "supported_reasoning_efforts": ["low", "high", "max"],
+      "supports_images": true,
+      "supports_tools": true,
+      "supports_json_schema": false,
+      "model_catalog_json": "deepseek-models.json",
+      "web_search": "disabled"
+    },
+    "glm": {
+      "provider": "zai",
+      "model": "glm-5.3-flash",
+      "base_url": "https://api.z.ai/api/v1",
+      "env_key": "ZAI_API_KEY",
+      "wire_api": "responses",
+      "reasoning_effort": "omit",
+      "supports_images": true,
+      "supports_tools": true,
+      "supports_json_schema": false,
+      "web_search": "disabled"
+    }
+  }
+}

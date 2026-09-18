@@ -32,7 +32,7 @@ from .report_editor_workspace import (
 from .report_editor_status import (_codex_process_warning, _completion_mode, _editor_failure, _editor_reason)
 
 REPORT_EDITOR_POLICY_VERSION = f"{SCIENTIFIC_POLICY_ID}:agent-authored-report-v3"
-REPORT_EDITOR_PROMPT_VERSION = "final_report_editor_v8_task_comparison_and_human_followup"
+REPORT_EDITOR_PROMPT_VERSION = "final_report_editor_v12_comparison_wording"
 
 
 def run_codex_report_editor_workflow(
@@ -109,6 +109,8 @@ def run_codex_report_editor_workflow(
             "technical_details": report_materials["technical_details"],
             "runtime_summary": {key: runtime_result[key] for key in ("scientific_all_terminal", "scientific_all_successful", "scientific_outcome_counts") if key in runtime_result},
             "task_packets": task_packets,
+            "image_inventory": [{**item, "path": f"{REPORT_ASSETS_DIR}/{item['path']}"}
+                for item in _accepted_asset_inventory(workspace / REPORT_ASSETS_DIR, task_packets)],
             "asset_warnings": asset_warnings,
             "repair": {
                 "enabled": bool(repair_context),
@@ -152,6 +154,8 @@ def run_codex_report_editor_workflow(
         for path in sorted((workspace / REPORT_ASSETS_DIR).rglob("*"))
         if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg"}
     ]
+    from .task_writer_inputs import unique_image_paths
+    image_paths = unique_image_paths(image_paths)
     codex_status = run_codex_subprocess(
         role="report_editor",
         work_dir=workspace,
@@ -291,22 +295,41 @@ def _build_report_editor_brief(
 - 只能创建 `review.md`、`reproduction_report.md`、`result_review.md`。禁止联网、安装依赖、执行复现代码、修改图片或创造科学证据。
 - 三份报告正文全部由你撰写。宿主只检查文件并转换 Word，不会插入终态表或用模板补全文字。交付前自行核对每个任务的结论、覆盖和图片。
 - 科学事实、参数和假设只能来自 Reporter 的 `verified_facts`、结论观察、比较记录及明确说明。保持论文原文、推导、假设、实际观测的来源区别。不能将任务计划或 Writer 自述升级为已核验事实。
+- 任务结论仅针对该任务的复现目标，不能推及整张图或整篇论文。Reporter 的 `additional_observations` 是范围外发现：在本地复现报告单独保留，必要时在结果对比报告的人工核查建议中简述；不得把它们改写为本任务验收失败、通过依据或自动重跑要求。若其 `evidence_files_available` 为 false，明确证据不可用，不写成已核实事实。任务目标内的算法错误及其结论仍按 Reporter 记录如实呈现。
 - `paper.opening_text_for_title_only` 只用于识别原论文标题。标题若确实无法识别，用来源文件名说明，不写“未命名论文”。不自行给英语论文创造中文正式名称。
 - `technical_details` 是本地复现报告的工程材料；其中 Writer 声明需要明确归属，不作为新的科学判决依据。
+- Reporter 的 decision_reason、逐主张观察、数值比较和 verified_facts 是科学说明的来源；不要要求额外的 comparison_summary 或 report_explanation。旧记录若带有这些字段可作补充，但不另立判决。Writer 的 implementation_notes、parameter_resolution、iteration_records 是自述；运行次数、退出码和耗时使用 execution_summary 中的宿主观测。缺少 Writer Markdown 不代表缺少结果。
+- 同一事实或条件只在需要的位置完整说明，其余位置引用任务或章节；两份报告分工互补，不逐段重复。发现来源冲突时保留归属与限制，不自行消解或补造事实。
 
 ## `result_review.md`：面向人工核查的结果对比报告
-直接从简短论文标题与结果摘要进入逐任务章节。每个任务按以下结构写，篇幅以讲清楚为准：
-1. **复现目标与结论**：要检查论文哪张图或哪项主张，Reporter 的结论是什么；执行成功不等于支持论文。
-2. **核心事实与假设**：仅挑影响理解结果的模型、算法、关键参数、比较条件和重要假设。说明来自论文还是补充假设，以及假设可能影响哪里。
-3. **本地结果与原文结果对比**：查看提供的所有相关图片，再组织对照。双列 Markdown 表格左放本地复现结果图、右放对应原文结果图或整页证据；覆盖任务的所有目标图，不能只取列表第一张。组合图可与多张原文图分别配对，并说明对应关系。保留 asset_notes 中的解释，不将未经独立审查的附件冒充科学证据。图像只是解释已有核验结果，不据图片重新裁决。
-4. **仍存在的差距**：用已有数值和观察解释哪些一致、哪些偏离、哪些不能比较，以及已知原因和未确定原因；适用时写指标单位、范围和统计不确定性。不能用趋势相同掩盖数值误差，也不把图片样式差异写成科学失败。
-5. **下一步人工核查建议**：针对每个未解决疑点，提出具体核查对象、应查看的原文/数据/代码位置，以及核查将消除什么不确定性。没有明确依据的方案写为待验证建议，不假装已经修复；已经充分支持的任务说明只需哪些必要抽查或无需进一步核查。
+以一个 `#` 标题开篇，写清论文主题和报告用途，不另做装饰封面或重复标题。接着用一个短段说明本次复现范围和主要结果；多个任务时给出紧凑总览表，列为“任务、复现目标、结论、关键差距”，每格只写短语，不将长段落塞进表格。不编造总体通过率。随后进入逐任务章节，每个任务按以下顺序组织，篇幅以讲清楚为准：
+1. **复现目标与结论**：先用一句话说明检查哪项任务目标，用“结论：……”表达既定中文状态及最主要原因，再补必要条件；执行成功不等于支持论文。不要以长篇实现过程开头，也不用“历史结论”“历史判决”作标签。
+2. **核心事实与假设**：只挑理解本任务所必需的模型、算法、关键参数和比较条件，用少量短段或列表分别标明“论文明确”“补充假设”“实际观测”。说明重要假设影响哪里；共有定义集中介绍一次，各任务仅补差异和引用。
+3. **本地结果与原文结果对比**：查看提供的所有相关图片，覆盖任务的所有目标图，不能只取列表第一张。按下方“图片组织”规则选择并排或上下布局；组合图说明面板对应关系。保留 asset_notes 中与图像身份、科学含义及证据限制有关的解释，按本报告的表达规则组织，不逐字照搬过程说明；不将未经独立审查的附件冒充科学证据。图像只是解释已有核验结果，不据图片重新裁决。
+4. **仍存在的差距**：先解释决定结论的差异，再列重要限制；多项比较用短表，列为“核查点、原文结果、本地结果、对任务结论的影响”。单位可放表头，长解释放表后。区分一致、偏离、无法比较及已知/未知原因，保留统计不确定性。不能用趋势相同掩盖数值误差，也不把图片样式差异写成科学失败。
+5. **下一步人工核查建议**：每条写清“核查对象、原文/数据/代码位置、能消除的疑点”。集中说明建议尚未执行，不每条重复免责声明。已经充分支持的任务仅列必要抽查；无证据的修复方案必须标为待验证建议。
 - 若只有一侧图片，显示现有图片并简述缺失原因；没有图的任务仍完整报告。不要编造原图、补绘所谓论文结果或猜测成对关系。
 - 只引用 `report_assets/<task_id>/` 下真实存在的相对图片路径。正文不用原始路径堆砌证据，建议位置可用可读的论文页码/公式号/模块名称。
 - 不放完整参数清单、criterion ID 大表、哈希、环境版本表、运行日志、完整重试历史或JSON。这些细节转到本地复现报告。
 
+### 对比报告的表达边界
+- 全文（含开篇、任务结论、表格、图注和附录）直接介绍复现目标、事实、假设、结果差距及人工核查建议。不写报告如何编写、重排或复用记录的过程说明，例如“本稿根据已完成的运行与独立审查记录重新编排”“沿用历史判决”“未重新执行或重新审查”；也不换一种说法表达同类意思。确有追溯价值的记录来源和编辑过程只放本地复现报告。
+- 不展示审查者或智能体的主观置信等级，包括 Reporter 的 confidence 字段及“历史审查置信程度为高”“审查置信度高/中/低”“对判决把握较大”等同类表达。结论直接说明结果及证据理由；主观等级若需追溯，仅在本地复现报告的记录索引保留。
+- 即使 comparison_summary、report_explanation、asset_notes 或旧稿包含上述表达，也应按这些规则改写；不能把删去过程措辞变成修改既定科学结论。可写“结论：未复现。指定区间内的方法排序与原文不一致。”，不追加历史裁决来源或主观置信评价。
+- 区分编辑过程与实验事实：“编辑器没有再跑一遍”属于不写入本报告的过程说明；任务缺少有效 full 执行、只有 smoke、证据不可用、附件未经核验、关键参数缺失等实质限制仍须如实说明。保留统计置信区间、抽样波动、方法排序不稳定及其他科学不确定性，也不能把尚未执行的人工核查建议写成已验证结果。
+
+### 图片组织
+- `image_inventory` 提供文件像素尺寸，仅用于选择版式，不是科学证据。必须实际查看图片，不能仅凭文件名或长宽比判断其含义。
+- 只有结构简单、比例接近且坐标图例在半页宽仍可读的单图，才用双列 Markdown 图片表（本地在左、原文在右）。宽图、多面板组合图、竖向整页证据用独立 `![图注](路径)` 上下排列，占满正文宽度；不要为追求并排把字压小。
+- 原文优先使用已提供且身份清楚的对应图裁剪，必须保留坐标、单位、图例和必要图注。你不能裁剪、重绘或修改图片。仅有原文整页时，以全宽形式放“附录 原文图像证据”，正文在本地图附近明确引用该附录中的页码与图号；不能假装已经有裁剪图，也不能因材料不美观要求新实验或新的科学审查。
+- 每组对照写清本地图、原文图号/页码与面板对应关系，并给一句来自 Reporter 记录的读图要点。同一原文页或同一张本地图只需展示一次，其他位置引用；必须保留所有不同的相关结果图，不能用去重省掉不同分支。
+- 图片 alt 写成简洁图注，避免文件名堆砌和整段论证。没有对应原图时说明事实，并展示已有公式/主张证据，不制造一一对应。
+
 ## `reproduction_report.md`：工程细节与追溯记录
-按任务介绍实际采用的实现、全部已提供参数及其来源、参数缺口、显式假设、配置、入口命令、依赖环境、运行记录、产物位置、交付限制和已知失败。把冗长比较表、证据索引、运行次数及必要的迭代摘要集中到这里，并链接结果对比报告。允许相对项目路径和可执行的已记录命令；安装信息未知时说明未知，不虚构可重运行保证。不复制原始会话、思维链或大段JSON。
+以一个 `#` 标题和简短阅读说明开篇，链接结果对比报告。按“项目入口与运行方法 → 环境与共享实现 → 各任务配置及假设 → 执行记录与问题 → 产物和证据索引”组织，使读者先找到怎么运行，再查实现与追溯材料。各任务仍完整介绍实际采用的实现、全部已提供参数及来源、参数缺口、假设、配置、运行产物、交付限制和已知失败。共有参数只列一次，任务章节列差异；不复制另一份报告的逐段分析。
+- 运行方法仅引用已记录的真实入口和命令，用代码块展示；没有完整命令时直接说明缺口并列已知入口，不从文件名猜测。安装信息未知时说明未知，不虚构可重运行保证。
+- 参数、运行次数、耗时等同类记录用窄表；长参数值、长路径、哈希和完整精度移到后部证据索引或附录，用短标识引用，不能截断原值。复杂推导和冗长诊断放本报告，结果报告保留其含义。
+- 来源说明集中写一次；只在确有歧义时标明 Writer 自述、Reporter 核验或宿主观测，不逐段堆叠流程术语。不复制原始会话、思维链或大段JSON。
 - `execution_summary.observed_full_attempt_count` 只代表有宿主收据的full尝试次数；`latest_valid_execution_count` 只是末次执行与产物有效（0/1），不是科研成功次数。未知保持未知。
 - 无独立环境重建验证是当前交付策略，不是验证失败或已经验证通过。已有宿主运行与搬移smoke要分别说明范围，smoke不能充当full证据。
 - 工程故障、未复现、信息不足和带假设复现分别表述，保留失败与不确定性。
@@ -317,9 +340,11 @@ def _build_report_editor_brief(
 {report_language.CHINESE_REPORT_RULES}
 
 ## 写作与交付
-- 使用简体中文、简短小标题和必要的表格，适合Word阅读。
+- 使用简体中文、简短小标题和必要的表格，适合Word阅读。每段集中解释一件事；用留白、标题层级和少量加粗突出重点，不使用装饰图标、大段加粗、HTML样式或状态卡片。
+- 面向读者的结论统一写“已复现、带假设复现、未复现、信息不足、执行失败、审查未完成”，分别对应 Reporter 的 reproduced、reproduced_with_assumptions、not_reproduced、inconclusive_missing_information、execution_failed、review_incomplete；这只是翻译标签，不准改变状态。原始状态字段放本地报告的追溯索引。
+- 正文数值一般保留 3–4 位有效数字；接近判定边界、方法排序或阈值时保留足够精度，不能让舍入改变原有结论。完整值留在本地报告或明确引用的数据文件，转换器不会替你四舍五入或改写测量。
 - 原始公式、单位、代码标识及必要英文引用保持准确；自然语言解释用中文。
-- 完成前自行核对每个任务都出现在两份详细报告中，结果对比报告每个任务都有上述五项内容，所有引用图片真实存在，结论与独立Reporter记录一致。
+- 完成前自行核对每个任务都出现在两份详细报告中，结果对比报告每个任务都有上述五项内容，所有引用图片真实存在，结论与独立Reporter记录一致；检查对比报告全文符合表达边界，没有编辑过程说明或主观审查置信等级，同时保留影响结果的真实限制。
 {repair_block}"""
 
 
@@ -347,8 +372,11 @@ def _report_materials(*, paper: dict, runtime_result: dict, task_records: list,
             "runtime_summary": {key: runtime_result[key] for key in ("passed", "coverage", "scientific_outcome_counts") if key in runtime_result},
             "writer_statements": [{"task_id": record.get("task_id"),
                 "reported": {key: (record.get("result_json") or {})[key] for key in
-                    ("parameter_resolution", "iteration_records", "execution_summary", "artifact_mapping", "component_usage")
+                    ("parameter_resolution", "iteration_records", "implementation_notes", "execution_refs", "artifact_mapping", "component_usage")
                     if key in (record.get("result_json") or {})},
+                "legacy_implementation_notes": {key: ((record.get("result_json") or {}).get("execution_summary") or {}).get(key)
+                    for key in ("backend", "device", "backend_choice_reason", "actual_compute_device_evidence")
+                    if key in ((record.get("result_json") or {}).get("execution_summary") or {})},
                 "delivery_issues": record.get("delivery_validation_issues", []),
                 "delivery_warnings": record.get("delivery_warnings", [])} for record in task_records],
         },

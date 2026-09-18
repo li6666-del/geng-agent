@@ -33,7 +33,7 @@ from .schemas import (
     validate_task_fact_refs,
 )
 from .scientific_materiality import SCIENTIFIC_POLICY_ID
-from .semantic_merge import semantic_conflicts, semantic_merge_repro_tasks
+from .semantic_merge import semantic_conflicts
 from .task_evidence_backfill import (
     backfill_normalization_issues,
     finalize_targeted_backfill,
@@ -174,19 +174,15 @@ def run_analysis_flow(
         paper=paper, paper_context=paper_context, paper_images=paper_images, figure_index=figure_index,
         host_capabilities=host_capabilities)
     analysis_stage_invocations += int(not current_plan.get("_meta", {}).get("cache_reused"))
-    preliminary_tasks = current_plan["tasks"]
-    preliminary_meta = (
-        preliminary_tasks.get("_meta", {})
-        if isinstance(preliminary_tasks.get("_meta"), dict)
-        else {}
-    )
-    preliminary_cache = preliminary_meta.get("cache")
-    preliminary_merge_base: dict[str, Any] = {"repro_tasks": []}
+    # The coupled planner publishes a complete task/architecture snapshot. Tasks
+    # sharing a figure can cover different regimes or claims; keep their IDs and
+    # relationship references intact rather than deduplicating by figure text.
+    preliminary_tasks = dict(current_plan["tasks"])
+    preliminary_meta = preliminary_tasks.get("_meta")
+    preliminary_cache = preliminary_meta.get("cache") if isinstance(preliminary_meta, dict) else None
+    preliminary_tasks["_meta"] = {"experiment_plan_snapshot": True}
     if isinstance(preliminary_cache, dict):
-        preliminary_merge_base["_meta"] = {"cache": dict(preliminary_cache)}
-    preliminary_tasks, _ = semantic_merge_repro_tasks(
-        preliminary_merge_base, preliminary_tasks
-    )
+        preliminary_tasks["_meta"]["cache"] = dict(preliminary_cache)
     preliminary_tasks = finalize_repro_tasks(preliminary_tasks, initial_facts)
     preliminary_structure_issues = validate_stage("repro_tasks", preliminary_tasks)
     if preliminary_structure_issues:

@@ -7,6 +7,13 @@ from .agentic_analysis import CODEX_ANALYSIS_BACKEND, run_codex_json_stage
 from .config import validate_case_output_dir
 from .llm import LLMClient
 from .mineru_runner import run_mineru_layout_stage
+from .model_config import (
+    CodexModelConfig,
+    get_current_model_config,
+    load_model_config,
+    model_config_scope,
+)
+from .outputs import write_json
 from .pipeline_analysis_flow import finish_analysis_only, run_analysis_flow
 from .pipeline_context import PipelineRunContext
 from .pipeline_execution_flow import run_execution_flow
@@ -85,6 +92,14 @@ SYSTEM_MESSAGE = (
 TARGETED_BACKFILL_MAX_ROUNDS = 3
 
 
+def _validate_model_backend(config: CodexModelConfig, analysis_backend: str | None) -> None:
+    if config.managed and analysis_backend == "llm":
+        raise ValueError(
+            "统一模型配置不能与旧 analysis_backend='llm' 混用；"
+            "请使用 codex 分析后端，让所有阶段共用所选模型。"
+        )
+
+
 class ReviewPipeline:
     def __init__(
         self,
@@ -149,6 +164,7 @@ class ReviewPipeline:
         analysis_backend: str | None = None,
         analysis_only: bool = False,
         progress: ProgressReporter | None = None,
+        model_config_path: Path | None = None,
     ) -> PipelineResult:
         stage_cleanup = {
             "facts": "facts",
@@ -167,25 +183,30 @@ class ReviewPipeline:
         except KeyError as exc:
             raise ValueError(f"unknown pipeline stage: {stage}") from exc
 
+        model_configs = get_current_model_config()
+        if model_config_path is not None or model_configs is None:
+            model_configs = load_model_config(model_config_path)
+        _validate_model_backend(model_configs, analysis_backend)
         output_dir = validate_case_output_dir(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         _ensure_v2_workflow(output_dir)
-        _clear_stage_outputs(output_dir, cleanup_stage)
-        return self.run(
-            paper_path=paper_path,
-            output_dir=output_dir,
-            max_pages=max_pages,
-            run_repro=run_repro,
-            run_timeout=run_timeout,
-            mineru_timeout=mineru_timeout,
-            json_repair_attempts=json_repair_attempts,
-            tasks_timeout=tasks_timeout,
-            resume=True,
-            analysis_fallback=analysis_fallback,
-            analysis_backend=analysis_backend,
-            analysis_only=analysis_only,
-            progress=progress,
-        )
+        with model_config_scope(model_configs):
+            _clear_stage_outputs(output_dir, cleanup_stage)
+            return self.run(
+                paper_path=paper_path,
+                output_dir=output_dir,
+                max_pages=max_pages,
+                run_repro=run_repro,
+                run_timeout=run_timeout,
+                mineru_timeout=mineru_timeout,
+                json_repair_attempts=json_repair_attempts,
+                tasks_timeout=tasks_timeout,
+                resume=True,
+                analysis_fallback=analysis_fallback,
+                analysis_backend=analysis_backend,
+                analysis_only=analysis_only,
+                progress=progress,
+            )
 
     def run(
         self,
@@ -202,9 +223,14 @@ class ReviewPipeline:
         analysis_backend: str | None = None,
         analysis_only: bool = False,
         progress: ProgressReporter | None = None,
+        model_config_path: Path | None = None,
     ) -> PipelineResult:
         """Run the V2 workflow through explicit analysis, execution and report flows."""
 
+        model_configs = get_current_model_config()
+        if model_config_path is not None or model_configs is None:
+            model_configs = load_model_config(model_config_path)
+        _validate_model_backend(model_configs, analysis_backend)
         output_dir = validate_case_output_dir(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         audit_dir = output_dir / "audit"
@@ -239,31 +265,39 @@ class ReviewPipeline:
             cumulative_usage=self._cumulative_usage,
             usage_by_model=self._usage_by_model,
         )
-        try:
-            analysis = run_analysis_flow(
-                self,
-                context,
-                mineru_stage=run_mineru_layout_stage,
-                backfill_loop_runner=run_targeted_backfill_loop,
-            )
-            if analysis_only:
-                return finish_analysis_only(context, analysis)
-            execution = run_execution_flow(context, analysis)
-            return run_report_flow(
-                self,
-                context,
-                analysis,
-                execution,
-                derive_verdict=derive_reproducibility_verdict,
-                provenance_builder=build_automation_provenance,
-            )
-        finally:
+        model_snapshot = {
+            "schema_version": 2,
+            "run_id": context.run_id,
+            "config": model_configs.identity(),
+        }
+        write_json(audit_dir / "model_configs" / f"{context.run_id}.json", model_snapshot)
+        write_json(audit_dir / "model_config.json", model_snapshot)
+        with model_config_scope(model_configs):
             try:
-                context.persist_cost_snapshot()
-            except Exception as exc:
-                # Accounting must never replace an original execution error.
-                import logging
-                logging.getLogger(__name__).warning("Unable to persist run cost: %s", exc)
+                analysis = run_analysis_flow(
+                    self,
+                    context,
+                    mineru_stage=run_mineru_layout_stage,
+                    backfill_loop_runner=run_targeted_backfill_loop,
+                )
+                if analysis_only:
+                    return finish_analysis_only(context, analysis)
+                execution = run_execution_flow(context, analysis)
+                return run_report_flow(
+                    self,
+                    context,
+                    analysis,
+                    execution,
+                    derive_verdict=derive_reproducibility_verdict,
+                    provenance_builder=build_automation_provenance,
+                )
+            finally:
+                try:
+                    context.persist_cost_snapshot()
+                except Exception as exc:
+                    # Accounting must never replace an original execution error.
+                    import logging
+                    logging.getLogger(__name__).warning("Unable to persist run cost: %s", exc)
 
     def _load_or_create_paper(
         self,

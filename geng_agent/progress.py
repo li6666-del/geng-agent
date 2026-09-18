@@ -77,7 +77,7 @@ class ConsoleProgressReporter:
              message: str | None = None, data: dict[str, Any] | None = None) -> None:
         import datetime
         import sys
-        if event_type.startswith(("step.", "phase.")):
+        if event_type.startswith(("step.", "phase.", "agent.")):
             timestamp = datetime.datetime.now().strftime("%H:%M:%S")
             print(f"[{timestamp}] {event_type} {step or phase}" + (f" {message}" if message else ""),
                   file=sys.stderr, flush=True)

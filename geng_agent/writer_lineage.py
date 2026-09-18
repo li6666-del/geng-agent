@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from collections.abc import Mapping
 import hashlib
 import importlib.metadata
 import inspect
@@ -32,7 +33,7 @@ def writer_policy_content_hashes() -> dict[str, str]:
 
     root = Path(__file__).parent
     policies = {name: text_identity((root / name).read_text(encoding="utf-8")) for name in (
-        "task_writer_prompts.py", "task_writer_execution_binding.py",
+        "task_writer_prompts.py", "task_writer_inputs.py", "task_writer_execution_binding.py",
         "task_writer_contracts.py", "task_writer_support.py", "writer_recovery.py",
         "scientific_materiality.py", "execution_receipts.py", "execution_client.py", "execution_sandbox.py",
         "writer_lineage.py",
@@ -289,12 +290,8 @@ def foundation_cache_projection(
             for ref in _objects((item.get("basis") or {}).get("evidence_facts"))}
     selected_facts = [item for item in _objects(facts.get("engineering_facts"))
                       if not refs or (str(item.get("type")), str(item.get("name")).casefold()) in refs]
-    module_root = Path(__file__).parent
-    policy = {name: text_identity((module_root / name).read_text(encoding="utf-8")) for name in (
-        "foundation_prompt_cache.py", "foundation_scope.py", "foundation_revision.py", "writer_lineage.py",
-    )}
     analysis_hash = _digest({"paper_sha256": file_sha256(paper_path) if paper_path.is_file() else None,
-                             "facts": selected_facts, "policy_content_hashes": policy})
+                             "facts": selected_facts, "policy_content_hashes": foundation_policy_content_hashes()})
     projected = {"schema_version": architecture.get("schema_version"), "components": components,
                  "bindings": bindings, **metadata,
                  "scope_policy": scope.get("policy_version")}
@@ -302,6 +299,31 @@ def foundation_cache_projection(
         projected["_foundation_revision"] = architecture["_foundation_revision"]
     runtime = foundation_consumed_runtime(architecture=architecture, case_runtime=case_runtime)
     return analysis_hash, projected, _digest(runtime)
+
+
+def foundation_policy_content_hashes() -> dict[str, str]:
+    """Track Foundation policy without coupling it to task Writer lineage edits.
+
+    This module also fingerprints task Writer policies and execution units. Hash only the
+    Foundation projection and the shared helpers it consumes, so those unrelated
+    policies cannot discard a valid frozen Foundation. Keep the helper list in
+    the fingerprint too: changing this boundary must invalidate the old key.
+    """
+    module_root = Path(__file__).parent
+    policy = {name: text_identity((module_root / name).read_text(encoding="utf-8")) for name in (
+        "foundation_prompt_cache.py", "foundation_scope.py", "foundation_revision.py",
+    )}
+    policy.update({
+        function.__name__: text_identity(inspect.getsource(function))
+        for function in (
+            foundation_policy_content_hashes, foundation_cache_projection,
+            foundation_consumed_runtime, _scoped_architecture_metadata,
+            _objects, _digest, _runtime_dependency_graph,
+            runtime_distribution_metadata, _runtime_projection,
+            _source_closure, _python_sources, _module_name,
+        )
+    })
+    return policy
 
 
 def foundation_consumed_runtime(
@@ -334,7 +356,14 @@ def build_writer_unit_lineage(
     case_runtime: CaseRuntime | None,
     task_root: Path,
     paper_thesis: dict[str, Any] | None = None,
+    policy_content_hashes: Mapping[str, str] | None = None,
 ) -> dict[str, dict[str, Any]]:
+    """Project live task/runtime inputs under one workflow's frozen policy.
+
+    Standalone callers read the current policy unless a snapshot is supplied.
+    Workflow finalizers supply their startup snapshot so source edits during a
+    running Writer cannot relabel its evidence with a policy it never used.
+    """
     architecture = _json(analysis_artifacts["scientific_architecture.json"]) if "scientific_architecture.json" in analysis_artifacts else {}
     scope = derive_foundation_scope(architecture, execution_plan)
     components = {str(item.get("id")): item for item in _objects(architecture.get("components"))}
@@ -343,7 +372,7 @@ def build_writer_unit_lineage(
     versions: dict[str, str] = {}
     graph = _runtime_dependency_graph(case_runtime, import_distributions=distribution_names, installed_versions=versions)
     observed_imports = _observed_imports_by_task(task_root.parent)
-    policy_hashes = writer_policy_content_hashes()
+    policy_hashes = dict(policy_content_hashes) if policy_content_hashes is not None else writer_policy_content_hashes()
     if paper_thesis is None and "paper_thesis.json" in analysis_artifacts:
         paper_thesis = _json(analysis_artifacts["paper_thesis.json"])
     result: dict[str, dict[str, Any]] = {}

@@ -226,17 +226,17 @@ def _is_private_source_path(
     frozen_paths: set[str],
     manifest: dict[str, Any],
 ) -> bool:
-    """Allow private modules without allowing import shadowing of frozen code."""
+    """Allow private modules/tests without import shadowing of frozen code."""
 
     if not isinstance(manifest.get("scope"), dict):
         return False
-    if not relative.startswith("src/") or not relative.endswith(".py"):
+    if not relative.startswith(("src/", "tests/")) or not relative.endswith(".py"):
         return False
     if relative in frozen_paths or relative in _TRUSTED_PROJECT_FILES:
         return False
     key = relative[:-12] if relative.endswith("/__init__.py") else relative[:-3]
     for frozen in frozen_paths | _TRUSTED_PROJECT_FILES:
-        if not frozen.startswith("src/") or not frozen.endswith(".py"):
+        if not frozen.startswith(("src/", "tests/")) or not frozen.endswith(".py"):
             continue
         frozen_key = frozen[:-12] if frozen.endswith("/__init__.py") else frozen[:-3]
         if key == frozen_key or frozen_key.startswith(key + "/"):

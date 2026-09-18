@@ -108,6 +108,45 @@ def test_backfill_revision_cache_survives_resume_bookkeeping(tmp_path):
     assert json.loads((output / "experiment_plan.json").read_text(encoding="utf-8"))["_meta"]["planning_complete"]
 
 
+def test_initial_plan_keeps_distinct_tasks_with_the_same_figure_anchor_on_resume(tmp_path):
+    from tests.test_pipeline import architecture_doc
+
+    claims = ["Fig.1(a,b)", "Fig.1(a,c,d)", "Tail claim beyond Fig.1"]
+    planned = task_doc(*(task(f"T{i + 1}", claim) for i, claim in enumerate(claims)))
+    for item, scope in zip(planned["repro_tasks"], ["N=2 errors", "N=3,6 refinement", "fixed-N tail limit"]):
+        item["target"] = scope
+    planned["backfill_handoff"] = {"ready_for_writer": True, "blocking_request_ids": [], "reason": "ready"}
+    planned["execution_relationships"] = [{
+        "relationship_id": "definitions", "kind": "shared_definition", "strength": "weak",
+        "task_ids": ["T1", "T2", "T3"], "producer_task_id": None,
+        "consumer_task_ids": [], "artifact_ids": [], "rationale": "shared numerical definitions",
+    }]
+    responses = [understanding_doc(fact_doc(*(fact("figure_claim", claim) for claim in claims))),
+                 {"tasks": planned, "scientific_architecture": architecture_doc(tmp_path, planned)}]
+
+    class Client:
+        def complete(self, prompt, **kwargs):
+            assert responses, "resume must reuse the accepted planner documents"
+            return json.dumps(responses.pop(0))
+
+    pipeline = ReviewPipeline(client=Client())
+    paper = tmp_path / "paper.md"
+    paper.write_text("# Results\nFig.1 compares different numerical regimes.", encoding="utf-8")
+    output = tmp_path / "case"
+    with patch("geng_agent.pipeline.run_mineru_layout_stage", return_value={"ok": True, "figure_index": {}}), \
+         patch("geng_agent.preflight.architecture_capability_inventory", return_value={}):
+        for _ in range(2):
+            pipeline.run(paper, output, analysis_only=True, analysis_backend="llm", analysis_fallback=False)
+            for filename in ("repro_tasks_preliminary.json", "repro_tasks.json"):
+                published = json.loads((output / filename).read_text(encoding="utf-8"))
+                assert [item["task_id"] for item in published["repro_tasks"]] == ["T1", "T2", "T3"]
+                assert [item["target"] for item in published["repro_tasks"]] == [item["target"] for item in planned["repro_tasks"]]
+                assert published["execution_relationships"] == planned["execution_relationships"]
+            execution = json.loads((output / "execution_plan.json").read_text(encoding="utf-8"))
+            assert execution["logical_task_count"] == 3
+    assert not responses
+
+
 @pytest.mark.parametrize("broken", ["missing", "syntax"])
 def test_combined_codex_repairs_one_document_in_same_workspace(tmp_path, broken):
     output = tmp_path / "case"
@@ -209,6 +248,35 @@ def test_coupled_planner_validates_actual_shared_dependencies(tmp_path):
     assert len(prompts) == 2
     assert "Shared scientific dependencies require an architecture" in prompts[1]
     assert {item["task_id"] for item in plan["scientific_architecture"]["bindings"]} == {"t1", "t2"}
+
+
+def test_combined_planner_explains_variant_binding_collision(tmp_path):
+    from geng_agent.consolidated_analysis import plan_document_issues
+    from tests.test_pipeline import architecture_doc
+
+    facts = fact_doc(fact("figure_claim", "Fig. 1"), fact("figure_claim", "Fig. 2"))
+    tasks = task_doc(task("t1", "Fig. 1"), task("t2", "Fig. 2"))
+    tasks["backfill_handoff"] = {"ready_for_writer": True, "blocking_request_ids": [], "reason": "ready"}
+    tasks["execution_relationships"] = [{
+        "relationship_id": "definitions", "kind": "shared_definition", "strength": "weak",
+        "task_ids": ["t1", "t2"], "producer_task_id": None,
+        "consumer_task_ids": [], "artifact_ids": [],
+    }]
+    architecture = architecture_doc(tmp_path, tasks)
+    alternate = deepcopy(architecture["bindings"][0])
+    alternate["overrides"] = {"snr_db": [1, 2, 3]}
+    architecture["bindings"].insert(1, alternate)
+    candidate = {"tasks": tasks, "scientific_architecture": architecture}
+    original = deepcopy(candidate)
+    issues = plan_document_issues(candidate, facts=facts, paper={}, figure_index={})
+    actionable = [issue for issue in issues if "renaming experiment_id cannot fix this" in issue.message]
+    assert len(actionable) == 1
+    assert actionable[0].path == "$.scientific_architecture.bindings"
+    assert "parameter_matrix" in actionable[0].message
+    assert "do not drop variants" in actionable[0].message
+    assert candidate == original  # The host diagnoses; the model owns consolidation.
+    prompt = (Path(__file__).parents[1] / "geng_agent/prompts/plan_experiments.md").read_text(encoding="utf-8")
+    assert "exactly one host experiment entry per task" in prompt
 
 
 def test_existing_editor_is_default_and_program_override_is_retired(tmp_path):

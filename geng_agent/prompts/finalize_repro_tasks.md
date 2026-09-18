@@ -14,7 +14,7 @@
 5. 累计 resolution 中完全 resolved 的请求应从 missing_fact_requests 删除，并将 matched_facts 加入 required_facts。
 6. `not_found_in_paper` 或 `ambiguous_or_conflicting` 字段不得伪装成论文事实。保留请求；已经能够给出合理工程默认值时可补 assumption，尚需结合代码和结果判断时直接交给 Writer，不要求在本阶段强行生成 sensitivity_check。
 7. formula_chain、parameter_matrix、baseline_definitions、statistical_protocol 和 validation_anchors 应按当前证据尽量完善；暂时未知可以保留 unresolved 或空数组，不要为了填满格式而发明内容。
-8. 同一张图的曲线、baseline、参数点和共享仿真结果继续合并为一个任务。
+8. 同一科学验收目标的曲线、baseline、参数点继续合并为一个任务；同图中的不同目标可以独立验收。共同公式、网格或可重算的确定性结果，不是合并任务或减少 Writer 数量的理由。
 9. 不输出任何运行前复现评级。Writer 后续仍以尽可能完整复现论文为目标。
 10. 最终 pass（round_index=final）输出每个任务的完整当前快照：同一公式、参数、baseline 或 assumption 只保留当前版本；已经被新证据推翻或取代的旧版本不再重复附上，历史由宿主 audit 保存。最终 pass 明确撤销的 execution_relationships 从完整列表删除；空数组表示当前没有这些关系。保持任务覆盖和稳定 task_id，不得省略仍需验收的实验。
 
@@ -24,9 +24,12 @@
 3. `kind` 只能按科学依赖选择 `same_run_outputs|checkpoint_flow|shared_pretraining|shared_random_realization|shared_dataset_partition|shared_definition|other`。不得根据特定论文、方法名、图号、绘图样式或为了减少 Writer 数量而创建关系。
 4. 只有定向产物流才使用 producer/consumer；`artifact_ids` 使用稳定逻辑 ID。`rationale` 说明独立执行的科学后果或为何 Foundation 共享已足够。
 5. 不存在跨任务科学依赖时输出空数组；不得为了结构完整性发明关系。
+6. 各任务默认独立 Writer；strong 连通任务会合并为一个 Writer，weak 保留并发。相同公式、确定性系数、网格、参考实现、方法集和指标定义应通过 weak + Foundation 保持一致，不能仅因复用确定性计算而声明 same_run_outputs。已有关系确实不再成立时按刷新规则显式修订并解释，宿主不根据措辞自动降级。
+7. strong 的 rationale 必须说明需要相同的实际状态或联合观测及其科学依据，解释同一冻结代码为何仍不足。保留精确检查点、成对随机样本、实际数据划分等真实依赖；仅有相同训练方法、分布或划分规则不自动构成 strong。未解决的必要状态缺口不得以并发为由隐去。
 
 科学验收契约刷新规则：
 1. 每个任务输出一个完整的 scientific_acceptance 快照（contract_version=`1.0`），不要把同一权威拆成第二份漂移的验收文件。
+   快照只覆盖该任务明确的复现目标及必要科学条件，与 target、figure_or_claim 保持一致。引用同一图号不自动纳入该图全部主张；范围外发现不决定本任务终态或重跑。目标内的算法与测量真实性仍由 Reporter 独立核验。
 2. paper_thesis_json 为空对象时是中间回补刷新：保留现有 claim_id/target_id/gap_id，只用新证据完善内容。它包含真实 thesis 时是论文主旨后的最终 Task Designer pass：用论文主旨、最终事实和全文上下文锁定下游共享的最小科学结论。
 3. paper_thesis_json 是证据，不是独立判定权威；最终写入 task.scientific_acceptance 的快照才是 Architecture、Writer 和 Reporter 的共同任务契约。
 4. core_conclusions 只包含排序、趋势、交点、阈值、缩放、增益/损失、机制或明确绝对量级等科学结论。像素、颜色、字体、线宽、marker、排版和绘图风格不得成为核心结论。

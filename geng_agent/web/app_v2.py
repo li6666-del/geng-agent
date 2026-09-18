@@ -29,7 +29,8 @@ from .artifacts import (
     preview_artifact,
 )
 from .db import SessionLocal, get_session, init_database
-from .events import event_cursor, events_after
+from .events import event_cursor, events_after, serialize_event
+from .case_view import case_research_view
 from .importer import UnsafePdfUrl, download_pdf
 from .models import ArtifactRecord, CaseRecord, ExportRecord, JobEvent, JobRecord
 from .settings import settings
@@ -246,6 +247,7 @@ def health(session: Session = Depends(get_session)) -> dict[str, Any]:
         "queue_depth": queue_depth,
         "cases_root": str(settings.cases_root),
         "url_import_enabled": settings.enable_url_import,
+        "max_pdf_bytes": settings.max_pdf_bytes,
     }
 
 
@@ -363,6 +365,9 @@ def get_case(case_id: str, session: Session = Depends(get_session)) -> dict[str,
     case = _authorized_case(session, case_id)
     job = _latest_job(session, case.id)
     artifacts = session.scalars(select(ArtifactRecord).where(ArtifactRecord.case_id == case.id)).all()
+    recent_events = [] if job is None else session.scalars(
+        select(JobEvent).where(JobEvent.job_id == job.id).order_by(JobEvent.id.desc()).limit(40)
+    ).all()
     return {
         "id": case.id,
         "display_name": case.display_name,
@@ -371,6 +376,8 @@ def get_case(case_id: str, session: Session = Depends(get_session)) -> dict[str,
         "job": _job_body(job),
         "phases": _phase_states(session, case.id, job),
         "artifacts": [_artifact_body(item) for item in artifacts],
+        "research": case_research_view(Path(case.directory)),
+        "recent_events": [serialize_event(item) for item in reversed(recent_events)],
     }
 
 

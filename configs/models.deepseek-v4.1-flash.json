@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "default": "deepseek_v41_flash",
+  "profiles": {
+    "deepseek_v41_flash": {
+      "provider": "deepseek",
+      "model": "deepseek-flash",
+      "base_url": "https://api.deepseek.com",
+      "env_key": "DEEPSEEK_API_KEY",
+      "wire_api": "responses",
+      "reasoning_effort": "max",
+      "supported_reasoning_efforts": ["low", "high", "max"],
+      "supports_images": true,
+      "supports_tools": true,
+      "supports_json_schema": false,
+      "model_catalog_json": "deepseek-models.json",
+      "web_search": "disabled"
+    }
+  }
+}

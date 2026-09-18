@@ -46,6 +46,29 @@ export interface CaseSummary {
 export interface CaseDetail extends CaseSummary {
   phases: Phase[];
   artifacts: Artifact[];
+  research: ResearchView;
+  recent_events: EventPayload[];
+}
+
+export interface ResearchTask {
+  task_id: string;
+  title: string;
+  target: string | null;
+  outcome: string | null;
+  engineering_status: string | null;
+  decision_reason: string | null;
+  remaining_uncertainties: string[];
+  host_action: string | null;
+}
+
+export interface ResearchView {
+  tasks: ResearchTask[];
+  verification_available: boolean;
+  all_terminal: boolean | null;
+  all_successful: boolean | null;
+  editor_ok: boolean | null;
+  editor_mode: string | null;
+  warnings: string[];
 }
 
 export interface EventPayload {

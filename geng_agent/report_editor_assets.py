@@ -88,7 +88,7 @@ def _build_task_packets(
                     "task_id", "outcome", "host_action", "run_valid",
                     "decision_reason", "decision_authority", "engineering_status", "engineering_issues", "asset_notes", "report_title", "report_explanation", "core_conclusions", "key_numeric_comparisons",
                     "comparison_summary", "differences", "non_material_differences", "evidence_files", "confidence",
-                    "verified_facts", "provenance_base") if key in verification},
+                    "verified_facts", "additional_observations", "provenance_base") if key in verification},
                 "terminal_outcome": terminal_outcome,
                 "asset_manifest": (record.get("task_reporter") or {}).get("asset_manifest", []),
                 "local_assets": _editor_asset_paths(task_id, verification.get("local_assets")),
@@ -135,6 +135,13 @@ def _host_report_execution(record: dict[str, Any], verification: dict[str, Any])
         "valid_count_scope": "latest execution and artifact validity only (0 or 1; unknown is null); scientific support is given only by the task outcome",
         "latest_run_id": latest.get("run_id") if receipts else None,
         "latest_returncode": latest.get("returncode") if receipts else None,
+        "runs": [{"run_id": run_id, "mode": receipt.get("mode"),
+                  "config": receipt.get("config"), "returncode": receipt.get("returncode"),
+                  "duration_s": (round(receipt["finished_at"] - receipt["started_at"], 3)
+                      if isinstance(receipt.get("finished_at"), (int, float))
+                      and isinstance(receipt.get("started_at"), (int, float)) else None),
+                  "environment_hash": receipt.get("environment_hash")}
+                 for run_id, receipt in sorted(receipts.items())],
         "unavailable_reason": "" if receipts else "No host-observed execution receipt supplied; Writer counts are unverified",
     }
 
@@ -203,11 +210,19 @@ def _accepted_asset_inventory(root: Path, task_packets: list[dict[str, Any]]) ->
     inventory: list[dict[str, Any]] = []
     for relative, source in _accepted_asset_sources(root, task_packets):
         stat = source.stat()
+        dimensions: dict[str, int] = {}
+        try:
+            from PIL import Image
+            with Image.open(source) as picture:
+                dimensions = {"width_px": picture.width, "height_px": picture.height}
+        except (OSError, ValueError, Image.DecompressionBombError):
+            pass  # Existing asset handling reports unreadable images; layout metadata is optional.
         inventory.append(
             {
                 "path": relative.as_posix(),
                 "size": stat.st_size,
                 "sha256": _sha256_file(source),
+                **dimensions,
             }
         )
     return inventory

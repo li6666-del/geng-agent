@@ -597,6 +597,124 @@ class ReconcileRequirementsTests(unittest.TestCase):
             issues = validate_requirements(root, runtime_lock=lock)
         self.assertIn("dependency_lock_constraint_mismatch", {item["category"] for item in issues})
 
+    def test_writer_can_pin_versions_already_verified_by_unversioned_case_lock(self) -> None:
+        records = [
+            {
+                "requirement": package,
+                "distribution": package,
+                "import_names": [package],
+                "applicable": True,
+                "installed_version": version,
+                "version_satisfied": True,
+                "imports_ok": True,
+                "satisfied": True,
+            }
+            for package, version in (("numpy", "2.5.3"), ("scipy", "1.18.1"))
+        ]
+        with TemporaryDirectory() as tmp:
+            root = self._project(
+                tmp,
+                requirements="numpy==2.5.3\nscipy==1.18.1\n",
+                sim_source="import numpy\nimport scipy\n",
+            )
+            # Availability comes from the selected runtime lock, not this process.
+            with patch("geng_agent.security.importlib.util.find_spec", return_value=None):
+                self.assertEqual(validate_requirements(root, runtime_lock=trusted_lock(records)), [])
+
+    def test_case_lock_compatibility_uses_installed_version(self) -> None:
+        samples = (
+            ("custom-runtime==1.2", "custom-runtime>=1,<2", "1.2", True),
+            ("custom-runtime>=1,<3", "custom-runtime~=1.2", "1.2.4", True),
+            ("custom-runtime", "custom-runtime==1.2", "1.2+local", True),
+            ("custom-runtime", "custom-runtime==2.0rc1", "2.0rc1", True),
+            ("custom-runtime", "custom-runtime!=1.2", "1.2", False),
+            ("custom-runtime", "custom-runtime>=2", "1.2", False),
+            ("custom-runtime", "custom-runtime<2", "2.0rc1", False),
+            # A contradictory lock cannot prove compatibility even if flags say ready.
+            ("custom-runtime>=2", "custom-runtime>=1", "1.2", False),
+        )
+        for locked, declared, installed, accepted in samples:
+            with self.subTest(locked=locked, declared=declared, installed=installed), TemporaryDirectory() as tmp:
+                root = self._project(tmp, requirements=declared + "\n", sim_source="")
+                lock = trusted_lock([{
+                    "requirement": locked,
+                    "distribution": "custom-runtime",
+                    "applicable": True,
+                    "installed_version": installed,
+                    "version_satisfied": True,
+                    "imports_ok": True,
+                    "satisfied": True,
+                }])
+                issues = validate_requirements(root, runtime_lock=lock)
+                self.assertEqual(not issues, accepted, issues)
+
+    def test_version_compatibility_does_not_expand_extras_markers_or_sources(self) -> None:
+        samples = (
+            ("custom-runtime", "custom-runtime[extra]==1.2"),
+            ("custom-runtime[extra]", "custom-runtime==1.2"),
+            ('custom-runtime; python_version >= "3.10"', "custom-runtime==1.2"),
+            ("custom-runtime", 'custom-runtime==1.2; python_version >= "3.10"'),
+            ("custom-runtime @ https://example.invalid/pkg.whl", "custom-runtime==1.2"),
+            ("custom-runtime", "custom-runtime @ https://example.invalid/pkg.whl"),
+            ("different-package", "custom-runtime==1.2"),
+        )
+        for locked, declared in samples:
+            with self.subTest(locked=locked, declared=declared), TemporaryDirectory() as tmp:
+                root = self._project(tmp, requirements=declared + "\n", sim_source="")
+                lock = trusted_lock([{
+                    "requirement": locked,
+                    "distribution": "custom-runtime",
+                    "applicable": True,
+                    "installed_version": "1.2",
+                    "version_satisfied": True,
+                    "imports_ok": True,
+                    "satisfied": True,
+                }])
+                self.assertTrue(validate_requirements(root, runtime_lock=lock))
+
+    def test_compatible_pin_still_requires_ready_trusted_version_evidence(self) -> None:
+        changes = (
+            {"installed_version": None},
+            {"installed_version": "not-a-version"},
+            {"version_satisfied": False},
+            {"imports_ok": False},
+            {"satisfied": False},
+            {"applicable": False},
+        )
+        with TemporaryDirectory() as tmp:
+            root = self._project(tmp, requirements="custom-runtime==1.2\n", sim_source="")
+            ready = {
+                "requirement": "custom-runtime",
+                "distribution": "custom-runtime",
+                "applicable": True,
+                "installed_version": "1.2",
+                "version_satisfied": True,
+                "imports_ok": True,
+                "satisfied": True,
+            }
+            for change in changes:
+                with self.subTest(change=change):
+                    self.assertTrue(validate_requirements(root, runtime_lock=trusted_lock([{**ready, **change}])))
+            self.assertTrue(validate_requirements(root, runtime_lock=trusted_lock([])))
+            untrusted = trusted_lock([ready])
+            untrusted["source_policy"]["trusted"] = False
+            self.assertIn(
+                "runtime_lock_untrusted_or_malformed",
+                {item["category"] for item in validate_requirements(root, runtime_lock=untrusted)},
+            )
+
+    def test_unchanged_nonapplicable_requirement_needs_no_installed_version(self) -> None:
+        requirement = 'custom-runtime>=1; python_version < "2"'
+        lock = trusted_lock([{
+            "requirement": requirement,
+            "distribution": "custom-runtime",
+            "applicable": False,
+            "installed_version": None,
+        }])
+        with TemporaryDirectory() as tmp:
+            root = self._project(tmp, requirements=requirement + "\n", sim_source="")
+            self.assertEqual(validate_requirements(root, runtime_lock=lock), [])
+
     def test_rejects_untrusted_requirement_sources_and_installer_options(self) -> None:
         samples = (
             "--extra-index-url https://evil.invalid/simple",

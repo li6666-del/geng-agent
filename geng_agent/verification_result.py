@@ -82,7 +82,7 @@ def _scientific_acceptance(task: dict[str, Any] | None) -> dict[str, Any]:
 
 def _normalize_core_conclusions(raw: dict[str, Any], task: dict[str, Any] | None,
                                 evidence_workspace: Path | None = None) -> list[dict[str, Any]]:
-    """Preserve the Reporter's assessments, including independent findings."""
+    """Preserve the Reporter's in-scope assessments without semantic reclassification."""
     del task
     items = raw.get("core_conclusions")
     result = []
@@ -101,7 +101,7 @@ def _normalize_numeric_item(target: dict[str, Any], candidate: dict[str, Any], *
                             target_id: str, workspace: Path | None) -> dict[str, Any]:
     # Text, units, signs, scale and comparability are Reporter decisions. Arithmetic
     # is diagnostic only and never changes the decision or authorizes another run.
-    fields = {"name", "metric", "unit", "regime", "paper_magnitude", "local_magnitude", "comparison_status",
+    fields = {"name", "metric", "unit", "regime", "goal_relation", "paper_magnitude", "local_magnitude", "comparison_status",
               "comparison_reason", "local_metric", "local_unit", "local_regime", "unavailable_reason", "basis_review"}
     result = {key: value for key, value in {**target, **candidate}.items() if key in fields}
     result["target_id"] = target_id
@@ -287,6 +287,8 @@ def normalize_task_verification(result: Any, expected_task_id: str, *,
         "rerun_reason": rerun_reason if action == "rerun_writer" else "none",
         "run_valid": False if run_valid_hint is False else raw.get("run_valid") if isinstance(raw.get("run_valid"), bool) else None,
         "core_conclusions": core, "key_numeric_comparisons": numeric,
+        "additional_observations": [dict(item) for item in raw.get("additional_observations", []) if isinstance(item, dict)]
+            if isinstance(raw.get("additional_observations"), list) else [],
         "max_key_numeric_ratio": max(ratios) if ratios else None,
         "comparison_summary": str(raw.get("comparison_summary") or ""),
         "report_explanation": str(raw.get("report_explanation") or ""),
@@ -334,9 +336,9 @@ def writer_delivery_issues(
     if not str(result.get("summary") or "").strip():
         issues.append("writer summary is empty")
     execution = result.get("execution_summary")
-    if not isinstance(execution, dict):
-        issues.append("execution_summary is missing")
-    else:
+    # New handoffs reference host receipts instead of transcribing counters.
+    # Keep old self-reports readable, but their absence is not missing execution.
+    if isinstance(execution, dict):
         try:
             full_run_count = int(execution.get("full_run_count") or 0)
         except (TypeError, ValueError):
@@ -419,6 +421,7 @@ def aggregate_task_verifications(task_results: list[dict[str, Any]]) -> dict[str
         "run_valid",
         "core_conclusions",
         "key_numeric_comparisons",
+        "additional_observations",
         "max_key_numeric_ratio",
         "comparison_summary",
         "report_explanation",
@@ -429,10 +432,12 @@ def aggregate_task_verifications(task_results: list[dict[str, Any]]) -> dict[str
         "feedback",
         "confidence",
         "remaining_uncertainties",
+        "provenance_base",
     )
+    defaults = {"additional_observations": [], "provenance_base": ""}
     for result in task_results:
         if isinstance(result, dict):
-            tasks.append({key: result.get(key) for key in keys})
+            tasks.append({key: result.get(key, defaults.get(key)) for key in keys})
     outcome_counts: dict[str, int] = {}
     for item in tasks:
         outcome = effective_task_outcome(item)

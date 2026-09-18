@@ -35,6 +35,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="一个或多个 case 输出目录；相对名称从统一 case 根目录解析。",
     )
     benchmark.add_argument("--out", type=Path, required=True, help="benchmark JSON/Markdown 输出目录。")
+    models = subparsers.add_parser("models", help="离线检查并显示全项目共用的模型配置，不调用模型。")
+    models.add_argument("--config", type=Path, default=None, help="模型配置 JSON；省略时读取 GENG_MODEL_CONFIG 或兼容默认值。")
     return parser
 
 
@@ -48,7 +50,8 @@ def _add_common_review_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--api-key", default=None, help="OpenAI 兼容 API key。")
     parser.add_argument("--base-url", default=None, help="OpenAI 兼容 API base URL。")
-    parser.add_argument("--model", default=None, help="模型名。")
+    parser.add_argument("--model", default=None, help="旧 LLM 分析接口的模型名；Codex 全流程使用 --model-config。")
+    parser.add_argument("--model-config", type=Path, default=None, help="Codex 全流程共用的模型配置 JSON，所有智能体使用同一模型与推理强度。")
     parser.add_argument("--max-pages", type=int, default=None, help="PDF 最多读取页数。")
     parser.add_argument("--temperature", type=float, default=0.1, help="LLM 采样温度，默认 0.1。")
     parser.add_argument("--timeout", type=float, default=120.0, help="单次 LLM 请求超时时间，单位秒。")
@@ -85,6 +88,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    if args.command == "models":
+        import json
+        from .model_config import load_model_config
+        try:
+            configs = load_model_config(args.config)
+        except ValueError as exc:
+            parser.error(str(exc))
+        print(json.dumps(configs.identity(),
+                         ensure_ascii=False, indent=2))
+        return 0
+
     if args.command == "doctor":
         from .preflight import check_environment, format_report
 
@@ -116,6 +130,7 @@ def main(argv: list[str] | None = None) -> int:
             analysis_backend=args.analysis_backend,
             analysis_only=args.analysis_only,
             progress=ConsoleProgressReporter(),
+            model_config_path=args.model_config,
         )
         if args.analysis_only:
             print(f"前两阶段完成：{result.output_dir}")

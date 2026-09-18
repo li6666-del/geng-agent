@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+from functools import wraps
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .outputs import write_json
 from .pipeline_context import PipelineRunContext
@@ -15,6 +16,20 @@ from .risk_report import (
 from .workflow_policy import _shared_foundation_is_material
 
 
+def _observe_agent_activity(
+    flow: Callable[[PipelineRunContext, AnalysisFlowResult], ExecutionFlowResult],
+) -> Callable[[PipelineRunContext, AnalysisFlowResult], ExecutionFlowResult]:
+    @wraps(flow)
+    def run(context: PipelineRunContext, analysis: AnalysisFlowResult) -> ExecutionFlowResult:
+        from .agent_activity import agent_activity_scope
+
+        with agent_activity_scope(context.audit_dir, context.progress_tracker.reporter):
+            return flow(context, analysis)
+
+    return run
+
+
+@_observe_agent_activity
 def run_execution_flow(
     context: PipelineRunContext,
     analysis: AnalysisFlowResult,

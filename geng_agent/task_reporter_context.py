@@ -32,12 +32,12 @@ from .report_language import CHINESE_REPORT_RULES
 
 
 TASK_VERIFICATION_FILE = "task_verification_result.json"
-TASK_REPORTER_PROMPT_VERSION = "isolated_task_reporter_v13_chinese_reports"
+TASK_REPORTER_PROMPT_VERSION = "isolated_task_reporter_v15_task_goal_scope"
 REPORTER_CONVERGENCE_POLICY = """## Convergence and materiality
 - Enforce paper-explicit scientific facts. Accept reasonable, disclosed choices where the paper is silent.
 - `host_execution.unobserved_artifacts` lists files added or changed after the observed run. They may illustrate the report, but cannot alone establish scientific support; inspect the observed measurements and implementation.
 - Decide numerical materiality from the claim, metric scale and statistical uncertainty, and explain your reasoning. There is no universal factor-of-10 acceptance rule. Separate missing paper information from unavailable execution or review evidence.
-- Recommend another Writer run only for `invalid_run`, `core_conclusion_failed`, or `material_numeric_discrepancy`, and only with paper evidence plus a concrete causal code/config change and predicted effect.
+- Recommend another Writer run only for `invalid_run`, `core_conclusion_failed`, or `material_numeric_discrepancy` affecting the assigned task goals, and only with paper evidence plus a concrete causal code/config change and predicted effect. Out-of-scope observations never justify a rerun.
 - Do not speculate. Unsupported but faithfully implemented results without a justified next change are reportable `not_reproduced`; unavailable decisive information is reportable `inconclusive_missing_information`.
 - Separate population or mechanism claims from the appearance of one illustrative realization. If its exact geometry, random state, or data sample is unavailable, a different peak location or envelope alone does not refute the mechanism. Explain that limitation; never request geometry/seed selection or coordinate relabeling to imitate the example. Preserve strict peak/threshold/accuracy/trend checks when the paper actually claims them.
 """
@@ -48,7 +48,7 @@ def _canonicalize_reporter_paper_evidence(workspace: Path) -> None:
     root = workspace / "paper_evidence"
     index_path = root / "index.json"
     index = _read_json_object(index_path)
-    index["policy"] = ["Reporter evidence: original paper is authoritative; task input is navigation only."]
+    index["policy"] = ["Assigned task goals define acceptance scope; the original paper defines the scientific facts and conditions within that scope."]
     index.pop("analysis_artifacts", None)
     for entry in index.get("tasks", []):
         evidence_path = workspace / entry["task_evidence_json"]
@@ -143,10 +143,14 @@ def _prepare_task_reporter_input(
         input_warnings.append("assigned writer source snapshot is missing")
     input_warnings.extend(source_warnings)
     writer_account_path = inputs_dir / "writer_account.json"
+    writer_result = dict(task_record.get("result_json") or {})
+    # Legacy records occasionally stored this only beside result_json. Preserve
+    # it once as a Writer claim; host_execution remains the observed authority.
+    if "execution_summary" not in writer_result and task_record.get("execution_summary"):
+        writer_result["execution_summary"] = task_record["execution_summary"]
     writer_account_path.write_text(json.dumps({
         "source": "Writer self-report; not an independent scientific decision",
-        "writer_result": task_record.get("result_json") or {},
-        "execution_summary": task_record.get("execution_summary") or {},
+        "writer_result": writer_result,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     return {
         "instructions": (
@@ -211,20 +215,21 @@ Verify exactly one reproduction task: `{task_id}`. The paper is the scientific a
 - Inspect the copied Writer source statically; do not execute it, edit it, install packages, or access the network.
 - Read `inputs/task_report_input.json`, Writer outputs/source, and the paper evidence. {page_policy}
 - Judge the scientific conclusion, not pixel alignment or private implementation identity.
-- The small `task.scientific_acceptance` object is a navigation aid. Use its IDs when available. If an ID or optional field is missing, recover the intended claim from the task and paper and record uncertainty; never reject merely for missing structure.
-- Report independently discovered method, mechanism, ordering, or other core failures even when the Designer omitted them. Give each additional observation a stable descriptive `claim_id`, explain its scientific consequence, and cite the paper and local evidence. A missing Designer ID must not erase contradictory evidence. Generic completion prose and host fallback text are not supporting scientific observations.
+- Establish acceptance scope from the assigned task goals, target conditions and `task.scientific_acceptance`. The small acceptance object is a navigation aid within those goals. Use its IDs when available. If an ID or optional field is missing, recover the intended goal from the task and paper and record uncertainty; never reject merely for missing structure. If the goal itself is ambiguous, explain the unresolved interpretation rather than expanding it to the whole figure or paper.
+- Keep `core_conclusions` and `key_numeric_comparisons` limited to the assigned goals and conditions necessary to test them faithfully. Report independently discovered implementation, method or other failures affecting those goals even when the Designer omitted them: use a stable descriptive ID, explain the connection in `goal_relation`, and cite the paper and local evidence. A missing Designer ID must not erase a goal-relevant failure. Generic completion prose and host fallback text are not supporting scientific observations.
+- Put findings outside the assigned goals in `additional_observations`, with evidence and a `scope_reason`. They do not change `outcome`, `run_valid`, or `host_action`, and cannot justify a Writer rerun. For example, when assigned goals concern accuracy versus term count and broad-interval performance, a separate local ordering claim in the same figure is not automatically an acceptance target. Conversely, an incorrect formula that corrupts those assigned measurements is in scope.
 - First trace the paper-defined observable, priors, metric and comparison conditions through the copied source to the recorded measurements. Then read `inputs/writer_account.json` to check the Writer's explanation against that trace. Disclosure does not make a transformation faithful: inspect whether it changes the scientific quantity or selects observations on the conclusion being tested.
 - Task facts and paper excerpts have one canonical copy. Follow their referenced paths when more context is needed; a file that exists but was not read is not evidence you inspected.
 
 ## Scientific decision
-Trace paper-explicit equations, models, algorithms, baselines, parameters, and metric definitions into the implementation. Then compare the full result with each core conclusion. Classify each conclusion as:
+Trace paper-explicit equations, models, algorithms, baselines, parameters, and metric definitions needed for the assigned goals into the implementation. Then compare the full result with each in-scope core conclusion. Classify each conclusion as:
 - `supported`;
 - `unsupported`; or
 - `unassessable_missing_information` when the paper or available evidence is insufficient.
 
 For each usable Task-Designer numeric target, report the observed local magnitude in the same metric, unit and regime; use null when unavailable. You decide comparison_status and explain comparison_reason, including equivalent expressions and conversions. The host may compute diagnostic ratios but cannot decide comparability or materiality. Do not force a comparison across incompatible dimensions or invent a value to complete the example.
 
-Designer criteria and numeric anchors are provisional. If a criterion is not a paper claim, use `status: not_applicable` and an optional `basis_review` with `status: not_applicable`, a concrete `reason`, and `paper_evidence_files` pointing to copied original source/pages. An unresolved interpretation uses `basis_review.status: disputed` and remains inconclusive. For a numeric anchor explicitly corrected by the paper, use `basis_review.status: corrected`, `corrected_paper_magnitude`, and the corrected `metric`, `unit`, `regime`. Include `local_metric`, `local_unit`, `local_regime` when needed to expose incompatibility. Writer prose and Designer navigation JSON cannot authorize a basis change. Keep independently observed method failures as separate unsupported observations; a disputed target never erases them.
+Designer criteria and numeric anchors are provisional. If a criterion is not a paper claim, use `status: not_applicable` and an optional `basis_review` with `status: not_applicable`, a concrete `reason`, and `paper_evidence_files` pointing to copied original source/pages. An unresolved interpretation uses `basis_review.status: disputed` and remains inconclusive. For a numeric anchor explicitly corrected by the paper, use `basis_review.status: corrected`, `corrected_paper_magnitude`, and the corrected `metric`, `unit`, `regime`. Include `local_metric`, `local_unit`, `local_regime` when needed to expose incompatibility. Writer prose and Designer navigation JSON cannot authorize a basis change. Correct the scientific basis within the assigned goals; do not replace or expand those goals. Keep independently observed goal-relevant method failures as separate unsupported core observations; a disputed target never erases them.
 
 {REPORTER_CONVERGENCE_POLICY}
 
@@ -233,14 +238,14 @@ Designer criteria and numeric anchors are provisional. If a criterion is not a p
 ## Output
 {CHINESE_REPORT_RULES}
 
-Include `report_explanation` as a short plain-text Chinese explanation for the final report, using only the evidence already independently verified in this review. Explain the tested claim, actual method and conditions, observations supporting the decision, and limitations. Do not run another experiment or repeat the review just to improve prose. Do not embed images or HTML in this text. The field is optional for older records.
+Write the scientific decision once: `decision_reason` explains the verdict, and the per-claim observations and numeric comparisons carry its evidence. Do not additionally write `comparison_summary`, `report_explanation`, or a Markdown report. The final Editor writes reader-facing prose. Refer to a claim/target ID rather than repeating its whole observation in differences or feedback; include additional differences and unresolved limitations without dropping them. Keep verified facts and their original evidence. Missing legacy prose fields never justify another experiment or review.
 
 Write `{TASK_VERIFICATION_FILE}` as one JSON object. Submit an explicit scientific decision and routing instruction. Missing decision fields cause a Reporter-only handoff repair, never a Writer rerun:
 ```json
 {{
   "schema_version": "3.0",
   "outcome": "reproduced|reproduced_with_assumptions|not_reproduced|inconclusive_missing_information|execution_failed",
-  "decision_reason": "中文直接判决理由：对应所引证据，并单独说明不确定性",
+  "decision_reason": "中文说明针对哪些任务目标作出判决、依据与不确定性；范围外发现不改变任务结论",
   "host_action": "complete|rerun_writer",
   "task_id": "{task_id}",
   "run_valid": null,
@@ -261,10 +266,9 @@ Write `{TASK_VERIFICATION_FILE}` as one JSON object. Submit an explicit scientif
       "unavailable_reason": ""
     }}
   ],
+  "additional_observations": [],
   "rerun_evidence": null,
-  "comparison_summary": "中文论文与本地结果对比结论",
   "report_title": "简短中文任务标题，可保留 BER、SNR 等术语及图号",
-  "report_explanation": "面向读者的简短中文解释：本任务验证什么，已核实的方法与条件，测量如何支持判决，以及假设与限制",
   "differences": ["用中文说明重大科学差异"],
   "non_material_differences": ["用中文说明非重大差异及其科学理由"],
   "evidence_files": ["existing relative evidence path"],
@@ -288,6 +292,8 @@ Only when another Writer run has a concrete scientific basis, replace `rerun_evi
 }}
 ```
 All five evidence parts are needed to spend another full run. If the result is unsupported but no evidence-based causal change exists, leave `rerun_evidence` null: the correct terminal result is `not_reproduced`. If missing paper information prevents assessment, leave it null and use `unassessable_missing_information`.
+
+For out-of-scope findings, optionally fill `additional_observations` with objects containing `observation_id`, `observation`, `scope_reason`, and existing `evidence_files`. Keep them out of the verdict and rerun evidence. Absence of such findings requires no extra review or experiment. Do not duplicate in-scope failures here or reclassify a goal-relevant algorithm defect merely to obtain a pass.
 
 For report writing, optionally add `verified_facts`: a short list of objects with
 `category` (implementation, parameter, assumption, or measurement), `text`,

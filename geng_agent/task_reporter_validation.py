@@ -161,6 +161,20 @@ def normalize_reporter_observation_evidence(
             continue
         verified_facts.append({key: fact[key] for key in ("category", "text", "source", "evidence_files") if key in fact})
     document["verified_facts"] = verified_facts
+    # Out-of-scope findings remain visible, but their missing evidence cannot
+    # invalidate the assigned task or authorize another scientific execution.
+    additional = document.get("additional_observations")
+    for item in additional if isinstance(additional, list) else []:
+        if not isinstance(item, dict):
+            continue
+        paths = item.get("evidence_files")
+        item["evidence_files_available"] = bool(
+            isinstance(paths, list) and paths
+            and all(_verified_reporter_evidence_path(path, workspace) is not None for path in paths)
+        )
+        if not item["evidence_files_available"]:
+            warnings.append("Out-of-scope observation has unavailable evidence: "
+                            + str(item.get("observation_id") or "unnamed observation"))
     if isinstance(rerun, dict):
         affected = rerun.get("contract_item_ids")
         if isinstance(affected, list) and missing_local_ids.intersection(map(str, affected)):

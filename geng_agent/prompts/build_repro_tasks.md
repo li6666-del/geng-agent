@@ -9,9 +9,9 @@
 4. 输出必须是 JSON object，不要 Markdown，不要解释文字。
 
 任务合并原则：
-1. 同一张图中的多条曲线、多个 baseline、多个参数点或可由同一次仿真共同生成的子结果，优先合并为一个复现任务。
-2. 只有当同一张图的子图使用完全不同的模型、数据、指标或运行环境，无法共享代码和运行结果时，才拆成多个任务。
-3. 每个 figure/subfigure + metric 只能有一个主任务；设计完成前先做语义去重，不得用不同 task_id 重复描述同一实验。
+1. 服务同一个科学验收目标的多条曲线、多个 baseline、多个参数点，优先合并为一个复现任务。
+2. 同一图中的精度、区间排序、渐近性质等不同科学目标可以保留为独立任务；能共享确定性代码或重算结果，不等于必须合并。任务边界围绕验收目标，不围绕减少 Writer 数量。
+3. 设计完成前先对科学目标及适用条件做语义去重，不得用不同 task_id 重复描述同一实验目标；共同引用同一 figure/subfigure + metric 不是重复任务的充分依据。
 4. 任务应尽量输出一套共享 CSV/summary 和该图所需的全部曲线，而不是为每条曲线分别启动 writer。
 5. 不得预测任务最终能否复现，也不得输出任何运行前评级。任务阶段只记录已知证据、缺口、假设和执行目标。
 
@@ -22,6 +22,8 @@
 4. `kind` 按真实依赖选择：`same_run_outputs|checkpoint_flow|shared_pretraining|shared_random_realization|shared_dataset_partition|shared_definition|other`。不要根据论文名称、领域关键词或图号做特判。
 5. 每个关系至少包含两个稳定 task_id。只有定向产物流才填 `producer_task_id`/`consumer_task_ids`；`artifact_ids` 写稳定的逻辑产物 ID，不写临时路径。
 6. `rationale` 必须说明分开执行会造成的科学后果，或为何仅共享定义就足够。没有证据支持的关系不要输出，允许 `execution_relationships=[]`。
+7. 不同科学任务默认交给独立 Writer；宿主把所有 strong 连通任务合并到一个 Writer，weak 不合并。相同公式、确定性系数、固定网格、参考实现、方法集合或排序定义通常应通过 weak + Foundation 保持一致，不能仅为复用 CSV 或省去确定性重算而声明 same_run_outputs。仅共享定义时不填 producer/consumer。
+8. 每条 strong 的 rationale 应指出必须相同的实际状态或联合观测、论文/实验依据，以及为什么独立调用同一冻结实现仍会破坏科学结论。相同随机分布、训练方法或划分规则不等于必须相同的随机样本、检查点或实际划分；但真实的成对样本、训练产物和状态传递必须保留。无法确认必要状态时保留信息缺口，不得为了并发自动降级。
 
 事实请求原则：
 1. 仅为会改变算法实现、公式、配置、baseline、数据输入、坐标尺度或验收结论的缺口创建请求。
@@ -40,6 +42,7 @@
 
 科学验收契约原则：
 1. `scientific_acceptance` 是 Task Designer、Architecture、Writer 和 Reporter 共享的最小科学语义，`contract_version` 固定为 `1.0`。
+   验收只围绕本任务的复现目标及其必要科学条件；在 target、figure_or_claim 中写清目标和适用范围，引用图号不等于承担整张图的全部主张。范围外发现另列，不改变该任务结论或触发重跑；影响本任务目标的算法错误仍必须核验。
 2. core_conclusions 只写论文核心科学结论，使用在本任务内稳定且唯一的 claim_id；kind 取 `ordering|trend|crossing|threshold|scaling|gain_loss|mechanism|absolute_level|other`。
 3. 像素、颜色、字体、线宽、marker、排版和绘图风格不得成为 core_conclusion。论文若明确要求适用于当前指标和实验条件的数值精度，必须把该精度本身写成 core_conclusion。
 4. key_numeric_targets 只列会实质影响论文结论的关键量级；paper_magnitude 无法可靠取得时写 null 且 evidence_quality=`unavailable`，不要猜数。

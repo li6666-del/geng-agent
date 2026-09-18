@@ -63,7 +63,7 @@ def validate_requirements(
                 "line": str(line_no),
                 "category": "dependency_lock_constraint_mismatch",
                 "package": package,
-                "message": f"declared requirement is not exactly represented by the case lock: {line}",
+                "message": f"declared requirement is not satisfied by a compatible case lock entry: {line}",
             })
             continue
         category, available = _runtime_dependency_state(

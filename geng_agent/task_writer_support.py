@@ -146,7 +146,7 @@ def _write_paper_evidence_bundle(
                 "Use this task evidence only as a navigation aid; it is not an information boundary and may omit relevant evidence.",
                 "If a needed parameter is missing from task-scoped facts, search the complete artifacts, copied paper source, captions, equations, tables, appendices, and all paper pages before assuming it.",
                 "If the paper still does not specify a parameter, make an explicit scientifically plausible assumption, record it, and revise it when comparison evidence contradicts it.",
-                "Evaluate the task against its scientific_acceptance criterion IDs. Styling, layout, fonts, colors, antialiasing, crop tightness, and pixel-level similarity are not scientific acceptance criteria.",
+                "Evaluate only the assigned task goals and their necessary scientific conditions; scientific_acceptance IDs guide the review but do not excuse goal-relevant algorithm errors. Out-of-scope findings remain separate observations, not failure or rerun criteria. Styling, layout, fonts, colors, antialiasing, crop tightness, and pixel-level similarity are not scientific acceptance criteria.",
                 "For a figure-oriented task, provide a readable local result image when practical; otherwise provide equivalent structured evidence such as CSV, a table, summary JSON, or concise text tied to the criterion IDs.",
                 "A missing or imperfect paper crop is an evidence-packaging limitation for the Reporter, never a reason to modify or rerun the scientific implementation.",
                 "Do not hard-code curves to match the paper pages; implement the scientific model.",

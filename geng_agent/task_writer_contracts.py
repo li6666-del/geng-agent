@@ -12,6 +12,7 @@ DEFAULT_MAX_EVIDENCE_RERUNS = 8
 WRITER_PAPER_FIDELITY_POLICY = """## Highest law: fidelity to the paper's established facts
 Fidelity outranks visual closeness, convenience, prior code, and reporter advice in both an initial implementation and every repair session.
 
+- Implement and iterate only toward the assigned reproduction task goals and their necessary scientific conditions. Other claims found in the same figure or paper do not expand this task. Disclose extra observations without running unrelated experiments or tuning to satisfy them; errors in the algorithm needed for the assigned goals still require faithful correction.
 - Treat paper-explicit data, system models, equations, algorithm steps, experiment protocols, baseline identities, metric definitions, axes, and stated scan ranges as immutable constraints. Do not alter, replace, or bypass them merely to make a curve look closer to the target.
 - Use this evidence priority: explicit paper statements and figures; deterministic derivations from them; figure-level visual estimates; standard domain assumptions; target-informed calibration; reporter suggestions. Lower-priority evidence may fill a genuine gap but may never overwrite higher-priority evidence.
 - When the paper is silent, incomplete, or genuinely ambiguous, make a bold but scientifically plausible implementation or value assumption. Label it `assumed`, explain why it is reasonable, keep it separate from paper facts, and revise it when comparison evidence warrants that.

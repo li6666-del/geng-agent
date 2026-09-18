@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import shutil
@@ -299,6 +300,18 @@ def _merge_task_writer_deliveries(
     _prune_unexpected_files(repro_project_dir, expected_paths)
     return expected_paths
 
+def _documentation_only_package(path: Path) -> bool:
+    if path.name != "__init__.py":
+        return False
+    try:
+        body = ast.parse(path.read_text(encoding="utf-8-sig")).body
+    except (OSError, SyntaxError, UnicodeError):
+        return False
+    return not body or (len(body) == 1 and isinstance(body[0], ast.Expr)
+                        and isinstance(body[0].value, ast.Constant)
+                        and isinstance(body[0].value.value, str))
+
+
 def _copy_merged_writer_file(
     *,
     source: Path,
@@ -322,12 +335,28 @@ def _copy_merged_writer_file(
     else:
         content_hash = _streaming_file_sha256(source)
     previous = copied_files.get(relative)
+    target = repro_project_dir / Path(relative)
     if previous is not None and previous[0] != content_hash:
+        if _documentation_only_package(source) and _documentation_only_package(target):
+            # A package shared by private submodules can have two descriptions.
+            # Keep both descriptions separately; only its package docstring is
+            # normalized. Imports, assignments and any executable code still
+            # take the collision error below. Original execution bytes remain
+            # in execution_records, rather than being recertified as this file.
+            for origin, origin_owner in ((target, previous[1]), (source, owner)):
+                note = f"task_notes/package_descriptions/{safe_label(origin_owner)}/{relative}.txt"
+                note_path = repro_project_dir / note
+                if not note_path.exists():
+                    write_text(note_path, origin.read_text(encoding="utf-8-sig"))
+                    expected_paths.add(note)
+            write_text(target, '"""Package assembled from task-private modules; descriptions are in task_notes/package_descriptions."""\n')
+            copied_files[relative] = (_streaming_file_sha256(target), "assembled_package")
+            expected_paths.add(relative)
+            return
         raise RuntimeError(
             "execution-unit package collision for "
             f"{relative}: {previous[1]} and {owner} supplied different content"
         )
-    target = repro_project_dir / Path(relative)
     if source.suffix.lower() == ".py":
         _copy_python_without_bom(source, target)
     else:
@@ -337,7 +366,7 @@ def _copy_merged_writer_file(
     expected_paths.add(relative)
 
 def _writer_package_files(sandbox: Path) -> list[Path]:
-    """Return portable Writer-owned files outside task outputs and frozen science."""
+    """Return portable runtime files, including original paper inputs when present."""
 
     frozen_paths = {
         str(item.get("path") or "").replace("\\", "/")
@@ -353,10 +382,8 @@ def _writer_package_files(sandbox: Path) -> list[Path]:
         ".ruff_cache",
         ".venv",
         "__pycache__",
-        PAPER_EVIDENCE_DIR,
         "outputs",
         "repair_logs",
-        "tasks",
         "venv",
         "writer_progress",
         ".tox",
@@ -391,6 +418,22 @@ def _writer_package_files(sandbox: Path) -> list[Path]:
         if not path.is_file() or path.is_symlink():
             continue
         relative_path = path.relative_to(sandbox)
+        # Only the top-level tasks/ tree is copied by _task_owned_files.
+        # An architecture may also assign modules such as src/tasks/ber.py;
+        # these are private dependencies, not a duplicate of the task scaffold.
+        if relative_path.parts[0].casefold() == "tasks":
+            continue
+        if relative_path.parts[0] == PAPER_EVIDENCE_DIR:
+            # Digitisation and other reproduction code may read the original
+            # PDF/page images at runtime. Keep these exact inputs while leaving
+            # role packets and machine-local analysis metadata in the audit.
+            if len(relative_path.parts) < 3 or relative_path.parts[1] not in {
+                "source", "full_paper_pages",
+            }:
+                continue
+            if (relative_path.parts[1] == "full_paper_pages"
+                    and path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}):
+                continue
         if any(part.casefold() in excluded_roots for part in relative_path.parts):
             continue
         relative = relative_path.as_posix()

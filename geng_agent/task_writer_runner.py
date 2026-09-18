@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from pathlib import Path
 from typing import Any, Callable
 
@@ -23,6 +25,7 @@ from .task_writer_delivery import _collect_task_writer_delivery
 from .task_writer_execution_binding import _load_task_execution_binding
 from .task_writer_prompts import _build_execution_unit_continuation_brief, _build_execution_unit_writer_brief, _build_task_writer_brief, _build_task_writer_continuation_brief
 from .task_writer_sandbox import _prepare_execution_unit_writer_sandbox, _prepare_task_writer_sandbox
+from .task_writer_inputs import write_writer_input, unique_image_paths
 from .task_writer_state import (
     _archive_execution_unit_delivery,
     _archive_nonterminal_writer_delivery,
@@ -85,6 +88,60 @@ def _execution_unit_rerun_fingerprints(
         for task_id, feedback in sorted(feedback_by_task_id.items())
     }
 
+
+def _review_task_records(
+    *,
+    work: list[tuple[int, dict[str, Any], dict[str, Any], int]],
+    callback: Callable[[int, dict[str, Any], dict[str, Any], int], dict[str, Any]],
+) -> list[tuple[str, dict[str, Any] | None]]:
+    """Collect independent reviews before any feedback mutates Writer inputs."""
+    if not work:
+        return []
+    with ThreadPoolExecutor(max_workers=len(work)) as executor:
+        futures = [
+            executor.submit(copy_context().run, callback, index, task, record, round_no)
+            for index, task, record, round_no in work
+        ]
+    # Waiting for the entire batch also protects shared Writer input snapshots
+    # on cache misses and resume. One failed callback does not discard siblings.
+    return [
+        _attach_task_reporter_review(
+            callback=lambda *_args, result=future: result.result(),
+            index=index, task=task, record=record, session_round=round_no,
+        )
+        for (index, task, record, round_no), future in zip(work, futures)
+    ]
+
+
+def _review_execution_unit_tasks(
+    *,
+    members: list[tuple[int, dict[str, Any], dict[str, Any]]],
+    records: list[dict[str, Any]],
+    callback: Callable[[int, dict[str, Any], dict[str, Any], int], dict[str, Any]],
+    session_round: int,
+) -> dict[str, dict[str, Any]]:
+    """Review each logical task concurrently against the completed Writer output.
+
+    Reporters own separate workspaces. Wait for all of them before attaching
+    decisions and localizing feedback into the shared Writer sandbox, so neither
+    feedback handling nor a Writer continuation can change another review's input.
+    """
+    if len(members) != len(records):
+        raise ValueError("each logical task must have a Writer delivery before review")
+    reviews = _review_task_records(
+        work=[
+            (index, task, record, session_round)
+            for (index, task, _entry), record in zip(members, records)
+        ],
+        callback=callback,
+    )
+    requested: dict[str, dict[str, Any]] = {}
+    for record, (action, returned) in zip(records, reviews):
+        if action == "writer_revision" and isinstance(returned, dict):
+            requested[str(record.get("task_id") or "")] = returned
+    return requested
+
+
 def _run_one_execution_unit_writer(
     *,
     unit: dict[str, Any],
@@ -145,6 +202,9 @@ def _run_one_execution_unit_writer(
         )
         for _index, task, entry in members
     }
+    write_writer_input(sandbox=sandbox, members=members, facts=facts,
+                       experiment_index=experiment_index, bindings=bindings, paper=paper,
+                       case_runtime=case_runtime, unit=unit)
     base_prompt = _build_execution_unit_writer_brief(
         unit=unit,
         members=members,
@@ -200,17 +260,12 @@ def _run_one_execution_unit_writer(
             for record in existing_records
         ):
             if task_review_callback is not None:
-                requested: dict[str, dict[str, Any]] = {}
-                for (index, task, _entry), record in zip(members, existing_records):
-                    action, returned = _attach_task_reporter_review(
-                        callback=task_review_callback,
-                        index=index,
-                        task=task,
-                        record=record,
-                        session_round=session_round,
-                    )
-                    if action == "writer_revision" and isinstance(returned, dict):
-                        requested[str(record.get("task_id") or "")] = returned
+                requested = _review_execution_unit_tasks(
+                    members=members,
+                    records=existing_records,
+                    callback=task_review_callback,
+                    session_round=session_round,
+                )
                 if not requested:
                     return existing_records
                 seen_rerun_requests.update(
@@ -346,16 +401,12 @@ def _run_one_execution_unit_writer(
 
         requested_feedback: dict[str, dict[str, Any]] = {}
         if run_repro and task_review_callback is not None:
-            for (index, task, _entry), record in zip(members, records):
-                action, returned = _attach_task_reporter_review(
-                    callback=task_review_callback,
-                    index=index,
-                    task=task,
-                    record=record,
-                    session_round=session_round,
-                )
-                if action == "writer_revision" and isinstance(returned, dict):
-                    requested_feedback[str(record.get("task_id") or "")] = returned
+            requested_feedback = _review_execution_unit_tasks(
+                members=members,
+                records=records,
+                callback=task_review_callback,
+                session_round=session_round,
+            )
 
         if required_change_baseline is not None:
             current_state = _writer_source_config_fingerprint(sandbox)
@@ -486,6 +537,9 @@ def _run_one_task_writer(
         execution_unit_id=unit_id,
     )
     execution_binding = _load_task_execution_binding(sandbox, task_id)
+    write_writer_input(sandbox=sandbox, members=[(index, task, manifest_entry)], facts=facts,
+                       experiment_index=experiment_index, bindings={task_id: execution_binding},
+                       paper=paper, case_runtime=case_runtime)
     base_prompt = _build_task_writer_brief(
         index=index,
         task=task,
@@ -736,6 +790,18 @@ def _run_one_task_writer(
             required=runtime_refresh_required,
         )
 
+def _clear_previous_reporter_decision(record: dict[str, Any]) -> None:
+    # A fresh failed review must never leave a previous successful verdict active.
+    for key in (
+        "task_verification", "task_reporter_terminal", "task_reporter_successful",
+        "task_reporter_error_kind", "task_reporter_error",
+        "verification_result", "verification_verified", "scientific_outcome",
+    ):
+        record.pop(key, None)
+    if record.get("task_writer_status") == "matched":
+        record["task_writer_status"] = TASK_WRITER_TERMINAL_STATUS
+
+
 def _attach_task_reporter_review(
     *,
     callback: Callable[[int, dict[str, Any], dict[str, Any], int], dict[str, Any]],
@@ -748,6 +814,7 @@ def _attach_task_reporter_review(
     try:
         task_reporter = callback(index, task, record, session_round)
     except Exception as exc:
+        _clear_previous_reporter_decision(record)
         message = redact_text(f"{type(exc).__name__}: {exc}")[:1000]
         task_reporter = {
             "ok": False,
@@ -763,6 +830,7 @@ def _attach_task_reporter_review(
             warnings.append("task Reporter failed; the host will synthesize a terminal outcome")
         return "failed", None
 
+    _clear_previous_reporter_decision(record)
     record["task_reporter"] = task_reporter
     verification = task_reporter.get("task_verification") if isinstance(task_reporter, dict) else None
     if isinstance(verification, dict):
@@ -915,7 +983,7 @@ def _run_task_writer_codex_session(
             role="task_writer", work_dir=sandbox, prompt=prompt, audit_dir=audit_dir,
             label=label, sandbox="workspace-write",
             command_override=get_config_value("GENG_CODEX_TASK_WRITER_CMD"),
-            image_paths=sorted(path.resolve() for path in (sandbox / PAPER_EVIDENCE_DIR / "full_paper_pages").glob("paper_page_*.png") if path.is_file()),
+            image_paths=unique_image_paths(sorted(path.resolve() for path in (sandbox / PAPER_EVIDENCE_DIR / "full_paper_pages").glob("paper_page_*.png") if path.is_file())),
             extra_env=runtime_env, path_prepend=[python_dir],
         )
     status.update(execution_receipts_required=require_execution_receipt, execution_audit_dir=str(audit_dir))

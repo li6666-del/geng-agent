@@ -170,6 +170,17 @@ def test_actual_policy_content_hash_participates_in_unit_key(tmp_path: Path) -> 
     assert all(first[key]["snapshot_hash"] != changed[key]["snapshot_hash"] for key in first)
 
 
+def test_explicit_policy_snapshot_is_used_without_rereading_or_aliasing(tmp_path: Path) -> None:
+    kwargs, _plan = _fixture(tmp_path)
+    frozen = {"prompt": "workflow-start"}
+    with patch("geng_agent.writer_lineage.writer_policy_content_hashes",
+               side_effect=AssertionError("frozen workflow must not reread source policy")):
+        first = build_writer_unit_lineage(**kwargs, policy_content_hashes=frozen)
+    frozen["prompt"] = "later-edit"
+    assert all(item["inputs"]["policy_content_hashes"] == {"prompt": "workflow-start"}
+               for item in first.values())
+
+
 def test_foundation_source_dependency_change_invalidates_only_consumers(tmp_path: Path) -> None:
     kwargs, plan = _fixture(tmp_path)
     architecture_path = kwargs["analysis_artifacts"]["scientific_architecture.json"]
@@ -301,3 +312,56 @@ def test_workflow_finalizes_discovered_imports_before_first_resume(tmp_path: Pat
     assert observed["before"] != observed["after"] == current
     evidence = json.loads((kwargs["task_root"] / "02_b/paper_evidence/index.json").read_text())
     assert evidence["analysis_snapshot_hash"] == current
+
+
+def test_workflow_freezes_policy_during_completion_and_refreshes_next_invocation(tmp_path: Path) -> None:
+    from geng_agent.agentic_task_writers import run_codex_task_writer_workflow
+    from geng_agent.task_writer_units import _execution_unit_work_items
+
+    kwargs, plan = _fixture(tmp_path)
+    tasks = {"repro_tasks": [pair[0] for pair in kwargs["task_pairs"]]}
+    for name, document in {"engineering_facts.json": kwargs["facts"], "repro_tasks.json": tasks,
+                           "experiment_index.json": {}}.items():
+        write_json(tmp_path / name, document)
+    on_disk_policy = {"prompt": "policy-before-worker-start"}
+    observed = []
+
+    class CompletedUnitBoundary(RuntimeError):
+        pass
+
+    def complete_one_unit(**call):
+        unit = _execution_unit_work_items(call["task_pairs"], call["execution_plan"])[0]
+        sandbox = call["task_root"] / "01_a"
+        write_json(sandbox / "paper_evidence/index.json", {"tasks": [{"task_id": "a"}]})
+        record = {"task_id": "a", "sandbox": str(sandbox)}
+        before = call["snapshot_hashes"][unit["unit_id"]]
+        # Simulate editing the checkout while the already-started Writer runs.
+        on_disk_policy["prompt"] = "policy-edited-during-worker"
+        call["snapshot_finalizer"](unit, [record])
+        saved = json.loads((call["audit_dir"] / "03c_writer_unit_lineage.json").read_text())
+        observed.append((before, record["analysis_snapshot_hash"],
+                         saved[unit["unit_id"]]["inputs"]["policy_content_hashes"]))
+        raise CompletedUnitBoundary()
+
+    with (
+        patch("geng_agent.agentic_task_writers.writer_policy_content_hashes",
+              side_effect=lambda: dict(on_disk_policy)) as read_policy,
+        patch("geng_agent.writer_lineage.writer_policy_content_hashes",
+              side_effect=AssertionError("finalization must use the startup policy snapshot")),
+        patch("geng_agent.agentic_task_writers._dispatch_task_writers", side_effect=complete_one_unit),
+    ):
+        for _ in range(2):
+            with pytest.raises(CompletedUnitBoundary):
+                run_codex_task_writer_workflow(
+                    facts=kwargs["facts"], tasks=tasks, experiment_index={}, paper={},
+                    paper_path=kwargs["paper_path"], paper_context_json="{}", paper_images=[],
+                    paper_thesis=None, output_dir=tmp_path, audit_dir=tmp_path / "audit",
+                    repro_project_dir=tmp_path / "repro_project", run_repro=False, resume=True,
+                    case_runtime=kwargs["case_runtime"], execution_plan=plan,
+                )
+        assert read_policy.call_count == 2
+
+    assert all(before == after for before, after, _policy in observed)
+    assert observed[0][2] == {"prompt": "policy-before-worker-start"}
+    assert observed[1][2] == {"prompt": "policy-edited-during-worker"}
+    assert observed[0][1] != observed[1][1]

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .codex_runner import run_codex_subprocess
+from .agent_activity import record_agent_cached
 from .execution_receipts import trusted_input_snapshot
 from .config import get_config_value
 from .mineru_adapter import task_figure_candidates
@@ -138,6 +139,8 @@ def run_codex_task_reporter_workflow(
         )
         if cached is not None:
             cached["cached"] = True
+            record_agent_cached(role="task_reporter", label=label,
+                                work_dir=Path(str(cached.get("workspace") or task_audit_dir)), task_id=task_id)
             return cached
 
     requested_round_no = max(1, int(round_no))

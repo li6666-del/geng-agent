@@ -168,6 +168,33 @@ def test_private_package_cannot_shadow_frozen_module(tmp_path: Path) -> None:
     assert not shadow.exists()
 
 
+def test_new_private_test_is_preserved_but_frozen_test_shadow_is_rejected(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path)
+    snapshot = Path(bundle["snapshot_dir"])
+    frozen_test = snapshot / "tests" / "test_shared.py"
+    frozen_test.parent.mkdir()
+    frozen_test.write_text("VALUE = 1\n", encoding="utf-8")
+    item = {"path": "tests/test_shared.py", "bytes": frozen_test.stat().st_size,
+            "sha256": hashlib.sha256(frozen_test.read_bytes()).hexdigest()}
+    bundle["manifest"]["files"].append(item)
+    bundle["manifest"]["snapshot_hash"] = foundation_snapshot_hash(bundle["manifest"]["files"])
+    bundle["snapshot_hash"] = bundle["manifest"]["snapshot_hash"]
+    sandbox = tmp_path / "writer"
+    install_foundation_snapshot(sandbox, bundle)
+    private = sandbox / "tests" / "test_private_ber.py"
+    private.write_text("def test_ber(): assert 1 == 1\n", encoding="utf-8")
+    assert foundation_violations(sandbox, bundle) == []
+    shadow = sandbox / "tests" / "test_shared" / "__init__.py"
+    shadow.parent.mkdir()
+    shadow.write_text("VALUE = 0\n", encoding="utf-8")
+    assert any(item["file"] == "tests/test_shared/__init__.py"
+               for item in foundation_violations(sandbox, bundle))
+    restore_foundation_snapshot(sandbox, bundle)
+    assert private.is_file()
+    assert not shadow.exists()
+    assert foundation_violations(sandbox, bundle) == []
+
+
 def test_scientific_revision_targets_consumers_and_keeps_previous_generation(tmp_path: Path) -> None:
     bundle = _bundle(tmp_path)
     sandbox = tmp_path / "revision"

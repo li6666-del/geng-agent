@@ -26,6 +26,8 @@ def test_resume_restores_verified_images_and_keeps_editor_text(tmp_path):
         'workspace': str(workspace), 'asset_manifest': manifest})
     inputs['paper'] = {'source_path': 'paper.pdf', 'chunks': [{'text': 'Original Paper Title'}]}
     inputs['task_records'][0]['result_json']['iteration_records'] = [{'reported_detail': 'writer statement'}]
+    uncertainties = ['样本不足，方法排序仍可能变化。']
+    inputs['task_verifications'][0]['remaining_uncertainties'] = uncertainties
     comparison = ('# 结果对比\n\n## 任务一\n\n核心事实与假设：固定功率。\n\n'
                   '| 本地结果 | 原文结果 |\n|---|---|\n'
                   '| ![本地图](report_assets/task_1/local_result.png) | ![原图](report_assets/task_1/paper_target.png) |\n\n'
@@ -38,20 +40,36 @@ def test_resume_restores_verified_images_and_keeps_editor_text(tmp_path):
         material = json.loads((editor_root / 'inputs/report_editor_input.json').read_text(encoding='utf-8'))
         assert material['paper']['opening_text_for_title_only'] == 'Original Paper Title'
         assert material['technical_details']['writer_statements'][0]['reported']['iteration_records']
+        assert len(material['image_inventory']) == 2
+        assert all(item['path'].startswith('report_assets/task_1/') for item in material['image_inventory'])
+        assert all(item['width_px'] > 0 and item['height_px'] > 0 for item in material['image_inventory'])
         assert 'iteration_records' not in material['task_packets'][0]
-        assert len(kwargs['image_paths']) == 2
+        packet = material['task_packets'][0]
+        assert packet['terminal_outcome'] == 'reproduced'
+        assert packet['verification']['confidence'] == 'high'
+        assert packet['remaining_uncertainties'] == uncertainties
+        # Both asset paths remain usable; byte-identical attachments are sent once.
+        assert len(kwargs['image_paths']) == 1
         for name, text in report_texts.items():
             (editor_root / name).write_text(text, encoding='utf-8')
         return {'ok': True, 'role': 'report_editor'}
 
     with patch('geng_agent.agentic_report_editor.run_codex_subprocess', side_effect=editor) as call:
-        result = run_codex_report_editor_workflow(**inputs)
-        assert result['ok'] and not result['asset_warnings']
+        # Simulate reports cached before the writing policy was upgraded.
+        with patch('geng_agent.agentic_report_editor.REPORT_EDITOR_PROMPT_VERSION',
+                   'final_report_editor_v11_readable_reports'):
+            result = run_codex_report_editor_workflow(**inputs)
+            assert result['ok'] and not result['asset_warnings']
+            inputs['resume'] = True
+            assert run_codex_report_editor_workflow(**inputs)['cached']
+            assert call.call_count == 1
+        refreshed = run_codex_report_editor_workflow(**inputs)
+        assert refreshed['ok'] and not refreshed['cached']
+        assert call.call_count == 2
         for name, text in report_texts.items():
             assert (output / name).read_text(encoding='utf-8') == text
-        inputs['resume'] = True
         assert run_codex_report_editor_workflow(**inputs)['cached']
-        assert call.call_count == 1
+        assert call.call_count == 2
     word = generate_docx_reports(output_dir=output, result_review_result={'passed': True})
     assert word['result_review_docx']['passed']
     with ZipFile(output / 'result_review.docx') as doc:
@@ -84,3 +102,18 @@ def test_existing_editor_prompt_assigns_concise_comparison_and_detailed_reproduc
     for requirement in ('核心事实与假设', '本地结果与原文结果对比', '仍存在的差距', '下一步人工核查建议',
                         '不能只取列表第一张', '不复制逐任务大表', '未知保持未知'):
         assert requirement in brief
+
+
+def test_editor_presentation_keeps_decisions_and_evidence_while_improving_readability():
+    brief = _build_report_editor_brief(task_count=3)
+    for requirement in (
+        '任务、复现目标、结论、关键差距',
+        '原文结果、本地结果、对任务结论的影响',
+        '上下排列', '附录 原文图像证据',
+        '只有结构简单、比例接近', '不能用去重省掉不同分支',
+        '不能让舍入改变原有结论', '不准改变状态',
+        '不会替你四舍五入或改写测量', '不从文件名猜测',
+        '项目入口与运行方法', '不得把它们改写为本任务验收失败',
+    ):
+        assert requirement in brief
+    assert '双列 Markdown 表格左放本地复现结果图' not in brief

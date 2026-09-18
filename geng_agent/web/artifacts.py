@@ -221,7 +221,8 @@ def preview_artifact(path: Path, kind: str) -> dict[str, Any] | None:
         except (UnicodeDecodeError, json.JSONDecodeError):
             return None
     if kind in {"markdown", "code", "text"}:
-        return {"text": path.read_text(encoding="utf-8", errors="replace")[:100_000]}
+        text = path.read_text(encoding="utf-8", errors="replace")
+        return {"text": text[:100_000], "truncated": len(text) > 100_000}
     return None
 
 

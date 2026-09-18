@@ -1,349 +1,69 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  ArrowDownToLine,
-  ArrowLeft,
-  BookOpenText,
-  Box,
-  Check,
-  ChevronRight,
-  CircleStop,
-  Code2,
-  FileArchive,
-  FileJson,
-  FlaskConical,
-  Image as ImageIcon,
-  LoaderCircle,
-  ListChecks,
-  Radio,
-  RefreshCw,
-  Route,
-  ScrollText,
-  Upload,
-  X,
-} from "lucide-react";
-import { api, connectEvents } from "./api";
-import type { Artifact, CaseDetail, CaseSummary, EventPayload, Phase, PhaseState } from "./types";
-
-const phaseCopy: Record<string, { kicker: string; description: string; icon: typeof BookOpenText }> = {
-  paper_analysis: { kicker: "阶段 1 / 5", description: "提取论文文本、图表、关键参数与工程事实。", icon: BookOpenText },
-  repro_design: { kicker: "阶段 2 / 5", description: "将论文主张转化为可执行、可验收的复现任务。", icon: Route },
-  task_reproduction: { kicker: "阶段 3 / 5", description: "各任务 writer 编写代码、运行实验并根据论文证据迭代。", icon: Code2 },
-  report_composition: { kicker: "阶段 4 / 5", description: "汇总任务核验结果，组织复现说明与论文对比结论。", icon: FlaskConical },
-  report_delivery: { kicker: "阶段 5 / 5", description: "生成 Word 报告、审计记录和可下载交付物。", icon: ScrollText },
-};
-
-const stateText: Record<PhaseState, string> = {
-  waiting: "等待处理",
-  running: "处理中",
-  partial: "已有阶段产物",
-  success: "已完成",
-  failed: "处理失败",
-  cancelled: "已取消",
-};
-
-const stepText: Record<string, string> = {
-  start: "初始化案例",
-  mineru_layout: "解析版面与图像",
-  facts_initial: "抽取全局事实",
-  tasks_preliminary: "设计初步任务",
-  facts: "定向回补事实",
-  tasks: "定稿复现任务",
-  thesis: "提炼论文主张",
-  experiment_index: "建立实验索引",
-  scientific_architecture: "设计科学代码架构",
-  environment_lock: "解析并锁定 Case 环境",
-  foundation: "构建共享科学底座",
-  generation: "Writer 复现迭代",
-  runtime: "汇总运行证据",
-  task_reporters: "逐任务独立核验",
-  report_editor: "编排三份报告",
-  reports: "生成交付文件",
-};
-
-function formatDate(value: string | null | undefined) {
-  if (!value) return "—";
-  return new Intl.DateTimeFormat("zh-CN", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(value));
-}
-
-function formatSize(bytes: number) {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-}
-
-function navigate(path: string) {
-  history.pushState({}, "", path);
-  window.dispatchEvent(new PopStateEvent("popstate"));
-}
+import { useCallback, useEffect, useRef, useState } from "react";
+import { ArrowRight, BookOpenText, ChevronRight, LoaderCircle, RefreshCw, Search, ShieldCheck, Upload } from "lucide-react";
+import { api } from "./api";
+import type { CaseSummary } from "./types";
+import { formatDate, formatSize, isActive, jobText, phases } from "./presentation";
+import { Badge, Brand, Empty, ErrorNote, message, navigate } from "./ui";
+import { CaseWorkspace } from "./CaseWorkspace";
 
 function App() {
   const [path, setPath] = useState(location.pathname);
-  useEffect(() => {
-    const sync = () => setPath(location.pathname);
-    addEventListener("popstate", sync);
-    return () => removeEventListener("popstate", sync);
-  }, []);
+  useEffect(() => { const sync = () => setPath(location.pathname); window.addEventListener("popstate", sync); return () => window.removeEventListener("popstate", sync); }, []);
   const match = path.match(/^\/cases\/([^/]+)$/);
-  return match ? <CaseVoyage caseId={match[1]} /> : <CaseLibrary />;
+  return match ? <CaseWorkspace key={match[1]} caseId={match[1]} /> : <CaseLibrary />;
 }
 
 function CaseLibrary() {
   const [cases, setCases] = useState<CaseSummary[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState("");
-  const [fileName, setFileName] = useState("");
-
+  const [loading, setLoading] = useState(true); const [error, setError] = useState("");
+  const [query, setQuery] = useState(""); const [filter, setFilter] = useState("all");
   const load = useCallback(async () => {
-    try {
-      const result = await api.listCases();
-      setCases(result.items);
-      setError("");
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "无法读取案例");
-    } finally {
-      setLoading(false);
-    }
+    try { setCases((await api.listCases()).items); setError(""); }
+    catch (reason) { setError(message(reason)); } finally { setLoading(false); }
   }, []);
+  useEffect(() => { void load(); const timer = window.setInterval(() => void load(), 10000); return () => clearInterval(timer); }, [load]);
+  const active = cases.filter(item => isActive(item.job?.status)).length;
+  const visible = cases.filter(item => item.display_name.toLowerCase().includes(query.toLowerCase()) && (filter === "all" || (filter === "active" ? isActive(item.job?.status) : ["failed", "cancelled"].includes(item.job?.status || ""))));
+  return <><header className="topbar"><Brand /><span className="top-note"><span className="status-dot" /> 本地研究工作区</span></header>
+    <main className="library page-width"><div className="lab-heading"><div><h1>通信论文复现</h1><p>上传论文，跟踪实验，查阅独立核验结果。</p></div><div className="lab-metrics"><div><span>案例总数</span><strong>{loading ? "—" : cases.length}</strong></div><div><span>正在处理</span><strong>{loading ? "—" : active}</strong></div></div></div><section className="intro-grid">
+      <div className="intro"><p className="eyebrow">工作流程</p><h2>从论文主张，<br />到可核查的实验结果。</h2><p className="intro-description">解析论文并组织复现实验，通过独立核验，汇总为结果对比与本地复现两份中文报告。</p>
+        <div className="workflow-mini">{Object.entries(phases).map(([id, phase], i) => <span key={id}><b>0{i + 1}</b>{phase.title}{i < 4 && <ChevronRight size={12} />}</span>)}</div>
+        <div className="principle"><ShieldCheck size={18} /><span>事实、假设与实验结果分别记录，保留差距和不确定性。</span></div>
+      </div><UploadCard />
+    </section>
+    <section className="case-section" aria-labelledby="case-heading">
+      <div className="section-heading"><div><p className="eyebrow">研究档案</p><h2 id="case-heading">我的复现案例 <span className="count">{cases.length}</span></h2></div><span className="subtle">{active ? `${active} 个案例正在处理` : "案例、执行证据与报告持续保存"}</span></div>
+      <div className="toolbar"><div className="filter-tabs" aria-label="案例筛选">{[["all", "全部案例"], ["active", "处理中"], ["attention", "已中断 / 已停止"]].map(([id, label]) => <button key={id} aria-pressed={filter === id} className={filter === id ? "selected" : ""} onClick={() => setFilter(id)}>{label}</button>)}</div><div className="toolbar-right"><label className="search"><Search size={16} /><input aria-label="搜索案例" value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索论文或案例…" /></label><button className="icon-button" aria-label="刷新案例" onClick={() => void load()}><RefreshCw size={17} /></button></div></div>
+      {error && <ErrorNote>{error}</ErrorNote>}
+      {loading ? <div className="loading"><LoaderCircle className="spin" /> 正在读取案例</div> : visible.length === 0 ? <Empty>{cases.length ? "没有符合筛选条件的案例。" : "还没有案例。上传第一篇论文，开始建立复现档案。"}</Empty> : <div className="case-list"><div className="case-table-heading"><span>论文 / 案例</span><span>当前阶段</span><span>处理状态</span></div>{visible.map(item => <button className="case-row" key={item.id} onClick={() => navigate(`/cases/${item.id}`)}>
+        <span className="paper-icon"><BookOpenText size={22} /></span><span className="case-name"><strong>{item.display_name}</strong><small>{formatDate(item.created_at)}<span>·</span>{item.source === "import" ? "本地导入" : item.source === "url" ? "链接导入" : "PDF 上传"}</small></span><span className="case-phase">{isActive(item.job?.status) ? phases[item.job?.current_phase || ""]?.title || "等待开始" : "查看任务与报告"}</span><Badge value={item.job?.status || "idle"}>{item.job ? jobText[item.job.status] || "状态未知" : "历史案例"}</Badge><ChevronRight size={18} />
+      </button>)}</div>}
+    </section><footer className="page-footer">流程结束与科研结论分别记录。复现结果保留失败、假设和不确定性。</footer></main></>;
+}
 
-  useEffect(() => void load(), [load]);
-
-  async function submit(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setSubmitting(true);
-    setError("");
-    try {
-      const form = new FormData(event.currentTarget);
-      const result = await api.createCase(form);
-      navigate(`/cases/${result.case_id}`);
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "提交失败");
-    } finally {
-      setSubmitting(false);
-    }
+function UploadCard() {
+  const [file, setFile] = useState<File | null>(null); const [name, setName] = useState("");
+  const [dragging, setDragging] = useState(false); const [busy, setBusy] = useState(false); const [error, setError] = useState("");
+  const [maxBytes, setMaxBytes] = useState<number | null>(null); const input = useRef<HTMLInputElement>(null);
+  useEffect(() => { void api.health().then(value => setMaxBytes(value.max_pdf_bytes)).catch(() => {}); }, []);
+  function select(selected?: File) {
+    if (!selected) return;
+    if (!selected.name.toLowerCase().endsWith(".pdf")) { setError("请选择 PDF 格式的论文。"); return; }
+    if (maxBytes && selected.size > maxBytes) { setError(`论文不能超过 ${formatSize(maxBytes)}。`); return; }
+    setFile(selected); setError("");
   }
-
-  return (
-    <main className="library-shell">
-      <header className="masthead">
-        <div className="wordmark"><span>RP</span>论文复现工作台</div>
-        <div className="edition">当前主流程与产物追踪</div>
-      </header>
-      <section className="hero-grid">
-        <div className="hero-copy">
-          <p className="eyebrow">论文工程复现系统</p>
-          <h1>论文复现流程<br /><em>分阶段可视化</em></h1>
-          <p className="hero-lead">从论文解构、复现设计、任务级复现、报告编排到交付物生成，持续展示处理进度、执行记录与阶段产物。</p>
-          <div className="hero-note"><Radio size={16} /> 每篇论文独立归档，运行进度与证据持续落盘</div>
-        </div>
-        <form className="departure-card" onSubmit={submit}>
-          <div className="card-index">新建任务</div>
-          <h2>提交论文复现</h2>
-          <label className="upload-field">
-            <input name="pdf_file" type="file" accept="application/pdf,.pdf" required onChange={(event) => setFileName(event.target.files?.[0]?.name || "")} />
-            <Upload size={24} />
-            <span>{fileName || "选择或拖入论文 PDF"}</span>
-            <small>最大 80 MB · 文件将归档至独立案例目录</small>
-          </label>
-          <label className="text-label">案例名称（可选）<input name="display_name" maxLength={255} placeholder="例如：WiMAX 自适应调制复现" /></label>
-          {error && <p className="form-error" role="alert">{error}</p>}
-          <button className="primary-button" disabled={submitting}>{submitting ? <LoaderCircle className="spin" /> : <ChevronRight />} {submitting ? "正在创建任务…" : "开始复现"}</button>
-        </form>
-      </section>
-      <section className="case-library">
-        <div className="section-heading"><div><p className="eyebrow">案例管理</p><h2>论文复现案例</h2></div><button className="ghost-button" onClick={() => void load()}><RefreshCw size={16} /> 刷新</button></div>
-        {loading ? <div className="skeleton-list"><i /><i /><i /></div> : cases.length === 0 ? (
-          <div className="empty-state"><Box /><h3>暂无复现案例</h3><p>上传论文后，系统将在此展示五个复现阶段的进度与产物。</p></div>
-        ) : (
-          <div className="case-grid">{cases.map((item, index) => <button key={item.id} className="case-ticket" onClick={() => navigate(`/cases/${item.id}`)}>
-            <span className="ticket-number">{String(index + 1).padStart(2, "0")}</span>
-            <span className="ticket-main"><strong>{item.display_name}</strong><small>{formatDate(item.created_at)} · {item.source === "import" ? "历史导入" : "网页提交"}</small></span>
-            <span className={`job-pill job-${item.job?.status || "idle"}`}>{item.job?.status || "未运行"}</span><ChevronRight size={18} />
-          </button>)}</div>
-        )}
-      </section>
-      <footer className="page-footer">本工具评估工程复现风险，不判定论文真伪。</footer>
-    </main>
-  );
-}
-
-function CaseVoyage({ caseId }: { caseId: string }) {
-  const [detail, setDetail] = useState<CaseDetail | null>(null);
-  const [events, setEvents] = useState<EventPayload[]>([]);
-  const [connected, setConnected] = useState(false);
-  const [error, setError] = useState("");
-  const [following, setFollowing] = useState(true);
-  const [selected, setSelected] = useState<Artifact | null>(null);
-  const phaseRefs = useRef<Record<string, HTMLElement | null>>({});
-
-  const refresh = useCallback(async () => {
-    try {
-      setDetail(await api.getCase(caseId));
-      setError("");
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "无法读取案例");
-    }
-  }, [caseId]);
-
-  useEffect(() => {
-    void refresh();
-    const timer = window.setInterval(() => void refresh(), 5000);
-    return () => clearInterval(timer);
-  }, [refresh]);
-
-  useEffect(() => {
-    if (!detail?.job || ["succeeded", "failed", "cancelled"].includes(detail.job.status)) {
-      setConnected(false);
-      return;
-    }
-    const stream = connectEvents(detail.job.id, (event) => {
-      setEvents((current) => [...current.slice(-39), event]);
-      void refresh();
-    }, setConnected);
-    return () => stream.close();
-  }, [detail?.job?.id, detail?.job?.status, refresh]);
-
-  const activePhase = detail?.job?.current_phase;
-  useEffect(() => {
-    if (following && activePhase) phaseRefs.current[activePhase]?.scrollIntoView({ behavior: "smooth", block: "center" });
-  }, [activePhase, following]);
-  useEffect(() => {
-    const stopFollowing = () => setFollowing(false);
-    addEventListener("wheel", stopFollowing, { passive: true });
-    addEventListener("touchstart", stopFollowing, { passive: true });
-    return () => { removeEventListener("wheel", stopFollowing); removeEventListener("touchstart", stopFollowing); };
-  }, []);
-
-  const artifactsByPhase = useMemo(() => {
-    const grouped: Record<string, Artifact[]> = {};
-    for (const item of detail?.artifacts || []) (grouped[item.phase] ||= []).push(item);
-    return grouped;
-  }, [detail?.artifacts]);
-
-  if (!detail) return <main className="loading-page"><LoaderCircle className="spin" /><p>{error || "正在加载复现任务…"}</p></main>;
-  const job = detail.job;
-  const terminalJob = Boolean(job && ["succeeded", "failed", "cancelled"].includes(job.status));
-  const connectionLabel = !job ? "历史案例" : terminalJob ? "任务已结束" : connected ? "实时连接" : "正在连接";
-  const completed = detail.phases.filter((phase) => phase.state === "success").length;
-
-  async function cancel() {
-    if (job && confirm("将在当前安全边界后停止任务，确定继续吗？")) {
-      await api.cancelJob(job.id);
-      void refresh();
-    }
+  async function submit(event: React.FormEvent) {
+    event.preventDefault(); if (!file) { setError("请先选择论文 PDF。"); return; }
+    setBusy(true); setError("");
+    try { const form = new FormData(); form.set("pdf_file", file); if (name.trim()) form.set("display_name", name.trim()); const created = await api.createCase(form); navigate(`/cases/${created.case_id}`); }
+    catch (reason) { setError(message(reason)); } finally { setBusy(false); }
   }
-
-  return (
-    <main className="voyage-shell">
-      <header className="voyage-header">
-        <button className="back-button" onClick={() => navigate("/")}><ArrowLeft size={17} /> 案例档案</button>
-        <div className="voyage-title"><p className="eyebrow">论文复现进度</p><h1>{detail.display_name}</h1><p>{formatDate(detail.created_at)} · 已完成 {completed}/5 个阶段</p></div>
-        <div className="header-actions">
-          <span className={`connection ${connected ? "online" : ""}`}><i />{connectionLabel}</span>
-          {job && ["queued", "running", "cancel_requested"].includes(job.status) && <button className="danger-ghost" onClick={() => void cancel()}><CircleStop size={16} /> 停止</button>}
-          <ExportButton caseId={caseId} />
-        </div>
-      </header>
-      {error && <div className="global-alert" role="alert">{error}</div>}
-      <div className="voyage-layout">
-        <aside className="route-rail" aria-label="五阶段复现进度">
-          <div className="rail-caption"><ListChecks size={18} /> 阶段进度</div>
-          <div className="rail-line"><i style={{ height: `${Math.max(0, (completed / 5) * 100)}%` }} /></div>
-          {detail.phases.map((phase) => <button key={phase.id} className={`rail-stop state-${phase.state}`} onClick={() => phaseRefs.current[phase.id]?.scrollIntoView({ behavior: "smooth", block: "start" })}>
-            <span>{phase.state === "success" ? <Check size={14} /> : phase.index}</span><div><strong>{phase.label}</strong><small>{stateText[phase.state]}</small></div>
-          </button>)}
-          {!following && activePhase && <button className="follow-button" onClick={() => { setFollowing(true); phaseRefs.current[activePhase]?.scrollIntoView({ behavior: "smooth" }); }}><Radio size={15} /> 返回实时位置</button>}
-        </aside>
-        <div className="chapters">
-          {detail.phases.map((phase) => <PhaseChapter
-            key={phase.id}
-            phase={phase}
-            artifacts={artifactsByPhase[phase.id] || []}
-            events={events.filter((event) => event.phase === phase.id)}
-            setRef={(node) => { phaseRefs.current[phase.id] = node; }}
-            onArtifact={setSelected}
-            caseId={caseId}
-            jobError={job?.current_phase === phase.id ? job.error : null}
-          />)}
-        </div>
-        <aside className="live-notes">
-          <div className="notes-title"><Radio size={15} /> 执行记录</div>
-          {events.length === 0 ? <p className="quiet">暂无新的执行记录</p> : events.slice(-8).reverse().map((event) => <div className="event-note" key={event.id}><time>{formatDate(event.created_at)}</time><p>{event.message || event.type}</p></div>)}
-        </aside>
-      </div>
-      {selected && <ArtifactDrawer artifact={selected} onClose={() => setSelected(null)} />}
-    </main>
-  );
-}
-
-function PhaseChapter({ phase, artifacts, events, setRef, onArtifact, caseId, jobError }: {
-  phase: Phase; artifacts: Artifact[]; events: EventPayload[]; setRef: (node: HTMLElement | null) => void;
-  onArtifact: (artifact: Artifact) => void; caseId: string; jobError: { code: string; message: string } | null;
-}) {
-  const copy = phaseCopy[phase.id];
-  const Icon = copy.icon;
-  return <section ref={setRef} className={`chapter state-${phase.state}`} id={phase.id}>
-    <div className="chapter-rule"><span>{String(phase.index).padStart(2, "0")}</span></div>
-    <header className="chapter-header">
-      <div className="chapter-icon"><Icon /></div><div><p>{copy.kicker}</p><h2>{phase.label}</h2><span>{copy.description}</span></div>
-      <div className="chapter-state"><i />{stateText[phase.state]}</div>
-    </header>
-    <div className="step-strip">{phase.steps.map((step) => <span key={step} className={events.some((event) => event.step === step) ? "observed" : ""}>{stepText[step] || step}</span>)}</div>
-    {phase.state === "running" && <div className="running-band"><LoaderCircle className="spin" /><div><strong>{events.at(-1)?.message || "系统正在处理本阶段"}</strong><small>任务状态与执行记录已持久化，可稍后返回查看</small></div></div>}
-    {jobError && <details className="error-detail"><summary>查看阻断原因</summary><strong>{jobError.code}</strong><pre>{jobError.message}</pre></details>}
-    {artifacts.length > 0 ? <div className="artifact-grid">{artifacts.slice(0, 12).map((artifact) => <ArtifactCard key={artifact.id} artifact={artifact} onOpen={() => onArtifact(artifact)} />)}</div> : <div className="chapter-empty"><span>本阶段暂无产物</span><small>生成的 JSON、代码、图像、CSV 与报告将在此展示。</small></div>}
-    {artifacts.length > 0 && <div className="chapter-footer"><span>{artifacts.length} 份产物</span><ExportButton caseId={caseId} phase={phase.id} compact /></div>}
-  </section>;
-}
-
-function ArtifactCard({ artifact, onOpen }: { artifact: Artifact; onOpen: () => void }) {
-  const Icon = artifact.kind === "image" ? ImageIcon : artifact.kind === "json" ? FileJson : artifact.kind === "archive" ? FileArchive : artifact.kind === "code" ? Code2 : ScrollText;
-  return <button className="artifact-card" onClick={onOpen}>
-    {artifact.kind === "image" ? <img src={artifact.content_url} alt={artifact.path} loading="lazy" /> : <div className="artifact-symbol"><Icon /></div>}
-    <span className="artifact-name">{artifact.path.split("/").at(-1)}</span><small>{artifact.path} · {formatSize(artifact.size_bytes)}</small>
-  </button>;
-}
-
-function ExportButton({ caseId, phase, compact = false }: { caseId: string; phase?: string; compact?: boolean }) {
-  const [busy, setBusy] = useState(false);
-  async function start() {
-    setBusy(true);
-    try {
-      const created = await api.createExport(caseId, phase);
-      let current = await api.getExport(created.export_id);
-      for (let attempt = 0; attempt < 180 && !["ready", "failed"].includes(current.status); attempt += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 700));
-        current = await api.getExport(created.export_id);
-      }
-      if (current.download_url) location.assign(current.download_url);
-      else if (!["ready", "failed"].includes(current.status)) throw new Error("导出仍在后台生成，请稍后重试");
-      else throw new Error(current.error || "导出失败");
-    } catch (reason) {
-      alert(reason instanceof Error ? reason.message : "导出失败");
-    } finally { setBusy(false); }
-  }
-  return <button className={compact ? "text-button" : "download-button"} disabled={busy} onClick={() => void start()}>{busy ? <LoaderCircle className="spin" size={15} /> : <ArrowDownToLine size={15} />}{compact ? "下载本阶段" : "下载全部产物"}</button>;
-}
-
-function ArtifactDrawer({ artifact, onClose }: { artifact: Artifact; onClose: () => void }) {
-  const [detail, setDetail] = useState<{ preview: { text?: string; rows?: string[][]; json?: unknown } | null } | null>(null);
-  const [loadError, setLoadError] = useState("");
-  useEffect(() => {
-    let active = true;
-    setDetail(null);
-    setLoadError("");
-    void api.getArtifact(artifact.id)
-      .then((value) => { if (active) setDetail(value); })
-      .catch((reason) => { if (active) setLoadError(reason instanceof Error ? reason.message : "无法读取产物"); });
-    return () => { active = false; };
-  }, [artifact.id]);
-  return <div className="drawer-scrim" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-    <aside className="artifact-drawer" role="dialog" aria-modal="true" aria-label={`查看产物 ${artifact.path}`}>
-      <header><div><p className="eyebrow">ARTIFACT</p><h2>{artifact.path.split("/").at(-1)}</h2><span>{artifact.path} · {formatSize(artifact.size_bytes)}</span></div><button aria-label="关闭" onClick={onClose}><X /></button></header>
-      <div className="drawer-body">{artifact.kind === "image" ? <img className="full-image" src={artifact.content_url} alt={artifact.path} /> : loadError ? <p className="form-error" role="alert">{loadError}</p> : !detail ? <LoaderCircle className="spin" /> : detail.preview?.rows ? <div className="table-scroll"><table><tbody>{detail.preview.rows.map((row, index) => <tr key={index}>{row.map((cell, cellIndex) => index === 0 ? <th key={cellIndex}>{cell}</th> : <td key={cellIndex}>{cell}</td>)}</tr>)}</tbody></table></div> : <pre>{detail.preview?.text || JSON.stringify(detail.preview?.json, null, 2) || "此文件仅支持下载查看。"}</pre>}</div>
-      <footer><a className="primary-button" href={artifact.download_url}><ArrowDownToLine size={16} /> 下载原文件</a></footer>
-    </aside>
-  </div>;
+  return <form className="upload-card" onSubmit={event => void submit(event)}><div className="card-heading"><span className="eyebrow">新建复现</span><span className="mini-tag">PDF</span></div><h2>从一篇论文开始</h2><p className="subtle">提交后开始解析与复现，可随时返回查看。</p>
+    <button type="button" disabled={busy} className={`dropzone ${dragging ? "dragging" : ""}`} onClick={() => input.current?.click()} onDragOver={event => { event.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={event => { event.preventDefault(); setDragging(false); if (!busy) select(event.dataTransfer.files[0]); }}><span className="upload-symbol"><Upload size={23} /></span><strong>{file ? file.name : "点击选择或拖入论文"}</strong><small>{file ? formatSize(file.size) : `PDF 文件${maxBytes ? ` · 最大 ${formatSize(maxBytes)}` : ""}`}</small></button>
+    <input ref={input} type="file" accept="application/pdf,.pdf" hidden onChange={event => { select(event.target.files?.[0]); event.target.value = ""; }} />
+    <label className="field-label">案例名称 <span>可选</span><input value={name} maxLength={255} disabled={busy} onChange={event => setName(event.target.value)} placeholder="例如：瑞利信道 BER 曲线复现" /></label>
+    {error && <ErrorNote>{error}</ErrorNote>}<button className="button primary wide" disabled={busy}>{busy ? <LoaderCircle className="spin" size={17} /> : <ArrowRight size={17} />}{busy ? "正在提交…" : "开始论文复现"}</button>
+  </form>;
 }
 
 export default App;

@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
+from packaging.version import InvalidVersion, Version
 
 
 RuntimeDocument = Mapping[str, Any] | Path | None
@@ -290,11 +291,30 @@ def _lock_requirement_matches(parsed: Requirement, record: Mapping[str, Any]) ->
         locked = Requirement(str(record.get("requirement") or ""))
     except InvalidRequirement:
         return False
-    return bool(
+    if not (
         _canonical_distribution_name(parsed.name) == _canonical_distribution_name(locked.name)
         and set(parsed.extras) == set(locked.extras)
-        and {str(item) for item in parsed.specifier} == {str(item) for item in locked.specifier}
         and str(parsed.marker or "") == str(locked.marker or "")
+        and parsed.url is None
+        and locked.url is None
+    ):
+        return False
+    if record.get("applicable") is False:
+        # No installed-version evidence exists for a skipped requirement. Keep
+        # its original constraint instead of inferring compatibility here.
+        return parsed.specifier == locked.specifier
+    if not all(record.get(field) is True for field in ("satisfied", "version_satisfied", "imports_ok")):
+        return False
+    try:
+        installed = Version(str(record.get("installed_version") or ""))
+    except InvalidVersion:
+        return False
+    # The case lock binds the runtime version, not the spelling of its original
+    # request. A Writer may pin that same version or use another satisfied range.
+    # Match environment_probe's prerelease policy and check both constraints.
+    return bool(
+        locked.specifier.contains(installed, prereleases=None)
+        and parsed.specifier.contains(installed, prereleases=None)
     )
 
 

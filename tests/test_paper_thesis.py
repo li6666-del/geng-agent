@@ -96,7 +96,10 @@ class ThesisOrderingMatchTests(unittest.TestCase):
         self.assertEqual(len(matched), 1)
         anchor = thesis_ordering_anchor_for_task(self.THESIS_FIG4, task)
         self.assertIn("STAB > ZF", anchor)
-        self.assertIn("baseline_comparison", anchor)
+        self.assertIn("不代表都属于本任务验收目标", anchor)
+        self.assertIn("additional_observations", anchor)
+        self.assertNotIn("优先级最高", anchor)
+        self.assertNotIn("does_not_support_paper_claim", anchor)
         self.assertIn("不要据此判 mismatch", anchor)  # the smoke-regime guard
 
     def test_no_match_for_different_figure(self) -> None:

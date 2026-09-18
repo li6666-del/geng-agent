@@ -65,6 +65,29 @@ def plan_document_issues(document: dict, *, facts: dict, paper: dict, figure_ind
     blockers, _warnings = partition_scientific_architecture_issues(
         architecture, facts=facts, tasks=tasks, experiment_index=index, execution_plan=execution_plan)
     issues = [*scientific_architecture_normalization_errors(architecture), *(blockers if shared else [])]
+    # The combined planner's index has one entry per task. Distinct variant
+    # labels therefore cannot be repaired by renaming experiment_id: normalize
+    # maps every label for that task back to the same host-owned address.
+    counts: dict[str, int] = {}
+    for binding in architecture.get("bindings", []):
+        if isinstance(binding, dict) and binding.get("task_id"):
+            task_id = str(binding["task_id"])
+            counts[task_id] = counts.get(task_id, 0) + 1
+    duplicates = [task_id for task_id, count in counts.items() if count > 1]
+    if duplicates:
+        issues = [issue for issue in issues if not issue.message.startswith(
+            "each task/experiment pair may have only one architecture binding")]
+        issues.append(ValidationIssue(
+            "$.bindings",
+            "The combined planner assigns exactly one host experiment per task. "
+            f"Multiple bindings for {duplicates!r} are mapped to the same experiment_id; "
+            "renaming experiment_id cannot fix this. Consolidate each task's bindings "
+            "into one binding exposing all required components and outputs. Preserve "
+            "every main/sensitivity/ablation variant, its distinct values and purpose "
+            "in the task parameter_matrix and assumptions/sensitivity_check; do not "
+            "drop variants or encode variant-specific conflicting values as common "
+            "binding overrides. Keep unrelated tasks and scientific claims unchanged.",
+        ))
     return [ValidationIssue("$.scientific_architecture" + item.path.removeprefix("$"), item.message) for item in issues]
 
 

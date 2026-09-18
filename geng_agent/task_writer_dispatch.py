@@ -3,22 +3,24 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from contextvars import copy_context
 from pathlib import Path
 from threading import Lock
 from typing import Any, Callable
 
+from .agent_activity import record_agent_cached
 from .case_runtime import CaseRuntime
 from .outputs import write_json
 from .paper_evidence import safe_label
 from .security import redact_text
 from .task_writer_results import _task_writer_runtime_task_passed
 from .task_writer_runner import (
-    _attach_task_reporter_review,
+    _review_task_records,
     _run_one_execution_unit_writer,
     _run_one_task_writer,
     _task_with_experiment_profile,
 )
-from .task_writer_state import _checkpoint_partial_task_writer_records, _record_has_terminal_task_verification, _task_writer_record_refresh_pending, _task_writer_record_refresh_reusable
+from .task_writer_state import _checkpoint_partial_task_writer_records, _task_writer_record_refresh_pending, _task_writer_record_refresh_reusable
 from .task_writer_units import _execution_unit_sandbox, _execution_unit_work_items
 
 
@@ -54,6 +56,7 @@ def _dispatch_task_writers(
     by_index: dict[int, dict[str, Any]] = {}
     pending_units: list[dict[str, Any]] = []
     reused_unit_ids: list[str] = []
+    cached_review_unit_ids: set[str] = set()
     for unit in units:
         members = unit["members"]
         reusable = all(
@@ -68,17 +71,27 @@ def _dispatch_task_writers(
                 or isinstance(existing[index].get("foundation_revision_request"), dict)
             )
             and str(existing[index].get("task_id") or "") not in forced
-            and (
-                task_review_callback is None
-                or _record_has_terminal_task_verification(existing[index])
-                or isinstance(existing[index].get("foundation_revision_request"), dict)
-            )
             for index, _task, _entry in members
         )
         if reusable:
-            for index, _task, _entry in members:
-                by_index[index] = existing[index]
-            reused_unit_ids.append(str(unit["unit_id"]))
+            # A terminal old verdict cannot establish that today's Reporter
+            # prompt, source snapshot or report assets are still current.
+            needs_review = task_review_callback is not None and not any(
+                isinstance(existing[index].get("foundation_revision_request"), dict)
+                or existing[index].get("scientific_stop_reason") == "foundation_revision_unresolved"
+                for index, _task, _entry in members
+            )
+            if needs_review:
+                cached_review_unit_ids.add(str(unit["unit_id"]))
+                pending_units.append(unit)
+            else:
+                for index, _task, _entry in members:
+                    by_index[index] = existing[index]
+                reused_unit_ids.append(str(unit["unit_id"]))
+            record_agent_cached(
+                role="task_writer", label=str(unit["unit_id"]),
+                work_dir=Path(str(existing[members[0][0]].get("sandbox") or task_root)),
+            )
         else:
             pending_units.append(unit)
     launched_task_ids = [
@@ -88,7 +101,7 @@ def _dispatch_task_writers(
     ]
     audit: dict[str, Any] = {
         "policy": "parallel_first",
-        "parallel_attempted": len(units) > 1,
+        "parallel_attempted": len(pending_units) > 1,
         "task_count": len(task_pairs),
         "logical_task_count": len(task_pairs),
         "execution_unit_count": len(units),
@@ -107,6 +120,8 @@ def _dispatch_task_writers(
         "attempts": [],
         "reused_task_ids": [str(record.get("task_id") or "") for record in by_index.values()],
         "reused_execution_unit_ids": reused_unit_ids,
+        "cached_writer_reporter_validation_unit_ids": sorted(cached_review_unit_ids),
+        "launch_counts_describe": "scheduled_unit_workflows_not_model_processes",
         "launched_execution_unit_ids": [str(unit["unit_id"]) for unit in pending_units],
         "launched_task_ids": launched_task_ids,
     }
@@ -121,7 +136,11 @@ def _dispatch_task_writers(
                     index, task, manifest_entry = members[0]
                     existing_record = existing.get(index)
                     future = executor.submit(
-                        _run_one_task_writer,
+                        copy_context().run,
+                        _resume_or_run_writer,
+                        writer_runner=_run_one_task_writer,
+                        cached_members=members if str(unit["unit_id"]) in cached_review_unit_ids else [],
+                        cached_records=existing,
                         index=index,
                         execution_unit_id=str(unit["unit_id"]),
                         reuse_existing=bool(existing_record),
@@ -155,7 +174,11 @@ def _dispatch_task_writers(
                         index in existing for index, _task, _entry in members
                     )
                     future = executor.submit(
-                        _run_one_execution_unit_writer,
+                        copy_context().run,
+                        _resume_or_run_writer,
+                        writer_runner=_run_one_execution_unit_writer,
+                        cached_members=members if str(unit["unit_id"]) in cached_review_unit_ids else [],
+                        cached_records=existing,
                         unit=unit,
                         reuse_existing=reuse_existing_unit,
                         runtime_refresh_required=any(
@@ -276,6 +299,48 @@ def _dispatch_task_writers(
     return records, audit
 
 
+def _cached_reporter_work(index, task, record, experiment_index):
+    try:
+        round_no = max(1, int(record.get("writer_session_count") or 1))
+    except (TypeError, ValueError):
+        round_no = 1
+    return index, _task_with_experiment_profile(task, experiment_index), record, round_no
+
+
+def _resume_or_run_writer(*, writer_runner, cached_members, cached_records, **kwargs):
+    """Validate resumed reviews concurrently with the other unit workflows.
+
+    Use the validated records directly: preparing an already finished sandbox
+    would change Reporter inputs just to find out whether a review is reusable.
+    Only an evidence-backed revision enters the Writer continuation machinery.
+    """
+    if cached_members:
+        records = [cached_records[index] for index, _task, _entry in cached_members]
+        callback = kwargs["task_review_callback"]
+        reviews = _review_task_records(
+            work=[
+                _cached_reporter_work(index, task, record, kwargs["experiment_index"])
+                for (index, task, _entry), record in zip(cached_members, records)
+            ],
+            callback=callback,
+        )
+        revisions = {
+            str(record["task_id"]): feedback
+            for record, (action, feedback) in zip(records, reviews)
+            if action == "writer_revision" and isinstance(feedback, dict)
+        }
+        if not revisions:
+            return records[0] if len(cached_members) == 1 else records
+        kwargs["task_review_callback"] = _reporter_callback_with_replay(
+            callback, {str(record["task_id"]): record.get("task_reporter") for record in records},
+        )
+        if len(cached_members) == 1:
+            kwargs["review_feedback"] = revisions.get(str(records[0]["task_id"]))
+        else:
+            kwargs["review_feedback"] = {**(kwargs.get("review_feedback") or {}), **revisions}
+    return writer_runner(**kwargs)
+
+
 def _refresh_cached_task_reporters(
     *,
     task_pairs: list[tuple[dict[str, Any], dict[str, Any]]],
@@ -303,69 +368,40 @@ def _refresh_cached_task_reporters(
         for record in cached_records
         if isinstance(record, dict) and str(record.get("task_id") or "")
     }
-    work: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
+    work: list[tuple[int, dict[str, Any], dict[str, Any], int]] = []
     for index, (task, entry) in enumerate(task_pairs, start=1):
         task_id = str(task.get("task_id") or entry.get("task_id") or f"task_{index}")
         record = records_by_id.get(task_id)
         if record is None:
             raise ValueError(f"cached Writer record is missing logical task {task_id}")
         record["index"] = index
-        work.append(
-            (
-                index,
-                _task_with_experiment_profile(task, experiment_index),
-                record,
-            )
-        )
+        work.append(_cached_reporter_work(index, task, record, experiment_index))
 
     by_index: dict[int, dict[str, Any]] = {}
     replay_by_task_id: dict[str, Any] = {}
     revision_feedback: dict[str, dict[str, Any]] = {}
     actions: list[dict[str, Any]] = []
 
-    def review_one(
-        index: int,
-        task: dict[str, Any],
-        record: dict[str, Any],
-    ) -> tuple[int, str, dict[str, Any], str, dict[str, Any] | None, Any]:
-        raw_round = record.get("writer_session_count")
-        try:
-            session_round = max(1, int(raw_round or 1))
-        except (TypeError, ValueError):
-            session_round = 1
-        action, feedback = _attach_task_reporter_review(
-            callback=task_review_callback,
-            index=index,
-            task=task,
-            record=record,
-            session_round=session_round,
-        )
+    reviews = _review_task_records(work=work, callback=task_review_callback)
+    for (index, task, record, _round_no), (action, feedback) in zip(work, reviews):
         task_id = str(record.get("task_id") or task.get("task_id") or f"task_{index}")
-        return index, task_id, record, action, feedback, record.get("task_reporter")
-
-    with ThreadPoolExecutor(max_workers=max(1, len(work))) as executor:
-        futures = {
-            executor.submit(review_one, index, task, record): (index, task, record)
-            for index, task, record in work
-        }
-        for future in as_completed(futures):
-            index, task_id, record, action, feedback, reporter_result = future.result()
-            by_index[index] = record
-            replay_by_task_id[task_id] = reporter_result
-            if action == "writer_revision" and isinstance(feedback, dict):
-                revision_feedback[task_id] = feedback
-            actions.append(
-                {
-                    "index": index,
-                    "task_id": task_id,
-                    "action": action,
-                    "reporter_cached": (
-                        reporter_result.get("cached")
-                        if isinstance(reporter_result, dict)
-                        else None
-                    ),
-                }
-            )
+        reporter_result = record.get("task_reporter")
+        by_index[index] = record
+        replay_by_task_id[task_id] = reporter_result
+        if action == "writer_revision" and isinstance(feedback, dict):
+            revision_feedback[task_id] = feedback
+        actions.append(
+            {
+                "index": index,
+                "task_id": task_id,
+                "action": action,
+                "reporter_cached": (
+                    reporter_result.get("cached")
+                    if isinstance(reporter_result, dict)
+                    else None
+                ),
+            }
+        )
 
     refreshed_records = [by_index[index] for index in range(1, len(work) + 1)]
     audit = {

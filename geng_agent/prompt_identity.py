@@ -54,10 +54,8 @@ def file_identity(path: Path) -> dict[str, Any]:
 
 def model_identity(role: str, *, backend: str = "codex", client: Any = None) -> dict[str, Any]:
     if backend == "codex":
-        from .config import get_config_value
-        from .codex_runner import DEFAULT_GENG_CODEX_MODEL, _resolve_reasoning_effort
-        return {"backend": backend, "model": get_config_value("GENG_CODEX_MODEL") or DEFAULT_GENG_CODEX_MODEL,
-                "reasoning_effort": _resolve_reasoning_effort(role, None)}
+        from .model_config import resolve_model_config
+        return {"backend": backend, **resolve_model_config(role).identity()}
     # Credentials and endpoint query strings must never enter audit documents.
     endpoint = str(getattr(client, "base_url", "") or "")
     return {"backend": backend, "client_type": type(client).__qualname__,

@@ -6,6 +6,11 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
+
+from geng_agent.docx_styles import _add_title, _setup_document
 
 from geng_agent.docx_writer import (
     write_markdown_report_docx,
@@ -19,6 +24,135 @@ TINY_PNG = base64.b64decode(
 
 
 class DocxWriterTests(unittest.TestCase):
+
+    def test_appendix_starts_a_page_without_an_empty_page_break_paragraph(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "report.docx"
+            write_markdown_report_docx(
+                path,
+                markdown_text="# 报告\n\n正文结尾。\n\n## 附录：完整证据\n\n保留证据。\n",
+                title="报告", subtitle="",
+            )
+            document = Document(path)
+            appendix = next(p for p in document.paragraphs if p.text == "附录：完整证据")
+            self.assertTrue(appendix.paragraph_format.page_break_before)
+            self.assertEqual(len(document._element.xpath(".//w:br[@w:type='page']")), 0)
+            self.assertEqual([p.text for p in document.paragraphs],
+                             ["报告", "正文结尾。", "附录：完整证据", "保留证据。"])
+
+    def test_title_disables_template_and_inherited_paragraph_borders(self) -> None:
+        document = Document()
+        for style_name in ("Normal", "Title"):
+            properties = document.styles[style_name]._element.get_or_add_pPr()
+            borders = OxmlElement("w:pBdr")
+            bottom = OxmlElement("w:bottom")
+            bottom.set(qn("w:val"), "single")
+            bottom.set(qn("w:color"), "0070C0")
+            borders.append(bottom)
+            properties.append(borders)
+        _setup_document(document)
+        _add_title(document, "简约报告", "")
+        for element in (document.styles["Title"]._element, document.paragraphs[0]._p):
+            borders = element.find(qn("w:pPr")).findall(qn("w:pBdr"))
+            self.assertEqual(len(borders), 1)
+            self.assertEqual(len(borders[0]), 6)
+            self.assertTrue(all(edge.get(qn("w:val")) == "nil" for edge in borders[0]))
+        # Overriding Title must not mutate the base style used by other content.
+        normal_border = document.styles["Normal"]._element.find(qn("w:pPr")).find(qn("w:pBdr"))
+        self.assertEqual(normal_border[0].get(qn("w:val")), "single")
+
+    def test_short_data_rows_stay_together_but_long_evidence_rows_can_paginate(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "report.docx"
+            long_text = "完整证据及参数说明。" * 500
+            write_markdown_report_docx(
+                path,
+                markdown_text=("# 报告\n\n| 项目 | 结果 |\n|---|---|\n"
+                               "| T1 | 该短行应整体换页，不能在表头后只留下半句话。 |\n"
+                               f"| 详细证据 | {long_text} |\n"),
+                title="报告", subtitle="",
+            )
+            document = Document(path)
+            rows = document.tables[0].rows
+            self.assertEqual(rows[1]._tr.trPr.find(qn("w:cantSplit")).get(qn("w:val")), "true")
+            self.assertEqual(rows[2]._tr.trPr.find(qn("w:cantSplit")).get(qn("w:val")), "false")
+            self.assertEqual(rows[2].cells[1].text, long_text)
+
+    def test_editor_title_is_used_once_without_added_report_body(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "review.docx"
+            write_markdown_report_docx(
+                path,
+                markdown_text="# Editor 的报告标题\n\n## 任务概览\n\n作者正文。\n",
+                title="旧版固定标题",
+                subtitle="旧版自动副标题",
+            )
+            document = Document(path)
+            self.assertEqual([p.text for p in document.paragraphs],
+                             ["Editor 的报告标题", "任务概览", "作者正文。"])
+            self.assertEqual(document.paragraphs[0].style.name, "Title")
+            self.assertEqual(document.paragraphs[1].style.name, "Heading 1")
+            self.assertTrue(document.styles["Heading 1"].paragraph_format.keep_with_next)
+            self.assertEqual(len(document.sections[0].footer._element.xpath(".//w:fldSimple")), 1)
+
+    def test_long_authored_text_is_preserved_in_paragraphs_and_table_cells(self) -> None:
+        long_text = "关键参数与完整证据。" * 250 + "正文结尾"
+        cell_text = "完整假设说明。" * 250 + "单元格结尾"
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "review.docx"
+            write_markdown_report_docx(
+                path,
+                markdown_text=f"# 报告\n\n{long_text}\n\n| 项目 | 内容 |\n|---|---|\n| 假设 | {cell_text} |\n",
+                title="回退标题", subtitle="",
+            )
+            document = Document(path)
+            self.assertIn(long_text, [paragraph.text for paragraph in document.paragraphs])
+            self.assertEqual(document.tables[0].cell(1, 1).text, cell_text)
+            self.assertNotIn("已截断", document._element.xml)
+
+    def test_links_and_code_blocks_remain_usable_without_markdown_interpretation(self) -> None:
+        code = "python run.py --label '**原样保留**'\n    # 不是标题\n    | a | b |"
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "report.docx"
+            write_markdown_report_docx(
+                path,
+                markdown_text=("# 报告\n\n打开[原始数据](results/data.csv)，运行 `python run.py`。\n\n"
+                               f"```powershell\n{code}\n```\n"),
+                title="报告", subtitle="",
+            )
+            document = Document(path)
+            links = document._element.xpath(".//w:hyperlink")
+            self.assertEqual(len(links), 1)
+            relationship = document.part.rels[links[0].get(qn("r:id"))]
+            self.assertEqual(relationship.target_ref, "results/data.csv")
+            self.assertEqual(links[0].xpath(".//w:t")[0].text, "原始数据")
+            blocks = [p for p in document.paragraphs if p.style.name == "Report Code"]
+            self.assertEqual([p.text for p in blocks], [code])
+            self.assertEqual(len(document.tables), 0)
+            inline_code = next(run for p in document.paragraphs for run in p.runs if run.text == "python run.py")
+            self.assertEqual(inline_code.font.name, "Consolas")
+
+    def test_table_widths_alignment_and_borders_preserve_readable_structure(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "report.docx"
+            write_markdown_report_docx(
+                path,
+                markdown_text=("# 报告\n\n| 任务 | 关键差距 | 数值 | 状态 |\n|---|---|---|:---:|\n"
+                               "| T1 | 区间内的方法排序与论文描述存在明显差异 | 0.00231 | 未复现 |\n"
+                               "| T2 | 多种方法存在重合曲线，不能视为独立交叉点 | -1.2e-3 | 未复现 |\n"),
+                title="报告", subtitle="",
+            )
+            document = Document(path)
+            table = document.tables[0]
+            self.assertGreater(table.columns[1].width, table.columns[0].width)
+            section = document.sections[0]
+            self.assertLessEqual(sum(column.width for column in table.columns),
+                                 section.page_width - section.left_margin - section.right_margin)
+            self.assertEqual(table.cell(1, 2).paragraphs[0].alignment, WD_ALIGN_PARAGRAPH.RIGHT)
+            self.assertEqual(table.cell(1, 3).paragraphs[0].alignment, WD_ALIGN_PARAGRAPH.CENTER)
+            borders = table._tbl.tblPr.find(qn("w:tblBorders"))
+            self.assertIsNotNone(borders)
+            self.assertTrue(all(border.get(qn("w:color")) == "D9D9D9" for border in borders))
 
 
     def test_write_result_review_markdown_docx_creates_openable_report(self) -> None:

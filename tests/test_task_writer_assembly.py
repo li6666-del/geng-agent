@@ -15,6 +15,89 @@ from geng_agent.outputs import validate_repro_project
 
 
 class TaskWriterAssemblyTests(unittest.TestCase):
+    def test_package_preserves_paper_runtime_inputs_without_role_packets(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sandbox = root / "writer"
+            inputs = {
+                "paper_evidence/source/paper.pdf": b"original-paper-bytes",
+                "paper_evidence/full_paper_pages/paper_page_003.png": b"original-page-bytes",
+            }
+            audit_only = {
+                "paper_evidence/writer_input.json",
+                "paper_evidence/analysis_artifacts/engineering_facts.json",
+                "paper_evidence/full_paper_pages/index.json",
+                "paper_evidence/source/.env",
+            }
+            for relative, contents in {**inputs, **{p: b"audit-only" for p in audit_only}}.items():
+                path = sandbox / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(contents)
+            project = root / "project"
+            expected = _merge_task_writer_deliveries(
+                repro_project_dir=project, task_manifest={"tasks": []}, expected_paths=set(),
+                task_records=[{"task_id": "figure", "module": "figure", "sandbox": str(sandbox)}],
+            )
+            # A relocated consumer must find exactly the bytes used by the Writer.
+            for relative, contents in inputs.items():
+                self.assertIn(relative, expected)
+                self.assertEqual((project / relative).read_bytes(), contents)
+            for relative in audit_only:
+                self.assertFalse((project / relative).exists())
+
+    def test_documentation_only_package_collision_preserves_both_descriptions(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            records = []
+            for owner in ("noise", "ber"):
+                sandbox = root / owner
+                package = sandbox / "src" / "tasks"
+                package.mkdir(parents=True)
+                (package / "__init__.py").write_text(f'"""{owner} task description."""\n', encoding="utf-8")
+                (package / f"{owner}.py").write_text("VALUE = 1\n", encoding="utf-8")
+                records.append({"task_id": owner, "module": owner, "sandbox": str(sandbox)})
+            project = root / "project"
+            expected = _merge_task_writer_deliveries(repro_project_dir=project,
+                task_manifest={"tasks": []}, expected_paths=set(), task_records=records)
+            self.assertIn("src/tasks/ber.py", expected)
+            for owner in ("noise", "ber"):
+                note = f"task_notes/package_descriptions/{owner}/src/tasks/__init__.py.txt"
+                self.assertIn(note, expected)
+                self.assertIn(owner + " task description", (project / note).read_text(encoding="utf-8"))
+
+    def test_package_initializer_with_executable_code_still_conflicts(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            records = []
+            for owner, value in (("noise", 1), ("ber", 2)):
+                sandbox = root / owner
+                package = sandbox / "src" / "tasks"
+                package.mkdir(parents=True)
+                (package / "__init__.py").write_text(f"VALUE = {value}\n", encoding="utf-8")
+                records.append({"task_id": owner, "module": owner, "sandbox": str(sandbox)})
+            with self.assertRaisesRegex(RuntimeError, "package collision"):
+                _merge_task_writer_deliveries(repro_project_dir=root / "project",
+                    task_manifest={"tasks": []}, expected_paths=set(), task_records=records)
+
+    def test_nested_src_tasks_package_is_preserved(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sandbox = root / "writer"
+            package = sandbox / "src" / "tasks"
+            package.mkdir(parents=True)
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            (package / "ber.py").write_text("VALUE = 0.125\n", encoding="utf-8")
+            (sandbox / "tasks").mkdir()
+            (sandbox / "tasks" / "figure.py").write_text("from src.tasks.ber import VALUE\n", encoding="utf-8")
+            project = root / "project"
+            expected = _merge_task_writer_deliveries(
+                repro_project_dir=project, task_manifest={"tasks": []}, expected_paths=set(),
+                task_records=[{"task_id": "figure", "module": "figure", "sandbox": str(sandbox)}],
+            )
+            self.assertIn("src/tasks/__init__.py", expected)
+            self.assertIn("src/tasks/ber.py", expected)
+            self.assertEqual((project / "src/tasks/ber.py").read_text(encoding="utf-8"), "VALUE = 0.125\n")
+
     def test_old_unconsumed_foundation_from_cached_unit_cannot_overwrite_current_snapshot(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)

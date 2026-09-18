@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$HostAddress = '127.0.0.1',
     [int]$Port = 8765,
     [switch]$Foreground
@@ -7,11 +7,13 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
 
-$DefaultPython = Join-Path $env:USERPROFILE 'miniconda3\envs\torch\python.exe'
+$DefaultPython = Join-Path $env:USERPROFILE 'Desktop\耿同学agent_cases\observed_rayleigh_20260908\venv\Scripts\python.exe'
 $Python = if ($env:GENG_PYTHON) { $env:GENG_PYTHON } else { $DefaultPython }
-if (-not (Test-Path -LiteralPath $Python)) {
+if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
     throw "geng-agent interpreter not found: $Python"
 }
+
+$env:GENG_PYTHON = $Python
 
 $CasesRoot = if ($env:GENG_CASES_ROOT) {
     $env:GENG_CASES_ROOT

@@ -58,7 +58,7 @@ from .case_runtime import (
 from .case_environment import EnvironmentPolicyError, RequirementRequest
 from .execution_plan import compile_execution_plan
 from .foundation_revision import FoundationRevisionRequired, collect_pending_foundation_revisions
-from .writer_lineage import build_writer_unit_lineage
+from .writer_lineage import build_writer_unit_lineage, writer_policy_content_hashes
 from .config import get_config_value
 from .io_runtime import BACKEND_RUNTIME_API_DOC, IO_RUNTIME_API_DOC, inject_io_runtime
 from .json_utils import pretty_json
@@ -381,6 +381,9 @@ def run_codex_task_writer_workflow(
     manifest_entries = [entry for entry in task_manifest.get("tasks", []) if isinstance(entry, dict)]
     task_pairs = list(zip(task_items, manifest_entries))
     task_root = audit_dir / "03c_task_writer_sandboxes"
+    # Finalization may discover runtime imports, but it must keep the policy
+    # that this invocation handed to its Writers. A new invocation reads anew.
+    workflow_policy_hashes = writer_policy_content_hashes()
 
     def unit_lineage() -> dict[str, dict[str, Any]]:
         return build_writer_unit_lineage(
@@ -394,6 +397,7 @@ def run_codex_task_writer_workflow(
             case_runtime=case_runtime,
             task_root=task_root,
             paper_thesis=paper_thesis,
+            policy_content_hashes=workflow_policy_hashes,
         )
 
     lineage = unit_lineage()
@@ -495,6 +499,11 @@ def run_codex_task_writer_workflow(
     refreshed_cached_records_by_index: dict[int, dict[str, Any]] = {}
     preserve_cached_report_assets = False
     if cached_writer_reusable:
+        from .agent_activity import record_agent_cached
+
+        for sandbox in sorted({str(record.get("sandbox") or "") for record in cached_records}):
+            if sandbox:
+                record_agent_cached(role="task_writer", label=Path(sandbox).name, work_dir=Path(sandbox))
         reporter_refresh_audit: dict[str, Any] | None = None
         if task_review_callback is not None:
             (
@@ -608,6 +617,9 @@ def run_codex_task_writer_workflow(
         "orchestration": "launch_all_then_wait",
     }
     status["agent_concurrency"] = int(execution_plan.get("execution_unit_count") or 0)
+    status["agent_concurrency_kind"] = "planned_writer_units"
+    status["planned_task_reporter_count"] = len(task_pairs) if task_review_callback is not None else 0
+    status["actual_agent_activity"] = "agent_activity.json"
     write_json(audit_dir / "03c_task_writers_start.json", status)
     task_records, dispatch_audit = _dispatch_task_writers(
         task_pairs=task_pairs,
