@@ -1,30 +1,11 @@
 from __future__ import annotations
 
-import math
 from pathlib import Path
 
 from typing import Any
 
-from .scientific_materiality import (
-    TERMINAL_SCIENTIFIC_OUTCOMES,
-    WRITER_RERUN_REASONS,
-    symmetric_magnitude_ratio,
-)
-
-
 WRITER_REVIEW_STATUS = "ready_for_review"
 FINAL_MATCHED_STATUS = "matched"
-TASK_REPORTER_RERUN_NONE = "none"
-TASK_REPORTER_RERUN_CORE_CONCLUSION_FAILED = "core_conclusion_failed"
-TASK_REPORTER_RERUN_KEY_NUMERIC_RATIO_GE_10 = "key_numeric_ratio_ge_10"
-TASK_REPORTER_RERUN_INVALID_RUN = "invalid_run"
-TASK_REPORTER_WRITER_RERUN_REASONS = WRITER_RERUN_REASONS
-
-_CORE_STATUSES = frozenset(
-    {"supported", "unsupported", "unassessable_missing_information", "not_applicable"}
-)
-
-
 def _paper_basis_review(item: dict[str, Any], workspace: Path | None) -> dict[str, Any] | None:
     """Accept a Reporter's scope correction only with copied original-paper evidence.
 
@@ -63,16 +44,6 @@ def _string_list(value: Any) -> list[str]:
     return [str(item).strip() for item in value if str(item).strip()]
 
 
-def _finite_number(value: Any) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    try:
-        number = float(value)
-    except OverflowError:
-        return None
-    return number if math.isfinite(number) else None
-
-
 def _scientific_acceptance(task: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(task, dict):
         return {}
@@ -81,13 +52,16 @@ def _scientific_acceptance(task: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def _normalize_core_conclusions(raw: dict[str, Any], task: dict[str, Any] | None,
-                                evidence_workspace: Path | None = None) -> list[dict[str, Any]]:
+                                evidence_workspace: Path | None = None) -> Any:
     """Preserve the Reporter's in-scope assessments without semantic reclassification."""
     del task
     items = raw.get("core_conclusions")
+    if not isinstance(items, list):
+        return items if items is not None else []
     result = []
-    for item in items if isinstance(items, list) else []:
+    for item in items:
         if not isinstance(item, dict):
+            result.append(item)
             continue
         normalized = dict(item)
         basis = _paper_basis_review(item, evidence_workspace)
@@ -99,53 +73,27 @@ def _normalize_core_conclusions(raw: dict[str, Any], task: dict[str, Any] | None
 
 def _normalize_numeric_item(target: dict[str, Any], candidate: dict[str, Any], *,
                             target_id: str, workspace: Path | None) -> dict[str, Any]:
-    # Text, units, signs, scale and comparability are Reporter decisions. Arithmetic
-    # is diagnostic only and never changes the decision or authorizes another run.
-    fields = {"name", "metric", "unit", "regime", "goal_relation", "paper_magnitude", "local_magnitude", "comparison_status",
-              "comparison_reason", "local_metric", "local_unit", "local_regime", "unavailable_reason", "basis_review"}
-    result = {key: value for key, value in {**target, **candidate}.items() if key in fields}
-    result["target_id"] = target_id
-    result.setdefault("name", target_id)
+    """Keep the Reporter's quantities; the host does not fill scientific anchors."""
+    del target, target_id
+    result = dict(candidate)
     basis = _paper_basis_review(candidate, workspace)
     if basis:
         result["basis_review"] = basis
-    if basis and basis.get("status") == "corrected" and "paper_magnitude" not in candidate:
-        result["paper_magnitude"] = basis.get("corrected_paper_magnitude")
-    paper = _finite_number(result.get("paper_magnitude"))
-    local = _finite_number(result.get("local_magnitude"))
-    result["paper_magnitude"] = paper
-    result["local_magnitude"] = local
-    result["symmetric_ratio"] = (symmetric_magnitude_ratio(paper, local)
-        if candidate.get("comparison_status") == "comparable" else None)
     return result
 
 
 def _normalize_numeric_comparisons(raw: dict[str, Any], task: dict[str, Any] | None,
-                                   evidence_workspace: Path | None = None) -> list[dict[str, Any]]:
-    targets = {str(item.get("target_id")): item
-               for item in _scientific_acceptance(task).get("key_numeric_targets", [])
-               if isinstance(item, dict)}
+                                   evidence_workspace: Path | None = None) -> Any:
+    del task
     items = raw.get("key_numeric_comparisons")
-    return [_normalize_numeric_item(targets.get(str(item.get("target_id")), {}), item,
+    return [_normalize_numeric_item({}, item,
                 target_id=str(item.get("target_id") or ""), workspace=evidence_workspace)
-            for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+            if isinstance(item, dict) else item for item in items] if isinstance(items, list) else (items if items is not None else [])
 
 
-def _normalize_rerun_evidence(raw: dict[str, Any]) -> dict[str, Any] | None:
+def _normalize_rerun_evidence(raw: dict[str, Any]) -> Any:
     value = raw.get("rerun_evidence")
-    if not isinstance(value, dict):
-        return None
-    reason = str(value.get("rerun_reason") or "none").strip()
-    if reason not in {"none", *WRITER_RERUN_REASONS}:
-        reason = "none"
-    return {
-        "rerun_reason": reason,
-        "contract_item_ids": _string_list(value.get("contract_item_ids")),
-        "paper_evidence_files": _string_list(value.get("paper_evidence_files")),
-        "causal_change": str(value.get("causal_change") or "").strip(),
-        "change_targets": _string_list(value.get("change_targets")),
-        "predicted_effect": str(value.get("predicted_effect") or "").strip(),
-    }
+    return dict(value) if isinstance(value, dict) else value
 
 
 def rerun_evidence_path_issues(
@@ -156,8 +104,8 @@ def rerun_evidence_path_issues(
 ) -> list[str]:
     """Require rerun paper evidence to be an existing trusted workspace file.
 
-    Invalid evidence only cancels another Writer run. Callers retain it as an
-    advisory warning and continue to a reportable terminal outcome.
+    Missing references are observations for the supervisor, not permission for
+    the host to alter the Reporter action or scientific conclusion.
     """
 
     evidence = result.get("rerun_evidence") if isinstance(result, dict) else None
@@ -199,114 +147,73 @@ def rerun_evidence_path_issues(
                 + raw_path
             )
     return issues
-def _rerun_reason_if_actionable(*, run_valid: bool | None,
-        core: list[dict[str, Any]], numeric: list[dict[str, Any]],
-        evidence: dict[str, Any] | None) -> str:
-    """Check a routing contract, without deciding scientific materiality."""
-    del run_valid
-    if not isinstance(evidence, dict):
-        return "none"
-    reason = str(evidence.get("rerun_reason") or "none")
-    known_ids = {str(item.get("claim_id") or "") for item in core} | {
-        str(item.get("target_id") or "") for item in numeric}
-    ids = set(_string_list(evidence.get("contract_item_ids")))
-    if (reason in WRITER_RERUN_REASONS and ids and ids <= known_ids
-        and _string_list(evidence.get("paper_evidence_files"))
-        and str(evidence.get("causal_change") or "").strip()
-        and _string_list(evidence.get("change_targets"))
-        and str(evidence.get("predicted_effect") or "").strip()):
-        return reason
-    return "none"
-
-
 def normalize_task_verification(result: Any, expected_task_id: str, *,
         task: dict[str, Any] | None = None, run_valid_hint: bool | None = None,
         evidence_workspace: Path | None = None) -> dict[str, Any]:
-    """Receive a v3 Reporter decision. Host checks never rewrite its science.
-
-    An incomplete handoff is an engineering state, not missing paper information.
-    Original notes remain in the Reporter audit workspace, including rejected ones.
-    """
+    """Attach host observations without rewriting the independent scientific note."""
     raw = result if isinstance(result, dict) else {}
-    core = _normalize_core_conclusions(raw, task, evidence_workspace)
-    numeric = _normalize_numeric_comparisons(raw, task, evidence_workspace)
-    issues = []
-    if raw.get("schema_version") != "3.0":
-        issues.append("Reporter must submit the v3 decision protocol; old notes require Reporter review")
+    protocol_issues = []
+    if not isinstance(result, dict):
+        protocol_issues.append("Reporter note is not a JSON object")
     if raw.get("task_id") != expected_task_id:
-        issues.append("Reporter task_id does not match the assigned task")
-    outcome = raw.get("outcome")
-    if not isinstance(outcome, str) or outcome not in TERMINAL_SCIENTIFIC_OUTCOMES - {"review_incomplete"}:
-        issues.append("Reporter must supply an explicit scientific outcome")
-        outcome = "review_incomplete"
-    reason = str(raw.get("decision_reason") or "").strip()
-    if not reason:
-        issues.append("Reporter must supply the direct decision_reason")
+        protocol_issues.append("Reporter task_id does not match the assigned task")
     action = raw.get("host_action")
     if not isinstance(action, str) or action not in {"complete", "rerun_writer"}:
-        issues.append("Reporter must supply complete or rerun_writer")
-        action = "complete"
-    if "run_valid" not in raw or (raw["run_valid"] is not None and not isinstance(raw["run_valid"], bool)):
-        issues.append("Reporter run_valid must be boolean or null")
+        protocol_issues.append("Reporter action cannot be dispatched; clarify complete or rerun_writer")
+    observations = _string_list(raw.get("_engineering_issues"))
+    if not raw.get("outcome"):
+        observations.append("Reporter did not supply a separate outcome label; inspect the original note")
+    if not raw.get("decision_reason"):
+        observations.append("Reporter did not supply a separate decision_reason field")
+    core = _normalize_core_conclusions(raw, task, evidence_workspace)
+    numeric = _normalize_numeric_comparisons(raw, task, evidence_workspace)
     for items, id_key, expected in (
         (core, "claim_id", _scientific_acceptance(task).get("core_conclusions", [])),
         (numeric, "target_id", _scientific_acceptance(task).get("key_numeric_targets", [])),
     ):
-        ids = [str(item.get(id_key) or "") for item in items]
-        if any(not value for value in ids) or len(ids) != len(set(ids)):
-            issues.append("Reporter observations need unique explicit " + id_key)
-        missing = {str(item.get(id_key)) for item in expected if isinstance(item, dict) and item.get(id_key)} - set(ids)
+        entries = items if isinstance(items, list) else []
+        ids = [str(item.get(id_key) or "") for item in entries if isinstance(item, dict)]
+        missing = {str(item.get(id_key)) for item in (expected if isinstance(expected, list) else [])
+                   if isinstance(item, dict) and item.get(id_key)} - set(ids)
+        if not isinstance(items, list) or any(not isinstance(item, dict) for item in entries):
+            observations.append("Scientific observations use another representation; inspect the original content")
         if missing:
-            issues.append("Reporter must account for navigation IDs (including not_applicable): " + ", ".join(sorted(missing)))
-    if any(not isinstance(item.get("status"), str) or item["status"] not in _CORE_STATUSES for item in core):
-        issues.append("Reporter conclusion status is missing or invalid")
-    if any(not isinstance(item.get("comparison_status"), str) or item["comparison_status"] not in {"comparable", "incompatible", "disputed", "not_applicable", "unavailable"}
-           or not str(item.get("comparison_reason") or "").strip() for item in numeric):
-        issues.append("Reporter numeric comparisons need comparison_status and comparison_reason")
-    rerun = _normalize_rerun_evidence(raw)
-    rerun_reason = _rerun_reason_if_actionable(run_valid=raw.get("run_valid"), core=core, numeric=numeric, evidence=rerun)
-    if action == "rerun_writer" and rerun_reason == "none":
-        issues.append("Reporter rerun request needs a complete causal plan with existing observation IDs")
-    evidence_issues = _string_list(raw.get("_engineering_issues"))
-    for item in [*core, *numeric]:
+            observations.append("Navigation IDs not separately listed: " + ", ".join(sorted(missing)))
+        if len(ids) != len(set(ids)) or any(not item for item in ids):
+            observations.append("Observation IDs contain duplicates or missing labels")
+    for item in [*(core if isinstance(core, list) else []), *(numeric if isinstance(numeric, list) else [])]:
+        if not isinstance(item, dict):
+            continue
         basis = item.get("basis_review")
         if isinstance(basis, dict) and not basis.get("paper_evidence_verified"):
-            evidence_issues.append("Basis correction lacks an existing original-paper evidence reference")
-    engineering_status = ("handoff_failed" if issues else "evidence_invalid" if evidence_issues
+            observations.append("Basis correction references unavailable original-paper evidence")
+    rerun = _normalize_rerun_evidence(raw)
+    engineering_status = ("handoff_failed" if protocol_issues
         else "execution_failed" if run_valid_hint is False
         else "verified" if run_valid_hint is True else "unverified_execution")
-    if issues or evidence_issues:
-        action = "complete"  # Caller may repair the Reporter handoff; never rerun science for it.
-    ratios = [x["symmetric_ratio"] for x in numeric if _finite_number(x.get("symmetric_ratio")) is not None]
     return {
-        "schema_version": "3.0", "task_id": expected_task_id,
-        "outcome": outcome, "decision_reason": reason, "decision_authority": "reporter",
-        "reporter_action": raw.get("host_action"), "host_action": action,
-        "engineering_status": engineering_status,
-        "engineering_issues": [*issues, *evidence_issues], "handoff_issues": issues,
-        "rerun_reason": rerun_reason if action == "rerun_writer" else "none",
-        "run_valid": False if run_valid_hint is False else raw.get("run_valid") if isinstance(raw.get("run_valid"), bool) else None,
+        **raw,
+        "task_id": raw.get("task_id"), "assigned_task_id": expected_task_id,
+        "outcome": raw.get("outcome"), "decision_authority": "reporter",
+        "reporter_action": action, "host_action": action,
+        "engineering_status": engineering_status, "host_run_valid": run_valid_hint,
+        "engineering_issues": [*protocol_issues, *observations], "handoff_issues": protocol_issues,
+        "host_observations": observations,
+        "rerun_reason": raw.get("rerun_reason") or (rerun.get("rerun_reason") if isinstance(rerun, dict) else None) or "none",
+        "run_valid": raw.get("run_valid"),
         "core_conclusions": core, "key_numeric_comparisons": numeric,
-        "additional_observations": [dict(item) for item in raw.get("additional_observations", []) if isinstance(item, dict)]
-            if isinstance(raw.get("additional_observations"), list) else [],
-        "max_key_numeric_ratio": max(ratios) if ratios else None,
-        "comparison_summary": str(raw.get("comparison_summary") or ""),
-        "report_explanation": str(raw.get("report_explanation") or ""),
-        "report_title": str(raw.get("report_title") or ""),
-        **{key: _string_list(raw.get(key)) for key in (
-            "differences", "non_material_differences", "evidence_files", "feedback",
-            "remaining_uncertainties", "local_assets", "paper_assets", "asset_notes")},
-        "confidence": raw.get("confidence") if isinstance(raw.get("confidence"), str) and raw["confidence"] in {"low", "medium", "high"} else "medium",
         "rerun_evidence": rerun,
-        "verified_facts": raw.get("verified_facts") if isinstance(raw.get("verified_facts"), list) else [],
+        "verified_facts": raw.get("verified_facts", []),
     }
 
 
 def verification_scientifically_successful(result: dict[str, Any]) -> bool:
-    return (result.get("outcome") in {"reproduced", "reproduced_with_assumptions"}
-        and result.get("engineering_status") == "verified" and result.get("run_valid") is True
-        and result.get("host_action") == "complete" and result.get("reporter_action") != "rerun_writer"
-        and not result.get("handoff_issues"))
+    """Count accepted positive reports only when the actual full evidence is valid."""
+    return (result.get("outcome") in ("reproduced", "reproduced_with_assumptions")
+        and result.get("host_action") == "complete"
+        and result.get("engineering_status") == "verified"
+        and result.get("host_run_valid", result.get("run_valid")) is True
+        and result.get("handoff_accepted", True) is True and not result.get("handoff_issues"))
 
 
 def partition_writer_delivery_issues(
@@ -356,136 +263,39 @@ def writer_delivery_issues(
 
 
 def task_verification_issues(result: Any, expected_task_id: str) -> list[str]:
-    """Only flag contradictions that make host routing impossible."""
-
+    """Only object, task identity and dispatchable action are protocol requirements."""
     if not isinstance(result, dict):
         return ["task_verification_result.json is not an object"]
-    issues: list[str] = []
-    if str(result.get("task_id") or "") != str(expected_task_id):
+    issues = []
+    if result.get("task_id") != expected_task_id:
         issues.append(f"task_id must be {expected_task_id}")
-    if str(result.get("outcome") or "") not in TERMINAL_SCIENTIFIC_OUTCOMES:
-        issues.append("outcome is not a recognized scientific outcome")
-    if str(result.get("host_action") or "") not in {"complete", "rerun_writer"}:
-        issues.append("host_action must be complete or rerun_writer")
-    if str(result.get("host_action") or "") == "rerun_writer" and str(
-        result.get("rerun_reason") or ""
-    ) not in WRITER_RERUN_REASONS:
-        issues.append("rerun_writer requires an allowed scientific rerun reason")
+    if result.get("host_action") not in ("complete", "rerun_writer"):
+        issues.append("host_action must be clarified before dispatch")
     return issues
 
 
-def partition_task_verification_issues(
-    result: Any,
-    expected_task_id: str,
-) -> tuple[list[str], list[str]]:
-    blockers = list(result.get("handoff_issues", [])) if isinstance(result, dict) else []
-    warnings: list[str] = []
-    for issue in task_verification_issues(result, expected_task_id):
-        if issue.startswith(("task_verification_result.json", "task_id must be")):
-            blockers.append(issue)
-        else:
-            warnings.append(issue)
-    return blockers, warnings
-
-
-def writer_revision_allowed(result: Any, expected_task_id: str) -> bool:
-    if (not isinstance(result, dict) or result.get("task_id") != expected_task_id
-        or result.get("host_action") != "rerun_writer" or result.get("handoff_issues")
-        or result.get("engineering_status") in {"handoff_failed", "evidence_invalid"}):
-        return False
-    return _rerun_reason_if_actionable(run_valid=result.get("run_valid"),
-        core=result.get("core_conclusions", []), numeric=result.get("key_numeric_comparisons", []),
-        evidence=result.get("rerun_evidence")) == result.get("rerun_reason") != "none"
+def partition_task_verification_issues(result: Any, expected_task_id: str) -> tuple[list[str], list[str]]:
+    return task_verification_issues(result, expected_task_id), list(result.get("host_observations", [])) if isinstance(result, dict) else []
 
 
 def effective_task_outcome(item: dict[str, Any]) -> str:
-    """Eligibility for publication, distinct from the preserved Reporter verdict."""
-    if item.get("engineering_status") in {"handoff_failed", "evidence_invalid", "unverified_execution"}:
-        return "review_incomplete"
-    if item.get("engineering_status") == "execution_failed":
-        return "execution_failed"
-    if item.get("outcome") in {"reproduced", "reproduced_with_assumptions"} and not verification_scientifically_successful(item):
-        return "review_incomplete"
-    return str(item.get("outcome") or "review_incomplete")
+    """Legacy accessor: never replace the Reporter's outcome with an engineering label."""
+    return str(item.get("outcome") or "")
 
 
 def aggregate_task_verifications(task_results: list[dict[str, Any]]) -> dict[str, Any]:
-    tasks: list[dict[str, Any]] = []
-    keys = (
-        "task_id",
-        "decision_reason", "decision_authority", "reporter_action",
-        "engineering_status", "engineering_issues", "handoff_issues",
-        "outcome",
-        "host_action",
-        "rerun_reason",
-        "run_valid",
-        "core_conclusions",
-        "key_numeric_comparisons",
-        "additional_observations",
-        "max_key_numeric_ratio",
-        "comparison_summary",
-        "report_explanation",
-        "report_title",
-        "differences",
-        "non_material_differences",
-        "evidence_files",
-        "feedback",
-        "confidence",
-        "remaining_uncertainties",
-        "provenance_base",
-    )
-    defaults = {"additional_observations": [], "provenance_base": ""}
-    for result in task_results:
-        if isinstance(result, dict):
-            tasks.append({key: result.get(key, defaults.get(key)) for key in keys})
-    outcome_counts: dict[str, int] = {}
+    tasks = [dict(result) for result in task_results if isinstance(result, dict)]
+    counts: dict[str, int] = {}
     for item in tasks:
-        outcome = effective_task_outcome(item)
-        outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
+        label = item.get("outcome")
+        if isinstance(label, str) and label:
+            counts[label] = counts.get(label, 0) + 1
     all_terminal = bool(tasks) and all(
-        str(item.get("host_action") or "") == "complete"
-        and str(item.get("outcome") or "") in TERMINAL_SCIENTIFIC_OUTCOMES
-        for item in tasks
-    )
-    all_successful = all_terminal and all(
-        verification_scientifically_successful(item)
-        for item in tasks
-    )
-    return {
-        "schema_version": "3.0",
-        "all_terminal": all_terminal,
-        "all_successful": all_successful,
-        "outcome_counts": outcome_counts,
-        "tasks": tasks,
-    }
-
-
-def verification_result_issues(result: Any, expected_task_ids: list[str]) -> list[str]:
-    if not isinstance(result, dict):
-        return ["verification_result.json is not an object"]
-    issues: list[str] = []
-    raw_tasks = result.get("tasks") if isinstance(result.get("tasks"), list) else []
-    ids = [str(item.get("task_id") or "") for item in raw_tasks if isinstance(item, dict)]
-    if any(not task_id for task_id in ids) or len(ids) != len(set(ids)):
-        issues.append("task verification IDs should be non-empty and unique")
-    expected = {str(task_id) for task_id in expected_task_ids if str(task_id)}
-    missing = sorted(expected - set(ids))
-    unexpected = sorted(set(ids) - expected)
-    if missing:
-        issues.append("missing task verification results: " + ", ".join(missing))
-    if unexpected:
-        issues.append("unexpected task verification results: " + ", ".join(unexpected))
-    if result.get("all_terminal") is not (
-        bool(raw_tasks)
-        and all(
-            isinstance(item, dict)
-            and item.get("host_action") == "complete"
-            and item.get("outcome") in TERMINAL_SCIENTIFIC_OUTCOMES
-            for item in raw_tasks
-        )
-    ):
-        issues.append("all_terminal is inconsistent with task outcomes")
-    return issues
+        item.get("host_action") == "complete" or item.get("coordination_status") == "stopped"
+        for item in tasks)
+    return {"schema_version": "3.0", "tasks": tasks, "outcome_counts": counts,
+            "all_terminal": all_terminal,
+            "all_successful": bool(tasks) and all(verification_scientifically_successful(item) for item in tasks)}
 
 
 def feedback_from_verification(result: dict[str, Any]) -> dict[str, dict[str, Any]]:

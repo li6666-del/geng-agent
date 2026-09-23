@@ -5,10 +5,10 @@ from typing import Any, Callable
 from .outputs import write_json
 from .pipeline_context import PipelineRunContext
 from .pipeline_models import AnalysisFlowResult, ExecutionFlowResult, PipelineResult
-from .pipeline_report_delivery import report_editor_exception_result
+from .pipeline_report_delivery import run_supervised_report_editor, ReportOperationError
 from .pipeline_verification import build_terminal_review_summary
+from .progress import PipelineCancelled
 from .risk_report import _build_run_cost, build_risk_report
-from .schemas import validate_stage
 
 
 def run_report_flow(
@@ -17,16 +17,12 @@ def run_report_flow(
     analysis: AnalysisFlowResult,
     execution: ExecutionFlowResult,
     *,
-    derive_verdict: Callable[..., dict[str, Any]],
     provenance_builder: Callable[..., dict[str, Any]],
 ) -> PipelineResult:
     from .agentic_report_editor import run_codex_report_editor_workflow
     from .agentic_task_reporters import task_verifications_document
     from .agentic_task_writers import apply_verified_result
-    from .verification_result import (
-        normalize_task_verification,
-        verification_result_issues,
-    )
+    from .supervisor import REPLAY_REQUIRED, current_supervisor, supervised_call
 
     output_dir = context.output_dir
     audit_dir = context.audit_dir
@@ -45,100 +41,44 @@ def run_report_flow(
     written_files = execution.written_files
     repro_project_dir = analysis.repro_project_dir
 
-    task_by_id = {
-        str(item.get("task_id") or ""): item
-        for item in tasks.get("repro_tasks", [])
-        if isinstance(item, dict) and str(item.get("task_id") or "")
-    }
     task_reporter_results: list[dict[str, Any]] = []
     for record in task_records:
         task_id = str(record.get("task_id") or "")
-        existing = (
-            record.get("task_reporter")
-            if isinstance(record.get("task_reporter"), dict)
-            else {}
-        )
-        verification = (
-            existing.get("task_verification")
-            if isinstance(existing.get("task_verification"), dict)
-            else None
-        )
-        if verification:
-            task_reporter_results.append(existing)
-            continue
-        from .task_reporter_validation import _task_record_run_valid_hint
-        run_valid_hint = _task_record_run_valid_hint(record)
-        verification = normalize_task_verification(
-            {},
-            task_id,
-            task=task_by_id.get(task_id),
-            run_valid_hint=run_valid_hint,
-        )
-        verification.setdefault("engineering_issues", []).append(
-            "The isolated Reporter did not produce a usable note; the host "
-            "recorded an incomplete review, not missing paper information."
-        )
-        synthetic = {
-            "ok": True,
-            "synthetic_terminal": True,
-            "task_id": task_id,
-            "task_verification": verification,
-            "scientific_terminal": True,
-            "scientific_successful": verification.get("outcome")
-            in {"reproduced", "reproduced_with_assumptions"},
-            "validation_warnings": [
-                str(existing.get("error") or "reporter unavailable")
-            ],
+        existing = record.get("task_reporter") if isinstance(record.get("task_reporter"), dict) else {}
+        raw = existing.get("task_verification")
+        accepted = bool(isinstance(raw, dict) and existing.get("ok") is True and not existing.get("supervisor_blocked"))
+        note = dict(raw) if isinstance(raw, dict) else {
+            "task_id": task_id, "outcome": None, "host_action": None,
+            "decision_authority": "no_reporter_decision", "engineering_status": "review_unavailable",
         }
-        record["task_reporter"] = synthetic
-        record["task_verification"] = verification
-        task_reporter_results.append(synthetic)
+        # This is the host's dispatch identity, not a correction of the note.
+        note["assigned_task_id"] = task_id
+        note["handoff_accepted"] = accepted
+        note["coordination_status"] = record.get("coordination_status") or (
+            "completed" if accepted and note.get("host_action") == "complete" else "stopped")
+        if note["coordination_status"] == "stopped":
+            note["coordination_reason"] = record.get("coordination_reason") or existing.get("error") or (
+                "Execution coordination ended; an uncompleted Reporter request is retained without changing its conclusion.")
+        if raw is not None and not accepted:
+            record["unaccepted_task_reporter"] = existing
+        record["task_verification"] = note
+        task_reporter_results.append({**existing, "ok": accepted, "task_id": task_id, "task_verification": note})
 
     verification_result = task_verifications_document(task_reporter_results)
-    if not verification_result.get("all_terminal"):
-        for result in task_reporter_results:
-            verification = (
-                result.get("task_verification")
-                if isinstance(result, dict)
-                else None
-            )
-            if (
-                not isinstance(verification, dict)
-                or verification.get("host_action") != "rerun_writer"
-            ):
-                continue
-            verification["host_action"] = "complete"
-            verification["rerun_reason"] = "none"
-            verification.setdefault("outcome", "review_incomplete")
-            verification.setdefault("engineering_issues", []).append(
-                "A requested causal rerun could not be completed; recorded as "
-                "a terminal outcome."
-            )
-        verification_result = task_verifications_document(task_reporter_results)
-
-    schema_issues = validate_stage("verification_result", verification_result)
-    verification_warnings = [
-        f"{issue.path}: {issue.message}" for issue in schema_issues
-    ] + verification_result_issues(
-        verification_result,
-        [str(record.get("task_id") or "") for record in task_records],
-    )
-    write_json(
-        audit_dir / "04_task_verification_warnings.json",
-        {
-            "advisory": True,
-            "warning_count": len(verification_warnings),
-            "warnings": verification_warnings,
-        },
-    )
     write_json(output_dir / "verification_result.json", verification_result)
+    # Scientific notes are metadata beside the original execution inputs. No
+    # repeated schema gate, config mutation or portable-project refreeze.
+    write_json(output_dir / "runtime_result.json", runtime_result)
     runtime_result = apply_verified_result(
-        task_records=task_records,
-        verification_result=verification_result,
-        output_dir=output_dir,
-        audit_dir=audit_dir,
-        repro_project_dir=repro_project_dir,
+        task_records=task_records, verification_result=verification_result,
+        output_dir=output_dir, audit_dir=audit_dir, repro_project_dir=repro_project_dir,
     )
+    runtime_result.update({
+        "scientific_all_terminal": verification_result.get("all_terminal"),
+        "scientific_all_successful": verification_result.get("all_successful"),
+        "scientific_outcome_counts": verification_result.get("outcome_counts", {}),
+    })
+    write_json(output_dir / "runtime_result.json", runtime_result)
     terminal_review = build_terminal_review_summary(verification_result)
     all_successful = bool(terminal_review["all_successful"])
     outcome_counts = terminal_review["outcome_counts"]
@@ -146,13 +86,10 @@ def run_report_flow(
         agentic_result["status"].update(
             {
                 "stop_class": (
-                    "verified_matched" if all_successful else "verified_terminal"
+                    "delivery_incomplete" if runtime_result.get("delivery_status") in ("partial", "blocked")
+                    else "reporter_handoff_collected"
                 ),
-                "stopped_reason": (
-                    "all tasks reproduced their core conclusions"
-                    if all_successful
-                    else "all tasks reached reportable scientific terminal outcomes"
-                ),
+                "stopped_reason": "Reporter decisions and coordination stops are preserved for report editing",
                 "runtime": {
                     "passed": runtime_result.get("passed"),
                     "coverage": runtime_result.get("coverage"),
@@ -192,64 +129,17 @@ def run_report_flow(
     context.begin("report_editor")
     report_mode = "model"
     report_runner = run_codex_report_editor_workflow
-    try:
-        report_editor_result = report_runner(
-            paper=paper,
-            facts=facts,
-            tasks=tasks,
-            paper_thesis=paper_thesis,
-            runtime_result=runtime_result,
-            risk_report=risk_report,
-            task_records=task_records,
-            task_verifications=[
-                item.get("task_verification")
-                for item in task_reporter_results
-                if isinstance(item, dict)
-                and isinstance(item.get("task_verification"), dict)
-            ],
-            output_dir=output_dir,
-            audit_dir=audit_dir,
-            resume=options.resume,
-        )
-    except Exception as exc:
-        report_editor_result = report_editor_exception_result(exc)
-    first_editor_status = report_editor_result.get("codex_status")
-    report_editor_invocations = int(
-        not report_editor_result.get("cached")
-        and isinstance(first_editor_status, dict)
-        and first_editor_status.get("role") == "report_editor"
+    report_editor_result, report_editor_invocations = run_supervised_report_editor(
+        report_runner,
+        arguments={
+            "paper": paper, "facts": facts, "tasks": tasks, "paper_thesis": paper_thesis,
+            "runtime_result": runtime_result, "risk_report": risk_report,
+            "task_records": task_records,
+            "task_verifications": [item["task_verification"] for item in task_reporter_results
+                                   if isinstance(item.get("task_verification"), dict)],
+            "output_dir": output_dir, "audit_dir": audit_dir, "resume": options.resume,
+        },
     )
-    if not report_editor_result.get("ok") and report_editor_result.get(
-        "retryable"
-    ):
-        try:
-            report_editor_result = report_runner(
-                paper=paper,
-                facts=facts,
-                tasks=tasks,
-                paper_thesis=paper_thesis,
-                runtime_result=runtime_result,
-                risk_report=risk_report,
-                task_records=task_records,
-                task_verifications=[
-                    item.get("task_verification")
-                    for item in task_reporter_results
-                    if isinstance(item, dict)
-                    and isinstance(item.get("task_verification"), dict)
-                ],
-                output_dir=output_dir,
-                audit_dir=audit_dir,
-                resume=False,
-                attempt_no=2,
-                repair_context=report_editor_result,
-            )
-        except Exception as exc:
-            report_editor_result = report_editor_exception_result(exc)
-        second_editor_status = report_editor_result.get("codex_status")
-        report_editor_invocations += int(
-            isinstance(second_editor_status, dict)
-            and second_editor_status.get("role") == "report_editor"
-        )
     result_review_result = report_editor_result.get("result_review_result")
     if not isinstance(result_review_result, dict):
         result_review_result = {
@@ -270,35 +160,9 @@ def run_report_flow(
         )
         write_json(output_dir / "risk_report.json", risk_report)
 
-    reproducibility_verdict = derive_verdict(
-        risk_report=risk_report,
-        runtime_result=runtime_result,
-        result_review=writer_review_document,
-    )
-    verdict_issues = validate_stage(
-        "reproducibility_verdict", reproducibility_verdict
-    )
-    if verdict_issues:
-        write_json(
-            audit_dir / "04b_reproducibility_verdict_fallback.json",
-            {
-                "advisory": True,
-                "errors": [issue.as_dict() for issue in verdict_issues],
-                "candidate": reproducibility_verdict,
-            },
-        )
-        reproducibility_verdict = {
-            "verdict": "inconclusive",
-            "confidence": "low",
-            "reasons": [
-                "internal verdict formatting failed; task-level scientific "
-                "evidence remains available"
-            ],
-            "recommended_action": (
-                "Use task verification and runtime artifacts as the authority; "
-                "regenerate only the summary verdict."
-            ),
-        }
+    # The Editor explains the accepted Reporter results. Python does not assign
+    # a new aggregate scientific label or subjective confidence.
+    reproducibility_verdict = None
     risk_report["reproducibility_verdict"] = reproducibility_verdict
     risk_report["task_reporters"] = {
         "ok": all(bool(item.get("ok")) for item in task_reporter_results),
@@ -321,10 +185,41 @@ def run_report_flow(
     }
     context.mark("report_editor")
     context.begin("reports")
-    docx_generation = pipeline._generate_docx_reports(
-        output_dir=output_dir,
-        result_review_result=result_review_result,
-    )
+    docx_generation: dict[str, Any] = {}
+
+    def deliver_word_reports() -> dict[str, Any]:
+        nonlocal docx_generation
+        docx_generation = pipeline._generate_docx_reports(
+            output_dir=output_dir, result_review_result=result_review_result,
+        )
+        if result_review_result.get("passed") and any(
+            isinstance(item, dict) and item.get("passed") is False
+            for key, item in docx_generation.items() if key != "review_docx"
+        ):
+            raise ReportOperationError({"error": "Word conversion failed; original Markdown reports are preserved",
+                                        "docx_generation": docx_generation})
+        return docx_generation
+
+    if result_review_result.get("passed"):
+        try:
+            docx_generation = supervised_call(
+                "report_delivery", deliver_word_reports,
+                inputs={"owner": "host_delivery", "reports": ["review.md", "result_review.md", "reproduction_report.md"]},
+                evidence_roots={name.replace(".", "_"): output_dir / name for name in
+                                ("review.md", "result_review.md", "reproduction_report.md",
+                                 "review.docx", "result_review.docx", "reproduction_report.docx", "report_assets")},
+                summarize=lambda result: result,
+                reconcile=lambda _state: REPLAY_REQUIRED, passthrough=(PipelineCancelled,),
+            )
+        except PipelineCancelled:
+            raise
+        except Exception as exc:
+            docx_generation["delivery_error"] = {"passed": False, "error": f"{type(exc).__name__}: {exc}",
+                                                  "markdown_preserved": True}
+    else:
+        docx_generation = pipeline._generate_docx_reports(
+            output_dir=output_dir, result_review_result=result_review_result,
+        )
     risk_report["docx_generation"] = docx_generation
 
     review_path = output_dir / "review.md"
@@ -372,8 +267,8 @@ def run_report_flow(
         analysis.analysis_warnings.get("warning_count") or 0
     )
     run_cost["json_format_repair_limit"] = int(options.json_repair_attempts)
-    run_cost["facts_stop_rule"] = "single_global_then_selected_blockers_max_3"
-    run_cost["tasks_stop_rule"] = "coupled_plan_or_revised_plan_handoff_ready"
+    run_cost["facts_stop_rule"] = "supervisor_selected_search_with_budget"
+    run_cost["tasks_stop_rule"] = "supervisor_accepts_planner_handoff"
     run_cost["mineru_layout"] = {
         "ok": analysis.mineru_result.get("ok"),
         "cached": analysis.mineru_result.get("cached"),
@@ -403,14 +298,14 @@ def run_report_flow(
                 "analysis_backend": options.analysis_backend,
                 "analysis_agent_count": 2,
                 "facts_stop_rule": (
-                    "single_global_then_selected_blockers_max_3"
+                    "supervisor_selected_search_with_budget"
                 ),
                 "tasks_stop_rule": "thesis_informed_core_conclusion_contract",
                 "task_writer_stop_rule": (
-                    "host_terminal_scientific_outcome_or_external_blocker"
+                    "supervisor_coordinates_reporter_actions_or_stop"
                 ),
                 "verification_stop_rule": (
-                    "all_tasks_reach_reportable_core_conclusion_outcomes"
+                    "reporter_decisions_preserved_with_coordination_status"
                 ),
                 "report_backend": (
                     "parallel_task_reporters_plus_final_editor"
@@ -424,6 +319,18 @@ def run_report_flow(
     review_docx_path = output_dir / "review.docx"
     reproduction_report_docx_path = output_dir / "reproduction_report.docx"
     result_review_docx_path = output_dir / "result_review.docx"
+    reports_accepted = bool(report_editor_result.get("ok") and result_review_result.get("passed"))
+
+    def accepted_docx(name: str, path: Any) -> Any:
+        status = docx_generation.get(name)
+        return path if (reports_accepted and isinstance(status, dict) and status.get("passed") is True
+                        and path.is_file()) else None
+
+    delivery_status = runtime_result.get("delivery_status", "complete")
+    if not report_editor_result.get("ok") or any(
+        isinstance(item, dict) and item.get("passed") is False for key, item in docx_generation.items() if key != "review_docx"
+    ):
+        delivery_status = "partial"
     context.finish()
     return PipelineResult(
         output_dir=output_dir,
@@ -431,6 +338,8 @@ def run_report_flow(
         repro_project_dir=repro_project_dir,
         risk_report_path=risk_report_path,
         runtime_passed=runtime_result.get("passed"),
+        delivery_status=delivery_status,
+        supervision_path=(audit_dir / "supervisor" / "goal.json") if current_supervisor() is not None else None,
         experiment_index_path=(
             output_dir / "experiment_index.json"
             if (output_dir / "experiment_index.json").exists()
@@ -443,21 +352,19 @@ def run_report_flow(
         ),
         result_review_path=(
             result_review_markdown_path
-            if result_review_markdown_path.exists()
+            if reports_accepted and result_review_markdown_path.exists()
             else None
         ),
         result_review_passed=result_review_result.get("passed"),
         reproducibility_verdict=reproducibility_verdict,
-        review_docx_path=review_docx_path if review_docx_path.exists() else None,
+        review_docx_path=accepted_docx("review_docx", review_docx_path),
         result_review_docx_path=(
-            result_review_docx_path if result_review_docx_path.exists() else None
+            accepted_docx("result_review_docx", result_review_docx_path)
         ),
         reproduction_report_path=(
-            reproduction_report_path if reproduction_report_path.exists() else None
+            reproduction_report_path if reports_accepted and reproduction_report_path.exists() else None
         ),
         reproduction_report_docx_path=(
-            reproduction_report_docx_path
-            if reproduction_report_docx_path.exists()
-            else None
+            accepted_docx("reproduction_report_docx", reproduction_report_docx_path)
         ),
     )

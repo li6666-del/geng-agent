@@ -6,8 +6,9 @@ Checkpoints, datasets, and random realizations belong to execution-plan flows.
 
 from __future__ import annotations
 
-from copy import deepcopy
 from typing import Any
+
+from .architecture_protocol import architecture_runtime_view
 
 
 def _objects(value: Any) -> list[dict[str, Any]]:
@@ -20,6 +21,7 @@ def derive_foundation_scope(
 ) -> dict[str, Any]:
     """Use every binding and transitive component dependency, never figure names."""
 
+    architecture = architecture_runtime_view(architecture)
     components = {
         str(item["id"]): item
         for item in _objects(architecture.get("components"))
@@ -94,7 +96,7 @@ def scoped_foundation_architecture(
 ) -> dict[str, Any]:
     """Restrict implementation ownership while retaining all task/experiment context."""
 
-    result = deepcopy(architecture)
+    result = architecture_runtime_view(architecture)
     scope = derive_foundation_scope(architecture, execution_plan)
     result["_foundation_scope"] = scope
     shared = set(scope["component_ids"])

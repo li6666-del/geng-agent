@@ -24,8 +24,6 @@ from .verification_result import (
     partition_writer_delivery_issues,
     rerun_evidence_path_issues,
     task_verification_issues,
-    verification_result_issues,
-    writer_revision_allowed,
     writer_delivery_issues,
 )
 from .task_writer_support import (
@@ -60,6 +58,7 @@ from .execution_plan import compile_execution_plan
 from .foundation_revision import FoundationRevisionRequired, collect_pending_foundation_revisions
 from .writer_lineage import build_writer_unit_lineage, writer_policy_content_hashes
 from .config import get_config_value
+from .supervisor import StageBlocked, REPLAY_REQUIRED, supervised_call
 from .io_runtime import BACKEND_RUNTIME_API_DOC, IO_RUNTIME_API_DOC, inject_io_runtime
 from .json_utils import pretty_json
 from .manifest_utils import expected_generated_paths
@@ -71,10 +70,6 @@ from .security import (
     dependency_policy_prompt_text,
     redact_text,
     split_static_security_issues,
-    split_requirement_issues,
-    static_scan_repro_project,
-    reconcile_runtime_requirements,
-    validate_requirements,
 )
 from .scientific_materiality import CORE_RESULT_STOP_POLICY, TERMINAL_SCIENTIFIC_OUTCOMES
 from .stage_cleanup import _clear_stage_outputs
@@ -85,30 +80,8 @@ from .task_writer_contracts import (
     WRITER_PAPER_FIDELITY_POLICY,
 )
 from .task_writer_delivery import _collect_task_writer_delivery, _collect_writer_images
-from .task_writer_execution_binding import (
-    _StaticCallScanner,
-    _analyze_static_function,
-    _analyze_static_module,
-    _assigned_task_entrypoint,
-    _canonical_static_symbol,
-    _declared_callable_is_called,
-    _dedupe_strings,
-    _imports_from_local_module,
-    _inspect_task_execution_source,
-    _load_task_execution_binding,
-    _normalize_python_module,
-    _reachable_local_src_modules,
-    _safe_task_source_path,
-    _sandbox_evidence_source,
-    _src_module_index,
-    _static_callable_usage,
-    _static_import_base,
-    _static_reference,
-    _task_execution_binding_from_architecture,
-    _task_execution_binding_issues,
-    _task_module_index,
-    _walk_static_calls,
-)
+from .task_writer_execution_binding import _load_task_execution_binding, _task_execution_binding_from_architecture
+
 from .task_writer_files import (
     _read_optional_json_object,
     _task_owned_files,
@@ -204,6 +177,68 @@ from .task_writer_dispatch import (
     _reporter_callback_with_replay,
     _task_writer_concurrency,
 )
+
+
+def _final_package_file_validation(
+    *, repro_project_dir: Path, expected_paths: set[str], validation: dict[str, Any],
+) -> dict[str, Any]:
+    """Refresh file-existence observations after assembly, without a science verdict."""
+    def present(relative: Any) -> bool:
+        if not isinstance(relative, str) or not relative:
+            return False
+        path = PurePosixPath(relative.replace("\\", "/"))
+        if path.is_absolute() or PureWindowsPath(relative).drive or ".." in path.parts:
+            return False
+        return (repro_project_dir / relative).is_file()
+
+    observations = list(validation.get("observations") or [])
+    declared = set(expected_paths)
+    declared.update(path for path in (validation.get("missing_files") or []) if isinstance(path, str))
+    declared.update(item["path"] for item in observations if isinstance(item, dict)
+                    and item.get("code") == "declared_package_file_missing"
+                    and isinstance(item.get("path"), str))
+    missing = sorted(path for path in declared if not present(path))
+    observations = [item for item in observations if not (
+        isinstance(item, dict) and item.get("code") == "declared_package_file_missing"
+        and present(item.get("path")))]
+    recorded = {item.get("path") for item in observations if isinstance(item, dict)
+                and item.get("code") == "declared_package_file_missing"}
+    observations.extend({"code": "declared_package_file_missing", "path": path}
+                        for path in missing if path not in recorded)
+    return {**validation, "required_files_present": not missing,
+            "missing_files": missing, "observations": observations}
+
+
+def _refresh_cached_package_validation(
+    *, cached: dict[str, Any], repro_project_dir: Path, output_dir: Path, audit_dir: Path,
+) -> dict[str, Any]:
+    """Refresh final delivery metadata after the existing cache integrity check."""
+    runtime = dict(cached.get("runtime_result") or {})
+    validation = _final_package_file_validation(
+        repro_project_dir=repro_project_dir,
+        expected_paths=_expected_paths_from_project_manifest(cached.get("manifest") or {}),
+        validation=dict(runtime.get("validation") or {}),
+    )
+    runtime["validation"] = validation
+    cached["runtime_result"] = runtime
+    status_path = audit_dir / "03c_task_writers_status.json"
+    status = {**_read_optional_json_object(status_path), **(cached.get("status") or {}),
+              "validation": validation}
+    cached["status"] = status
+    write_json(output_dir / "runtime_result.json", runtime)
+    write_json(status_path, status)
+    for name in ("03c_project_portability.json", "03c_project_portability_final.json"):
+        path = audit_dir / name
+        if not path.is_file() or path_is_foundation_link(path):
+            continue
+        record = _read_optional_json_object(path)
+        refreshed = _final_package_file_validation(
+            repro_project_dir=repro_project_dir, expected_paths=set(),
+            validation={"observations": record.get("observations") or []},
+        )
+        if record.get("observations") != refreshed["observations"]:
+            write_json(path, {**record, "observations": refreshed["observations"]})
+    return cached
 
 
 def _commit_cached_task_reporter_refresh(
@@ -422,6 +457,30 @@ def run_codex_task_writer_workflow(
                 evidence["analysis_snapshot_hash"] = current["snapshot_hash"]
                 write_json(evidence_path, evidence)
         write_json(audit_dir / "03c_writer_unit_lineage.json", lineage)
+
+    def handoff_pending_foundation_revisions(records, dispatch_policy) -> None:
+        # Cached and freshly run Reporters reach the same host-owned shared
+        # repair boundary before any Writer restart or final cached return.
+        requests = collect_pending_foundation_revisions(
+            records, foundation, declined_foundation_revision_ids,
+        )
+        if requests:
+            write_json(audit_dir / "03c_task_writers_records.json", {
+                "dispatch_policy": dispatch_policy, "tasks": records,
+            })
+            validation = {"required_files_present": False, "python_compiles": None,
+                          "host_validation_skipped": True, "packaging_completed": False}
+            runtime = _task_writer_runtime_result(task_records=records, validation=validation,
+                requirement_warnings=[], requirement_issues=[], security_issues=[])
+            runtime["delivery_status"] = "partial"
+            raise FoundationRevisionRequired(requests, partial_result={
+                "manifest": {"files": [], "tasks": task_manifest.get("tasks", []),
+                             "_meta": {"packaging_completed": False}},
+                "task_records": records, "runtime_result": runtime, "written_files": [],
+                "writer_review_doc": {**_task_writer_alignment_summary(records),
+                    "task_writer_reviews": [_compact_task_writer_review(record) for record in records]},
+                "status": {"stop_class": "pending_foundation_revision", "validation": validation}})
+
     expected_paths = expected_generated_paths([item["script"] for item in manifest_entries])
     review_feedback = dict(review_feedback or {})
     force_task_ids = {str(item) for item in (force_task_ids or set()) if str(item)}
@@ -522,6 +581,7 @@ def run_codex_task_writer_workflow(
                 audit_dir / "03c_cached_task_reporters.json",
                 reporter_refresh_audit,
             )
+            handoff_pending_foundation_revisions(cached_records, reporter_refresh_audit)
             if reporter_revisions:
                 # Only an evidence-backed Reporter revision re-enters the
                 # existing Writer continuation state machine. Replay the
@@ -571,8 +631,12 @@ def run_codex_task_writer_workflow(
                         "reporter_refresh": reporter_refresh_audit,
                     },
                 )
-                return cached
+                return _refresh_cached_package_validation(
+                    cached=cached, repro_project_dir=repro_project_dir,
+                    output_dir=output_dir, audit_dir=audit_dir,
+                )
         else:
+            handoff_pending_foundation_revisions(cached_records, {"source": "cached artifacts"})
             cached["writer_review_doc"] = {
                 "_meta": {"mode": "task_writer_scientific_results"},
                 **_task_writer_alignment_summary(cached_records),
@@ -584,7 +648,10 @@ def run_codex_task_writer_workflow(
                 audit_dir / "03c_task_writers_resume.json",
                 {"ok": True, "source": "cached artifacts"},
             )
-            return cached
+            return _refresh_cached_package_validation(
+                cached=cached, repro_project_dir=repro_project_dir,
+                output_dir=output_dir, audit_dir=audit_dir,
+            )
     if refreshed_cached_records_by_index:
         # Carry the Reporter-refreshed records into dispatch. Unaffected
         # execution units remain reusable; only a unit containing a requested
@@ -614,7 +681,7 @@ def run_codex_task_writer_workflow(
         "task_count": len(task_pairs),
         "logical_task_count": len(task_pairs),
         "execution_unit_count": int(execution_plan.get("execution_unit_count") or 0),
-        "orchestration": "launch_all_then_wait",
+        "orchestration": "supervisor_tool_dispatch",
     }
     status["agent_concurrency"] = int(execution_plan.get("execution_unit_count") or 0)
     status["agent_concurrency_kind"] = "planned_writer_units"
@@ -647,12 +714,7 @@ def run_codex_task_writer_workflow(
     )
     write_json(audit_dir / "writer_dispatch.json", dispatch_audit)
 
-    foundation_requests = collect_pending_foundation_revisions(
-        task_records, foundation, declined_foundation_revision_ids
-    )
-    if foundation_requests:
-        write_json(audit_dir / "03c_task_writers_records.json", {"dispatch_policy": dispatch_audit, "tasks": task_records})
-        raise FoundationRevisionRequired(foundation_requests)
+    handoff_pending_foundation_revisions(task_records, dispatch_audit)
 
     pending_requests = _task_environment_requests(task_records)
     if pending_requests:
@@ -660,79 +722,99 @@ def run_codex_task_writer_workflow(
             audit_dir / "03c_task_writers_records.json",
             {"dispatch_policy": dispatch_audit, "tasks": task_records},
         )
+        pending_validation = {"required_files_present": False, "python_compiles": None,
+                              "host_validation_skipped": True, "packaging_completed": False}
+        pending_runtime = _task_writer_runtime_result(
+            task_records=task_records, validation=pending_validation,
+            requirement_warnings=[], requirement_issues=[], security_issues=[],
+        )
+        pending_runtime["delivery_status"] = "partial"
         raise EnvironmentRequestRequired(
             pending_requests,
             source="task_writers",
+            partial_result={
+                "manifest": {"_meta": {"mode": "task_writers", "packaging_completed": False},
+                             "files": [], "tasks": task_manifest.get("tasks", [])},
+                "task_records": task_records, "runtime_result": pending_runtime,
+                "written_files": [], "writer_review_doc": {
+                    **_task_writer_alignment_summary(task_records),
+                    "task_writer_reviews": [_compact_task_writer_review(record) for record in task_records]},
+                "status": {**status, "stop_class": "pending_environment",
+                           "validation": pending_validation},
+            },
         )
 
-    _prepare_project_workspace(repro_project_dir, task_manifest)
-    expected_paths = _merge_task_writer_deliveries(
-        repro_project_dir=repro_project_dir,
-        task_manifest=task_manifest,
-        expected_paths=set(expected_paths),
-        task_records=task_records,
-        foundation=foundation,
-        execution_plan=execution_plan,
-        case_runtime=case_runtime,
-        require_lineage=run_repro,
-    )
-    _restore_trusted_files(repro_project_dir, task_manifest)
-    final_task_manifest = task_manifest
-    write_json(repro_project_dir / "tasks_manifest.json", final_task_manifest)
-    reconcile_runtime_requirements(
-        repro_project_dir,
-        runtime_policy=case_runtime.manifest if case_runtime is not None else None,
-        runtime_lock=case_runtime.lock if case_runtime is not None else None,
-    )
-    validation = validate_repro_project(repro_project_dir)
-    validation["host_validation_skipped"] = False
-    requirement_findings = validate_requirements(
-        repro_project_dir,
-        runtime_policy=case_runtime.manifest if case_runtime is not None else None,
-        runtime_lock=case_runtime.lock if case_runtime is not None else None,
-    )
-    requirement_issues, requirement_warnings = split_requirement_issues(
-        requirement_findings,
-        runtime_policy=case_runtime.manifest if case_runtime is not None else None,
-        runtime_lock=case_runtime.lock if case_runtime is not None else None,
-    )
-    foundation_integrity_issues = (
-        foundation_violations(repro_project_dir, foundation)
-        if foundation is not None
-        else []
-    )
-    if foundation is not None:
-        validation["foundation_integrity_checked"] = True
-        validation["foundation_integrity_ok"] = not foundation_integrity_issues
-        validation["foundation_violations"] = foundation_integrity_issues
-    security_issues = _classify_task_writer_security_issues(
-        static_scan_repro_project(repro_project_dir),
-        foundation=foundation,
-        foundation_integrity_issues=foundation_integrity_issues,
-    )
-    syntax_issues = [
-        issue for issue in security_issues if "syntax error" in str(issue.get("message") or "").lower()
-    ]
-    if syntax_issues:
-        validation["python_compiles"] = False
-        validation["compile_errors"] = syntax_issues
-        validation["host_validation_skipped"] = False
-    manifest, portability = _freeze_repro_project_package(
-        repro_project_dir=repro_project_dir,
-        output_dir=output_dir,
-        audit_path=audit_dir / "03c_project_portability.json",
-        task_manifest=final_task_manifest,
-        expected_paths=expected_paths,
-        analysis_snapshot_hash=analysis_snapshot_hash,
-        foundation_snapshot_hash=foundation_snapshot_hash,
-        environment_hash=environment_hash,
-        run_smoke=bool(run_repro),
-        python_executable=(
-            case_runtime.python_executable if case_runtime is not None else None
-        ),
-    )
-    validation["portable"] = bool(portability.get("portable"))
-    validation["relocated_smoke"] = portability.get("smoke", {})
+    initial_expected_paths = set(expected_paths)
+    def assemble_project():
+        _prepare_project_workspace(repro_project_dir, task_manifest)
+        expected_paths = _merge_task_writer_deliveries(
+            repro_project_dir=repro_project_dir,
+            task_manifest=task_manifest,
+            expected_paths=set(initial_expected_paths),
+            task_records=task_records,
+            foundation=foundation,
+            execution_plan=execution_plan,
+            case_runtime=case_runtime,
+            require_lineage=run_repro,
+        )
+        _restore_trusted_files(repro_project_dir, task_manifest)
+        final_task_manifest = task_manifest
+        write_json(repro_project_dir / "tasks_manifest.json", final_task_manifest)
+        validation = {"python_compiles": None, "host_validation_skipped": True,
+                      "observations": []}
+        requirement_warnings, requirement_issues, security_issues = [], [], []
+        manifest, portability = _freeze_repro_project_package(
+            repro_project_dir=repro_project_dir,
+            output_dir=output_dir,
+            audit_path=audit_dir / "03c_project_portability.json",
+            task_manifest=final_task_manifest,
+            expected_paths=expected_paths,
+            analysis_snapshot_hash=analysis_snapshot_hash,
+            foundation_snapshot_hash=foundation_snapshot_hash,
+            environment_hash=environment_hash,
+            run_smoke=bool(run_repro),
+            python_executable=(
+                case_runtime.python_executable if case_runtime is not None else None
+            ),
+            contextual_findings=validation["observations"],
+        )
+        validation = _final_package_file_validation(
+            repro_project_dir=repro_project_dir, expected_paths=expected_paths,
+            validation=validation,
+        )
+        validation["portable"] = bool(portability.get("portable"))
+        validation["relocated_smoke"] = portability.get("smoke", {})
+
+        return expected_paths, manifest, portability, validation, requirement_warnings, requirement_issues, security_issues
+
+    delivery_blocked = None
+    try:
+        expected_paths, manifest, portability, validation, requirement_warnings, requirement_issues, security_issues = supervised_call(
+            "packaging", assemble_project,
+            inputs={"owner": "packaging", "analysis_snapshot_hash": analysis_snapshot_hash,
+                    "foundation_snapshot_hash": foundation_snapshot_hash, "environment_hash": environment_hash,
+                    "task_manifest": task_manifest,
+                    "task_results": [{key: record.get(key) for key in
+                        ("task_id", "writer_completed", "task_verification", "execution_summary", "coordination_status", "coordination_observations")}
+                        for record in task_records],
+                    "instruction": "Assemble only existing verified artifacts. Retain failed or unreproduced tasks; do not rerun scientific experiments to repair delivery."},
+            evidence_roots={"project": repro_project_dir, "writers": audit_dir / "03c_task_writer_sandboxes"},
+            summarize=lambda value: {"manifest": value[1], "portability": value[2], "validation": value[3]},
+            reconcile=lambda _state: REPLAY_REQUIRED,
+            passthrough=(EnvironmentRequestRequired, FoundationRevisionRequired),
+        )
+    except StageBlocked as exc:
+        # Keep current-run verified scientific results available to the editor.
+        # A broken assembled tree must never masquerade as a portable delivery.
+        delivery_blocked = {"node_id": exc.node_id, "decision": exc.decision, "error": str(exc)}
+        write_json(audit_dir / "03c_packaging_blocked.json", delivery_blocked)
+        manifest = {"_meta": {"mode": "task_writers", "delivery_blocked": delivery_blocked},
+                    "files": [], "tasks": task_manifest.get("tasks", [])}
+        portability = {"portable": False, "delivery_blocked": delivery_blocked}
+        validation = {"required_files_present": False, "python_compiles": None,
+                      "host_validation_skipped": True, "portable": False,
+                      "delivery_blocked": delivery_blocked}
+        requirement_warnings, requirement_issues, security_issues = [], [], []
 
     runtime_result = _task_writer_runtime_result(
         task_records=task_records,
@@ -741,6 +823,10 @@ def run_codex_task_writer_workflow(
         requirement_issues=requirement_issues,
         security_issues=security_issues,
     )
+    if delivery_blocked is not None:
+        runtime_result["delivery_status"] = "partial"
+        runtime_result["engineering_failures"] = [delivery_blocked]
+        runtime_result["partial_success"]["has_partial_output"] = bool(task_records)
     write_json(output_dir / "runtime_result.json", runtime_result)
     alignment_summary = _task_writer_alignment_summary(task_records)
     writer_review_doc = {
@@ -785,6 +871,7 @@ def run_codex_task_writer_workflow(
         "runtime_result": runtime_result,
         "task_records": task_records,
         "writer_review_doc": writer_review_doc,
+        "delivery_blocked": delivery_blocked,
         "written_files": [str(path) for path in _manifest_disk_paths(manifest, repro_project_dir)],
         "status": status,
     }

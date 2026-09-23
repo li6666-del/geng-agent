@@ -365,7 +365,7 @@ def test_merge_preserves_writer_src_and_namespaces_tests_but_not_host_contracts(
     assert json.loads((project / "execution_plan.json").read_text(encoding="utf-8")) == plan
 
 
-def test_undirected_strong_artifact_requires_persisted_lineage(tmp_path: Path) -> None:
+def test_missing_strong_artifact_description_is_presented_for_review(tmp_path: Path) -> None:
     tasks = {
         "repro_tasks": [_task("curve_a"), _task("curve_b")],
         "execution_relationships": [
@@ -409,21 +409,18 @@ def test_undirected_strong_artifact_requires_persisted_lineage(tmp_path: Path) -
     project = tmp_path / "project"
     project.mkdir()
 
-    try:
-        _merge_task_writer_deliveries(
-            repro_project_dir=project,
-            task_manifest=manifest,
-            expected_paths=expected_generated_paths(
-                [entry["script"] for entry in manifest["tasks"]]
-            ),
-            task_records=records,
-            execution_plan=plan,
-            require_lineage=True,
-        )
-    except RuntimeError as exc:
-        assert "random_state" in str(exc)
-    else:
-        raise AssertionError("missing undirected strong lineage must block packaging")
+    _merge_task_writer_deliveries(
+        repro_project_dir=project,
+        task_manifest=manifest,
+        expected_paths=expected_generated_paths(
+            [entry["script"] for entry in manifest["tasks"]]
+        ),
+        task_records=records,
+        execution_plan=plan,
+        require_lineage=True,
+    )
+    lineage = json.loads((project / "artifact_lineage.json").read_text(encoding="utf-8"))
+    assert any(item["code"] == "strong_artifact_description_missing" for item in lineage["observations"])
 
 
 def test_large_binary_is_packaged_by_inventory_not_embedded_as_manifest_text(
@@ -487,7 +484,7 @@ def test_large_binary_hashing_does_not_use_path_read_bytes(
     assert len(_streaming_file_sha256(checkpoint)) == 64
 
 
-def test_strong_lineage_cannot_alias_task_source_as_material_artifact(tmp_path: Path) -> None:
+def test_source_declared_as_checkpoint_is_observed_for_scientific_review(tmp_path: Path) -> None:
     tasks = {
         "repro_tasks": [_task("train"), _task("evaluate")],
         "execution_relationships": [
@@ -525,23 +522,20 @@ def test_strong_lineage_cannot_alias_task_source_as_material_artifact(tmp_path: 
         encoding="utf-8",
     )
 
-    try:
-        _build_artifact_lineage(
-            repro_project_dir=project,
-            execution_plan=plan,
-            task_records=[
-                {
-                    "task_id": "train",
-                    "execution_unit_id": unit_id,
-                    "sandbox": str(sandbox),
-                }
-            ],
-            require_lineage=True,
-        )
-    except RuntimeError as exc:
-        assert "must be persisted under" in str(exc)
-    else:
-        raise AssertionError("source code must not satisfy persisted checkpoint lineage")
+    result = _build_artifact_lineage(
+        repro_project_dir=project,
+        execution_plan=plan,
+        task_records=[
+            {
+                "task_id": "train",
+                "execution_unit_id": unit_id,
+                "sandbox": str(sandbox),
+            }
+        ],
+        require_lineage=True,
+    )
+    assert any(item["code"] == "artifact_namespace_differs" for item in result["observations"])
+    assert result["artifacts"][0]["path"] == "tasks/train.py"
 
 
 def test_merge_removes_stale_outputs_repair_logs_and_case_variant_caches(
@@ -951,7 +945,8 @@ def test_resumed_compound_repeated_causal_request_runs_one_shared_continuation(
     assert by_id["train"]["scientific_stop_reason"] == (
         "repeated_execution_unit_rerun_request_without_new_causal_plan"
     )
-    assert by_id["train"]["task_verification"]["host_action"] == "complete"
+    assert by_id["train"]["task_verification"]["host_action"] == "rerun_writer"
+    assert by_id["train"]["coordination_status"] == "stopped"
 
 
 def test_compound_runtime_refresh_marker_requires_fresh_success(
@@ -1014,7 +1009,7 @@ def test_compound_runtime_refresh_marker_requires_fresh_success(
         write_delivery=True,
     )
     marker_name = ".geng_runtime_refresh_pending.json"
-    assert not (successful_sandbox / marker_name).exists()
+    assert not (successful_sandbox / marker_name).exists(), successful_records
     assert all(record["runtime_refresh_completed"] is True for record in successful_records)
     assert all(record["environment_refresh_completed"] is True for record in successful_records)
 

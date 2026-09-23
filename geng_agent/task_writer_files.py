@@ -6,10 +6,12 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .outputs import _is_fresh
+
 
 def _writer_delivery_path_is_fresh(path: Path, since: float | None) -> bool:
     try:
-        return path.is_file() and (since is None or path.stat().st_mtime >= since)
+        return path.is_file() and _is_fresh(path, since)
     except OSError:
         return False
 

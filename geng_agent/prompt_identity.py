@@ -80,21 +80,15 @@ def analysis_contract_identity(*, stage_label: str, schema_stage: str,
     from .agentic_analysis import _build_analysis_brief
     from .pipeline import SYSTEM_MESSAGE
     from . import pipeline_helpers
-    from . import analysis_repair
-    from .schema_models import model_for_stage
+    from .analysis_protocol import analysis_protocol_issues
 
-    repairs = {name: text_identity(inspect.getsource(getattr(pipeline_helpers, name)))
-               for name in ("build_json_inline_retry_prompt", "build_json_scientific_retry_prompt", "build_json_preservation_retry_prompt")
-               if hasattr(pipeline_helpers, name)}
-    repairs.update({name: text_identity(inspect.getsource(getattr(analysis_repair, name)))
-                    for name in ("scientific_correction_paths", "preserved_science_issues")})
+    repairs = {}
     if backend != "codex":
         repairs["build_text_only_evidence_prompt"] = text_identity(inspect.getsource(pipeline_helpers.build_text_only_evidence_prompt))
-    schema = model_for_stage(schema_stage).model_json_schema()
-    return {"version": "analysis-contract-v1", "stage": stage_label,
+    return {"version": "analysis-contract-v2-supervisor-owned", "stage": stage_label,
             "prompt_sha256": text_identity(prompt),
             "system_sha256": text_identity(SYSTEM_MESSAGE) if backend != "codex" else None,
             "wrapper_sha256": text_identity(inspect.getsource(_build_analysis_brief)) if backend == "codex" else None,
             "repair_sha256": repairs,
-            "schema_sha256": hashlib.sha256(json.dumps(schema, sort_keys=True, ensure_ascii=False).encode()).hexdigest(),
+            "protocol_sha256": text_identity(inspect.getsource(analysis_protocol_issues)),
             "model": model_identity("analysis", backend=backend, client=client)}

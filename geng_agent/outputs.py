@@ -5,6 +5,7 @@ import py_compile
 import base64
 import csv
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -473,7 +474,10 @@ def _valid_scientific_artifact(
 
 
 def _is_fresh(path: Path, since: float | None) -> bool:
-    return since is None or path.stat().st_mtime >= since
+    # Windows clock/filetime conversion can round one floating-point step apart
+    # (about 0.24 microseconds today). This is precision tolerance, not a grace
+    # period for old artifacts; execution receipts still bind the actual run.
+    return since is None or path.stat().st_mtime >= math.nextafter(since, -math.inf)
 
 
 def _valid_csv(path: Path) -> bool:

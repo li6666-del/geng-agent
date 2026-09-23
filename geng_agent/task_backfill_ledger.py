@@ -44,12 +44,14 @@ def summarize_backfill_resolution(
         for field in _request_fields(request):
             field_id = str(field.get("field_id") or "")
             field_result = result_by_field.get(field_id)
-            if field_result is None or str(field_result.get("status") or "") not in _FIELD_STATUSES:
+            if field_result is None:
                 complete = False
                 all_evidenced = False
                 fields.append({**field, "status": "open", "fact_refs": []})
                 continue
             status = str(field_result.get("status") or "")
+            if status not in _FIELD_STATUSES:
+                complete = False
             refs = [ref for ref in field_result.get("fact_refs", []) if isinstance(ref, dict)]
             if status not in _EVIDENCED_STATUSES:
                 all_evidenced = False
@@ -61,6 +63,9 @@ def summarize_backfill_resolution(
         item = {
             **copy.deepcopy(request),
             "field_results": fields,
+            # Missing answers are observations about this response. They do
+            # not revoke an earlier answer recorded under the same field ID.
+            "reported_field_ids": list(result_by_field),
             "matched_facts": matched_facts,
             "terminal": complete,
         }
@@ -72,6 +77,7 @@ def summarize_backfill_resolution(
             open_requests.append(item)
     unresolved = [*terminal_unresolved, *open_requests]
     return {
+        "classification": "owner_reported_status_only; supervisor judges evidential sufficiency",
         "request_count": len(requests),
         "resolved_count": len(resolved),
         "terminal_unresolved_count": len(terminal_unresolved),
@@ -104,8 +110,11 @@ def update_search_ledger(
             for item in result.get("field_results", [])
             if isinstance(item, dict)
         }
+        reported_ids = result.get("reported_field_ids")
         for field in _request_fields(request):
             field_id = str(field.get("field_id") or "")
+            if isinstance(reported_ids, list) and field_id not in reported_ids:
+                continue
             field_result = fields.get(field_id, {})
             entries.append(
                 {

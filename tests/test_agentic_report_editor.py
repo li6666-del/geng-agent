@@ -170,7 +170,7 @@ class FinalReportEditorTests(unittest.TestCase):
             self.assertIn("不是科研成功次数", brief)
             self.assertEqual(
                 REPORT_EDITOR_PROMPT_VERSION,
-                "final_report_editor_v12_comparison_wording",
+                "final_report_editor_v15_conditional_comparison",
             )
 
     def test_human_readable_task_headings_do_not_require_machine_task_ids(self) -> None:
@@ -367,11 +367,11 @@ class FinalReportEditorTests(unittest.TestCase):
             with patch("geng_agent.agentic_report_editor.REPORT_MARKDOWN_MAX_BYTES", 64 * 1024):
                 result = _run_with_command(command, **_workflow_inputs(output))
 
-            self.assertFalse(result["ok"], result)
-            self.assertEqual(result["completion_mode"], "hard_failure")
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["completion_mode"], "passed_after_normalization")
             self.assertEqual(result["fallback_files"], [])
-            self.assertEqual(result["missing_outputs"], ["review.md"])
-            self.assertTrue(any("resource limit" in issue for issue in result["recovered_packaging_issues"]))
+            self.assertEqual(result["missing_outputs"], [])
+            self.assertTrue(any("resource limit" in issue for issue in result["host_observations"]))
             discarded = Path(result["workspace"]) / "discarded_report_outputs" / "review.md"
             self.assertGreater(discarded.stat().st_size, 64 * 1024)
             self.assertFalse((output / "review.md").exists())
@@ -388,13 +388,13 @@ class FinalReportEditorTests(unittest.TestCase):
 
             result = _run_with_command(command, **_workflow_inputs(output))
 
-            self.assertFalse(result["ok"], result)
-            self.assertTrue(result["retryable"])
-            self.assertEqual(result["completion_mode"], "hard_failure")
+            self.assertTrue(result["ok"], result)
+            self.assertFalse(result["retryable"])
+            self.assertEqual(result["completion_mode"], "passed_after_normalization")
             self.assertEqual(result["hard_issues"], [])
             self.assertEqual(result["fallback_files"], [])
-            self.assertEqual(result["missing_outputs"], ["review.md"])
-            self.assertTrue(any("regular file" in issue for issue in result["recovered_packaging_issues"]))
+            self.assertEqual(result["missing_outputs"], [])
+            self.assertTrue(any("regular file" in issue for issue in result["host_observations"]))
             self.assertFalse((output / "review.md").exists())
             discarded = Path(result["workspace"]) / "discarded_report_outputs" / "review.md"
             self.assertTrue(discarded.is_dir())

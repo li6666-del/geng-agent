@@ -31,6 +31,8 @@ def classify_static_security_issue(issue: dict[str, Any]) -> str:
     """
 
     message = str(issue.get("message") or "")
+    if message.startswith("absolute path literal is forbidden: "):
+        return "absolute_path_literal"
     import_prefix = "forbidden import: "
     if message.startswith(import_prefix):
         imported = message[len(import_prefix):].strip()

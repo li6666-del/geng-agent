@@ -136,4 +136,4 @@ def test_preparation_writer_session_host_rejects_full_but_runs_smoke(monkeypatch
         assert responses["smoke"]["returncode"] == 0 and responses["smoke"]["mode"] == "smoke"
         receipts = list((audit / "execution_runs").glob("*/execution_receipt.json"))
         assert len(receipts) == 1
-        assert json.loads(receipts[0].read_text())["mode"] == "smoke"
+        assert json.loads(receipts[0].read_text(encoding="utf-8"))["mode"] == "smoke"

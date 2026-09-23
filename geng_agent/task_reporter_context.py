@@ -36,6 +36,7 @@ TASK_REPORTER_PROMPT_VERSION = "isolated_task_reporter_v15_task_goal_scope"
 REPORTER_CONVERGENCE_POLICY = """## Convergence and materiality
 - Enforce paper-explicit scientific facts. Accept reasonable, disclosed choices where the paper is silent.
 - `host_execution.unobserved_artifacts` lists files added or changed after the observed run. They may illustrate the report, but cannot alone establish scientific support; inspect the observed measurements and implementation.
+- `writer_observations` records process, paper-directory and Foundation anomalies. Investigate their effect on the assigned claim; an observation is not itself a scientific verdict. The paper evidence in this workspace is copied afresh from the original source.
 - Decide numerical materiality from the claim, metric scale and statistical uncertainty, and explain your reasoning. There is no universal factor-of-10 acceptance rule. Separate missing paper information from unavailable execution or review evidence.
 - Recommend another Writer run only for `invalid_run`, `core_conclusion_failed`, or `material_numeric_discrepancy` affecting the assigned task goals, and only with paper evidence plus a concrete causal code/config change and predicted effect. Out-of-scope observations never justify a rerun.
 - Do not speculate. Unsupported but faithfully implemented results without a justified next change are reportable `not_reproduced`; unavailable decisive information is reportable `inconclusive_missing_information`.
@@ -167,6 +168,7 @@ def _prepare_task_reporter_input(
         ),
         "writer_account_path": "inputs/writer_account.json",
         "host_execution": task_record.get("host_execution"),
+        "writer_observations": task_record.get("writer_observations", {}),
         "artifacts": (
             task_record.get("artifacts")
             if isinstance(task_record.get("artifacts"), dict)
@@ -190,6 +192,7 @@ def _build_task_reporter_brief(
     report_asset_dir: str,
     include_all_paper_pages: bool,
     repair: bool = False,
+    clarification: bool = False,
 ) -> str:
     page_policy = (
         "The host attachment manifest identifies the full-paper pages actually attached for evidence recovery."
@@ -205,6 +208,16 @@ already supported by the same immutable inputs. Do not restart the scientific
 review or change a conclusion merely to satisfy formatting. If the previous note
 is absent or unusable, recover the necessary observations from the listed evidence.
 """ if repair else ""
+    if clarification:
+        repair_block = """## Independently clarify a recovery question
+Read `inputs/reporter_repair.json` and the previous note. The moderator supplies
+a focused question, never a scientific verdict. Check its premises against the
+original paper and immutable execution evidence, and answer within the assigned
+task's existing goals. You may maintain or correct your previous conclusion,
+with cited evidence; explain disagreement or remaining uncertainty explicitly.
+Do not execute the Writer code, expand acceptance, or force a successful result.
+Retain unaffected observations and issue your own complete decision protocol.
+"""
     return f"""# Role: isolated scientific task reporter
 
 Verify exactly one reproduction task: `{task_id}`. The paper is the scientific authority. The Writer's prose is evidence, not a verdict.
@@ -227,7 +240,7 @@ Trace paper-explicit equations, models, algorithms, baselines, parameters, and m
 - `unsupported`; or
 - `unassessable_missing_information` when the paper or available evidence is insufficient.
 
-For each usable Task-Designer numeric target, report the observed local magnitude in the same metric, unit and regime; use null when unavailable. You decide comparison_status and explain comparison_reason, including equivalent expressions and conversions. The host may compute diagnostic ratios but cannot decide comparability or materiality. Do not force a comparison across incompatible dimensions or invent a value to complete the example.
+For each usable Task-Designer numeric target, report the observed local magnitude in the same metric, unit and regime; use null when unavailable. You decide comparison_status and explain comparison_reason, including equivalent expressions and conversions. Any ratio is optional arithmetic; you decide comparability and materiality. Do not force a comparison across incompatible dimensions or invent a value to complete the example.
 
 Designer criteria and numeric anchors are provisional. If a criterion is not a paper claim, use `status: not_applicable` and an optional `basis_review` with `status: not_applicable`, a concrete `reason`, and `paper_evidence_files` pointing to copied original source/pages. An unresolved interpretation uses `basis_review.status: disputed` and remains inconclusive. For a numeric anchor explicitly corrected by the paper, use `basis_review.status: corrected`, `corrected_paper_magnitude`, and the corrected `metric`, `unit`, `regime`. Include `local_metric`, `local_unit`, `local_regime` when needed to expose incompatibility. Writer prose and Designer navigation JSON cannot authorize a basis change. Correct the scientific basis within the assigned goals; do not replace or expand those goals. Keep independently observed goal-relevant method failures as separate unsupported core observations; a disputed target never erases them.
 
@@ -240,58 +253,22 @@ Designer criteria and numeric anchors are provisional. If a criterion is not a p
 
 Write the scientific decision once: `decision_reason` explains the verdict, and the per-claim observations and numeric comparisons carry its evidence. Do not additionally write `comparison_summary`, `report_explanation`, or a Markdown report. The final Editor writes reader-facing prose. Refer to a claim/target ID rather than repeating its whole observation in differences or feedback; include additional differences and unresolved limitations without dropping them. Keep verified facts and their original evidence. Missing legacy prose fields never justify another experiment or review.
 
-Write `{TASK_VERIFICATION_FILE}` as one JSON object. Submit an explicit scientific decision and routing instruction. Missing decision fields cause a Reporter-only handoff repair, never a Writer rerun:
+Write `{TASK_VERIFICATION_FILE}` as one JSON object with the exact assigned `task_id` and a dispatchable `host_action` (`complete` or `rerun_writer`). These are the transport protocol. Scientific reasoning may use whichever concise structure clearly expresses the evidence; missing optional fields, alternate wording or Designer IDs are not reasons to reject a handoff.
+A small example (adapt evidence fields to the actual task):
 ```json
 {{
-  "schema_version": "3.0",
-  "outcome": "reproduced|reproduced_with_assumptions|not_reproduced|inconclusive_missing_information|execution_failed",
-  "decision_reason": "中文说明针对哪些任务目标作出判决、依据与不确定性；范围外发现不改变任务结论",
-  "host_action": "complete|rerun_writer",
   "task_id": "{task_id}",
-  "run_valid": null,
-  "core_conclusions": [
-    {{
-      "claim_id": "claim id from task.scientific_acceptance",
-      "status": "supported|unsupported|unassessable_missing_information",
-      "local_observation": "用中文说明本地完整执行结果实际显示了什么",
-      "evidence_files": ["existing relative evidence path"]
-    }}
-  ],
-  "key_numeric_comparisons": [
-    {{
-      "target_id": "target id from task.scientific_acceptance",
-      "local_magnitude": null,
-      "comparison_status": "comparable|incompatible|disputed|not_applicable|unavailable",
-      "comparison_reason": "用中文解释该数值比较为何可比、不可比或无法判断",
-      "unavailable_reason": ""
-    }}
-  ],
-  "additional_observations": [],
-  "rerun_evidence": null,
-  "report_title": "简短中文任务标题，可保留 BER、SNR 等术语及图号",
-  "differences": ["用中文说明重大科学差异"],
-  "non_material_differences": ["用中文说明非重大差异及其科学理由"],
-  "evidence_files": ["existing relative evidence path"],
-  "feedback": [],
-  "confidence": "low|medium|high",
-  "local_assets": [],
-  "paper_assets": [],
+  "host_action": "complete",
+  "outcome": "not_reproduced",
+  "decision_reason": "中文说明任务结论、依据和不确定性",
+  "core_conclusions": [],
+  "key_numeric_comparisons": [],
+  "verified_facts": [],
   "remaining_uncertainties": []
 }}
 ```
-
-Only when another Writer run has a concrete scientific basis, replace `rerun_evidence: null` with:
-```json
-{{
-  "rerun_reason": "invalid_run|core_conclusion_failed|material_numeric_discrepancy",
-  "contract_item_ids": ["affected claim_id or target_id"],
-  "paper_evidence_files": ["paper evidence path"],
-  "causal_change": "specific code or configuration change",
-  "change_targets": ["file/function/config key"],
-  "predicted_effect": "why this change should resolve the blocker"
-}}
-```
-All five evidence parts are needed to spend another full run. If the result is unsupported but no evidence-based causal change exists, leave `rerun_evidence` null: the correct terminal result is `not_reproduced`. If missing paper information prevents assessment, leave it null and use `unassessable_missing_information`.
+Use a descriptive scientific outcome, preferably `reproduced`, `reproduced_with_assumptions`, `not_reproduced`, or `inconclusive_missing_information` where appropriate. Describe engineering limitations separately. Python preserves your scientific note; the supervisor reads its meaning and may ask you to clarify an incomplete handoff.
+For a proposed Writer rerun, explain in `rerun_evidence` the observed problem, its relation to the assigned goal, the paper/local evidence, a concrete causal change and its expected effect. This is a reasoning guide, not a required set of JSON keys. A reference ID helps navigation but does not authorize or prohibit an experiment. The supervisor considers the complete context before coordinating a repair. Do not request blind retries, seed selection or adjustments solely to match the paper's curve.
 
 For out-of-scope findings, optionally fill `additional_observations` with objects containing `observation_id`, `observation`, `scope_reason`, and existing `evidence_files`. Keep them out of the verdict and rerun evidence. Absence of such findings requires no extra review or experiment. Do not duplicate in-scope failures here or reclassify a goal-relevant algorithm defect merely to obtain a pass.
 
@@ -498,6 +475,7 @@ def _task_reporter_input_hash(
         "role_contract": role_contract_identity(role="task_reporter", prompt=_build_task_reporter_brief(
             task_id=task_id, report_asset_dir=f"report_assets/{safe_label(task_id)}", include_all_paper_pages=False), image_paths=candidate_images,
             policy_texts=[_build_task_reporter_brief(task_id=task_id, report_asset_dir=f"report_assets/{safe_label(task_id)}", include_all_paper_pages=False, repair=True),
+                          _build_task_reporter_brief(task_id=task_id, report_asset_dir=f"report_assets/{safe_label(task_id)}", include_all_paper_pages=False, clarification=True),
                           inspect.getsource(_reporter_attachment_visibility), inspect.getsource(_task_reporter_image_paths),
                           *_reporter_scientific_policy_texts()]),
         "paper_context": paper_context_for_task(paper=paper, task=task) if paper is not None else None,
@@ -511,6 +489,7 @@ def _task_reporter_input_hash(
         "result": task_record.get("result_json"),
         "execution": task_record.get("execution_summary"),
         "host_execution": task_record.get("host_execution"),
+        "writer_observations": task_record.get("writer_observations", {}),
         "output_inventory": _file_inventory(
             sandbox / "outputs" / output_subdir,
             source_root=sandbox,
@@ -543,7 +522,7 @@ def _reporter_scientific_policy_texts() -> list[str]:
     from . import verification_result as verification
     functions = (
         verification.normalize_task_verification, verification.verification_scientifically_successful,
-        verification._normalize_numeric_item, verification._rerun_reason_if_actionable,
+        verification._normalize_numeric_item,
         evidence.normalize_reporter_observation_evidence, evidence._task_record_run_valid_hint,
     )
     return [inspect.getsource(module) for module in (verification, materiality)] + [inspect.getsource(fn) for fn in functions]

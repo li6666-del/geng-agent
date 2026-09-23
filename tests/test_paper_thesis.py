@@ -1,6 +1,9 @@
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from geng_agent.consolidated_analysis import load_paper_understanding
+from geng_agent.supervisor import NodeFailure
 import unittest
 
 from geng_agent.pipeline import ReviewPipeline
@@ -41,14 +44,14 @@ class PaperThesisSchemaTests(unittest.TestCase):
         doc = {**GOOD_THESIS, "comparisons": []}
         self.assertEqual(validate_stage("paper_thesis", doc), [])
 
-    def test_missing_central_claim_is_rejected(self) -> None:
+    def test_missing_central_claim_remains_visible_for_supervisor_review(self) -> None:
         doc = {key: value for key, value in GOOD_THESIS.items() if key != "central_claim"}
-        self.assertTrue(validate_stage("paper_thesis", doc))
+        self.assertEqual(validate_stage("paper_thesis", doc), [])
 
-    def test_blank_mechanism_is_rejected(self) -> None:
-        # mechanism is the WHOLE point -- a blank one must not validate.
+    def test_blank_mechanism_is_not_a_transport_failure(self) -> None:
+        # Scientific sufficiency is not established by a nonblank string.
         doc = {**GOOD_THESIS, "mechanism": "   "}
-        self.assertTrue(validate_stage("paper_thesis", doc))
+        self.assertEqual(validate_stage("paper_thesis", doc), [])
 
 
 class PaperThesisPromptTests(unittest.TestCase):
@@ -137,41 +140,36 @@ class _ThesisFake:
 
 
 class PaperThesisStageTests(unittest.TestCase):
-    def _run_stage(self, raw: str):
-        temp = TemporaryDirectory()
-        out = Path(temp.name)
-        (out / "audit").mkdir(parents=True, exist_ok=True)
-        pipeline = ReviewPipeline(client=_ThesisFake(raw))
-        doc = pipeline._load_or_create_paper_thesis(
-            output_dir=out,
-            audit_dir=out / "audit",
-            facts={"paper_domain": "communication", "paper_repro_type": "other", "engineering_facts": [], "missing_information": []},
-            paper_context="[]",
-            paper_images=[],
-            resume=False,
-            max_attempts=1,
-        )
-        return doc, out, temp
+    def _run_stage(self, out: Path, client: _ThesisFake):
+        context = SimpleNamespace(output_dir=out, audit_dir=out / "audit",
+            options=SimpleNamespace(resume=False, analysis_backend="llm"))
+        return load_paper_understanding(ReviewPipeline(client=client), context,
+            paper={"source_sha256": "fixture"}, paper_context="original paper text",
+            paper_images=[], valid_chunk_ids=set(), valid_pages=set())
 
-    def test_returns_doc_and_persists_paper_thesis_json(self) -> None:
-        doc, out, temp = self._run_stage(json.dumps(GOOD_THESIS))
-        try:
-            self.assertIsNotNone(doc)
-            self.assertEqual(doc["proposed_method"], GOOD_THESIS["proposed_method"])
-            persisted = json.loads((out / "paper_thesis.json").read_text(encoding="utf-8"))
-            self.assertEqual(persisted["central_claim"], GOOD_THESIS["central_claim"])
-        finally:
-            temp.cleanup()
+    def test_combined_understanding_keeps_thesis_and_facts_from_one_reading(self) -> None:
+        facts = {"engineering_facts": [{"name": "paper condition", "value": "dense/high Doppler"}]}
+        client = _ThesisFake(json.dumps({"facts": facts, "paper_thesis": GOOD_THESIS}))
+        with TemporaryDirectory() as directory:
+            out = Path(directory)
+            doc = self._run_stage(out, client)
+            self.assertEqual(doc["paper_thesis"], GOOD_THESIS)
+            self.assertEqual(doc["facts"], facts)
+            persisted = json.loads((out / "paper_understanding.json").read_text(encoding="utf-8"))
+            self.assertEqual(persisted["paper_thesis"]["central_claim"], GOOD_THESIS["central_claim"])
+            self.assertEqual(len(client.calls), 1)
 
-    def test_non_fatal_on_failure_returns_none_and_logs(self) -> None:
-        # A thesis stage that never yields valid JSON must NOT sink the run -- it is advisory.
-        doc, out, temp = self._run_stage("this is not json at all")
-        try:
-            self.assertIsNone(doc)
-            self.assertFalse((out / "paper_thesis.json").exists())
-            self.assertTrue((out / "audit" / "paper_thesis_error.json").exists())
-        finally:
-            temp.cleanup()
+    def test_unreadable_understanding_retains_raw_error_for_owner_recovery(self) -> None:
+        client = _ThesisFake("this is not json at all")
+        with TemporaryDirectory() as directory:
+            out = Path(directory)
+            with self.assertRaises(NodeFailure):
+                self._run_stage(out, client)
+            self.assertEqual(len(client.calls), 1)
+            self.assertFalse((out / "paper_understanding.json").exists())
+            candidates = list((out / "audit/api_prompt_inputs").glob("*/raw.txt"))
+            self.assertEqual(len(candidates), 1)
+            self.assertEqual(candidates[0].read_text(encoding="utf-8"), client.raw)
 
 
 if __name__ == "__main__":

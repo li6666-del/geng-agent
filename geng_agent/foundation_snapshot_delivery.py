@@ -582,7 +582,7 @@ def _assert_foundation_sandbox_layout_safe(sandbox: Path) -> None:
         raise RuntimeError("Foundation sandbox root is a link or reparse point")
     if not sandbox.is_dir():
         raise RuntimeError("Foundation sandbox root is not a directory")
-    files, _, links, special = scan_foundation_tree(sandbox)
+    files, _, links, special = scan_foundation_tree(sandbox, skip_regenerable_caches=True)
     if links:
         relative = links[0].relative_to(sandbox).as_posix()
         raise RuntimeError(f"Foundation output contains a link or reparse point: {relative}")

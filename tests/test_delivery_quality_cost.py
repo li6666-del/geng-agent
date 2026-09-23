@@ -29,7 +29,7 @@ class DeliveryQualityCostTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError) as caught:
                     ReviewPipeline().run(root / "paper.pdf", root / "case")
             self.assertIs(caught.exception, error)
-            cost = json.loads((root / "case" / "run_cost.json").read_text())
+            cost = json.loads((root / "case" / "run_cost.json").read_text(encoding="utf-8"))
             self.assertTrue(cost["interrupted_before_terminal_report"])
             self.assertEqual(cost["cumulative"]["codex"]["llm_calls"], 1)
             self.assertIsNone(cost["cumulative"]["totals"]["total_tokens"])

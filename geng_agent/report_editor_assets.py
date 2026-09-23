@@ -69,7 +69,7 @@ def _build_task_packets(
         if isinstance(record, dict)
     }
     verification_by_id = {
-        str(item.get("task_id") or ""): item
+        str(item.get("assigned_task_id") or item.get("task_id") or ""): item
         for item in task_verifications
         if isinstance(item, dict)
     }
@@ -84,11 +84,7 @@ def _build_task_packets(
                 "task": {key: task[key] for key in ("task_id", "title", "target", "figure_or_claim", "metric") if key in task},
                 "remaining_uncertainties": verification.get("remaining_uncertainties", []),
                 "execution_summary": _host_report_execution(record, verification),
-                "verification": {key: verification[key] for key in (
-                    "task_id", "outcome", "host_action", "run_valid",
-                    "decision_reason", "decision_authority", "engineering_status", "engineering_issues", "asset_notes", "report_title", "report_explanation", "core_conclusions", "key_numeric_comparisons",
-                    "comparison_summary", "differences", "non_material_differences", "evidence_files", "confidence",
-                    "verified_facts", "additional_observations", "provenance_base") if key in verification},
+                "verification": dict(verification),
                 "terminal_outcome": terminal_outcome,
                 "asset_manifest": (record.get("task_reporter") or {}).get("asset_manifest", []),
                 "local_assets": _editor_asset_paths(task_id, verification.get("local_assets")),
@@ -123,9 +119,9 @@ def _host_report_execution(record: dict[str, Any], verification: dict[str, Any])
     latest_observed = (latest.get("run_id") in receipts and latest.get("observer") == "orchestration_host"
                        and latest.get("mode") == "full")
     valid_latest = None
-    if latest_observed and (host.get("passed") is False or verification.get("run_valid") is False):
+    if latest_observed and host.get("passed") is False:
         valid_latest = 0
-    elif latest_observed and host.get("passed") is True and verification.get("run_valid") is True:
+    elif latest_observed and host.get("passed") is True:
         valid_latest = 1
     return {
         "source": "host_execution_receipts" if receipts else "unavailable",

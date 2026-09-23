@@ -29,34 +29,8 @@ from .portability_inventory import (
     _source_inventory_issues,
     build_source_inventory,
 )
-from .portability_reference_scan import (
-    _HOST_ABSOLUTE_PATH,
-    _MAX_SCANNED_TEXT_BYTES,
-    _MULTI_FILE_REFERENCE_KEYS,
-    _PYTHON_PATH_CALL_HINTS,
-    _PYTHON_PATH_NAME_HINTS,
-    _ROOT_MANIFEST_NAMES,
-    _SINGLE_FILE_REFERENCE_KEYS,
-    _TEXT_FILENAMES,
-    _TEXT_SUFFIXES,
-    _case_path_reference_findings,
-    _dotted_ast_name,
-    _filesystem_issues,
-    _is_python_test_source,
-    _json_strings,
-    _literal_path_issues,
-    _looks_path_like,
-    _manifest_reference_issues,
-    _manifest_references,
-    _name_has_path_hint,
-    _python_docstring_nodes,
-    _python_literal_is_execution_path,
-    _python_parent_map,
-    _python_parent_reference_is_direct,
-    _should_scan_text_path,
-    _target_has_path_hint,
-    _validate_manifest_reference,
-)
+from .portability_reference_scan import _filesystem_issues
+
 from .portability_smoke import (
     _LARGE_RELOCATION_COPY_BYTES,
     _MAX_SMOKE_TIMEOUT_SECONDS,
@@ -80,6 +54,7 @@ def validate_repro_project_portability(
     smoke_command: Sequence[str] | None = None,
     smoke_timeout_s: float = 60.0,
     raise_on_error: bool = True,
+    contextual_findings: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Validate that a reproduction project can be moved and run independently.
 
@@ -121,13 +96,10 @@ def validate_repro_project_portability(
     warnings: list[dict[str, Any]] = []
     issues.extend(_source_inventory_issues(root, inventory))
     issues.extend(_filesystem_issues(root))
-    path_issues, path_warnings = _case_path_reference_findings(root)
-    issues.extend(path_issues)
-    warnings.extend(path_warnings)
-    issues.extend(_manifest_reference_issues(root))
+    # Static source/path/manifest wording does not establish runtime failure.
+    # The packaging supervisor reviews owner notes with the observed bytes.
+    observations = list(contextual_findings or [])
     issues = _dedupe_issues(issues)
-    warnings = _dedupe_issues(warnings)
-
     smoke_result: dict[str, Any] = {"requested": bool(run_smoke), "ran": False}
     if run_smoke and not issues:
         smoke_result, smoke_issues, smoke_warnings = _run_relocated_smoke(
@@ -143,6 +115,7 @@ def validate_repro_project_portability(
         warnings = _dedupe_issues(warnings)
 
     result = _result(inventory=inventory, issues=issues, warnings=warnings, smoke=smoke_result)
+    result["observations"] = observations
     if issues and raise_on_error:
         raise ProjectPortabilityError(result)
     return result

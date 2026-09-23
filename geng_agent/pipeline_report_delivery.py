@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .outputs import write_json
+from .progress import PipelineCancelled
 
 
 def _docx_error(stage: str, exc: Exception) -> dict[str, str]:
@@ -44,12 +45,102 @@ def report_editor_exception_result(exc: Exception) -> dict[str, Any]:
     }
 
 
+def _report_editor_handoff_summary(result: dict[str, Any]) -> dict[str, Any]:
+    """Retain delivery/error data while ignoring the host's cache-hit flag."""
+    return {key: value for key, value in result.items() if key != "cached"}
+
+
+class ReportOperationError(RuntimeError):
+    """A recoverable delivery result, including the original owner diagnostics."""
+
+    def __init__(self, result: dict[str, Any]):
+        self.result = result
+        reason = (result.get("result_review_result") or {}).get("reason")
+        super().__init__(str(reason or result.get("error") or "report delivery incomplete"))
+
+
+def run_supervised_report_editor(
+    runner: Callable[..., dict[str, Any]], *, arguments: dict[str, Any],
+) -> tuple[dict[str, Any], int]:
+    """One supervisor-owned repair budget replaces the legacy second attempt."""
+    from .supervisor import REPLAY_REQUIRED, StageBlocked, current_supervisor, supervised_call
+
+    latest: dict[str, Any] = {}
+    attempt_no = 1
+    invocation_count = 0
+    repair_context: dict[str, Any] | None = None
+    applied_instruction: dict[str, Any] | None = None
+    reconcile_cache = False
+
+    def run() -> dict[str, Any]:
+        nonlocal latest, invocation_count, reconcile_cache
+        supervisor = current_supervisor()
+        instruction = supervisor.current_instruction("report_editor") if supervisor is not None else None
+        if instruction and instruction.get("action") == "retry" and instruction != applied_instruction:
+            repair(instruction)
+            reconcile_cache = True
+        try:
+            resume = reconcile_cache or (arguments["resume"] if attempt_no == 1 else False)
+            reconcile_cache = False
+            latest = runner(**{**arguments, "resume": resume,
+                               "attempt_no": attempt_no, "repair_context": repair_context})
+        except PipelineCancelled:
+            raise
+        except Exception as exc:
+            latest = report_editor_exception_result(exc)
+            raise
+        status = latest.get("codex_status")
+        invocation_count += int(not latest.get("cached") and isinstance(status, dict)
+                                and status.get("role") == "report_editor")
+        if not latest.get("ok"):
+            raise ReportOperationError(latest)
+        return latest
+
+    def repair(decision: dict[str, Any]) -> None:
+        nonlocal attempt_no, repair_context, latest, applied_instruction
+        if not latest:
+            from .agentic_report_editor import _read_json_object
+            latest = _read_json_object(arguments["audit_dir"] / "04b_report_editor_status.json")
+        attempt_no = max(attempt_no, int(latest.get("attempt_no") or 1)) + 1
+        repair_context = {**latest, "supervisor_guidance": decision}
+        applied_instruction = decision
+
+    def reconcile(_state: dict) -> Any:
+        nonlocal reconcile_cache
+        reconcile_cache = True
+        return REPLAY_REQUIRED
+
+    try:
+        result = supervised_call(
+            "report_editor", run,
+            inputs={"owner": "report_editor", "task_verifications": arguments["task_verifications"],
+                    "delivery_status": arguments["runtime_result"].get("delivery_status"),
+                    "engineering_failures": arguments["runtime_result"].get("engineering_failures", [])},
+            evidence_roots={**{name.replace(".", "_"): arguments["output_dir"] / name for name in
+                              ("review.md", "result_review.md", "reproduction_report.md", "verification_result.json")},
+                            "report_assets": arguments["output_dir"] / "report_assets",
+                            "editor_status": arguments["audit_dir"] / "04b_report_editor_status.json"},
+            summarize=_report_editor_handoff_summary, repair=repair,
+            reconcile=reconcile, passthrough=(PipelineCancelled,),
+        )
+    except PipelineCancelled:
+        raise
+    except Exception as exc:
+        # Report failure cannot erase completed task evidence. No Python-authored
+        # replacement report is created; the owner drafts remain available.
+        result = latest if latest and not latest.get("ok") else report_editor_exception_result(exc)
+        result = {**result, "supervisor_blocked": True,
+                  "supervisor_decision": getattr(exc, "decision", {})}
+        write_json(arguments["output_dir"] / "report_editor_error.json", result)
+    return result, invocation_count
+
+
 def generate_docx_reports(
     *,
     output_dir: Path,
     result_review_result: dict[str, Any],
 ) -> dict[str, Any]:
-    """Render the three final Markdown reports to DOCX when delivery is usable."""
+    """Convert the two reports and optional navigation without writing prose."""
 
     errors: list[dict[str, str]] = []
     specs = (
@@ -80,6 +171,8 @@ def generate_docx_reports(
 
     try:
         from .docx_writer import write_markdown_report_docx
+    except PipelineCancelled:
+        raise
     except Exception as exc:
         error = _docx_error("import_docx_writer", exc)
         errors.append(error)
@@ -106,7 +199,7 @@ def generate_docx_reports(
         docx_path = output_dir / f"{stem}.docx"
         if not markdown_path.exists():
             result[key] = {
-                "passed": False,
+                "passed": None if stem == "review" else False,
                 "path": None,
                 "reason": f"{markdown_path.name} was not generated",
             }
@@ -122,6 +215,8 @@ def generate_docx_reports(
                 base_dir=output_dir,
             )
             result[key] = {"passed": True, "path": str(generated)}
+        except PipelineCancelled:
+            raise
         except Exception as exc:
             error = _docx_error(docx_path.name, exc)
             errors.append(error)

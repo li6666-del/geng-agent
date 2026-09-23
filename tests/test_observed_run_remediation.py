@@ -13,14 +13,13 @@ import unittest
 from unittest.mock import patch
 
 from geng_agent.verification_result import (normalize_task_verification,
-    verification_scientifically_successful, writer_revision_allowed)
+    verification_scientifically_successful, task_verification_issues)
 from geng_agent.execution_receipts import ExecutionBroker, _io_path
 from geng_agent.execution_client import _wait_for_result
 from geng_agent.delivery_environment import export_installation
 from geng_agent.task_writer_packaging import _freeze_repro_project_package
 from geng_agent.risk_report import _build_run_cost
 from geng_agent.progress import ConsoleProgressReporter
-from geng_agent.portability_reference_scan import _literal_path_issues
 from geng_agent.task_writer_state import _terminalize_rerun_request
 from geng_agent.case_environment import subprocess_argv_runner
 
@@ -59,13 +58,14 @@ class ReporterDecisionTests(unittest.TestCase):
             self.assertEqual(normalize_task_verification(raw, "bpsk", run_valid_hint=True)["outcome"], outcome)
 
     def test_missing_handoff_is_not_missing_paper_information(self):
-        for raw in ({}, {**decision(), "schema_version": "2.0"}):
-            result = normalize_task_verification(raw, "bpsk", run_valid_hint=True)
-            self.assertEqual(result["engineering_status"], "handoff_failed")
-            self.assertNotEqual(result["outcome"], "inconclusive_missing_information")
-            self.assertEqual(result["host_action"], "complete")
-            self.assertFalse(writer_revision_allowed(result, "bpsk"))
-            self.assertFalse(verification_scientifically_successful(result))
+        result = normalize_task_verification({}, "bpsk", run_valid_hint=True)
+        self.assertEqual(result["engineering_status"], "handoff_failed")
+        self.assertIsNone(result["outcome"])
+        self.assertIsNone(result["host_action"])
+        self.assertTrue(task_verification_issues(result, "bpsk"))
+        legacy = normalize_task_verification({**decision(), "schema_version": "2.0"}, "bpsk", run_valid_hint=True)
+        self.assertEqual(legacy["outcome"], "reproduced")
+        self.assertFalse(task_verification_issues(legacy, "bpsk"))
 
     def test_engineering_failure_preserves_but_does_not_certify_reporter_decision(self):
         for hint in (False, None):
@@ -73,28 +73,26 @@ class ReporterDecisionTests(unittest.TestCase):
             self.assertEqual(result["outcome"], "reproduced")
             self.assertFalse(verification_scientifically_successful(result))
 
-    def test_malformed_decision_fields_need_handoff_repair_without_crashing(self):
+    def test_malformed_optional_fields_are_preserved_and_only_action_blocks(self):
         cases = [decision(outcome={}), decision(host_action=[]), decision(run_valid="yes")]
-        bad_conclusion = decision()
-        bad_conclusion["core_conclusions"][0]["status"] = []
-        bad_numeric = decision()
-        bad_numeric["key_numeric_comparisons"][0]["comparison_status"] = {}
-        for raw in [*cases, bad_conclusion, bad_numeric]:
+        for raw in cases:
             with self.subTest(raw=raw):
                 result = normalize_task_verification(raw, "bpsk", run_valid_hint=True)
-                self.assertEqual(result["engineering_status"], "handoff_failed")
-                self.assertFalse(verification_scientifically_successful(result))
-                self.assertFalse(writer_revision_allowed(result, "bpsk"))
+                self.assertEqual(result["outcome"], raw["outcome"])
+                self.assertEqual(result["host_action"], raw["host_action"])
+                self.assertEqual(bool(task_verification_issues(result, "bpsk")), raw["host_action"] == [])
 
     def test_host_stop_cannot_turn_reporter_pending_action_into_verified_success(self):
         verification = normalize_task_verification(decision(), "bpsk", run_valid_hint=True)
         verification.update(host_action="rerun_writer", reporter_action="rerun_writer",
                             remaining_uncertainties=["Sampling uncertainty remains."])
-        stopped = _terminalize_rerun_request(record={}, verification=verification,
+        record = {}
+        stopped = _terminalize_rerun_request(record=record, verification=verification,
             stop_reason="no_progress", uncertainty="The requested correction was not completed.")
         self.assertEqual(stopped["outcome"], "reproduced")
         self.assertEqual(stopped["remaining_uncertainties"], ["Sampling uncertainty remains."])
-        self.assertIn("The requested correction was not completed.", stopped["engineering_issues"])
+        self.assertIn("The requested correction was not completed.", record["coordination_observations"])
+        self.assertEqual(stopped["host_action"], "rerun_writer")
         self.assertFalse(verification_scientifically_successful(stopped))
 
     def test_material_discrepancy_rerun_does_not_require_tenfold_ratio(self):
@@ -103,7 +101,7 @@ class ReporterDecisionTests(unittest.TestCase):
             "paper_evidence_files": ["paper_evidence/source/paper.pdf"], "causal_change": "Correct the noise variance",
             "change_targets": ["tasks/bpsk.py"], "predicted_effect": "Correct the BER under the same SNR definition"})
         result = normalize_task_verification(raw, "bpsk", run_valid_hint=True)
-        self.assertTrue(writer_revision_allowed(result, "bpsk"))
+        self.assertTrue((not task_verification_issues(result, "bpsk") and result.get("host_action") == "rerun_writer"))
 
 
 class ExecutionDeliveryTests(unittest.TestCase):
@@ -157,13 +155,7 @@ class ExecutionDeliveryTests(unittest.TestCase):
 
 
 class PackagingTests(unittest.TestCase):
-    def test_namespace_prefix_is_portable_but_concrete_windows_paths_are_not(self):
-        for value in ("\\\\?\\", "\\\\?\\UNC\\"):
-            self.assertEqual(_literal_path_issues("run_task.py", value, location="literal"), [])
-        for value in ("\\\\?\\C:\\case\\input.csv", "\\\\?\\UNC\\server\\share\\input.csv"):
-            self.assertTrue(_literal_path_issues("run_task.py", value, location="literal"))
-
-    def test_final_freeze_preserves_dependency_closure_and_only_reuses_matching_validation(self):
+    def test_final_freeze_preserves_dependency_closure_without_repeating_validation(self):
         with TemporaryDirectory() as tmp:
             output = Path(tmp)
             project = output / "project"
@@ -188,12 +180,12 @@ class PackagingTests(unittest.TestCase):
                 (project / "config.json").write_text('{"scientific_outcomes":{"bpsk":"reproduced"}}')
                 _, final = _freeze_repro_project_package(**kwargs, run_smoke=False, audit_path=output / "audit/final.json")
                 self.assertNotIn("clean_environment", final)
-                self.assertTrue(final["validation_reused"])
+                self.assertNotIn("validation_reused", final)
                 self.assertEqual((project / "constraints.repro.txt").read_bytes(), original)
                 (project / "run_experiment.py").write_text('raise RuntimeError("changed")')
                 _, changed = _freeze_repro_project_package(**kwargs, run_smoke=False, audit_path=output / "audit/final.json")
                 self.assertNotIn("clean_environment", changed)
-                self.assertFalse(changed["validation_reused"])
+                self.assertNotIn("validation_reused", changed)
 
 
 class ReportAndCostTests(unittest.TestCase):

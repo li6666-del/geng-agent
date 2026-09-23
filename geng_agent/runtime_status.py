@@ -216,8 +216,8 @@ def _load_cached_result_review_status(output_dir: Path) -> dict[str, Any] | None
             parsed = _read_json_file(result_json_path)
         except Exception:
             return None
-        if validate_stage("result_review", parsed):
-            return None
+        # The editor's Markdown is the report; the optional legacy JSON is
+        # retained as metadata and is not a second report-approval protocol.
 
     status = {
         "enabled": True,

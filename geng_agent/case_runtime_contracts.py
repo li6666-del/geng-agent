@@ -54,11 +54,15 @@ class EnvironmentResolutionError(RuntimeError):
 class EnvironmentRequestRequired(RuntimeError):
     """A writer requested a safe dependency that only the host may install."""
 
-    def __init__(self, requests: Sequence[RequirementRequest], *, source: str):
+    def __init__(self, requests: Sequence[RequirementRequest], *, source: str,
+                 partial_result: dict[str, Any] | None = None):
         normalized = tuple(_normalized_request(item, requested_by=source) for item in requests)
         super().__init__(f"{source} requested {len(normalized)} case-environment extension(s)")
         self.requests = normalized
         self.source = source
+        # Only the invoking workflow may supply current, in-memory deliveries.
+        # Recovery must never reconstruct them from an older disk checkpoint.
+        self.partial_result = partial_result
 
 
 @dataclass(frozen=True)

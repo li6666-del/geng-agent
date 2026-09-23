@@ -220,13 +220,15 @@ def test_scientific_revision_targets_consumers_and_keeps_previous_generation(tmp
         _validate_scoped_foundation_revision(sandbox=sandbox, previous_foundation=bundle, revision_request=request)
 
 
-def test_revision_rejects_private_components_and_missing_paper_evidence(tmp_path: Path) -> None:
+def test_revision_rejects_private_components_but_observes_missing_paper_evidence(tmp_path: Path) -> None:
     request = {"component_ids": ["ber"], "paper_evidence_files": ["paper_evidence/missing.pdf"], "causal_change": "fix"}
     with pytest.raises(ValueError, match="frozen shared"):
         validate_foundation_revision_request(request, architecture=_architecture(), execution_plan=_plan(), evidence_root=tmp_path)
     request["component_ids"] = ["noise"]
-    with pytest.raises(FileNotFoundError):
-        validate_foundation_revision_request(request, architecture=_architecture(), execution_plan=_plan(), evidence_root=tmp_path)
+    result = validate_foundation_revision_request(request, architecture=_architecture(), execution_plan=_plan(), evidence_root=tmp_path)
+    assert result["paper_evidence"] == []
+    assert result["observations"]
+    assert result["original_request"]["paper_evidence_files"] == ["paper_evidence/missing.pdf"]
 
 
 def test_applied_revision_retires_old_records_but_keeps_new_or_declined_requests() -> None:

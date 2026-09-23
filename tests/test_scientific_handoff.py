@@ -10,7 +10,7 @@ import unittest
 from geng_agent.semantic_merge import semantic_merge_engineering_facts, semantic_merge_repro_tasks
 from geng_agent.task_acceptance_normalize import normalize_scientific_acceptance
 from geng_agent.task_reporter_validation import normalize_reporter_observation_evidence
-from geng_agent.verification_result import normalize_task_verification, writer_revision_allowed, verification_scientifically_successful
+from geng_agent.verification_result import normalize_task_verification, task_verification_issues, verification_scientifically_successful
 
 
 def _fact(value: object, *, explicit: bool = False, name: str = "noise variance") -> dict:
@@ -174,7 +174,9 @@ class ReporterObservationTests(unittest.TestCase):
             checked, _ = normalize_reporter_observation_evidence(raw, workspace, host_execution=host)
             self.assertEqual(checked["core_conclusions"][0]["status"], "supported")
             # A later presentation image does not invalidate the observed CSV.
-            self.assertFalse(checked["_engineering_issues"])
+            self.assertEqual(checked["_engineering_issues"], [
+                "Post-execution artifacts are presentation only; scientific claims require observed outputs or source evidence."
+            ])
 
     def test_status_spelling_cannot_bypass_local_evidence_check(self) -> None:
         with TemporaryDirectory() as temp:
@@ -210,7 +212,7 @@ class ReporterObservationTests(unittest.TestCase):
             result = normalize_task_verification(checked, "experiment_a", task=_task(), run_valid_hint=True)
             self.assertEqual(result["engineering_status"], "handoff_failed")
             self.assertFalse(verification_scientifically_successful(result))
-            self.assertEqual(result["host_action"], "complete")
+            self.assertIsNone(result["host_action"])
             self.assertTrue(any("missing.csv" in warning for warning in warnings))
             self.assertEqual(raw["core_conclusions"][0]["status"], "supported")
 
@@ -240,7 +242,7 @@ class ReporterObservationTests(unittest.TestCase):
             checked, _ = normalize_reporter_observation_evidence(raw, workspace)
             result = normalize_task_verification(checked, "experiment_a", task=_task(), run_valid_hint=True)
             self.assertEqual(result["outcome"], "not_reproduced")
-            self.assertTrue(writer_revision_allowed(result, "experiment_a"))
+            self.assertTrue((not task_verification_issues(result, "experiment_a") and result.get("host_action") == "rerun_writer"))
 
     def test_top_level_real_output_can_support_a_claim_without_duplicate_paths(self) -> None:
         with TemporaryDirectory() as temp:
@@ -290,8 +292,8 @@ class ReporterObservationTests(unittest.TestCase):
                 self.assertEqual(result["engineering_status"], "handoff_failed")
                 self.assertFalse(verification_scientifically_successful(result))
                 self.assertEqual(result["core_conclusions"][0], item)
-                self.assertEqual(result["evidence_files"], [])
-                self.assertFalse(writer_revision_allowed(result, "experiment_a"))
+                self.assertNotIn("evidence_files", result)
+                self.assertFalse((not task_verification_issues(result, "experiment_a") and result.get("host_action") == "rerun_writer"))
 
     def test_duplicate_claim_cannot_overwrite_an_unsupported_observation(self) -> None:
         failed = {"claim_id": "ordering", "status": "unsupported", "local_observation": "A is worse at low SNR."}
@@ -316,7 +318,7 @@ class ReporterObservationTests(unittest.TestCase):
         acceptance = task["scientific_acceptance"]
         self.assertEqual(acceptance["core_conclusions"][0]["claim_id"], "排序_α")
         self.assertEqual(acceptance["information_gaps"][0]["affects_claim_ids"], ["排序_α"])
-        self.assertAlmostEqual(acceptance["key_numeric_targets"][0]["paper_magnitude"], -0.0012)
+        self.assertEqual(acceptance["key_numeric_targets"][0]["paper_magnitude"], "−1.2×10^−3")
 
 
 if __name__ == "__main__":

@@ -17,8 +17,6 @@ from geng_agent.analysis_prompt_context import (
 )
 from geng_agent.llm import LLMImage, OpenAICompatibleClient
 from geng_agent.pipeline import ReviewPipeline
-from geng_agent.scientific_architecture import validate_scientific_architecture
-from geng_agent.scientific_architecture_normalize import validate_scientific_architecture_repair_preservation
 from tests.test_scientific_architecture import _inputs
 
 
@@ -60,103 +58,14 @@ def run_candidates(tmp_path, backend, candidates, **kwargs):
     return result, prompts
 
 
-@pytest.mark.parametrize("backend", ["codex", "llm"])
-@pytest.mark.parametrize("correction", ["remove_override", "fix_scope"])
-def test_scientific_override_can_be_corrected_from_original_evidence(tmp_path, backend, correction):
-    facts, tasks, experiments, before = _inputs()
-    before["bindings"][0]["overrides"] = {"snr_db": [99]}
-    before["bindings"][0]["allowed_overrides"] = ["snr_db"]
-    after = copy.deepcopy(before)
-    if correction == "remove_override":
-        after["bindings"][0]["overrides"] = {}
-        evidence = "all experiments use the same SNR grid [0,5,10]."
-    else:
-        after["quantities"][0]["scope"] = "experiment"
-        evidence = "the experiment SNR override is 99 and this quantity varies by experiment."
-    result, calls = run_candidates(
-        tmp_path, backend, [before, after], prompt="SOURCE: " + evidence,
-        stage_label="architecture", schema_stage="scientific_architecture", max_attempts=2,
-        extra_validation=lambda item: validate_scientific_architecture(item, facts=facts, tasks=tasks, experiment_index=experiments),
-        repair_preservation_validator=validate_scientific_architecture_repair_preservation,
-        images=[IMAGE],
-    )
-    assert result["bindings"][0]["overrides"] == after["bindings"][0]["overrides"]
-    assert result["quantities"][0]["scope"] == after["quantities"][0]["scope"]
-    assert len(calls) == 2
-    assert "EVIDENCE-BASED SCIENTIFIC CORRECTION" in calls[1][0]
-    assert "SOURCE: " + evidence in calls[1][0]
-    assert calls[1][1]  # original visual evidence survives scientific correction
 
 
-@pytest.mark.parametrize("backend", ["codex", "llm"])
-def test_scientific_correction_does_not_authorize_unrelated_normalization_change(tmp_path, backend):
-    facts, tasks, experiments, before = _inputs()
-    before["bindings"][0]["overrides"] = {"snr_db": [99]}
-    after = copy.deepcopy(before)
-    after["bindings"][0]["overrides"] = {}
-    after["quantities"][1]["normalization"] = "arbitrary scale chosen to fit the paper"
-    with pytest.raises(RuntimeError, match="normalization"):
-        run_candidates(
-            tmp_path, backend, [before, after], prompt="Shared SNR evidence.",
-            stage_label="architecture", schema_stage="scientific_architecture", max_attempts=2,
-            extra_validation=lambda item: validate_scientific_architecture(item, facts=facts, tasks=tasks, experiment_index=experiments),
-            repair_preservation_validator=validate_scientific_architecture_repair_preservation,
-        )
 
 
-@pytest.mark.parametrize("backend", ["codex", "llm"])
-def test_third_attempt_restores_unauthorized_drift_without_undoing_valid_scope_correction(tmp_path, backend):
-    facts, tasks, experiments, before = _inputs()
-    before["bindings"][0]["overrides"] = {"snr_db": [99]}
-    before["bindings"][0]["allowed_overrides"] = ["snr_db"]
-    corrected = copy.deepcopy(before)
-    corrected["quantities"][0]["scope"] = "experiment"
-    drifted = copy.deepcopy(corrected)
-    drifted["quantities"][1]["normalization"] = "invalid unrequested replacement"
-    result, calls = run_candidates(
-        tmp_path, backend, [before, drifted, corrected],
-        prompt="SOURCE: SNR varies by experiment; BER normalization remains errors/bits.",
-        stage_label="architecture", schema_stage="scientific_architecture", max_attempts=3,
-        extra_validation=lambda item: validate_scientific_architecture(item, facts=facts, tasks=tasks, experiment_index=experiments),
-        repair_preservation_validator=validate_scientific_architecture_repair_preservation,
-        images=[IMAGE],
-    )
-    assert len(calls) == 3
-    assert "SCIENTIFIC PRESERVATION RESTORATION" in calls[2][0]
-    assert "BEGIN UNTRUSTED PRESERVATION BASELINE" in calls[2][0]
-    assert '"normalization": "errors/bits"' in calls[2][0]
-    assert '"normalization": "invalid unrequested replacement"' in calls[2][0]
-    assert result["quantities"][0]["scope"] == "experiment"
-    assert result["quantities"][1]["normalization"] == "errors/bits"
-    assert not calls[2][1]
 
 
-def test_api_format_repair_contains_complete_middle_and_omits_images(tmp_path):
-    _, _, _, architecture = _inputs()
-    architecture["quantities"][0]["basis"]["note"] = "A" * 15000 + "UNIQUE_MIDDLE_EVIDENCE" + "B" * 15000
-    complete = json.dumps(architecture)
-    client = SequenceClient([complete[:-1], complete])
-    result = ReviewPipeline(client=client)._call_validated_json(
-        prompt="Original source", stage_label="architecture", schema_stage="scientific_architecture",
-        audit_dir=tmp_path, max_attempts=2, images=[IMAGE],
-    )
-    assert "UNIQUE_MIDDLE_EVIDENCE" in client.calls[1][0]
-    assert complete[:-1] in client.calls[1][0]
-    assert "FORMAT REPAIR ONLY" in client.calls[1][0]
-    assert client.calls[1][1] == []
-    assert result["quantities"][0]["basis"]["note"] == architecture["quantities"][0]["basis"]["note"]
 
 
-def test_preservation_identifies_multiple_experiments_of_one_task():
-    _, _, _, architecture = _inputs()
-    architecture["bindings"][1]["task_id"] = architecture["bindings"][0]["task_id"]
-    architecture["bindings"][0]["overrides"] = {"snr_db": [0]}
-    architecture["bindings"][1]["overrides"] = {"snr_db": [10]}
-    reordered = copy.deepcopy(architecture)
-    reordered["bindings"].reverse()
-    assert validate_scientific_architecture_repair_preservation(architecture, reordered) == []
-    reordered["bindings"][0]["overrides"]["snr_db"] = [99]
-    assert validate_scientific_architecture_repair_preservation(architecture, reordered)
 
 
 def test_prompt_projections_preserve_science_and_remove_only_proven_duplicates():

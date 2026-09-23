@@ -16,6 +16,7 @@ from packaging.utils import canonicalize_name
 
 from .case_runtime import CaseRuntime
 from .foundation_scope import derive_foundation_scope
+from .architecture_protocol import architecture_runtime_view
 from .foundation_snapshot import file_sha256, path_is_foundation_link, scan_foundation_tree
 from .task_writer_support import WRITER_HANDOFF_POLICY_VERSION, WRITER_ANALYSIS_SCHEMA_VERSION
 from .task_writer_units import _execution_unit_sandbox, _execution_unit_work_items, _public_execution_unit
@@ -364,7 +365,8 @@ def build_writer_unit_lineage(
     Workflow finalizers supply their startup snapshot so source edits during a
     running Writer cannot relabel its evidence with a policy it never used.
     """
-    architecture = _json(analysis_artifacts["scientific_architecture.json"]) if "scientific_architecture.json" in analysis_artifacts else {}
+    architecture = architecture_runtime_view(
+        _json(analysis_artifacts["scientific_architecture.json"]) if "scientific_architecture.json" in analysis_artifacts else {})
     scope = derive_foundation_scope(architecture, execution_plan)
     components = {str(item.get("id")): item for item in _objects(architecture.get("components"))}
     paper_hash = file_sha256(paper_path) if paper_path.is_file() else None

@@ -31,13 +31,6 @@ def _task_record_run_valid_hint(
         passed = host_execution.get("passed")
         if isinstance(passed, bool):
             return passed
-        returncode = host_execution.get("returncode")
-        if isinstance(returncode, int) and not isinstance(returncode, bool):
-            return returncode == 0
-    host_returncode = task_record.get("host_run_returncode")
-    if isinstance(host_returncode, int) and not isinstance(host_returncode, bool):
-        return host_returncode == 0
-
     return None  # Writer self-reported execution counts are not host evidence.
 
 
@@ -129,40 +122,25 @@ def normalize_reporter_observation_evidence(
             continue
         claim_id = str(item.get("claim_id") or "unnamed claim")
         missing_local_ids.add(claim_id)
-        status = str(item.get("status") or "").strip()
-        if status not in {"supported", "unsupported", "unassessable_missing_information"}:
-            status = (
-                "supported" if item.get("supported") is True
-                else "unsupported" if item.get("supported") is False
-                else "unassessable_missing_information"
-            )
-        if status == "supported":
-            engineering_issues.append(f"claim {claim_id} lacks verified local evidence")
-            warnings.append(
-                f"claim {claim_id} has no verifiable copied local output or source evidence; "
-                "Reporter assessment is preserved but evidence is not certified"
-            )
-        elif status == "unsupported":
-            warnings.append(
-                f"claim {claim_id} reports a failure without verifiable copied local evidence; "
-                "the finding is retained, but cannot authorize a scientific rerun"
-            )
+        warnings.append(f"claim {claim_id} references no copied observed local output or source evidence; inspect the original note")
     rerun = document.get("rerun_evidence")
     verified_facts = []
     for fact in document.get("verified_facts", []) if isinstance(document.get("verified_facts"), list) else []:
         if not isinstance(fact, dict) or not str(fact.get("text") or "").strip():
+            verified_facts.append(fact)
+            warnings.append("Reporter fact has no separately readable text field; inspect original content")
             continue
         paths = [path for value in fact.get("evidence_files", [])
                  if (path := _verified_reporter_evidence_path(value, workspace)) is not None] if isinstance(fact.get("evidence_files"), list) else []
         paper_roots = [workspace.resolve() / "paper_evidence" / part for part in ("source", "full_paper_pages", "mineru_figure_candidates")]
         paper_evidence = [p for p in paths if any(p.is_relative_to(root) for root in paper_roots)]
-        if not (paper_evidence if fact.get("source") == "paper" else local_evidence(fact)):
-            warnings.append("Omitted report fact without verified original-paper or copied local evidence: " + str(fact["text"])[:120])
-            continue
-        verified_facts.append({key: fact[key] for key in ("category", "text", "source", "evidence_files") if key in fact})
-    document["verified_facts"] = verified_facts
-    # Out-of-scope findings remain visible, but their missing evidence cannot
-    # invalidate the assigned task or authorize another scientific execution.
+        available = bool(paper_evidence if fact.get("source") == "paper" else local_evidence(fact))
+        if not available:
+            warnings.append("Reporter fact references unavailable original-paper or copied local evidence: " + str(fact["text"])[:120])
+        verified_facts.append({**fact, "host_evidence_available": available})
+    if isinstance(document.get("verified_facts"), list):
+        document["verified_facts"] = verified_facts
+    # Availability observations do not decide scientific relevance or execution.
     additional = document.get("additional_observations")
     for item in additional if isinstance(additional, list) else []:
         if not isinstance(item, dict):
@@ -179,7 +157,7 @@ def normalize_reporter_observation_evidence(
         affected = rerun.get("contract_item_ids")
         if isinstance(affected, list) and missing_local_ids.intersection(map(str, affected)):
             engineering_issues.append("Rerun observations lack verified local evidence")
-    document["_engineering_issues"] = list(dict.fromkeys(engineering_issues))
+    document["_engineering_issues"] = list(dict.fromkeys([*engineering_issues, *warnings]))
     return document, warnings
 
 

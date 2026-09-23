@@ -19,6 +19,21 @@ PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCA
 
 
 class OutputTests(unittest.TestCase):
+    def test_freshness_tolerates_clock_conversion_rounding_but_rejects_older_files(self) -> None:
+        import math
+        from geng_agent.task_writer_files import _writer_delivery_path_is_fresh
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output = root / "outputs" / "result.csv"
+            output.parent.mkdir()
+            output.write_text("snr,ber\n0,0.12\n", encoding="utf-8")
+            recorded = output.stat().st_mtime
+            boundary = math.nextafter(recorded, math.inf)
+            self.assertTrue(_writer_delivery_path_is_fresh(output, boundary))
+            self.assertTrue(inspect_output_artifacts(root, since=boundary)["has_csv"])
+            self.assertFalse(_writer_delivery_path_is_fresh(output, recorded + 0.001))
+            self.assertFalse(inspect_output_artifacts(root, since=recorded + 0.001)["has_csv"])
+
     def test_rejects_path_traversal(self) -> None:
         with TemporaryDirectory() as temp_dir:
             with self.assertRaises(ValueError):

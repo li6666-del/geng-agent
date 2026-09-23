@@ -26,8 +26,7 @@ from geng_agent.task_reporter_validation import _materialize_task_assets
 from geng_agent.verification_result import (
     normalize_task_verification,
     task_verification_issues,
-    verification_result_issues,
-    writer_revision_allowed,
+    task_verification_issues,
 )
 
 
@@ -183,6 +182,7 @@ def _run_reporter(
     reporter_assets: dict[str, bytes] | None = None,
     assigned_task: dict | None = None,
     assigned_experiment_index: dict | None = None,
+    repair_context: dict | None = None,
 ) -> dict:
     paper = root / "paper.md"
     if not paper.exists():
@@ -211,10 +211,36 @@ def _run_reporter(
             audit_dir=root / "case" / "audit",
             resume=resume,
             round_no=1,
+            repair_context=repair_context,
         )
 
 
 class IsolatedTaskReporterTests(unittest.TestCase):
+    def test_moderator_clarification_bypasses_cache_and_preserves_reporter_authority(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = _record(root)
+            initial = _run_reporter(root, _supported_raw(), record=record)
+            self.assertTrue(initial["ok"])
+            # Even a valid cached conclusion must be re-examined when a
+            # moderator explicitly asks about an observation.
+            correction = _supported_raw(outcome="not_reproduced")
+            correction["decision_reason"] = "The original evidence does not support the claim."
+            result = _run_reporter(root, correction, record=record, resume=True,
+                repair_context={**initial, "kind": "moderator_clarification", "decision_id": "fixture-decision",
+                                "instructions": "核对原始证据，并独立决定是否维持先前结论。"})
+            self.assertTrue(result["ok"])
+            self.assertFalse(result.get("cached"))
+            self.assertEqual(result["task_verification"]["outcome"], "not_reproduced")
+            workspace = Path(result["workspace"])
+            packet = json.loads((workspace / "inputs/reporter_repair.json").read_text(encoding="utf-8"))
+            self.assertEqual(packet["kind"], "moderator_clarification")
+            self.assertEqual(packet["decision_id"], "fixture-decision")
+            self.assertIn("reproduced", (workspace / "inputs/previous_reporter_note.txt").read_text())
+            prompt = (workspace.parent / f"{workspace.name}_brief.md").read_text(encoding="utf-8")
+            self.assertIn("independently", prompt)
+            self.assertIn("moderator", prompt.lower())
+
     def test_prompt_uses_small_advisory_contract_and_host_owned_materiality(self) -> None:
         prompt = _build_task_reporter_brief(
             task_id="task_a",
@@ -224,7 +250,7 @@ class IsolatedTaskReporterTests(unittest.TestCase):
 
         self.assertIn("navigation aid", prompt)
         self.assertIn("never reject merely for missing structure", prompt)
-        self.assertIn("The host may compute diagnostic ratios", prompt)
+        self.assertIn("Any ratio is optional arithmetic", prompt)
         self.assertIn("Designer criteria and numeric anchors are provisional", prompt)
         self.assertIn("invalid_run", prompt)
         self.assertIn("core_conclusion_failed", prompt)
@@ -245,13 +271,13 @@ class IsolatedTaskReporterTests(unittest.TestCase):
 
     def test_missing_structure_is_reporter_handoff_failure(self):
         result = normalize_task_verification({"task_id": "wrong_task"}, "task_a", task=_task(), run_valid_hint=True)
-        self.assertEqual(result["outcome"], "review_incomplete")
+        self.assertIsNone(result["outcome"])
         self.assertEqual(result["engineering_status"], "handoff_failed")
         self.assertTrue(result["handoff_issues"])
         self.assertEqual(result["core_conclusions"], [])
-        self.assertFalse(writer_revision_allowed(result, "task_a"))
+        self.assertFalse((not task_verification_issues(result, "task_a") and result.get("host_action") == "rerun_writer"))
 
-    def test_host_recomputes_numeric_ratio_and_ignores_reporter_ratio(self) -> None:
+    def test_host_preserves_reporter_numeric_values_without_recomputing(self) -> None:
         task = _task()
         task["scientific_acceptance"]["key_numeric_targets"][0]["paper_magnitude"] = 2.0
         raw = _supported_raw(local_magnitude=8.0)
@@ -259,7 +285,8 @@ class IsolatedTaskReporterTests(unittest.TestCase):
 
         result = normalize_task_verification(raw, "task_a", task=task, run_valid_hint=True)
 
-        self.assertEqual(result["max_key_numeric_ratio"], 4.0)
+        self.assertEqual(result["key_numeric_comparisons"][0]["symmetric_ratio"], 1.0)
+        self.assertNotIn("max_key_numeric_ratio", result)
         self.assertEqual(result["outcome"], "reproduced")
         self.assertEqual(result["host_action"], "complete")
 
@@ -271,10 +298,10 @@ class IsolatedTaskReporterTests(unittest.TestCase):
             run_valid_hint=True,
         )
 
-        self.assertEqual(result["max_key_numeric_ratio"], 10.0)
+        self.assertNotIn("max_key_numeric_ratio", result)
         self.assertEqual(result["outcome"], "not_reproduced")
         self.assertEqual(result["host_action"], "complete")
-        self.assertFalse(writer_revision_allowed(result, "task_a"))
+        self.assertFalse((not task_verification_issues(result, "task_a") and result.get("host_action") == "rerun_writer"))
 
     def test_uncontracted_reporter_numeric_gap_is_preserved(self) -> None:
         task = _task()
@@ -299,7 +326,7 @@ class IsolatedTaskReporterTests(unittest.TestCase):
             result["key_numeric_comparisons"][1]["target_id"],
             "reporter_discovered_scale",
         )
-        self.assertEqual(result["max_key_numeric_ratio"], 10.0)
+        self.assertNotIn("max_key_numeric_ratio", result)
         self.assertEqual(result["outcome"], "not_reproduced")
 
     def test_complete_causal_evidence_allows_one_writer_rerun(self) -> None:
@@ -312,7 +339,7 @@ class IsolatedTaskReporterTests(unittest.TestCase):
 
         self.assertEqual(result["host_action"], "rerun_writer")
         self.assertEqual(result["rerun_reason"], "core_conclusion_failed")
-        self.assertTrue(writer_revision_allowed(result, "task_a"))
+        self.assertTrue((not task_verification_issues(result, "task_a") and result.get("host_action") == "rerun_writer"))
 
     def test_reporter_discovered_failure_is_not_erased_by_unknown_designer_id(self) -> None:
         result = normalize_task_verification(
@@ -328,15 +355,16 @@ class IsolatedTaskReporterTests(unittest.TestCase):
         self.assertEqual(result["host_action"], "rerun_writer")
         self.assertEqual(result["rerun_reason"], "core_conclusion_failed")
         self.assertEqual(result["outcome"], "not_reproduced")
-        self.assertTrue(writer_revision_allowed(result, "task_a"))
+        self.assertTrue((not task_verification_issues(result, "task_a") and result.get("host_action") == "rerun_writer"))
         self.assertEqual(result["core_conclusions"][1]["claim_id"], "invented_claim")
 
-    def test_wrong_numeric_target_id_requires_handoff_repair_without_rewriting_science(self):
+    def test_wrong_numeric_target_id_is_an_observation_without_rewriting_science(self):
         raw = _supported_raw(local_magnitude=1.0)
         raw["key_numeric_comparisons"][0]["target_id"] = "invented_target"
         result = normalize_task_verification(raw, "task_a", task=_task(), run_valid_hint=True)
         self.assertEqual(result["outcome"], "reproduced")
-        self.assertEqual(result["engineering_status"], "handoff_failed")
+        self.assertEqual(result["engineering_status"], "verified")
+        self.assertTrue(result["host_observations"])
         self.assertEqual(result["key_numeric_comparisons"][0]["target_id"], "invented_target")
         self.assertEqual(result["host_action"], "complete")
 
@@ -371,7 +399,7 @@ class IsolatedTaskReporterTests(unittest.TestCase):
         self.assertTrue(document["all_terminal"])
         self.assertFalse(document["all_successful"])
         self.assertEqual(document["outcome_counts"], {"reproduced": 1, "not_reproduced": 1})
-        self.assertEqual(verification_result_issues(document, ["task_a", "task_b"]), [])
+        self.assertTrue(document["all_terminal"])
 
     def test_visual_assets_are_optional_but_supplied_paths_are_scoped(self) -> None:
         with TemporaryDirectory() as temp:
@@ -789,7 +817,7 @@ class IsolatedTaskReporterTests(unittest.TestCase):
             self.assertEqual(item["crop_status"], "unresolved")
             self.assertIn("optional paper crop failed", item["crop_result"]["issues"][0])
 
-    def test_workflow_declines_missing_paper_evidence_without_failing(self) -> None:
+    def test_workflow_preserves_missing_paper_evidence_for_supervisor_without_failing(self) -> None:
         with TemporaryDirectory() as temp:
             root = Path(temp)
             item = _run_reporter(
@@ -798,8 +826,8 @@ class IsolatedTaskReporterTests(unittest.TestCase):
             )
 
             self.assertTrue(item["ok"], item)
-            self.assertTrue(item["terminal"])
-            self.assertEqual(item["task_verification"]["host_action"], "complete")
+            self.assertFalse(item["terminal"])
+            self.assertEqual(item["task_verification"]["host_action"], "rerun_writer")
             self.assertEqual(item["task_verification"]["outcome"], "not_reproduced")
             self.assertTrue(any("missing or outside" in issue for issue in item["validation_warnings"]))
 

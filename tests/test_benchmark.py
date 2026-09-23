@@ -88,14 +88,16 @@ class BenchmarkTests(unittest.TestCase):
             self.assertEqual(report["totals"]["cost_usd"], 1.5)
 
             runtime_stage = next(item for item in report["stage_totals"] if item["stage"] == "runtime")
-            self.assertEqual(runtime_stage, {"stage": "runtime", "ok": 0, "not_ok": 2, "total": 2})
+            # Both runtime records are available; scientific/runtime coverage
+            # remains the separately recorded 1/3 result above.
+            self.assertEqual(runtime_stage, {"stage": "runtime", "ok": 2, "not_ok": 0, "total": 2})
 
             rendered_json = render_benchmark_json(report)
             self.assertEqual(json.loads(rendered_json), report)
             rendered_markdown = render_benchmark_markdown(report)
             self.assertIn("| case-a |", rendered_markdown)
             self.assertIn("| **Total** |", rendered_markdown)
-            self.assertIn("| runtime | 0 | 2 | 2 |", rendered_markdown)
+            self.assertIn("| runtime | 2 | 0 | 2 |", rendered_markdown)
 
             json_path, markdown_path = write_benchmark_reports(
                 report,

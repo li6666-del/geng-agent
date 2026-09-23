@@ -132,14 +132,21 @@ def main(argv: list[str] | None = None) -> int:
             progress=ConsoleProgressReporter(),
             model_config_path=args.model_config,
         )
+        delivery_status = getattr(result, "delivery_status", "complete")
+        incomplete = delivery_status in {"partial", "blocked"}
         if args.analysis_only:
-            print(f"前两阶段完成：{result.output_dir}")
+            title = "分析尚未完成" if incomplete else "前两阶段完成"
+            print(f"{title}：{result.output_dir}")
             print(f"最终事实：{result.output_dir / 'engineering_facts.json'}")
             print(f"最终任务：{result.output_dir / 'repro_tasks.json'}")
             print(f"实验索引：{result.experiment_index_path}")
             print(f"科学架构：{result.scientific_architecture_path}")
-            return 0
-        print(f"审查完成：{result.output_dir}")
+            if result.supervision_path is not None:
+                print(f"主持人运行记录：{result.supervision_path}")
+            return 1 if incomplete else 0
+        title = {"partial": "已保留部分交付，仍有工程问题待解决", "blocked": "运行受阻，未完成交付"}.get(
+            delivery_status, "审查完成")
+        print(f"{title}：{result.output_dir}")
         print(f"报告：{result.review_path if result.review_path.exists() else '未生成'}")
         print(f"Word 主报告：{result.review_docx_path}")
         print(f"复现项目：{result.repro_project_dir}")
@@ -148,7 +155,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"本地复现报告：{result.reproduction_report_path}")
         print(f"Word 本地复现报告：{result.reproduction_report_docx_path}")
         print(f"Word 结果审查：{result.result_review_docx_path}")
-        return 0
+        if result.supervision_path is not None:
+            print(f"主持人运行记录：{result.supervision_path}")
+        return 1 if incomplete else 0
 
     if args.command == "benchmark":
         from .benchmark import build_benchmark, write_benchmark_reports

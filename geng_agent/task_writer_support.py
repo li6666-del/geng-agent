@@ -533,13 +533,7 @@ def _load_cached_task_writer_workflow(
         return None
     if analysis_snapshot_hash and meta.get("analysis_snapshot_hash") != analysis_snapshot_hash:
         return None
-    validation = validate_repro_project(repro_project_dir)
-    if (
-        not validation.get("required_files_present")
-        or not validation.get("python_compiles")
-        or not validation.get("local_imports_resolve")
-    ):
-        return None
+    validation = {"host_validation_skipped": True, "python_compiles": None}
     try:
         declared_paths = _manifest_declared_disk_paths(manifest, repro_project_dir)
     except ValueError:

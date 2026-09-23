@@ -5,9 +5,6 @@ from geng_agent.pipeline import (
     _execution_plan_requires_shared_science,
     _shared_foundation_is_material,
 )
-from geng_agent.scientific_architecture import (
-    partition_scientific_architecture_issues,
-)
 from geng_agent.tasks_normalize import finalize_repro_tasks
 
 
@@ -175,148 +172,15 @@ def test_only_cross_unit_weak_relationships_make_foundation_material() -> None:
     assert _shared_foundation_is_material(cross_unit_weak_plan, architecture={})
 
 
-def test_undeclared_shared_quantity_cannot_satisfy_relationship_contract() -> None:
-    tasks = _document(
-        ["task_a", "task_b"],
-        [_relationship("weak_ab", "weak", "task_a", "task_b")],
-    )
-    experiments = {
-        "experiments": [
-            {"task_id": "task_a", "experiment_id": "exp_a"},
-            {"task_id": "task_b", "experiment_id": "exp_b"},
-        ]
-    }
-    basis = {
-        "status": "unresolved",
-        "evidence_facts": [],
-        "assumption_refs": [],
-        "note": "",
-    }
-    architecture = {
-        "schema_version": "1.0",
-        "workflow_version": "2",
-        "quantities": [
-            {
-                "id": "declared_task_output",
-                "scope": "task",
-                "basis": basis,
-            }
-        ],
-        "components": [
-            {
-                "id": "component_a",
-                "module": "src/component_a.py",
-                "inputs": [],
-                "outputs": ["declared_task_output"],
-                "parameters": [],
-                "depends_on": [],
-                "basis": basis,
-            },
-            {
-                "id": "component_b",
-                "module": "src/component_b.py",
-                "inputs": [],
-                "outputs": ["declared_task_output"],
-                "parameters": [],
-                "depends_on": [],
-                "basis": basis,
-            },
-        ],
-        "consistency_groups": [
-            {
-                "id": "weak_ab_group",
-                "task_ids": ["task_a", "task_b"],
-                "shared_quantity_ids": ["undeclared_shared_quantity"],
-            }
-        ],
-        "bindings": [
-            {
-                "task_id": "task_a",
-                "experiment_id": "exp_a",
-                "consistency_group": "weak_ab_group",
-                "components": ["component_a"],
-                "overrides": {},
-                "outputs": ["declared_task_output"],
-            },
-            {
-                "task_id": "task_b",
-                "experiment_id": "exp_b",
-                "consistency_group": "weak_ab_group",
-                "components": ["component_b"],
-                "overrides": {},
-                "outputs": ["declared_task_output"],
-            },
-        ],
-        "invariants": [],
-    }
-
-    blockers, _warnings = partition_scientific_architecture_issues(
-        architecture,
-        facts={"engineering_facts": []},
-        tasks=tasks,
-        experiment_index=experiments,
-        execution_plan=compile_execution_plan(tasks),
-    )
-
-    assert any(
-        issue.path == "$.execution_relationships[0].shared_science"
-        for issue in blockers
-    )
 
 
-def test_material_weak_relationship_requires_exact_architecture_membership() -> None:
-    tasks = _document(
-        ["task_a", "task_b", "task_c"],
-        [_relationship("weak_ab", "weak", "task_a", "task_b")],
-    )
-    architecture, experiments = _shared_architecture(
-        ["task_a", "task_b", "task_c"],
-        group_task_ids=["task_a", "task_b", "task_c"],
-    )
-
-    blockers, _warnings = partition_scientific_architecture_issues(
-        architecture,
-        facts={"engineering_facts": []},
-        tasks=tasks,
-        experiment_index=experiments,
-        execution_plan=compile_execution_plan(tasks),
-    )
-
-    assert any(
-        issue.path == "$.execution_relationships[0].task_ids"
-        for issue in blockers
-    )
 
 
-def test_missing_or_invalid_strength_normalizes_to_conservative_strong() -> None:
-    normalized = finalize_repro_tasks(
-        {
-            "execution_relationships": [
-                {
-                    "relationship_id": "missing_strength",
-                    "kind": "shared_definition",
-                    "task_ids": ["task_a", "task_b"],
-                },
-                {
-                    "relationship_id": "invalid_strength",
-                    "kind": "shared_definition",
-                    "strength": "uncertain",
-                    "task_ids": ["task_b", "task_c"],
-                },
-            ],
-            "repro_tasks": [_task(task_id) for task_id in ("task_a", "task_b", "task_c")],
-        },
-        {"engineering_facts": []},
-    )
 
-    assert [
-        relationship["strength"]
-        for relationship in normalized["execution_relationships"]
-    ] == ["strong", "strong"]
-    plan = compile_execution_plan(normalized)
-    assert plan["execution_unit_count"] == 1
-    assert plan["execution_units"][0]["task_ids"] == [
-        "task_a",
-        "task_b",
-        "task_c",
-    ]
+def test_invalid_strength_stays_visible_for_planner_repair():
+    from geng_agent.schemas import validate_stage
+    raw = {"repro_tasks": [_task("a"), _task("b")], "execution_relationships": [{
+        "strength": "uncertain", "task_ids": ["a", "b"]}]}
+    copied = finalize_repro_tasks(raw, {})
+    assert copied == raw
+    assert validate_stage("repro_tasks", copied)

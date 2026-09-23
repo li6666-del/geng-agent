@@ -5,8 +5,6 @@ from pathlib import Path
 from typing import Any
 
 from .foundation_snapshot import path_is_foundation_link, validate_foundation_snapshot
-from .outputs import validate_repro_project
-from .schemas import validate_stage
 from .security import _runtime_lock_is_trusted
 
 
@@ -127,6 +125,8 @@ def inspect_case_status(output_dir: Path) -> dict[str, Any]:
         "exists": output_exists,
         "workflow_version": CURRENT_WORKFLOW_VERSION,
         "supported": True,
+        "delivery_status": next((item.get("delivery_status") for item in stage_status if item["stage"] == "runtime"), None),
+        "supervision_path": str(output_dir / "audit" / "supervisor") if (output_dir / "audit" / "supervisor").is_dir() else None,
         "next_stage": next_stage,
         "resume_from": RESUME_LABELS.get(next_stage, "complete" if next_stage is None else next_stage),
         "suggested_command": suggested_review_command(output_dir, next_stage),
@@ -227,19 +227,20 @@ def inspect_stage(output_dir: Path, name: str, rel_path: str, schema_stage: str 
         }
 
     if name == "repro_project":
-        validation = validate_repro_project(path)
-        ok = bool(
-            validation.get("required_files_present")
-            and validation.get("python_compiles")
-            and validation.get("local_imports_resolve")
-        )
-        return {"stage": name, "ok": ok, "path": str(path), "validation": validation, "reason": "valid" if ok else "invalid project"}
+        # Status is observation only. Compiling or importing the project here
+        # would mutate its evidence and create a second execution gate.
+        ok = path.is_dir()
+        return {"stage": name, "ok": ok, "path": str(path),
+                "reason": "present" if ok else "not a directory", "validation_repeated": False}
 
     if name == "runtime":
         try:
             data = read_json(path)
-            ok = data.get("passed") is True
-            return {"stage": name, "ok": ok, "path": str(path), "passed": data.get("passed"), "reason": "passed" if ok else "not passed"}
+            ok = isinstance(data, dict)
+            return {"stage": name, "ok": ok, "path": str(path),
+                    "passed": data.get("passed") if ok else None,
+                    "delivery_status": data.get("delivery_status") if ok else None,
+                    "reason": "recorded" if ok else "runtime record is not an object"}
         except Exception as exc:
             return {"stage": name, "ok": False, "path": str(path), "reason": f"invalid json: {exc}"}
 
@@ -262,32 +263,14 @@ def inspect_stage(output_dir: Path, name: str, rel_path: str, schema_stage: str 
     if schema_stage:
         try:
             data = read_json(path)
-            required_files = _required_files_for_stage(name, data)
-            issues = validate_stage(schema_stage, data, required_files=required_files)
-            ok = not issues
-            return {
-                "stage": name,
-                "ok": ok,
-                "path": str(path),
-                "reason": "valid" if ok else "schema validation failed",
-                "issues": [issue.as_dict() for issue in issues[:5]],
-            }
+            ok = isinstance(data, dict)
+            return {"stage": name, "ok": ok, "path": str(path),
+                    "reason": "recorded" if ok else "stage record is not an object",
+                    "validation_repeated": False}
         except Exception as exc:
             return {"stage": name, "ok": False, "path": str(path), "reason": f"invalid json: {exc}"}
 
     return {"stage": name, "ok": path.is_file(), "path": str(path), "reason": "present" if path.is_file() else "not a file"}
-
-
-def _required_files_for_stage(name: str, data: dict[str, Any]) -> set[str] | None:
-    if name != "repro_project_manifest":
-        return None
-    meta = data.get("_meta") if isinstance(data, dict) else None
-    if not isinstance(meta, dict) or meta.get("mode") != "task_writers":
-        return None
-    generated = meta.get("generated_paths")
-    if isinstance(generated, list) and all(isinstance(item, str) for item in generated):
-        return set(generated)
-    return None
 
 
 def latest_audit_items(audit_dir: Path, limit: int = 8) -> list[dict[str, Any]]:

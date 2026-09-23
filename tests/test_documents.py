@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from geng_agent.documents import load_paper, split_text
 from geng_agent.facts_normalize import finalize_engineering_facts, select_valid_engineering_facts
+from geng_agent.schemas import validate_fact_sources
 from geng_agent.pipeline import build_risk_report
 
 
@@ -133,15 +134,17 @@ class DocumentTests(unittest.TestCase):
         self.assertEqual(len(kept), 1)
         self.assertEqual(len(dropped), 0)
 
-        # bad chunk_id -> retained but explicitly marked unverified
+        # An unmatched source stays intact; source-address observations are separate evidence.
         bad_text_fact = dict(good_text_fact)
         bad_text_fact["source"] = dict(good_text_fact["source"], chunk_id="p99_c99")
         kept2, dropped2 = select_valid_engineering_facts({"engineering_facts": [bad_text_fact]}, valid_chunk_ids, valid_pages)
         self.assertEqual(len(kept2), 1)
         self.assertEqual(dropped2, [])
-        provenance = kept2[0]["value"]["_provenance"]
-        self.assertFalse(provenance["verified"])
-        self.assertTrue(any("chunk id" in reason for reason in provenance["reasons"]))
+        self.assertEqual(kept2[0], bad_text_fact)
+        self.assertNotIn("_provenance", kept2[0]["value"])
+        observations = validate_fact_sources({"engineering_facts": kept2}, valid_chunk_ids, valid_pages)
+        self.assertTrue(any(issue.path.endswith(".chunk_id") for issue in observations))
+        self.assertEqual(bad_text_fact["source"]["chunk_id"], "p99_c99")
 
         # figure fact citing a page that exists in the document's chunk pages (simulates paper with figures where facts ref Fig on page X)
         fig_fact = {
@@ -184,19 +187,15 @@ class DocumentTests(unittest.TestCase):
             except RuntimeError as e:
                 self.assertIn("pymupdf 或 pypdf", str(e))
 
-    def test_build_risk_report_injects_pdf_images_lost_for_pdf_format(self) -> None:
-        """Covers the recent auto-injection of image/figure loss limitation note into risk_report (for pdf text-chunk loading which drops images/figures)."""
+    def test_pdf_format_does_not_imply_lost_images(self) -> None:
         facts = {"engineering_facts": [], "missing_information": []}
         tasks = {"repro_tasks": []}
         validation = {"required_files_present": True, "python_compiles": True}
         risk = build_risk_report(facts, tasks, validation, paper_format="pdf")
         findings = risk.get("findings", [])
         lost = [f for f in findings if f.get("type") == "pdf_images_lost"]
-        self.assertEqual(len(lost), 1, "pdf_images_lost must be auto-injected for pdf")
-        self.assertIn("PDF 文本抽取", lost[0]["message"])
-        self.assertIn("图表", lost[0]["message"])
-        self.assertTrue(lost[0].get("always_injected_for_pdfs"))
-        self.assertEqual(lost[0]["severity"], "advisory")
+        self.assertEqual(lost, [])
+        self.assertEqual(risk["paper_format"], "pdf")
 
         # non-pdf should not inject it
         risk_md = build_risk_report(facts, tasks, validation, paper_format="md")
@@ -221,7 +220,8 @@ class DocumentTests(unittest.TestCase):
         risk = build_risk_report(facts, tasks, validation, runtime_result=runtime_result)
 
         self.assertTrue(any(item["type"] == "dependency_warnings" for item in risk["findings"]))
-        self.assertIn("requirements_warnings=1", risk["risk_dimensions"]["security_isolation"]["evidence"])
+        self.assertEqual(risk["runtime_result"]["requirements_warnings"], runtime_result["requirements_warnings"])
+        self.assertIsNone(risk["risk_level"])
 
 
     def test_unresolved_task_evidence_is_reported_without_pre_rating(self) -> None:
@@ -249,7 +249,8 @@ class DocumentTests(unittest.TestCase):
         risk = build_risk_report(facts, tasks, validation)
 
         self.assertEqual(risk["task_evidence_gap_count"], 1)
-        self.assertTrue(any(item["type"] == "task_evidence_gaps" for item in risk["findings"]))
+        self.assertEqual(risk["analysis_records"]["task_evidence_gaps"][0]["record"],
+                         tasks["repro_tasks"][0]["missing_fact_requests"][0])
 
 if __name__ == "__main__":
     unittest.main()

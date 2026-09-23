@@ -137,15 +137,18 @@ class DocxImageLayoutTests(unittest.TestCase):
             self.assertNotIn("已截断", document.paragraphs[1].text)
             self.assertFalse(document.paragraphs[1].paragraph_format.keep_together)
 
-    def test_dissimilar_shapes_stack_even_when_neither_is_extremely_wide(self) -> None:
+    def test_editor_pair_with_moderately_different_shapes_stays_side_by_side(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
             square = self._image(root, "square.png", (800, 800))
             landscape = self._image(root, "landscape.png", (1200, 800))
             document = self._document()
             _add_image_comparison_table(document, ["A", "B"], [[f"![A]({square})", f"![B]({landscape})"]])
-            self.assertTrue(all(len(row._tr.tc_lst) == 1 for row in document.tables[0].rows))
-            self.assertGreater(document.inline_shapes[0].width.inches, 5)
+            self.assertEqual(len(document.tables[0].rows), 2)
+            self.assertEqual(len(document.tables[0].rows[1]._tr.tc_lst), 2)
+            self.assertEqual(len(document.inline_shapes), 2)
+            self.assertTrue(all(shape.width.inches < _page_content_size(document)[0] / 2
+                                for shape in document.inline_shapes))
 
     def test_comparison_width_tracks_custom_section_and_survives_save(self) -> None:
         with TemporaryDirectory() as directory:

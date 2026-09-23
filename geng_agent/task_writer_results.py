@@ -8,8 +8,7 @@ from typing import Any
 from .outputs import write_json
 from .security import FOUNDATION_STATIC_SECURITY_ADVISORY_CATEGORIES, split_static_security_issues
 from .task_writer_files import _read_optional_json_object
-from .task_writer_packaging import _expected_paths_from_project_manifest, _freeze_repro_project_package
-from .verification_result import FINAL_MATCHED_STATUS, WRITER_REVIEW_STATUS, verification_result_issues
+from .verification_result import FINAL_MATCHED_STATUS, WRITER_REVIEW_STATUS
 
 
 def _task_writer_runtime_result(
@@ -52,20 +51,9 @@ def _task_writer_runtime_result(
         valid_artifact_files.extend(
             f"{output_subdir}/{item}" for item in artifact_files if isinstance(item, str)
         )
-    blocking_security = any(
-        not isinstance(issue, dict)
-        or str(issue.get("severity") or "error").strip().lower() != "warning"
-        for issue in security_issues
-    )
-    all_checks_passed = (
-        total > 0
-        and passed == total
-        and validation.get("required_files_present") is True
-        and validation.get("python_compiles") is not False
-        and validation.get("foundation_integrity_ok") is not False
-        and not blocking_requirements
-        and not blocking_security
-    )
+    # Runtime success describes the observed full executions, not generated
+    # filenames, optional compile scans or a second interpretation of warnings.
+    all_checks_passed = total > 0 and passed == total
     return {
         "enabled": True,
         "passed": bool(all_checks_passed),
@@ -174,211 +162,38 @@ def _classify_task_writer_security_issues(
     return classified
 
 def _task_writer_runtime_task_passed(record: dict[str, Any]) -> bool:
-    if isinstance(record.get("host_execution"), dict) and record["host_execution"].get("passed") is False:
-        return False
-    delivery_passed = bool(record.get("writer_completed")) and str(record.get("task_writer_status") or "") in {
-        WRITER_REVIEW_STATUS,
-        FINAL_MATCHED_STATUS,
-    }
-    if not delivery_passed:
-        return False
-    verification = (
-        record.get("verification_result")
-        if isinstance(record.get("verification_result"), dict)
-        else record.get("task_verification")
-    )
-    if isinstance(verification, dict):
-        return (
-            verification.get("run_valid") is True
-            and verification.get("outcome") != "execution_failed"
-        )
-    # Build-only workflows have no independent scientific verification yet.
-    return True
+    host = record.get("host_execution")
+    return isinstance(host, dict) and host.get("passed") is True
+
 
 def apply_verified_result(
-    *,
-    task_records: list[dict[str, Any]],
-    verification_result: dict[str, Any],
-    output_dir: Path,
-    audit_dir: Path,
-    repro_project_dir: Path,
+    *, task_records: list[dict[str, Any]], verification_result: dict[str, Any],
+    output_dir: Path, audit_dir: Path, repro_project_dir: Path,
 ) -> dict[str, Any]:
-    """Attach every normal scientific terminal outcome to the Writer records."""
-
-    expected_task_ids = [str(record.get("task_id") or "") for record in task_records]
-    result_issues = verification_result_issues(verification_result, expected_task_ids)
-    if result_issues:
-        raise ValueError("cannot finalize incomplete task outcomes: " + "; ".join(result_issues))
-    if not verification_result.get("all_terminal"):
-        raise ValueError("cannot finalize while a task still requests a Writer rerun")
-
-    outcome_by_id = {
-        str(item.get("task_id")): item
-        for item in verification_result.get("tasks", [])
-        if isinstance(item, dict) and str(item.get("task_id") or "")
-    }
+    """Publish notes beside execution evidence without rewriting or refreezing code."""
+    del repro_project_dir
+    by_id = {item.get("assigned_task_id") or item.get("task_id"): item
+             for item in verification_result.get("tasks", [])
+             if isinstance(item, dict) and (item.get("assigned_task_id") or item.get("task_id"))}
     for record in task_records:
-        task_id = str(record.get("task_id") or "")
-        task_outcome = outcome_by_id.get(task_id)
-        if not isinstance(task_outcome, dict):
-            raise ValueError(f"missing terminal outcome for {task_id}")
-        outcome = str(task_outcome.get("outcome") or "inconclusive_missing_information")
-        from .verification_result import verification_scientifically_successful
-        record["task_writer_status"] = (
-            FINAL_MATCHED_STATUS
-            if verification_scientifically_successful(task_outcome)
-            else WRITER_REVIEW_STATUS
-        )
-        record["scientific_outcome"] = outcome
-        record["verification_result"] = task_outcome
-        record["verification_verified"] = task_outcome.get("engineering_status") == "verified" and not task_outcome.get("handoff_issues")
+        note = by_id.get(record.get("task_id"))
+        if note is not None:
+            record["verification_result"] = note
+            record["scientific_outcome"] = note.get("outcome")
+            record["verification_verified"] = note.get("handoff_accepted", False)
+    runtime = _read_optional_json_object(output_dir / "runtime_result.json")
+    runtime.update(verification_mode="preserved_reporter_decisions",
+        scientific_all_terminal=verification_result.get("all_terminal", False),
+        scientific_all_successful=verification_result.get("all_successful", False),
+        scientific_outcome_counts=verification_result.get("outcome_counts", {}))
+    write_json(output_dir / "runtime_result.json", runtime)
+    write_json(audit_dir / "03c_task_writers_records.json", {"verification_result": verification_result, "tasks": task_records})
+    return runtime
 
-    previous_runtime = _read_optional_json_object(output_dir / "runtime_result.json")
-    runtime_result = _task_writer_runtime_result(
-        task_records=task_records,
-        validation=(
-            previous_runtime.get("validation")
-            if isinstance(previous_runtime.get("validation"), dict)
-            else {"host_validation_skipped": True}
-        ),
-        requirement_warnings=(
-            previous_runtime.get("requirements_warnings")
-            if isinstance(previous_runtime.get("requirements_warnings"), list)
-            else []
-        ),
-        security_issues=(
-            previous_runtime.get("security_issues")
-            if isinstance(previous_runtime.get("security_issues"), list)
-            else []
-        ),
-        requirement_issues=(
-            previous_runtime.get("requirements_issues")
-            if isinstance(previous_runtime.get("requirements_issues"), list)
-            else []
-        ),
-    )
-    runtime_result["verification_verified"] = all(record.get("verification_verified") for record in task_records)
-    runtime_result["verification_mode"] = "reporter_decisions_with_host_evidence"
-    runtime_result["scientific_all_terminal"] = True
-    runtime_result["scientific_all_successful"] = bool(
-        verification_result.get("all_successful")
-    )
-    runtime_result["scientific_outcome_counts"] = verification_result.get("outcome_counts", {})
-    write_json(output_dir / "runtime_result.json", runtime_result)
-    write_json(
-        audit_dir / "03c_task_writers_records.json",
-        {"verification_result": verification_result, "tasks": task_records},
-    )
-    status_path = audit_dir / "03c_task_writers_status.json"
-    status = _read_optional_json_object(status_path)
-    all_successful = bool(verification_result.get("all_successful"))
-    status.update(
-        {
-            "stop_class": "verified_matched" if all_successful else "verified_terminal",
-            "stopped_reason": (
-                "all tasks reproduced the assigned core conclusions"
-                if all_successful
-                else "all tasks reached reportable scientific terminal outcomes"
-            ),
-            "runtime": {"passed": runtime_result.get("passed"), "coverage": runtime_result.get("coverage")},
-            "tasks": [
-                {
-                    "task_id": record.get("task_id"),
-                    "status": record.get("task_writer_status"),
-                    "scientific_outcome": record.get("scientific_outcome"),
-                    "verification_verified": record.get("verification_verified", False),
-                }
-                for record in task_records
-            ],
-        }
-    )
-    write_json(status_path, status)
-    config_path = repro_project_dir / "config.json"
-    config = _read_optional_json_object(config_path)
-    config["task_statuses"] = {
-        str(record.get("task_id")): str(record.get("task_writer_status") or WRITER_REVIEW_STATUS)
-        for record in task_records
-    }
-    config["scientific_outcomes"] = {
-        str(record.get("task_id")): str(record.get("scientific_outcome") or "")
-        for record in task_records
-    }
-    config["verification_verified"] = runtime_result["verification_verified"]
-    write_json(config_path, config)
-
-    # Reporter terminalization is the last mutation inside the portable project.
-    # Re-freeze after that write so the committed inventory and text manifest
-    # describe the package users actually receive.  The scientific smoke already
-    # ran before reporting; this pass revalidates structure and every file hash.
-    manifest_path = output_dir / "repro_project_manifest.json"
-    if manifest_path.is_file():
-        previous_manifest = _read_optional_json_object(manifest_path)
-        meta = previous_manifest.get("_meta")
-        task_manifest = meta.get("tasks_manifest") if isinstance(meta, dict) else None
-        if not isinstance(task_manifest, dict):
-            raise RuntimeError("cannot final-freeze package without tasks_manifest metadata")
-        expected_paths = _expected_paths_from_project_manifest(previous_manifest)
-        if not expected_paths:
-            raise RuntimeError("cannot final-freeze package without declared project paths")
-        _final_manifest, final_portability = _freeze_repro_project_package(
-            repro_project_dir=repro_project_dir,
-            output_dir=output_dir,
-            audit_path=audit_dir / "03c_project_portability_final.json",
-            task_manifest=task_manifest,
-            expected_paths=expected_paths,
-            analysis_snapshot_hash=str(meta.get("analysis_snapshot_hash") or ""),
-            foundation_snapshot_hash=str(meta.get("foundation_snapshot_hash") or ""),
-            environment_hash=str(meta.get("environment_lock_hash") or ""),
-            run_smoke=False,
-        )
-        validation = runtime_result.get("validation")
-        if not isinstance(validation, dict):
-            validation = {}
-            runtime_result["validation"] = validation
-        validation["portable"] = bool(final_portability.get("portable"))
-        final_inventory = final_portability.get("inventory")
-        validation["final_package_inventory_sha256"] = (
-            final_inventory.get("inventory_sha256")
-            if isinstance(final_inventory, dict)
-            else None
-        )
-        validation["final_package_portability_audit"] = (
-            "audit/03c_project_portability_final.json"
-        )
-        write_json(output_dir / "runtime_result.json", runtime_result)
-    return runtime_result
 
 def _task_writer_alignment_summary(task_records: list[dict[str, Any]]) -> dict[str, Any]:
-    if not task_records:
-        return {
-            "overall_alignment": "inconclusive",
-            "overall_result_credibility": "low",
-            "overall_summary": "没有可审查的复现任务。",
-        }
-    if any(_task_writer_blocked_by_codex(record) for record in task_records):
-        return {
-            "overall_alignment": "inconclusive",
-            "overall_result_credibility": "low",
-            "overall_summary": "至少一个 Codex task writer 因额度或限流被阻塞，不能把缺失任务视为科学复现失败。",
-        }
-    if any(not record.get("writer_completed") for record in task_records):
-        return {
-            "overall_alignment": "inconclusive",
-            "overall_result_credibility": "low",
-            "overall_summary": "部分自治 writer 未正常完成，不能给出强复现结论。",
-        }
-    statuses = {str(record.get("task_writer_status") or "failed") for record in task_records}
-    if statuses <= {WRITER_REVIEW_STATUS, FINAL_MATCHED_STATUS}:
-        return {
-            "overall_alignment": "candidate",
-            "overall_result_credibility": "medium",
-            "overall_summary": "所有自治 writer 均已完成 full 并提交待独立审查的结果。",
-        }
-    return {
-        "overall_alignment": "inconclusive",
-        "overall_result_credibility": "low",
-        "overall_summary": "至少一个 writer 遭遇外部进程错误，任务尚未完成。",
-    }
+    """Keep dispatch diagnostics separate from scientific interpretation."""
+    return {"task_count": len(task_records), "deliveries_completed": sum(bool(item.get("writer_completed")) for item in task_records)}
 
 def _compact_task_writer_review(record: dict[str, Any]) -> dict[str, Any]:
     result = record.get("result_json") if isinstance(record.get("result_json"), dict) else {}

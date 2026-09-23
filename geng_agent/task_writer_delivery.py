@@ -7,9 +7,8 @@ from typing import Any
 
 from .outputs import inspect_output_artifacts
 from .task_writer_contracts import TASK_WRITER_TERMINAL_STATUS
-from .task_writer_execution_binding import _task_execution_binding_issues
 from .task_writer_files import _read_optional_json_object, _task_result_file_path, _writer_delivery_path_is_fresh
-from .verification_result import partition_writer_delivery_issues, writer_delivery_issues
+from .verification_result import partition_writer_delivery_issues
 
 
 def _collect_task_writer_delivery(
@@ -43,33 +42,21 @@ def _collect_task_writer_delivery(
     markdown_is_fresh = _writer_delivery_path_is_fresh(markdown_path, fresh_since)
     result_doc = _read_optional_json_object(result_path) if result_is_fresh else {}
     reported_status = str(result_doc.get("status") or "")
-    delivery_issues = writer_delivery_issues(
-        result_doc,
-        require_stopping_assessment=require_stopping_assessment,
-    )
     delivery_blockers, delivery_warnings = partition_writer_delivery_issues(
         result_doc,
         require_stopping_assessment=require_stopping_assessment,
     )
+    delivery_issues = [*delivery_blockers, *delivery_warnings]
     artifacts = inspect_output_artifacts(
         sandbox,
         since=fresh_since,
         subdir=output_subdir,
         declared_artifacts=task.get("expected_artifacts"),
     )
-    binding_issues = _task_execution_binding_issues(
-        sandbox=sandbox,
-        task_id=task_id,
-        result_doc=result_doc,
-    )
-    if binding_issues:
-        binding_warnings = [f'shared_component_advisory: {issue}' for issue in binding_issues]
-        delivery_issues.extend(binding_warnings)
-        delivery_warnings.extend(binding_warnings)
     # Writer JSON is self-reported disclosure. A malformed/incomplete object
     # stays visible as warnings, while readable scientific artifacts still
     # advance to the independent Reporter.
-    delivery_usable = bool(result_doc) or bool(artifacts.get("has_artifacts"))
+    delivery_usable = bool(result_doc) or markdown_is_fresh or bool(artifacts.get("has_artifacts"))
     if not delivery_usable:
         blocker = "writer produced neither a readable result note nor a scientific artifact"
         delivery_blockers.append(blocker)
@@ -80,7 +67,10 @@ def _collect_task_writer_delivery(
         host_execution = find_host_execution(sandbox, Path(writer_status["execution_audit_dir"]), task_id)
         if writer_status.get("error_kind") in {"foundation_modified", "evidence_modified"}:
             host_execution["passed"] = False
-            host_execution.setdefault("issues", []).append("execution used an unauthorized Foundation revision")
+            issue = ("Frozen Foundation files changed during Writer execution"
+                     if writer_status.get("error_kind") == "foundation_modified"
+                     else "Original paper evidence changed during Writer execution")
+            host_execution.setdefault("issues", []).append(issue)
     status = TASK_WRITER_TERMINAL_STATUS if delivery_usable else "failed"
     local_images = _collect_writer_images(
         sandbox=sandbox,
@@ -96,6 +86,12 @@ def _collect_task_writer_delivery(
         "output_subdir": output_subdir,
         "sandbox": str(sandbox),
         "writer_status": writer_status,
+        "writer_observations": {
+            "paper_evidence_added_files": writer_status.get("paper_evidence_added_files", []),
+            "paper_evidence_changed_files": writer_status.get("paper_evidence_changed_files", []),
+            "foundation_violations": writer_status.get("foundation_violations", []),
+            "process_warning": writer_status.get("error") or writer_status.get("blocked_reason"),
+        },
         "host_execution": host_execution,
         "writer_completed": delivery_usable,
         "task_writer_status": status,

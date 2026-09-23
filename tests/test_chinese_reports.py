@@ -15,7 +15,7 @@ def test_report_language_policy_covers_normal_and_repair_workers():
         brief = _build_task_reporter_brief(task_id="t1", report_asset_dir="report_assets/t1",
                                           include_all_paper_pages=False, repair=repair)
         assert CHINESE_REPORT_RULES in brief
-        assert '"report_title"' in brief
+        assert "简体中文" in brief
         editor = _build_report_editor_brief(task_count=1, repair_targets=["result_review.md"] if repair else [])
         assert CHINESE_REPORT_RULES in editor
     raw = _supported_raw()

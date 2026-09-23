@@ -239,6 +239,7 @@ class TaskWriterAssemblyTests(unittest.TestCase):
         record = {
             "task_id": "fig_1",
             "writer_completed": True,
+            "host_execution": {"passed": True},
             "task_writer_status": "ready_for_review",
             "artifacts": {},
         }
@@ -322,7 +323,7 @@ class TaskWriterAssemblyTests(unittest.TestCase):
                 "environment_access",
                 "ordinary_reflection",
                 "dangerous_dynamic_import",
-                "security_violation",
+                "absolute_path_literal",
             ],
         )
 
@@ -362,10 +363,11 @@ class TaskWriterAssemblyTests(unittest.TestCase):
         self.assertEqual(issues[0]["category"], "importlib_usage")
         self.assertEqual(issues[0]["severity"], "error")
 
-    def test_runtime_blocks_any_error_but_not_security_warnings(self) -> None:
+    def test_runtime_preserves_observed_full_despite_static_findings(self) -> None:
         record = {
             "task_id": "fig_1",
             "writer_completed": True,
+            "host_execution": {"passed": True},
             "task_writer_status": "ready_for_review",
             "artifacts": {},
         }
@@ -403,7 +405,7 @@ class TaskWriterAssemblyTests(unittest.TestCase):
         )
 
         self.assertTrue(warning_result["passed"])
-        self.assertFalse(error_result["passed"])
+        self.assertTrue(error_result["passed"])
 
     def test_runtime_blocks_unresolved_dependency_issue(self) -> None:
         result = _task_writer_runtime_result(

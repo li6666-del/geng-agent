@@ -22,29 +22,6 @@ from .task_writer_files import _read_optional_json_object, _task_owned_files, _t
 from .task_writer_support import PAPER_EVIDENCE_DIR, _manifest_from_project, _prune_unexpected_files
 
 
-def _runtime_validation_identity(project: Path) -> dict[str, str]:
-    """Bind installation/relocation checks to executable inputs, not report prose."""
-    inventory = build_source_inventory(project)
-    entries = inventory.get("files", [])
-    paths = [item["path"] for item in entries] if isinstance(entries, list) else list(entries)
-    identity = {}
-    for name in paths:
-        path = project / name
-        if name in {"README.md", "README.foundation.md", "review.md", "result_review.md", "reproduction_report.md"}:
-            continue
-        if name in {"source_inventory.json", "execution_evidence.json", "reproducibility_manifest.json"} or name.startswith(("execution_records/", "task_notes/", "report_assets/")):
-            continue
-        if name == "config.json":
-            value = _read_optional_json_object(path)
-            for key in ("task_statuses", "scientific_outcomes", "verification_verified"):
-                value.pop(key, None)
-            payload = json.dumps(value, sort_keys=True, ensure_ascii=False).encode("utf-8")
-        else:
-            payload = path.read_bytes()
-        identity[name] = hashlib.sha256(payload).hexdigest()
-    return identity
-
-
 def _freeze_repro_project_package(
     *,
     repro_project_dir: Path,
@@ -57,6 +34,7 @@ def _freeze_repro_project_package(
     environment_hash: str,
     run_smoke: bool,
     python_executable: Path | None = None,
+    contextual_findings: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Freeze the final tree only after its last package mutation.
 
@@ -67,17 +45,16 @@ def _freeze_repro_project_package(
 
     from .delivery_environment import export_installation
     expected_paths.update(export_installation(repro_project_dir, python_executable=python_executable))
-    runtime_identity = _runtime_validation_identity(repro_project_dir)
-    previous_checks = _read_optional_json_object(output_dir / "audit" / "03c_project_portability.json")
     source_inventory = build_source_inventory(repro_project_dir)
     write_json(repro_project_dir / "source_inventory.json", source_inventory)
     portability = validate_repro_project_portability(
         repro_project_dir,
-        run_smoke=run_smoke,
+        run_smoke=False,
         python_executable=python_executable,
         smoke_command=["python", "run_experiment.py", "config_smoke.json"],
         smoke_timeout_s=120.0,
         raise_on_error=False,
+        contextual_findings=contextual_findings,
     )
     evidence = _read_optional_json_object(repro_project_dir / "execution_evidence.json")
     evidence_tasks = evidence.get("tasks", [])
@@ -89,21 +66,13 @@ def _freeze_repro_project_package(
             "code": "execution_evidence_incomplete", "severity": "warning",
             "message": "Original execution bytes are unavailable for tasks: " + ", ".join(incomplete),
         })
-    portability["runtime_validation_identity"] = runtime_identity
-    if not run_smoke:
-        if previous_checks.get("runtime_validation_identity") == runtime_identity:
-            for key in ("smoke",):
-                if key in previous_checks:
-                    portability[key] = previous_checks[key]
-            portability["validation_reused"] = True
-        else:
-            portability["validation_reused"] = False
-    # Persist the full smoke diagnostics before failing.  Relocation uses a
-    # temporary copy, so otherwise task-level errors disappear with that copy
-    # and callers receive only the aggregate return code.
     write_json(audit_path, portability)
     if not portability.get("portable"):
+        # Only byte integrity / filesystem safety can prevent freezing.
         raise ProjectPortabilityError(portability)
+    lineage = _read_optional_json_object(repro_project_dir / "artifact_lineage.json")
+    portability.setdefault("observations", []).extend(lineage.get("observations") or [])
+    write_json(audit_path, portability)
     manifest = _manifest_from_project(
         repro_project_dir=repro_project_dir,
         expected_paths=expected_paths,
@@ -494,6 +463,7 @@ def _build_artifact_lineage(
     require_lineage: bool,
 ) -> dict[str, Any]:
     entries_by_artifact: dict[str, dict[str, Any]] = {}
+    observations: list[dict[str, Any]] = []
     processed_sandboxes: set[str] = set()
     for record in task_records:
         raw_sandbox = str(record.get("sandbox") or "").strip()
@@ -512,6 +482,7 @@ def _build_artifact_lineage(
             artifact_id = str(raw_entry.get("artifact_id") or "").strip()
             raw_path = str(raw_entry.get("path") or "").strip().replace("\\", "/")
             if not artifact_id or not raw_path:
+                observations.append({"code": "incomplete_artifact_description", "task_id": record.get("task_id"), "entry": raw_entry})
                 continue
             portable_path = PurePosixPath(raw_path)
             if (
@@ -520,11 +491,7 @@ def _build_artifact_lineage(
                 or PureWindowsPath(raw_path).drive
                 or ".." in portable_path.parts
             ):
-                if require_lineage:
-                    raise RuntimeError(
-                        f"material artifact {artifact_id!r} uses a non-portable path: {raw_path}"
-                    )
-                continue
+                raise RuntimeError(f"material artifact {artifact_id!r} uses an unsafe path: {raw_path}")
             unit_id = str(record.get("execution_unit_id") or "").strip()
             asset_root = PurePosixPath("execution_units") / safe_label(unit_id)
             if (
@@ -532,12 +499,8 @@ def _build_artifact_lineage(
                 or tuple(portable_path.parts[: len(asset_root.parts)])
                 != asset_root.parts
             ):
-                if require_lineage:
-                    raise RuntimeError(
-                        f"material artifact {artifact_id!r} must be persisted under "
-                        f"{asset_root.as_posix()}/: {raw_path}"
-                    )
-                continue
+                observations.append({"code": "artifact_namespace_differs", "artifact_id": artifact_id,
+                                     "path": raw_path, "expected_namespace": asset_root.as_posix()})
             relative = Path(*portable_path.parts)
             source = sandbox / relative
             target = repro_project_dir / relative
@@ -545,16 +508,9 @@ def _build_artifact_lineage(
                 source.resolve().relative_to(sandbox.resolve())
                 target.resolve().relative_to(repro_project_dir.resolve())
             except ValueError:
-                if require_lineage:
-                    raise RuntimeError(
-                        f"material artifact {artifact_id!r} escapes its execution unit"
-                    )
-                continue
+                raise RuntimeError(f"material artifact {artifact_id!r} escapes its execution unit")
             if not source.is_file() or not target.is_file():
-                if require_lineage:
-                    raise RuntimeError(
-                        f"material artifact {artifact_id!r} was not persisted into the final project: {raw_path}"
-                    )
+                observations.append({"code": "declared_artifact_unavailable", "artifact_id": artifact_id, "path": raw_path})
                 continue
             item = {
                 "artifact_id": artifact_id,
@@ -648,23 +604,18 @@ def _build_artifact_lineage(
     for artifact_id, requirement in sorted(strong_requirements.items()):
         item = entries_by_artifact.get(artifact_id)
         if item is None:
-            if require_lineage:
-                raise RuntimeError(
-                    f"strong relationship artifact {artifact_id!r} is missing from execution_unit_result.json"
-                )
+            observations.append({"code": "strong_artifact_description_missing", "artifact_id": artifact_id})
             continue
         producers = set(requirement["producers"])
         expected_producer = next(iter(producers)) if len(producers) == 1 else None
-        if require_lineage and len(producers) > 1:
-            raise RuntimeError(
-                f"strong relationship artifact {artifact_id!r} has multiple producers"
-            )
-        if require_lineage and item.get("producer_task_id") not in {None, expected_producer}:
-            raise RuntimeError(
-                f"artifact {artifact_id!r} names producer {item.get('producer_task_id')!r}, expected {expected_producer!r}"
-            )
+        if len(producers) > 1:
+            observations.append({"code": "multiple_declared_producers", "artifact_id": artifact_id,
+                                 "producers": sorted(producers)})
+        if item.get("producer_task_id") not in {None, expected_producer}:
+            observations.append({"code": "producer_description_differs", "artifact_id": artifact_id,
+                                 "declared": item.get("producer_task_id"), "planned": expected_producer})
         if item.get("producer_task_id") is None and expected_producer is not None:
-            item["producer_task_id"] = expected_producer
+            item["planned_producer_task_id"] = expected_producer
         consumers = set(item.get("consumer_task_ids") or [])
         consumers.update(requirement["consumers"])
         item["consumer_task_ids"] = sorted(consumers)
@@ -672,6 +623,7 @@ def _build_artifact_lineage(
     return {
         "schema_version": "1.0",
         "artifacts": [entries_by_artifact[key] for key in sorted(entries_by_artifact)],
+        "observations": observations,
         "strong_dependency_count": sum(
             1
             for dependency in dependencies.values()

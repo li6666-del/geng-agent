@@ -7,7 +7,7 @@ Case 工作流只接受 `workflow_version: "2"`。已有阶段产物但缺少有
 
 开发与验证默认在本机执行，使用本机已有的合适 Python 环境。远端同步、SSH 和远端验证不再是前置要求；`tools/remote_*` 仅保留作明确需要时的可选工具。执行约定见 `AGENTS.md`。
 
-本轮通用复现整改的实现范围和实际验证记录见 [实施计划](docs/reproduction_remediation_plan.md) 与 [验证记录](docs/remediation_validation_20260906.md)。
+当前全局主持人职责、宿主裁决清理与验证边界见 [主持人实施记录](docs/host_moderator_plan.md)。此前通用复现整改记录见 [实施计划](docs/reproduction_remediation_plan.md) 与 [验证记录](docs/remediation_validation_20260906.md)。
 
 提示词与调用上下文的后续整改见 [修改计划](docs/prompt_context_remediation_plan.md) 和 [本地回归及 21 次静态模型对照](docs/prompt_context_validation_20260906.md)。后者明确区分科学判断、实际 token/缓存用量与完整论文复现的验证边界。
 
@@ -16,7 +16,7 @@ Case 工作流只接受 `workflow_version: "2"`。已有阶段产物但缺少有
 
 - 解析 PDF/TXT/Markdown 论文，保留全文分块、页面图像和带 caption/page/bbox 的图候选索引，供 Codex 直接查证。
 - 论文理解一次读取原文，同时产出工程事实和核心主张；分别保存 `engineering_facts_initial.json`、`paper_thesis.json`，组合缓存为 `paper_understanding.json`。
-- 实验规划同时生成任务、验收导航和科学架构。主张在初次规划前已可用；无缺口路径只有理解、规划两次主要分析调用，JSON 修复与定向回补另计。
+- 实验规划同时生成任务、验收导航和科学架构。主张在初次规划前已可用；无缺口路径包含理解、规划两次主要分析调用。正常节点交接不再调用主持人批准。
 - 只有规划者明确选中的关键缺口才进入定向回补；理解角色按请求查证，规划者随后共同修订任务与架构。保留搜索台账、旧稿及信息不足，不再另调主张提炼、最终定稿或架构 Agent。
 - `scientific_acceptance` 是有来源、稳定 ID 的审查导航；独立 Reporter 以原论文、实际实现与执行证据判断科研结论，程序不按文字相似度或统一倍率阈值重判。
 - 联合计划保存为 `experiment_plan.json`，同时发布供下游使用的 `repro_tasks.json` 和可选 `scientific_architecture.json`。私有独立任务可以不单列架构；跨执行单元共享科学定义必须具备相应契约。
@@ -24,10 +24,10 @@ Case 工作流只接受 `workflow_version: "2"`。已有阶段产物但缺少有
 - Task Designer 显式声明任务间的执行关系：`strong` 关系编译为同一个 execution unit、同一个 Codex Writer/sandbox/run；`weak` 关系保持独立 execution unit，只在跨 unit 时要求共享冻结的科学定义。逻辑任务始终保留独立验收与独立 Reporter。
 - Foundation Writer 仅为确需跨 execution unit 一致的组件及其依赖生成共享 `src/` 与契约测试，并形成按内容哈希冻结的 canonical snapshot；没有跨单元共享需求时直接跳过，任务私有实现保持可修改。
 - 第三阶段按 execution unit 启动自治 writer：互不相关的 unit 并行，compound Writer 在一个沙箱内按依赖顺序完成所有成员任务，并为每个逻辑任务分别交付结果。
-- 每个 writer 把论文明确事实和任务验收 ID 作为最高约束，只在论文未披露或确有歧义处作显式工程假设；它保留“运行—比较—修改—重跑”的自迭代，但只能根据 Reporter 指出的运行无效、核心结论失败或重大数值偏差重跑，且必须给出证据对应的因果修改计划。
-- 主持人只做任务覆盖、证据路径和基础代码健康检查，不参与科学结论。
-- 每个 writer 交付后立即启动对应的独立 Codex task reporter，按 criterion ID 核对论文与本地产物。Reporter 给出 `reproduced`、`reproduced_with_assumptions`、`inconclusive_missing_information` 或 `not_reproduced`；后两者是可报告终态，不会被当作流水线故障或逼迫 Writer 无限重跑。所有任务进入终态后默认调用已有的报告编辑智能体撰写报告。
-- 固定生成主审查报告 `review.md/docx`、本地复现报告 `reproduction_report.md/docx` 和论文对比报告 `result_review.md/docx`；对比报告不附带 writer 迭代流水账。
+- 每个 Writer 围绕论文明确事实和任务目标实现，只在论文未披露或确有歧义处作显式假设。Reporter 提出有证据和预期效果的修订，主持人决定是否交回 Writer；Python 不按固定理由标签或字段模板判断修订是否值得执行。
+- 宿主按数据依赖推进正常阶段和独立 Writer 批次，记录交付、实际执行与异常；只有下一步无法执行或修复归属不明时才唤醒主持人。科学结论由独立 Reporter 判断，主持人安排异常修复。
+- 每个 Writer 交付后立即启动对应的独立 Codex task reporter，核对论文与本地产物。Reporter 给出 `reproduced`、`reproduced_with_assumptions`、`inconclusive_missing_information` 或 `not_reproduced`；后两者是可报告终态。协调停止时仍保留未接受意见及停止原因，交由已有的报告编辑智能体说明。
+- 主要交付为本地复现报告 `reproduction_report.md/docx` 和论文对比报告 `result_review.md/docx`；`review.md/docx` 是可选导航。两份正文由编辑智能体生成，Word 转换由宿主执行；导航缺失不阻碍正文交付。
 - 提供极简 Web UI，可上传 PDF 或填写 PDF 链接并实时查看阶段进度。
 
 ## 工作流
@@ -38,7 +38,7 @@ Case 工作流只接受 `workflow_version: "2"`。已有阶段产物但缺少有
   -> 论文理解：工程事实 + 核心主张（同一调用、分开文件）
   -> 实验规划：任务 + 验收导航 + 科学架构（同一调用）
        -> 有阻塞缺口：理解角色定向查证 -> 原规划角色联合修订
-          沿用字段搜索台账和最多三轮上限；搜索不足保留限制
+          主持人决定搜索或定稿；沿用搜索台账及三轮资源预算，保留未解决项
        -> 无阻塞缺口：发布联合计划及下游文档
   -> 宿主编译 strong/weak 关系、实验索引，检查可执行依赖
   -> 确需跨执行单元共享时：Foundation 编写共享模块并冻结
@@ -46,10 +46,12 @@ Case 工作流只接受 `workflow_version: "2"`。已有阶段产物但缺少有
   -> 每个逻辑任务的独立 Reporter 查原文、代码及执行证据，给出科学结论与解释
        -> 有证据和因果修改方案：相应 Writer 迭代 -> 独立核验
        -> 无可验证的下一步：保留未复现、信息不足或工程故障终态
-  -> 全部任务形成可报告终态：冻结与核验交付项目
+  -> 汇集已接受结果和停止原因：按实际文件与执行收据组装交付项目
   -> 已有报告编辑智能体撰写中文报告，按任务解释事实、假设、结果图与差距、人工核查建议
        -> 缺少报告文件时由同一编辑角色修复，Python 不补写报告正文
-  -> 输出 review、reproduction_report、result_review 的 Markdown/Word 版本
+  -> 输出 reproduction_report、result_review 的 Markdown/Word 版本，review 为可选导航
+上述箭头表示数据依赖：宿主推进正常阶段和独立批次，主持人决定非例行的补查与修复，Python 执行并记录事件
+局部工程故障：保留已验证成果并继续可行报告，交付标记 complete/partial/blocked
 ```
 
 ## 科学结果与执行证据
@@ -119,7 +121,9 @@ MinerU 缺失、超时、非零退出或未识别到目标图时，流程不会�
 
 ## Codex 配置
 
-全流程使用一份统一模型配置：选定服务商、模型和推理强度后，Analysis、Foundation、Writer、Reporter、Editor 全部共用，运行时固定配置并纳入缓存和审计。参见 [模型配置说明](docs/model_configuration.md)、[配置示例](configs/models.example.json) 和 [DeepSeek V4.1 Flash / max 配置](configs/models.deepseek-v4.1-flash.json)。
+全流程使用一份统一模型配置：选定服务商、模型和推理强度后，Analysis、Foundation、Writer、Reporter、Moderator、Editor 全部共用，运行时固定配置并纳入缓存和审计。参见 [模型配置说明](docs/model_configuration.md)、[配置示例](configs/models.example.json) 和 [DeepSeek V4.1 Flash / max 配置](configs/models.deepseek-v4.1-flash.json)。
+
+Moderator 默认只处理异常与非例行选择。宿主按已有数据依赖启动分析、执行、报告及独立 Writer 单元；只有交接无法继续、依赖或共享修订需要判断时才唤醒主持人。运行中仅能等待时直接等待，不再调用模型解释“仍在运行”。Writer 的可读交付连同宿主执行异常交给独立 Reporter；宿主不预先给科学结论。Python 继续负责真实收据、文件归属、写入冲突、取消与预算约束。`GENG_SUPERVISOR_MAX_ACTIONS` 默认 128，限制异常调度会话的动作数量。宿主进程退出后仍需重启工作进程恢复。详见 [主持人设计与实施记录](docs/host_moderator_plan.md)。
 
 ```powershell
 python -m geng_agent models --config configs/models.example.json
@@ -138,9 +142,9 @@ set GENG_CODEX_CMD=codex
 
 两份详细报告正文均使用简体中文，由同一个最终 Editor 撰写：
 
-- `result_review.md/docx`：逐任务介绍复现目标与结论、核心事实和假设、本地结果图与原文结果图对照、仍存在的差距，以及具体的下一步人工核查建议。多图任务覆盖相关目标图，缺图明确说明，不能伪造原图或猜测配对。
+- `result_review.md/docx`：逐任务介绍复现目标与结论、核心事实和假设，并优先把可读的本地结果图与原文结果图并排对照。差距和人工核查建议只在确有未解决问题时写；已复现且无重要限制的任务不硬套这两节。多图任务覆盖相关目标图，缺图明确说明，不能伪造原图或猜测配对。
 - `reproduction_report.md/docx`：集中保存完整参数及来源、实现与配置、依赖环境、入口命令、运行与迭代摘要、产物和证据索引、交付限制等详细信息。
-- `review.md/docx`：简短论文身份、任务结果摘要与两份报告的导航，不再重复大表。
+- `review.md/docx`：可选的简短导航；缺少它不阻止两份详细报告发布。
 
 程序只整理材料、按 Reporter 记录的哈希恢复图片、检查文件、保存智能体产物和转换 Word 格式；不插入终态正文，不进行语义匹配或替 Editor 判定表达。来源事实与 Writer 自述明确区分，人工核查建议标为未执行的建议。语言修订不改变科学判决，也不构成 Writer 重跑理由。
 
@@ -163,7 +167,7 @@ set GENG_CODEX_REASONING_EFFORT=medium
 
 所有角色共用这份模型与推理设置，不再读取按角色设置的模型名或推理强度。使用 DeepSeek 等服务商时，通过一份项目模型配置统一切换，详见[模型配置说明](docs/model_configuration.md)。
 
-task writer 采用全任务并发：有多少复现任务就同时启动多少个 writer。每个 writer 在自己的 sandbox 内直接调用当前 Python，自行探测 CPU/GPU、选择 backend、声明依赖并运行 smoke/full；主持人不做资源排队或科学判断。项目不对 Codex 推理会话设置 wall-clock 上限；会话只在正常完成、明确失败或用户停止时结束。后续迭代只在材料性原因成立且有具体因果修改方案时启动。
+task writer 按相互独立的 execution unit 并发，strong 依赖组成的 compound unit 共用一个 Writer；每个逻辑任务保持独立 Reporter。正常单元交接无需主持人检查；局部异常修复不阻塞其他已启动单元。每个 Writer 在自己的 sandbox 内调用当前 Python，自行探测 CPU/GPU、选择 backend、声明依赖并运行 smoke/full；当前没有新增 GPU 资源排队。项目不对 Codex 推理会话设置 wall-clock 上限；会话只在正常完成、明确失败或用户停止时结束。后续迭代只在材料性原因成立且有具体因果修改方案时启动。
 
 Writer 必须先读取 `repro_tasks.json` 的 `_meta.fact_gap_handoff`，再从抽取事实、原论文 PDF、caption、正文、公式、表格和附录中补找缺失参数；前两阶段的未解决记录只是导航，不是停止依据。论文明确给出的数据、模型、公式、算法和实验协议不可为了贴图而改动；仍找不到的值或实现细节才允许成为可追踪、可调整的科学假设。对 Monte Carlo、批量矩阵运算和分钟级 CPU full，CUDA 可用时应优先实现真实 Torch CUDA 计算路径；仅调用 backend selector 或在报告中写 GPU 名称不算使用 GPU。
 
@@ -334,6 +338,8 @@ case_001/
 - `result_review.md/docx`：逐任务展示可用的本地复现图、论文原图或等价结构化证据，并给出 criterion 级终态、原因与不确定性；不包含 writer 自我迭代附录。
 - `verification_result.json`：Reporter 原始科学结论、直接理由和独立的工程状态；review_incomplete 表示审查交接或证据未完成，inconclusive_missing_information 表示 Reporter 判断缺少决定性的论文信息。
 - `runtime_result.json`：执行摘要、产物汇总和最终独立验收状态；所有任务进入终态即可报告，只有全部成功复现才计为 matched。
+- `delivery_index.json`、`audit/supervisor/outcome.json`：本次可用交付及全局结局。`complete/partial/blocked` 表示工程交付状态，与科学“已复现/未复现”分开；旧报告存在不代表本次报告已经完成。
+- `audit/supervisor/tools/`、`events/`、`assignments/`：工具目录、逐次调用、唤醒事件和可跨重启恢复的角色修订指令。
 - `analysis_warnings.json`：前两阶段来源、引用、证据契约和缺失字段的非阻断诊断，供 Writer 继续核对全文。
 - `risk_report.json`：可复现性风险、缺失信息、前两阶段兜底、运行异常和审计摘要。
 - `audit/`：Codex prompt、stdout/stderr、JSON 校验、运行日志、图片证据等完整审计链。
@@ -346,19 +352,19 @@ case_001/
 2. 自行探测硬件并选择 CPU/GPU、并行度、批量大小和依赖。
 3. 在 `--run-repro` 开启时按 execution plan 的依赖顺序运行 smoke/full；共享数据、检查点和状态写入稳定的 unit 命名空间。
 4. 先核验论文明确的数据、模型、公式、核心算法和实验协议，再按稳定 ID 对照核心结论和关键数值目标。
-5. 只在论文未披露或确有歧义处提出显式合理假设；三类材料性原因之一成立且存在具体因果修正方向时修改并重跑，其他差异只记录。
+5. 只在论文未披露或确有歧义处提出显式合理假设；需要修改或重跑时，主持人根据任务目标、原始证据和可验证的修改方案安排，Python 不按固定原因枚举二次否决。
 6. 有可审查的 full 结果后交付 ready_for_review，由 Reporter 结合原文、指标尺度与统计不确定性决定科学结论。Writer 不输出最终 matched，也不凭通用倍率门槛调参至通过。
 
-主持人同时启动所有 execution-unit Writers。每个逻辑任务仍有且仅有一个 task reporter；compound unit 中任一 Reporter 指出共享科学的材料性缺陷时，整个 unit 才在原 sandbox 中作一次有因果依据的续跑，其余 unit 不受影响。所有任务进入终态后，宿主冻结包含源码、配置、数据/检查点、环境锁、artifact lineage 和 source inventory 的便携项目，再由已有的最终 Editor 撰写中文报告：结果对比报告集中介绍核心事实、假设、成对结果图、差距和人工核查建议，运行与追溯细节放入本地复现报告。
+宿主在资源不冲突时同批启动所有就绪的独立 execution-unit Writers；异常情况下由主持人决定恢复路径。每个逻辑任务仍有且仅有一个 task reporter；compound unit 中任一 Reporter 指出共享科学的材料性缺陷时，整个 unit 才在原 sandbox 中作一次有因果依据的续跑，其余 unit 不受影响。所有任务进入终态后，宿主冻结包含源码、配置、数据/检查点、环境锁、artifact lineage 和 source inventory 的便携项目，再由已有的最终 Editor 撰写中文报告：结果对比报告集中介绍核心事实、假设、成对结果图、差距和人工核查建议，运行与追溯细节放入本地复现报告。
 
 ## 安全边界
 
 - 生成代码、论文文本、日志、stdout/stderr 和图片内容都按不可信输入处理。
 - Python 包不使用静态准入白名单。Writer 只能提交普通 PEP 508 依赖请求，不能提供 URL、索引或安装参数；宿主对已有包做真实探测，只从登记的 HTTPS 来源补齐缺失 wheel。动态锁同时绑定宿主运行时 provenance、请求包的版本/import 结果，以及新安装 artifact 的 SHA-256；Writer 不得自行运行安装器。
-- 静态扫描会检查高风险文件操作、系统命令、网络行为等。
-- 每个 writer 使用独立 sandbox 隔离任务文件；运行权限和资源决策由 writer 自己负责。
-- 主持人会确定性清理 Python BOM；静态扫描发现语法错误时 runtime 不得显示通过。
-- `matched` 要求 Reporter 明确给出 reproduced 或 reproduced_with_assumptions，且宿主检查执行证据有效、交接完整。数值差异、符号、对数尺度、概率边界与统计波动由 Reporter 按论文主张解释；没有统一的十倍通过规则。
+- 科学执行保留原有操作系统沙箱、运行时访问限制、凭据隔离和文件身份校验。退役的 AST 科研推断、导入写法和路径文案检查不再决定流程通过与否。
+- 每个 Writer 使用独立 sandbox；Python 负责执行权限、真实资源状态和并发约束，只有异常恢复需要主持人根据这些事实安排工作。
+- 宿主可处理 BOM 等确定性的传输问题，并如实记录语法/进程错误；主持人判断错误与任务的关系，必要时交原负责角色修复。实际失败不能被描述成执行成功。
+- Reporter 科学意见、异常时的主持人修复决定和宿主执行证据分别保存。数值差异、符号、对数尺度、概率边界与统计波动由智能体结合论文解释；Python 不按十倍阈值、字段齐全程度或关键词重算科学结论。
 
 ## 项目定位
 

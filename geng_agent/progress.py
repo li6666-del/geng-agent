@@ -77,9 +77,17 @@ class ConsoleProgressReporter:
              message: str | None = None, data: dict[str, Any] | None = None) -> None:
         import datetime
         import sys
-        if event_type.startswith(("step.", "phase.", "agent.")):
+        if event_type.startswith(("step.", "phase.", "agent.", "moderator.", "supervisor.")):
+            payload = data or {}
+            if event_type == "moderator.started":
+                # Present the existing trigger without changing orchestration
+                # decisions, persisted events or the moderator policy identity.
+                message = {
+                    "tool_dispatch": "主持人正在安排工具与后续工作",
+                }.get(payload.get("trigger"), message)
             timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-            print(f"[{timestamp}] {event_type} {step or phase}" + (f" {message}" if message else ""),
+            label = step or payload.get("node_id") or phase
+            print(f"[{timestamp}] {event_type} {label}" + (f" {message}" if message else ""),
                   file=sys.stderr, flush=True)
 
     def check_cancelled(self) -> None:

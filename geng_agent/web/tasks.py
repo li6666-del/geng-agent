@@ -148,7 +148,7 @@ def run_review(self, job_id: str) -> None:
         if initial_sync_error is not None:
             _record_sync_warning(job_id, initial_sync_error)
         pipeline = ReviewPipeline()
-        pipeline.run(
+        result = pipeline.run(
             paper_path=paper_path,
             output_dir=case_dir,
             run_repro=bool(options.get("run_repro", True)),
@@ -157,20 +157,32 @@ def run_review(self, job_id: str) -> None:
             progress=reporter,
         )
         reporter.check_cancelled()
+        delivery_status = getattr(result, "delivery_status", "complete")
+        incomplete = delivery_status in {"partial", "blocked"}
+        completion_message = {
+            "partial": "已保留部分交付，仍有工程问题待解决；现有代码、结果和报告可以查看",
+            "blocked": "运行受阻，未完成交付；请查看主持人运行记录和已保留成果",
+        }.get(delivery_status, "复现任务已完成交付")
         final_sync_error = _best_effort_sync_job_artifacts(job_id)
         with SessionLocal() as session:
             job = session.get(JobRecord, job_id)
             case = session.get(CaseRecord, job.case_id) if job else None
             if job is None or case is None:
                 return
-            job.status = "succeeded"
-            job.error_code = None
-            job.error_message = None
+            # Keep the existing API/UI status vocabulary. Scientific
+            # not_reproduced is still a successful delivery; engineering
+            # partial/blocked results remain a resumable failed job.
+            job.status = "failed" if incomplete else "succeeded"
+            job.error_code = f"delivery_{delivery_status}" if incomplete else None
+            job.error_message = completion_message if incomplete else None
             job.finished_at = datetime.now(timezone.utc)
             session.commit()
         if final_sync_error is not None:
             _record_sync_warning(job_id, final_sync_error)
-        append_event(job_id, {"type": "job.finished", "message": "复现航行已完成", "data": {"ok": True}})
+        append_event(job_id, {"type": "job.finished", "message": completion_message, "data": {
+            "ok": not incomplete, "delivery_status": delivery_status,
+            "supervision_path": str(result.supervision_path) if getattr(result, "supervision_path", None) else None,
+        }})
     except PipelineCancelled:
         sync_error = _best_effort_sync_job_artifacts(job_id)
         if sync_error is not None:

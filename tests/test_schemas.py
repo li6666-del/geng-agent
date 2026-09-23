@@ -49,7 +49,7 @@ class SchemaTests(unittest.TestCase):
 
         self.assertTrue(issues)
 
-    def test_repro_tasks_requires_metric_formula(self) -> None:
+    def test_task_description_gap_does_not_block_mechanical_handoff(self) -> None:
         tasks = {
             "repro_tasks": [
                 {
@@ -75,7 +75,8 @@ class SchemaTests(unittest.TestCase):
 
         issues = validate_stage("repro_tasks", tasks)
 
-        self.assertTrue(any("metric_formula" in issue.path for issue in issues))
+        self.assertEqual(issues, [])
+        self.assertNotIn("metric_formula", tasks["repro_tasks"][0])
 
     def test_exported_json_schemas_match_pydantic_models(self) -> None:
         schema_dir = Path(__file__).resolve().parents[1] / "schemas"
@@ -190,7 +191,7 @@ class SchemaTests(unittest.TestCase):
         self.assertTrue(response_format["json_schema"]["strict"])
         self.assertEqual(response_format["json_schema"]["schema"], SCHEMA_MODELS["repro_tasks"].model_json_schema())
 
-    def test_targeted_backfill_schema_requires_field_resolutions(self) -> None:
+    def test_backfill_evidence_without_field_classification_is_preserved(self) -> None:
         document = {
             "paper_domain": "communication",
             "paper_repro_type": "signal_chain",
@@ -200,7 +201,8 @@ class SchemaTests(unittest.TestCase):
 
         issues = validate_stage("targeted_fact_backfill", document)
 
-        self.assertTrue(any("request_resolutions" in issue.path for issue in issues))
+        self.assertEqual(issues, [])
+        self.assertNotIn("request_resolutions", document)
 
 
 if __name__ == "__main__":

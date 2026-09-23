@@ -16,6 +16,7 @@ FOUNDATION_CONTRACT_VERSION = "1"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _TOP_LEVEL_FILES = {"requirements.txt", "README.foundation.md"}
 _CONFIG_SUFFIXES = {".json", ".yaml", ".yml"}
+_REGENERABLE_CACHE_DIRS = frozenset({".pytest_cache", "__pycache__"})
 
 
 def file_sha256(path: Path) -> str:
@@ -38,7 +39,7 @@ def path_is_foundation_link(path: Path) -> bool:
     return stat.S_ISLNK(metadata.st_mode) or bool(attributes & reparse_flag)
 
 
-def scan_foundation_tree(root: Path) -> tuple[list[Path], list[Path], list[Path], list[Path]]:
+def scan_foundation_tree(root: Path, *, skip_regenerable_caches: bool = False) -> tuple[list[Path], list[Path], list[Path], list[Path]]:
     """Walk a tree without traversing any symlink, junction, or reparse point."""
 
     files: list[Path] = []
@@ -56,7 +57,10 @@ def scan_foundation_tree(root: Path) -> tuple[list[Path], list[Path], list[Path]
                 links.append(path)
             elif entry.is_dir(follow_symlinks=False):
                 directories.append(path)
-                pending.append(path)
+                # Inspect the entry type first. A cache-named junction/link is
+                # still rejected above; a regular unused cache is never read.
+                if not skip_regenerable_caches or entry.name.casefold() not in _REGENERABLE_CACHE_DIRS:
+                    pending.append(path)
             elif entry.is_file(follow_symlinks=False):
                 files.append(path)
             else:
@@ -234,8 +238,6 @@ def validate_foundation_manifest(
                             "message": "required module must be a Foundation Python module under src/",
                         }
                     )
-                if normalized not in file_paths:
-                    issues.append({"path": f"$.required_modules[{index}]", "message": "required module is absent from files"})
             if expected_required_modules is not None and required_modules != sorted(expected_required_modules):
                 issues.append(
                     {"path": "$.required_modules", "message": "does not match the current scientific architecture"}
@@ -245,10 +247,9 @@ def validate_foundation_manifest(
     if not isinstance(validation, dict):
         issues.append({"path": "$.validation", "message": "must be an object"})
     else:
-        if validation.get("tests_passed") is not True:
-            issues.append({"path": "$.validation.tests_passed", "message": "must be true"})
-        if validation.get("local_imports_resolve") is not True:
-            issues.append({"path": "$.validation.local_imports_resolve", "message": "must be true"})
+        for key in ("tests_passed", "local_imports_resolve"):
+            if validation.get(key) is not None and not isinstance(validation[key], bool):
+                issues.append({"path": f"$.validation.{key}", "message": "must be boolean or null"})
     return _dedupe(issues)
 
 

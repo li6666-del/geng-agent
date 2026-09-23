@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "default": "gpt6_astra_xhigh",
+  "profiles": {
+    "gpt6_astra_xhigh": {
+      "provider": "openai",
+      "model": "gpt-6-astra",
+      "reasoning_effort": "xhigh",
+      "supports_images": true,
+      "supports_tools": true,
+      "supports_json_schema": true,
+      "web_search": "disabled"
+    }
+  }
+}

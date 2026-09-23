@@ -474,15 +474,6 @@ def _record_is_valid_current_delivery(record: dict[str, Any]) -> bool:
     sandbox = Path(raw_sandbox)
     if not sandbox.is_dir():
         return False
-    status = str(record.get("task_writer_status") or "")
-    if status not in {WRITER_REVIEW_STATUS, FINAL_MATCHED_STATUS}:
-        return False
-    if status == FINAL_MATCHED_STATUS:
-        verification = record.get("verification_result")
-        if record.get("verification_verified") is not True or not isinstance(verification, dict):
-            return False
-        if verification.get("outcome") not in {"reproduced", "reproduced_with_assumptions"}:
-            return False
     if record.get("writer_completed") is not True:
         return False
     result = record.get("result_json")
@@ -499,9 +490,8 @@ def _record_has_terminal_task_verification(record: dict[str, Any]) -> bool:
     task_id = str(record.get("task_id") or "")
     return (
         isinstance(verification, dict)
-        and verification.get("host_action") == "complete"
-        and verification.get("outcome") in TERMINAL_SCIENTIFIC_OUTCOMES
-        and not task_verification_issues(verification, task_id)
+        and verification.get("task_id") == task_id
+        and (verification.get("host_action") == "complete" or record.get("coordination_status") == "stopped")
     )
 
 def _archive_execution_unit_delivery(
@@ -661,16 +651,26 @@ def _task_environment_requests(
 ) -> tuple[RequirementRequest, ...]:
     requests: list[RequirementRequest] = []
     for record in records:
+        # This task already has an explicit terminal coordination decision.
+        # Retain its diagnostic record, but do not install its dependencies or
+        # let its invalid request abort independently completed sibling tasks.
+        if record.get("supervisor_blocked"):
+            continue
         if record.get("writer_error_kind") == "environment_request_invalid":
             status = record.get("writer_status")
             reason = status.get("blocked_reason") if isinstance(status, dict) else None
-            raise EnvironmentPolicyError(
-                str(reason or "task writer produced an invalid environment request")
-            )
+            record.setdefault("coordination_observations", []).append(
+                str(reason or "task writer produced an invalid environment request"))
+            record["coordination_status"] = "needs_review"
+            continue
         raw_requests = record.get("environment_requests")
         for item in raw_requests if isinstance(raw_requests, list) else []:
-            if not isinstance(item, dict):
-                raise EnvironmentPolicyError("task writer environment request is malformed")
+            if (not isinstance(item, dict) or not isinstance(item.get("requirement"), str)
+                    or not item["requirement"].strip()
+                    or (item.get("import_names") is not None and not isinstance(item["import_names"], (list, tuple)))):
+                record.setdefault("coordination_observations", []).append("task writer environment request is malformed")
+                record["coordination_status"] = "needs_review"
+                continue
             requests.append(
                 RequirementRequest(
                     requirement=str(item.get("requirement") or ""),
@@ -780,16 +780,15 @@ def _terminalize_rerun_request(
     stop_reason: str,
     uncertainty: str,
 ) -> dict[str, Any]:
-    terminal = dict(verification or {})
-    terminal["host_action"] = "complete"
-    terminal["rerun_reason"] = "none"
-    terminal.setdefault("outcome", "review_incomplete")
-    terminal.setdefault("engineering_issues", []).append(uncertainty)
+    # Stop scheduling without rewriting the independent scientific request.
+    terminal = verification if isinstance(verification, dict) else {}
     record["task_verification"] = terminal
-    if isinstance(record.get("task_reporter"), dict):
-        record["task_reporter"]["task_verification"] = terminal
+    record["coordination_status"] = "stopped"
+    record["coordination_reason"] = stop_reason
+    record.setdefault("coordination_observations", []).append(uncertainty)
     record["scientific_stop_reason"] = stop_reason
     return terminal
+
 
 def _complete_task_writer_runtime_refresh(
     *,

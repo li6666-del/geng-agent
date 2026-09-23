@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import copy
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from geng_agent.semantic_merge import semantic_merge_repro_tasks
 from geng_agent.targeted_backfill_loop import run_targeted_backfill_loop
@@ -108,7 +110,7 @@ class TaskRelationshipMergeTests(unittest.TestCase):
         self.assertTrue(merged["backfill_handoff"]["ready_for_writer"])
         self.assertNotIn("backfill_handoff", merged.get("_meta", {}))
 
-    def test_reconciliation_preserves_omitted_relationships_and_refreshes_matching_ids(self) -> None:
+    def test_reconciliation_keeps_the_complete_new_graph_and_does_not_mutate_old_evidence(self) -> None:
         preliminary = _document(
             ready=False,
             relationships=[
@@ -127,18 +129,24 @@ class TaskRelationshipMergeTests(unittest.TestCase):
             ],
         )
 
+        original = copy.deepcopy(preliminary)
+        revised = copy.deepcopy(candidate)
         reconciled = reconcile_final_tasks(preliminary, candidate, {"resolved": []})
+        self.assertEqual(preliminary, original)
+        self.assertEqual(candidate, revised)
+        self.assertEqual(reconciled, candidate)
 
         self.assertEqual(reconciled["schema_version"], "2.0")
         self.assertEqual(
             [item["relationship_id"] for item in reconciled["execution_relationships"]],
-            ["keep_me", "refresh_me"],
+            ["refresh_me"],
         )
-        self.assertEqual(reconciled["execution_relationships"][1]["strength"], "strong")
+        self.assertEqual(reconciled["execution_relationships"][0]["strength"], "strong")
         self.assertTrue(reconciled["backfill_handoff"]["ready_for_writer"])
         self.assertNotIn("backfill_handoff", reconciled.get("_meta", {}))
 
-    def test_backfill_refresh_keeps_relationships_and_writes_top_level_handoff(self) -> None:
+    def test_backfill_refresh_publishes_new_graph_and_keeps_old_input_for_audit(self) -> None:
+        audit_dir = Path(self.enterContext(TemporaryDirectory())) / "audit"
         initial = _document(
             ready=False,
             relationships=[_relationship("keep_across_refresh")],
@@ -178,6 +186,7 @@ class TaskRelationshipMergeTests(unittest.TestCase):
             return refreshed
 
         result = run_targeted_backfill_loop(
+            audit_dir=audit_dir,
             initial_facts={
                 "paper_domain": "communication",
                 "paper_repro_type": "other",
@@ -197,8 +206,10 @@ class TaskRelationshipMergeTests(unittest.TestCase):
                 item["relationship_id"]
                 for item in result["tasks"]["execution_relationships"]
             ],
-            ["keep_across_refresh"],
+            [],
         )
+        self.assertEqual(initial["execution_relationships"][0]["relationship_id"], "keep_across_refresh")
+        self.assertFalse(initial["backfill_handoff"]["ready_for_writer"])
         self.assertTrue(result["tasks"]["backfill_handoff"]["ready_for_writer"])
         self.assertFalse(result["tasks"]["backfill_handoff"]["inferred"])
         self.assertNotIn("backfill_handoff", result["tasks"].get("_meta", {}))

@@ -12,7 +12,7 @@ import geng_agent.task_writer_runner as writer_runner
 from geng_agent.verification_result import (
     normalize_task_verification,
     rerun_evidence_path_issues,
-    writer_revision_allowed,
+    task_verification_issues,
 )
 
 
@@ -57,7 +57,7 @@ def _writer_record() -> dict:
 
 
 class ScientificStateMachineSafetyTests(unittest.TestCase):
-    def test_made_up_contract_id_cannot_authorize_rerun(self) -> None:
+    def test_unknown_contract_id_is_observed_without_changing_requested_rerun(self) -> None:
         result = normalize_task_verification(
             _rerun_note(claim_id="claim.made_up"),
             "task_a",
@@ -65,9 +65,10 @@ class ScientificStateMachineSafetyTests(unittest.TestCase):
             run_valid_hint=True,
         )
         self.assertEqual(result["core_conclusions"][0]["claim_id"], "claim.made_up")
-        self.assertEqual(result["engineering_status"], "handoff_failed")
-        self.assertEqual(result["host_action"], "complete")
-        self.assertFalse(writer_revision_allowed(result, "task_a"))
+        self.assertEqual(result["engineering_status"], "verified")
+        self.assertTrue(result["host_observations"])
+        self.assertEqual(result["host_action"], "rerun_writer")
+        self.assertTrue((not task_verification_issues(result, "task_a") and result.get("host_action") == "rerun_writer"))
 
     def test_reporter_can_mark_rc_zero_output_invalid(self) -> None:
         result = normalize_task_verification(
@@ -78,7 +79,7 @@ class ScientificStateMachineSafetyTests(unittest.TestCase):
         )
         self.assertFalse(result["run_valid"])
         self.assertEqual(result["host_action"], "rerun_writer")
-        self.assertTrue(writer_revision_allowed(result, "task_a"))
+        self.assertTrue((not task_verification_issues(result, "task_a") and result.get("host_action") == "rerun_writer"))
 
     def test_rerun_paper_evidence_must_exist_under_trusted_root(self) -> None:
         with TemporaryDirectory() as temp:
@@ -114,7 +115,7 @@ class ScientificStateMachineSafetyTests(unittest.TestCase):
         self.assertEqual(record["execution_summary"]["last_returncode"], 0)
         self.assertEqual(record["task_reporter_error_kind"], "task_reporter_callback_failed")
 
-    def test_untrusted_rerun_path_becomes_terminal(self) -> None:
+    def test_missing_rerun_evidence_is_observed_without_rewriting_request(self) -> None:
         with TemporaryDirectory() as temp:
             workspace = Path(temp)
             (workspace / "paper_evidence").mkdir()
@@ -126,20 +127,26 @@ class ScientificStateMachineSafetyTests(unittest.TestCase):
                 note, "task_a", task=_task(), run_valid_hint=True
             )
             record = _writer_record()
-            action, _ = writers._attach_task_reporter_review(
-                callback=lambda *_args: {
-                    "ok": True,
-                    "workspace": str(workspace),
-                    "task_verification": verification,
-                },
-                index=1,
-                task=_task(),
-                record=record,
-                session_round=1,
-            )
+            record["sandbox"] = str(workspace)
+            with patch("geng_agent.task_recovery.request_moderation", return_value={
+                "action": "stop", "instructions": "The source evidence is unavailable.",
+            }) as moderate:
+                action, _ = writers._attach_task_reporter_review(
+                    callback=lambda *_args: {
+                        "ok": True,
+                        "workspace": str(workspace),
+                        "task_verification": verification,
+                    },
+                    index=1,
+                    task=_task(),
+                    record=record,
+                    session_round=1,
+                )
             self.assertEqual(action, "terminal")
-            self.assertEqual(record["task_verification"]["host_action"], "complete")
-            self.assertEqual(record["scientific_stop_reason"], "untrusted_rerun_paper_evidence")
+            self.assertEqual(record["task_verification"]["host_action"], "rerun_writer")
+            self.assertEqual(record["coordination_status"], "stopped")
+            self.assertEqual(record["scientific_stop_reason"], "moderator_stopped_revision")
+            self.assertTrue(moderate.call_args.kwargs["context"]["ownership"]["evidence_observations"])
 
     def test_missing_sandbox_does_not_read_caller_working_directory(self) -> None:
         with TemporaryDirectory() as temp:

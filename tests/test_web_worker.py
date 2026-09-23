@@ -4,6 +4,7 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from sqlalchemy import delete, select
@@ -57,6 +58,38 @@ class WebWorkerTests(unittest.TestCase):
             for model in (JobEvent, ArtifactRecord, ExportRecord, JobRecord, CaseRecord):
                 session.execute(delete(model))
             session.commit()
+
+    def test_worker_preserves_partial_artifacts_without_claiming_complete_delivery(self) -> None:
+        for delivery_status in ("complete", "partial", "blocked"):
+            with self.subTest(delivery_status=delivery_status), tempfile.TemporaryDirectory() as temporary:
+                case_dir = Path(temporary)
+                paper_path = case_dir / "paper.md"
+                paper_path.write_text("synthetic case", encoding="utf-8")
+                case_id, job_id = str(uuid.uuid4()), str(uuid.uuid4())
+                with SessionLocal() as session:
+                    session.add(CaseRecord(id=case_id, display_name="delivery state",
+                        directory=str(case_dir), paper_path=str(paper_path), source="upload"))
+                    session.add(JobRecord(id=job_id, case_id=case_id, status="queued"))
+                    session.commit()
+
+                class DeliveryPipeline:
+                    def run(self, **kwargs):
+                        (case_dir / "review.md").write_text("# 未复现\n保留已有科学结果", encoding="utf-8")
+                        return SimpleNamespace(delivery_status=delivery_status, runtime_passed=False,
+                                               supervision_path=case_dir / "supervisor.json")
+
+                with patch("geng_agent.web.tasks.ReviewPipeline", DeliveryPipeline):
+                    run_review.run(job_id)
+                with SessionLocal() as session:
+                    job = session.get(JobRecord, job_id)
+                    event = session.scalar(select(JobEvent).where(
+                        JobEvent.job_id == job_id, JobEvent.event_type == "job.finished"))
+                    self.assertEqual(job.status, "succeeded" if delivery_status == "complete" else "failed")
+                    self.assertEqual(job.error_code, None if delivery_status == "complete" else f"delivery_{delivery_status}")
+                    self.assertEqual(event.data["ok"], delivery_status == "complete")
+                    self.assertEqual(event.data["delivery_status"], delivery_status)
+                    self.assertIsNotNone(session.scalar(select(ArtifactRecord).where(
+                        ArtifactRecord.case_id == case_id, ArtifactRecord.relative_path == "review.md")))
 
     def test_worker_calls_current_public_pipeline_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

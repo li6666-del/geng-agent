@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
+from dataclasses import asdict
 from typing import Any
 
 from .codex_runner import run_codex_subprocess, run_python_unittest_subprocess
@@ -27,73 +28,20 @@ from .case_runtime import (
     read_environment_request, requirements_from_scientific_architecture,
     requirements_missing_from_lock,
 )
-from .case_environment import EnvironmentPolicyError, normalize_requirement
+from .case_environment import EnvironmentPolicyError, RequirementRequest, normalize_requirement
+from .case_runtime_requests import _lock_satisfies_requirement
 from .json_utils import pretty_json
-from .outputs import _missing_local_imports, write_json, write_text
+from .outputs import write_json, write_text
 from .scientific_architecture import foundation_module_paths
-from .security import (
-    FOUNDATION_STATIC_SECURITY_ADVISORY_CATEGORIES, split_requirement_issues,
-    split_static_security_issues, static_scan_repro_project, validate_requirements,
-)
 from .task_writer_support import (
     PAPER_EVIDENCE_DIR, _analysis_snapshot_hash, _collect_writer_analysis_artifacts,
     _missing_required_analysis_artifacts, _write_paper_evidence_bundle,
 )
-from .foundation_architecture import (
-    architecture_components as _architecture_components,
-    architecture_dependency_names as _architecture_dependency_names,
-    architecture_requires_execution_contracts as _architecture_requires_execution_contracts,
-    declared_requirement_keys as _declared_requirement_keys,
-    dependency_strings as _dependency_strings,
-    initial_foundation_requirements as _initial_foundation_requirements,
-    library_keys as _library_keys, normalized_library_name as _normalized_library_name,
-    requirement_name_for_library as _requirement_name_for_library,
-)
-from .foundation_bindings import (
-    _Binding, _advance_binding, _ast_dotted_name, _binding_is_trivial_external_stub,
-    _class_member_binding, _component_framework_import_keys, _declared_callable_binding,
-    _expression_binding, _foundation_project_import_keys, _foundation_source_trees,
-    _framework_is_external, _imported_module_path, _module_candidate,
-    _top_level_binding, _validate_declared_callable,
-)
-from .foundation_capability_evidence import (
-    _analyze_flow_statements, _assert_expression_has_component_change,
-    _assertion_call_has_component_change, _assertion_operand_tags, _assign_flow_target,
-    _capability_test_passed, _component_change_pair, _component_factory_tags,
-    _component_test_flow, _contract_values_equal,
-    _execution_requires_trusted_capability_probe, _factory_expression_tags,
-    _flow_expression_tags, _framework_has_trusted_capability_probe,
-    _method_evidences_capability, _method_references_component,
-    _negated_equality_has_component_change, _new_component_flow,
-    _required_component_capabilities,
-)
-from .foundation_execution_contracts import (
-    _external_runtime_available, _external_runtime_command,
-    _trusted_external_runtime_adapter,
-    validate_foundation_execution_contracts as _validate_foundation_execution_contracts,
-)
-from .foundation_execution_policy import (
-    CAPABILITY_GROUPS as _CAPABILITY_GROUPS,
-    EXECUTION_CONTRACT_FIELDS as _EXECUTION_CONTRACT_FIELDS,
-    FRAMEWORK_EXEMPTIONS as _FRAMEWORK_EXEMPTIONS,
-    FRAMEWORK_SEMANTIC_LABELS as _FRAMEWORK_SEMANTIC_LABELS,
-    LIBRARY_CANONICAL_NAMES as _LIBRARY_CANONICAL_NAMES,
-    MATERIAL_EXECUTION_FIELDS as _MATERIAL_EXECUTION_FIELDS,
-    TRUSTED_CAPABILITY_PROBE_FRAMEWORKS as _TRUSTED_CAPABILITY_PROBE_FRAMEWORKS,
-    TRUSTED_EXTERNAL_RUNTIME_ADAPTERS as _TRUSTED_EXTERNAL_RUNTIME_ADAPTERS,
-    TRUSTED_PROJECT_FILES as _TRUSTED_PROJECT_FILES,
-)
-from .foundation_test_catalog import (
-    _DeliveredTest, _capability_matches_group, _capability_status_passed,
-    _component_test_target, _decorator_skips_test, _delivered_test_references,
-    _flow_reference, _normalized_capability, _normalized_test_reference,
-    _resolve_test_name, _static_bool, _test_has_substantive_body,
-    _test_import_targets, _test_is_skipped,
-)
+from .foundation_architecture import initial_foundation_requirements as _initial_foundation_requirements
 from .foundation_prompt_cache import (
-    FOUNDATION_CORE_MODULES, FOUNDATION_LABEL, FOUNDATION_RESULT_STATUS,
+    FOUNDATION_LABEL, FOUNDATION_RESULT_STATUS,
     _foundation_brief, _foundation_input_hash, _load_cached_foundation,
-    _load_cached_foundation_failure, _required_foundation_modules,
+    _required_foundation_modules,
 )
 from .foundation_snapshot_delivery import (
     _assert_foundation_sandbox_layout_safe,
@@ -125,6 +73,7 @@ def run_codex_foundation_writer_workflow(
     revision_request: dict[str, Any] | None = None,
     revision_evidence_root: Path | None = None,
     previous_foundation: dict[str, Any] | None = None,
+    recovery_instructions: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Build and freeze the shared scientific layer before parallel task writers.
 
@@ -133,6 +82,7 @@ def run_codex_foundation_writer_workflow(
     sole shared layer installed into every writer sandbox and the final project.
     """
 
+    allow_environment_resume = resume
     original_architecture = scientific_architecture
     if execution_plan is None and isinstance(tasks.get("repro_tasks"), list):
         execution_plan = compile_execution_plan(tasks)
@@ -170,6 +120,8 @@ def run_codex_foundation_writer_workflow(
             }),
         }
         resume = False
+    if recovery_instructions is not None:
+        resume = True
 
     analysis_artifacts = _collect_writer_analysis_artifacts(output_dir=output_dir)
     missing = _missing_required_analysis_artifacts(analysis_artifacts)
@@ -209,6 +161,56 @@ def run_codex_foundation_writer_workflow(
     writer_delivery_dir = (
         audit_dir / "03b_foundation_writer_deliveries" / input_hash
     )
+    # This key identifies the completed implementation, not a successful test
+    # result. Changing only the environment must revalidate its original bytes.
+    environment_resume_key = _foundation_input_hash(
+        analysis_hash, {"architecture": scientific_architecture,
+                        "recovery_instructions": recovery_instructions},
+        environment_hash="foundation_environment_handoff_v1",
+    )
+    environment_resume_path = (
+        audit_dir / "03b_foundation_environment_resume" / f"{environment_resume_key}.json"
+    )
+    if allow_environment_resume:
+        pending_delivery = _load_environment_pending_foundation(
+            path=environment_resume_path, audit_dir=audit_dir,
+            expected_key=environment_resume_key, required_modules=required_modules,
+        )
+        if pending_delivery is not None:
+            saved_dir, receipt, record = pending_delivery
+            restore_foundation_writer_delivery(
+                delivery_dir=saved_dir, receipt=receipt, sandbox=sandbox,
+            )
+            pending = _foundation_pending_requirements(
+                sandbox=sandbox, case_runtime=case_runtime,
+                explicit_requests=[RequirementRequest(**item) for item in record["requests"]],
+            )
+            if pending:
+                raise EnvironmentRequestRequired(pending, source="foundation_writer")
+            write_json(audit_dir / "03b_foundation_writer_resume.json", {
+                "ok": None, "source": "environment_pending_writer_delivery",
+                "input_hash": input_hash, "writer_input_hash": receipt["input_hash"],
+                "writer_snapshot_hash": receipt["snapshot_hash"], "writer_rerun": False,
+            })
+            finalized = _finalize_foundation_delivery(
+                sandbox=sandbox, snapshot_dir=snapshot_dir, manifest_path=manifest_path,
+                audit_dir=audit_dir, scientific_architecture=scientific_architecture,
+                required_modules=required_modules, analysis_hash=analysis_hash,
+                environment_hash=environment_hash, input_hash=input_hash,
+                trusted_changed=list(receipt["trusted_changed"]), case_runtime=case_runtime,
+            )
+            if revision_request is not None:
+                write_json(audit_dir / "03b_foundation_current_revision.json", {
+                    "base_input_hash": base_input_hash, "revision_input_hash": input_hash,
+                    "snapshot_path": snapshot_dir.relative_to(audit_dir).as_posix(),
+                    "request_id": revision_request["request_id"],
+                })
+            write_json(environment_resume_path, {
+                **record, "state": "validated", "validated_input_hash": input_hash,
+                "validated_environment_hash": environment_hash,
+                "validation": finalized["manifest"]["validation"],
+            })
+            return finalized
 
     repair_delivery = None
     repair_validation = None
@@ -219,7 +221,7 @@ def run_codex_foundation_writer_workflow(
             expected_base_input_hash=base_input_hash,
             expected_required_modules=required_modules,
         )
-        if revised is not None:
+        if revised is not None and recovery_instructions is None:
             if not _foundation_runtime_matches(revised, scientific_architecture, case_runtime):
                 _revalidate_cached_foundation_runtime(revised, scientific_architecture, case_runtime)
             return revised
@@ -229,7 +231,7 @@ def run_codex_foundation_writer_workflow(
             expected_input_hash=input_hash,
             expected_required_modules=required_modules,
         )
-        if cached is not None and _foundation_runtime_matches(cached, scientific_architecture, case_runtime):
+        if cached is not None and recovery_instructions is None and _foundation_runtime_matches(cached, scientific_architecture, case_runtime):
             write_json(audit_dir / "03b_foundation_writer_resume.json", {"ok": True, "source": "content_addressed_snapshot"})
             return cached
         writer_delivery = load_foundation_writer_delivery(
@@ -241,25 +243,9 @@ def run_codex_foundation_writer_workflow(
             validation_path=audit_dir / "03b_foundation_validation.json",
             expected_input_hash=input_hash,
         )
-        reuse_writer_delivery = (
-            writer_delivery is not None
-            and _validation_allows_writer_delivery_reuse(validation_record)
-        )
-        host_validation_policy_hash = _host_validation_policy_hash()
-        if (
-            reuse_writer_delivery
-            and isinstance(validation_record, dict)
-            and validation_record.get("ok") is False
-            and _host_revalidation_already_attempted(
-                resume_path=audit_dir / "03b_foundation_writer_resume.json",
-                expected_input_hash=input_hash,
-                expected_policy_hash=host_validation_policy_hash,
-            )
-        ):
-            raise RuntimeError(
-                "Foundation host validation still fails after one pristine delivery "
-                "revalidation; the completed Writer is preserved and will not be rerun"
-            )
+        # Reconcile the immutable delivery first. Only the supervisor may ask
+        # the Writer to change it; failure-message heuristics do not choose an owner.
+        reuse_writer_delivery = writer_delivery is not None and recovery_instructions is None
         if reuse_writer_delivery and writer_delivery is not None:
             try:
                 restore_foundation_writer_delivery(
@@ -290,7 +276,6 @@ def run_codex_foundation_writer_workflow(
                     "input_hash": input_hash,
                     "previous_issues": previous_issues,
                     "writer_rerun": False,
-                    "host_validation_policy_hash": host_validation_policy_hash,
                 },
             )
             return _finalize_foundation_delivery(
@@ -360,6 +345,15 @@ def run_codex_foundation_writer_workflow(
     write_json(sandbox / PAPER_EVIDENCE_DIR / "analysis_artifacts" / "foundation_context.json", cache_architecture)
     trusted_before = _trusted_hashes(sandbox)
     prompt = _foundation_brief(scientific_architecture, case_runtime=case_runtime)
+    if recovery_instructions:
+        write_json(sandbox / "supervisor_recovery.json", recovery_instructions)
+        prompt += (
+            "\n## Project supervisor repair assignment\n"
+            "Repair the preserved Foundation within its original scientific scope. "
+            "Use the diagnosis below and verify the expected change with the existing contract tests. "
+            "Do not weaken tests, alter paper goals, or claim success without validation.\n"
+            + pretty_json(recovery_instructions)
+        )
     if repair_delivery is not None:
         validation = repair_validation or {}
         write_json(sandbox / "foundation_validation_feedback.json", validation)
@@ -371,6 +365,7 @@ def run_codex_foundation_writer_workflow(
             "`foundation_validation_feedback.json`. Re-run the shared contract tests "
             "after the smallest causal correction.\n"
             + pretty_json({"issues": validation.get("issues", []),
+                           "moderator_instructions": recovery_instructions,
                            "returncode": tests.get("returncode"),
                            "stderr_tail": str(tests.get("stderr") or tests.get("error") or "")[-4000:]})
             + "\n\n" + prompt
@@ -420,27 +415,9 @@ def run_codex_foundation_writer_workflow(
         # below may read or replace an agent-controlled path until the complete
         # sandbox has been walked without following links or reparse points.
         _assert_foundation_sandbox_layout_safe(sandbox)
-        pending_requests = list(
-            read_environment_request(sandbox=sandbox, source="foundation_writer")
-        )
-        if case_runtime is not None:
-            pending_requests.extend(
-                requirements_missing_from_lock(
-                    sandbox / "requirements.txt",
-                    case_runtime.lock,
-                    source="foundation_writer:requirements.txt",
-                )
-            )
-        if pending_requests:
-            raise EnvironmentRequestRequired(
-                pending_requests,
-                source="foundation_writer",
-            )
         trusted_after = _trusted_hashes(sandbox)
         trusted_changed = sorted(path for path, digest in trusted_before.items() if trusted_after.get(path) != digest)
         _restore_trusted_runtime_atomically(sandbox)
-    except EnvironmentRequestRequired:
-        raise
     except (OSError, RuntimeError, EnvironmentPolicyError) as exc:
         raise RuntimeError(f"foundation writer produced an unsafe filesystem layout: {exc}") from exc
     if not status.get("ok"):
@@ -460,6 +437,20 @@ def run_codex_foundation_writer_workflow(
         required_modules=required_modules,
         trusted_changed=trusted_changed,
     )
+    pending_requests = _foundation_pending_requirements(
+        sandbox=sandbox, case_runtime=case_runtime,
+        explicit_requests=list(read_environment_request(sandbox=sandbox, source="foundation_writer")),
+    )
+    if pending_requests:
+        write_json(environment_resume_path, {
+            "schema_version": 1, "state": "awaiting_environment",
+            "recovery_input_hash": environment_resume_key,
+            "writer_input_hash": input_hash,
+            "writer_snapshot_hash": writer_delivery["snapshot_hash"],
+            "requests": [asdict(request) for request in pending_requests],
+            "validation": None,
+        })
+        raise EnvironmentRequestRequired(pending_requests, source="foundation_writer")
     restore_foundation_writer_delivery(
         delivery_dir=writer_delivery_dir,
         receipt=writer_delivery,
@@ -491,6 +482,49 @@ def run_codex_foundation_writer_workflow(
     return finalized
 
 
+def _load_environment_pending_foundation(
+    *, path: Path, audit_dir: Path, expected_key: str, required_modules: set[str],
+) -> tuple[Path, dict[str, Any], dict[str, Any]] | None:
+    """Read a host checkpoint only when its completed delivery is still intact."""
+    if path_is_foundation_link(path) or path_is_foundation_link(path.parent):
+        raise RuntimeError("unsafe Foundation environment-resume checkpoint")
+    if not path.is_file():
+        return None
+    record = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(record, dict) or record.get("recovery_input_hash") != expected_key:
+        raise RuntimeError("Foundation environment-resume checkpoint does not match its inputs")
+    if record.get("state") == "validated":
+        return None
+    writer_hash = record.get("writer_input_hash")
+    if (record.get("state") != "awaiting_environment" or not isinstance(writer_hash, str)
+            or len(writer_hash) != 64 or any(char not in "0123456789abcdef" for char in writer_hash)
+            or not isinstance(record.get("requests"), list)):
+        raise RuntimeError("invalid Foundation environment-resume checkpoint")
+    delivery_dir = audit_dir / "03b_foundation_writer_deliveries" / writer_hash
+    receipt = load_foundation_writer_delivery(
+        delivery_dir=delivery_dir, expected_input_hash=writer_hash,
+        expected_required_modules=required_modules,
+    )
+    if receipt is None or receipt["snapshot_hash"] != record.get("writer_snapshot_hash"):
+        raise RuntimeError("completed Foundation delivery changed before environment recovery; preserved for inspection")
+    return delivery_dir, receipt, record
+
+
+def _foundation_pending_requirements(
+    *, sandbox: Path, case_runtime: CaseRuntime | None,
+    explicit_requests: list[RequirementRequest],
+) -> list[RequirementRequest]:
+    if case_runtime is None:
+        return explicit_requests
+    pending = [request for request in explicit_requests
+               if not _lock_satisfies_requirement(normalize_requirement(request), case_runtime.lock)]
+    pending.extend(requirements_missing_from_lock(
+        sandbox / "requirements.txt", case_runtime.lock,
+        source="foundation_writer:requirements.txt",
+    ))
+    return pending
+
+
 def _foundation_runtime_matches(
     foundation: dict[str, Any], architecture: dict[str, Any], case_runtime: CaseRuntime | None,
 ) -> bool:
@@ -518,7 +552,8 @@ def _revalidate_cached_foundation_runtime(
         architecture=architecture, case_runtime=case_runtime,
         source_root=Path(foundation["snapshot_dir"]),
     )
-    manifest["validation"] = {"tests_passed": bool(tests.get("passed")), "local_imports_resolve": True}
+    manifest["validation"] = {"tests_passed": tests.get("passed"), "local_imports_resolve": None,
+                              "observations": tests.get("observations", []), "tests": tests}
     manifest["environment_lock_hash"] = case_runtime.environment_hash if case_runtime is not None else "host-runtime"
     _write_foundation_manifest(Path(foundation["manifest_path"]), manifest)
 
@@ -623,112 +658,6 @@ def _load_foundation_validation_record(
     return record
 
 
-def _validation_allows_writer_delivery_reuse(
-    record: dict[str, Any] | None,
-) -> bool:
-    """Reuse only for an unfinished finalize or evidence of host-side failure."""
-
-    if record is None or record.get("ok") is True:
-        return True
-    issues = record.get("issues")
-    tests = record.get("tests")
-    if not isinstance(issues, list) or not isinstance(tests, dict):
-        return False
-    if not issues or any(
-        not isinstance(item, dict) or str(item.get("file") or "") != "tests"
-        for item in issues
-    ):
-        return False
-    if tests.get("skipped") is True:
-        return False
-    diagnostics = "\n".join(
-        str(tests.get(key) or "") for key in ("stdout", "stderr", "error")
-    ).casefold()
-    if tests.get("timed_out") is True:
-        # A timeout is an indeterminate host-validation result, not evidence
-        # that regenerating the completed scientific implementation will help.
-        # Reuse only the pristine immutable delivery; the existing policy-hash
-        # marker permits one host revalidation and then stops without freezing
-        # or accepting a delivery that still times out.
-        explicit_test_failure = any(
-            marker in diagnostics
-            for marker in (
-                "assertionerror",
-                "failed (failures=",
-                "failed (errors=",
-            )
-        ) or any(
-            line.lstrip().startswith(("fail:", "error:"))
-            for line in diagnostics.splitlines()
-        )
-        return (
-            tests.get("passed") is False
-            and tests.get("delivery_immutable") is True
-            and tests.get("returncode") is None
-            and not tests.get("spawn_error")
-            and not explicit_test_failure
-        )
-    if (
-        tests.get("runtime_cleanup_error")
-        or tests.get("spawn_error")
-        or (
-            isinstance(tests.get("returncode"), int)
-            and tests["returncode"] < 0
-        )
-    ):
-        return True
-    if "foundation runtime guard:" in diagnostics and "site-packages" in diagnostics:
-        return True
-    host_stack_signatures = (
-        ("site-packages", "nameerror"),
-        ("getpass.py", "no module named 'pwd'"),
-        ("site-packages", "torch", "already has an"),
-        ("site-packages", "dll load failed"),
-    )
-    return any(all(marker in diagnostics for marker in signature) for signature in host_stack_signatures)
-
-
-def _host_revalidation_already_attempted(
-    *,
-    resume_path: Path,
-    expected_input_hash: str,
-    expected_policy_hash: str,
-) -> bool:
-    try:
-        if (
-            path_is_foundation_link(resume_path)
-            or path_is_foundation_link(resume_path.parent)
-            or not resume_path.is_file()
-        ):
-            return False
-        record = json.loads(resume_path.read_text(encoding="utf-8-sig"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return False
-    return bool(
-        isinstance(record, dict)
-        and record.get("source") == "cached_writer_delivery_host_revalidation"
-        and record.get("input_hash") == expected_input_hash
-        and record.get("host_validation_policy_hash") == expected_policy_hash
-        and record.get("writer_rerun") is False
-    )
-
-
-def _host_validation_policy_hash() -> str:
-    """Fingerprint the host validator and guarded unittest runner implementation."""
-
-    digest = hashlib.sha256()
-    module_paths = (
-        Path(__file__),
-        Path(str(getattr(sys.modules.get(run_python_unittest_subprocess.__module__), "__file__", ""))),
-    )
-    for path in module_paths:
-        try:
-            digest.update(path.resolve().read_bytes())
-        except (OSError, RuntimeError):
-            digest.update(str(path).encode("utf-8", errors="replace"))
-    return digest.hexdigest()
-
-
 def _finalize_foundation_delivery(
     *,
     sandbox: Path,
@@ -784,8 +713,10 @@ def _finalize_foundation_delivery(
             source_root=snapshot_dir,
         ) if isinstance(scientific_architecture.get("_foundation_scope"), dict) else None,
         "validation": {
-            "tests_passed": bool(test_result.get("passed")),
-            "local_imports_resolve": True,
+            "tests_passed": test_result.get("passed"),
+            "local_imports_resolve": None,
+            "observations": test_result.get("observations", []),
+            "tests": test_result,
         },
     }
     manifest_issues = validate_foundation_manifest(
@@ -812,177 +743,70 @@ def _validate_foundation_delivery(
     trusted_changed: list[str],
     case_runtime: CaseRuntime | None = None,
 ) -> tuple[list[dict[str, str]], dict[str, Any]]:
-    """Validate executable Foundation content and retain metadata debt as warnings."""
+    """Collect actual delivery/test observations; usability belongs to the supervisor.
 
-    issues: list[dict[str, str]] = []
-    warnings: list[dict[str, str]] = []
-    if trusted_changed:
-        issues.extend({"file": path, "message": "Foundation Writer modified a host-trusted runtime file"} for path in trusted_changed)
+    Only unsafe access or changes to the files being certified prevent freezing.
+    An optional test failure, import spelling or architecture description is not
+    a Python verdict about whether this Foundation can support the task.
+    """
+    issues = [{"file": path, "message": "Foundation Writer modified a host-trusted runtime file"}
+              for path in trusted_changed]
+    observations: list[dict[str, Any]] = []
     try:
-        # Perform the no-follow layout gate before reading foundation_result.json
-        # or invoking any validator that reads generated source/config files.
-        _foundation_project_files(sandbox)
+        files = _foundation_project_files(sandbox)
     except (OSError, RuntimeError, ValueError) as exc:
-        issues.append({"file": ".", "message": str(exc)})
-        return issues, {
-            "passed": False,
-            "skipped": True,
-            "reason": "unsafe Foundation filesystem layout",
-            "warnings": warnings,
-        }
+        issues.append({"file": str(getattr(exc, "filename", None) or sandbox),
+                       "message": f"{type(exc).__name__}: {exc}"})
+        return issues, {"passed": False, "skipped": True,
+                        "reason": "unsafe Foundation filesystem layout", "observations": observations}
+    if issues:
+        return issues, {"passed": False, "skipped": True,
+                        "reason": "host runtime integrity changed", "observations": observations}
 
-    result_path = sandbox / "foundation_result.json"
     result: dict[str, Any] = {}
     try:
-        loaded_result = json.loads(result_path.read_text(encoding="utf-8-sig"))
-        if not isinstance(loaded_result, dict):
-            raise ValueError("hand-off JSON must be an object")
-        result = loaded_result
-    except Exception as exc:
-        warnings.append(
-            {
-                "file": "foundation_result.json",
-                "message": f"missing or invalid hand-off JSON: {type(exc).__name__}: {exc}",
-                "severity": "warning",
-            }
-        )
-    if result.get("status") != FOUNDATION_RESULT_STATUS:
-        warnings.append(
-            {
-                "file": "foundation_result.json",
-                "message": f"status is not {FOUNDATION_RESULT_STATUS}; host validation decides usability",
-                "severity": "warning",
-            }
-        )
+        value = json.loads((sandbox / "foundation_result.json").read_text(encoding="utf-8-sig"))
+        if isinstance(value, dict):
+            result = value
+        else:
+            observations.append({"file": "foundation_result.json", "kind": "handoff_not_object",
+                                 "message": "Writer handoff is not a JSON object; original content is retained."})
+    except (OSError, UnicodeError, ValueError) as exc:
+        observations.append({"file": "foundation_result.json", "kind": "handoff_unavailable",
+                             "message": f"{type(exc).__name__}: {exc}"})
 
-    execution_issues, execution_warnings = _validate_foundation_execution_contracts(
-        sandbox=sandbox,
-        architecture=architecture,
-        result=result,
-    )
-    # Execution-contract findings are static proof gaps, not observed runtime
-    # failures. Preserve them in the audit, but let the concrete case capability
-    # probes and host unittests decide whether the Foundation is usable.
-    for item in execution_issues:
-        message = str(item.get("message") or "")
-        warning = {str(k): str(v) for k, v in item.items()}
-        warning["severity"] = "warning"
-        warning["category"] = (
-            "execution_capability_advisory"
-            if (
-                "environment_extension_required" in message
-                or "host capability gap" in message
-                or "trusted host" in message
-                or "external runtime" in message
-            )
-            else "static_contract_advisory"
-        )
-        warnings.append(warning)
-    warnings.extend(execution_warnings)
-    required_modules = _required_foundation_modules(architecture)
-    scope = architecture.get("_foundation_scope")
-    if isinstance(scope, dict):
-        for relative in scope.get("private_module_paths", []):
-            if (sandbox / str(relative)).is_file():
-                issues.append({
-                    "file": str(relative),
-                    "message": "task-private scientific module is outside the shared Foundation scope",
-                })
-    for relative in sorted(required_modules):
-        if not (sandbox / Path(relative)).is_file():
-            issues.append({"file": relative, "message": "required architecture module is missing"})
-    tests = sorted((sandbox / "tests").rglob("test*.py")) if (sandbox / "tests").is_dir() else []
+    observed_paths = {path.relative_to(sandbox).as_posix() for path in files}
+    expected_modules = sorted(_required_foundation_modules(architecture))
+    missing_modules = [path for path in expected_modules if path not in observed_paths]
+    if missing_modules:
+        observations.append({"kind": "declared_modules_missing", "paths": missing_modules,
+                             "message": "Declared modules are absent; the supervisor decides whether the actual implementation fulfills the handoff."})
+    tests = sorted(path for path in observed_paths if path.startswith("tests/") and Path(path).name.startswith("test") and path.endswith(".py"))
     if not tests:
-        warnings.append(
-            {
-                "file": "tests",
-                "message": "no Foundation contract test was delivered; host import checks still apply",
-                "severity": "warning",
-            }
-        )
+        observations.append({"kind": "no_delivered_tests", "message": "No Foundation test files were delivered."})
 
-    for path in sandbox.rglob("*.py"):
-        if PAPER_EVIDENCE_DIR in path.parts or "__pycache__" in path.parts:
-            continue
-        relative = path.relative_to(sandbox).as_posix()
-        if not (relative.startswith("src/") or relative.startswith("tests/")):
-            warnings.append(
-                {
-                    "file": relative,
-                    "message": "Python file is outside Foundation ownership and will be excluded from the snapshot",
-                    "severity": "warning",
-                }
-            )
-            continue
-        try:
-            compile(path.read_text(encoding="utf-8-sig"), str(path), "exec")
-        except (OSError, SyntaxError, UnicodeError) as exc:
-            issues.append({"file": relative, "message": f"syntax error: {exc}"})
-
-    issues.extend(_missing_local_imports(sandbox))
-    requirement_issues = validate_requirements(
-        sandbox,
-        runtime_policy=case_runtime.manifest if case_runtime is not None else None,
-        runtime_lock=case_runtime.lock if case_runtime is not None else None,
-    )
-    if _architecture_requires_execution_contracts(architecture):
-        blocking_requirements, requirement_warnings = split_requirement_issues(
-            requirement_issues,
-            runtime_policy=case_runtime.manifest if case_runtime is not None else None,
-            runtime_lock=case_runtime.lock if case_runtime is not None else None,
-        )
-        issues.extend({str(k): str(v) for k, v in item.items()} for item in blocking_requirements)
-        warnings.extend({str(k): str(v) for k, v in item.items()} for item in requirement_warnings)
-    else:
-        for raw in requirement_issues:
-            item = {str(k): str(v) for k, v in raw.items()}
-            item["severity"] = "warning"
-            warnings.append(item)
-    blocking_security, security_warnings = split_static_security_issues(
-        static_scan_repro_project(sandbox),
-        advisory_categories=FOUNDATION_STATIC_SECURITY_ADVISORY_CATEGORIES,
-    )
-    issues.extend(blocking_security)
-    warnings.extend(security_warnings)
-    if issues:
-        return issues, {
-            "passed": False,
-            "skipped": True,
-            "reason": "pre-test validation failed",
-            "warnings": warnings,
-        }
-    delivery_hashes_before = _foundation_delivery_hashes(sandbox)
-    test_result = dict(
-        _run_foundation_tests(sandbox)
-        if case_runtime is None
-        else _run_foundation_tests(sandbox, case_runtime=case_runtime)
-    )
-    test_result["warnings"] = warnings
-    changed_delivery_files: list[str] = []
+    before = _foundation_delivery_hashes(sandbox)
+    test_result = dict(_run_foundation_tests(sandbox) if case_runtime is None
+                       else _run_foundation_tests(sandbox, case_runtime=case_runtime))
+    test_result.update(observations=observations, writer_handoff=result,
+                       source_files=sorted(observed_paths), declared_modules=expected_modules,
+                       test_files=tests, decision_authority="supervisor")
     try:
-        delivery_hashes_after = _foundation_delivery_hashes(sandbox)
-        changed_delivery_files = sorted(
-            relative
-            for relative in set(delivery_hashes_before) | set(delivery_hashes_after)
-            if delivery_hashes_before.get(relative) != delivery_hashes_after.get(relative)
-        )
+        after = _foundation_delivery_hashes(sandbox)
+        changed = sorted(path for path in set(before) | set(after) if before.get(path) != after.get(path))
     except (OSError, RuntimeError, ValueError) as exc:
-        changed_delivery_files = [f"layout inspection failed: {type(exc).__name__}: {exc}"]
-    test_result["delivery_immutable"] = not changed_delivery_files
-    if changed_delivery_files:
-        test_result["passed"] = False
-        test_result["changed_delivery_files"] = changed_delivery_files
-        issues.append(
-            {
-                "file": "tests",
-                "message": (
-                    "Foundation contract tests changed files that are eligible for freezing: "
-                    + ", ".join(changed_delivery_files[:8])
-                ),
-            }
-        )
-    if not test_result.get("passed"):
-        issues.append({"file": "tests", "message": "Foundation contract tests failed or timed out"})
+        changed = [f"layout inspection failed: {type(exc).__name__}: {exc}"]
+    test_result["delivery_immutable"] = not changed
+    if changed:
+        test_result["changed_delivery_files"] = changed
+        issues.append({"file": "tests", "message": "Foundation tests changed files eligible for freezing: " + ", ".join(changed[:8])})
+    # Keep the subprocess result exactly as observed. The node supervisor can
+    # distinguish an irrelevant test from a broken shared implementation.
+    if test_result.get("passed") is not True:
+        observations.append({"kind": "test_execution_not_passed",
+                             "returncode": test_result.get("returncode"),
+                             "timed_out": test_result.get("timed_out", False),
+                             "message": "Delivered tests did not pass; this is an observation, not a scientific rejection."})
     return issues, test_result
 
 

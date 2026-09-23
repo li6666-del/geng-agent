@@ -694,8 +694,14 @@ def run_codex_subprocess(
     started = time.monotonic()
     invocation_started_at = time.time()
     activity = session_started(invocation_id=invocation_id, role=role, label=label, work_dir=work_dir)
+    cancelled = None
+    from .supervisor import current_supervisor
+    from .progress import PipelineCancelled
+    supervisor = current_supervisor()
     try:
-        completed = subprocess.run(
+        from .supervisor_process import run_observed_process
+        completed = run_observed_process(command, supervisor=supervisor, label=f"{role}:{label}",
+            cwd=work_dir, env=env, input=prompt) if supervisor is not None else subprocess.run(
             command,
             cwd=work_dir,
             env=env,
@@ -715,6 +721,12 @@ def run_codex_subprocess(
         if completed.returncode != 0:
             _annotate_codex_failure(status, transcript)
             status["error"] = f"codex exited with status {completed.returncode}"
+    except PipelineCancelled as exc:
+        cancelled = exc
+        status.update(ok=False, error_kind="cancelled", error="用户停止运行",
+                      returncode=getattr(exc, "returncode", None))
+        transcript = redact_provider_secrets(str(getattr(exc, "stdout", "") or "") + "\n" +
+                                            str(getattr(exc, "stderr", "") or ""), provider_secrets)
     except Exception as exc:
         status["error_kind"] = "subprocess_error"
         status["error"] = redact_text(redact_provider_secrets(f"{type(exc).__name__}: {exc}", provider_secrets))
@@ -745,6 +757,8 @@ def run_codex_subprocess(
     status["transcript_tail_truncated"] = len(redacted_transcript) > MAX_TRANSCRIPT_CHARS
     status["transcript"] = str(transcript_path)
     write_json(audit_dir / f"{label}.json", status)
+    if cancelled is not None:
+        raise cancelled
     return status
 
 

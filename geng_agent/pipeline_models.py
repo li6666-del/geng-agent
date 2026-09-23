@@ -21,6 +21,8 @@ class PipelineResult:
     result_review_docx_path: Path | None = None
     reproduction_report_path: Path | None = None
     reproduction_report_docx_path: Path | None = None
+    delivery_status: str = "complete"
+    supervision_path: Path | None = None
 
 
 @dataclass(frozen=True)

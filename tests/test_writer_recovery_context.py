@@ -48,7 +48,8 @@ def test_foundation_repair_restores_implementation_and_actual_validation_failure
     monkeypatch.setattr(foundation, 'run_codex_subprocess', worker)
     result = foundation.run_codex_foundation_writer_workflow(facts={}, tasks={}, experiment_index={},
         scientific_architecture={}, paper={}, paper_path=tmp_path/'paper.pdf', paper_images=[],
-        paper_thesis=None, output_dir=output, audit_dir=audit, resume=True)
+        paper_thesis=None, output_dir=output, audit_dir=audit, resume=True,
+        recovery_instructions={"action": "retry", "instructions": "Repair the normalization and its failing unit-power test."})
     assert result == {'repaired': True} and len(seen) == 1 and restored
 
 

@@ -15,6 +15,7 @@ from geng_agent.case_runtime import (
     EnvironmentResolutionError,
 )
 from geng_agent.outputs import write_json
+from geng_agent.supervisor import StageBlocked
 from geng_agent.pipeline_analysis_flow import run_analysis_flow
 from geng_agent.pipeline_execution_flow import run_execution_flow
 from geng_agent.pipeline_report_flow import run_report_flow
@@ -207,17 +208,6 @@ def _run_to_task_writer_boundary(
         write_json(kwargs["output_path"], document)
         return document
 
-    def fake_thesis(**kwargs):
-        document = {
-            "central_claim": "BER decreases with SNR",
-            "proposed_method": "test method",
-            "mechanism": "higher SNR improves decoding",
-            "comparisons": [],
-            "headline_shape": "decreasing",
-            "caveats": [],
-        }
-        write_json(kwargs["output_dir"] / "paper_thesis.json", document)
-        return document
 
     def fake_experiment_index(**kwargs):
         document = {
@@ -233,10 +223,6 @@ def _run_to_task_writer_boundary(
         write_json(kwargs["output_dir"] / "experiment_index.json", document)
         return document
 
-    def fake_architecture(**kwargs):
-        document = architecture_doc(kwargs["output_dir"])
-        write_json(kwargs["output_dir"] / "scientific_architecture.json", document)
-        return document
 
     mineru_result = {
         "ok": True,
@@ -255,16 +241,10 @@ def _run_to_task_writer_boundary(
             "_load_or_create_analysis_stage_json",
             side_effect=fake_analysis_stage,
         ),
-        patch.object(pipeline, "_load_or_create_paper_thesis", side_effect=fake_thesis),
         patch.object(
             pipeline,
             "_load_or_create_experiment_index",
             side_effect=fake_experiment_index,
-        ),
-        patch.object(
-            pipeline,
-            "_load_or_create_scientific_architecture",
-            side_effect=fake_architecture,
         ),
         patch("geng_agent.case_runtime.ensure_case_runtime", new=environment_mock),
         patch(
@@ -284,7 +264,6 @@ def _run_minimal_full_pipeline(
     *,
     report_editor_error: Exception | None = None,
     report_editor_result: dict | None = None,
-    verdict_candidate: dict,
     report_mode: str = "model",
 ):
     paper_path = root / "paper.md"
@@ -311,17 +290,6 @@ def _run_minimal_full_pipeline(
         write_json(kwargs["output_path"], document)
         return document
 
-    def fake_thesis(**kwargs):
-        document = {
-            "central_claim": "BER decreases with SNR",
-            "proposed_method": "test method",
-            "mechanism": "higher SNR improves decoding",
-            "comparisons": [],
-            "headline_shape": "decreasing",
-            "caveats": [],
-        }
-        write_json(kwargs["output_dir"] / "paper_thesis.json", document)
-        return document
 
     def fake_experiment_index(**kwargs):
         document = {
@@ -379,13 +347,11 @@ def _run_minimal_full_pipeline(
             "_load_or_create_analysis_stage_json",
             side_effect=fake_analysis_stage,
         ),
-        patch.object(pipeline, "_load_or_create_paper_thesis", side_effect=fake_thesis),
         patch.object(
             pipeline,
             "_load_or_create_experiment_index",
             side_effect=fake_experiment_index,
         ),
-        patch.object(pipeline, "_load_or_create_scientific_architecture", return_value=None),
         patch(
             "geng_agent.case_runtime.ensure_case_runtime",
             return_value=case_runtime_fixture(output_dir, "0" * 64),
@@ -400,7 +366,6 @@ def _run_minimal_full_pipeline(
         ),
         editor_patch,
         patch.dict("os.environ", {"GENG_REPORT_MODE": report_mode}),
-        patch("geng_agent.pipeline.derive_reproducibility_verdict", return_value=verdict_candidate),
         patch.object(
             pipeline,
             "_generate_docx_reports",
@@ -417,6 +382,25 @@ def _run_minimal_full_pipeline(
     return result, output_dir
 
 class PipelineTests(unittest.TestCase):
+    def test_foundation_cancel_does_not_fall_back_or_start_task_writers(self) -> None:
+        from geng_agent.progress import PipelineCancelled
+
+        for task_count in (1, 2):
+            with self.subTest(task_count=task_count), TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                writer = Mock()
+                foundation = Mock(side_effect=PipelineCancelled("user stopped the run"))
+                with self.assertRaisesRegex(PipelineCancelled, "user stopped"):
+                    _run_to_task_writer_boundary(
+                        root, resume=False,
+                        environment_mock=Mock(return_value=case_runtime_fixture(root / "case", "0" * 64)),
+                        foundation_mock=foundation, task_writer_mock=writer,
+                        tasks_document=task_doc(*(task(f"t{i}", f"Claim {i}") for i in range(task_count))),
+                    )
+                foundation.assert_called_once()
+                writer.assert_not_called()
+                self.assertFalse((root / "case/audit/03b_foundation_fallback.json").exists())
+
     def test_preliminary_task_cache_survives_snapshot_publication(self) -> None:
         expected_cache = {
             "stage_label": "02a_build_preliminary_repro_tasks",
@@ -500,13 +484,10 @@ class PipelineTests(unittest.TestCase):
                 )
             )
             self.assertEqual(persisted["_meta"]["cache"], expected_cache)
-            self.assertNotIn("untrusted", persisted["_meta"])
-            self.assertTrue(persisted["_meta"]["experiment_plan_snapshot"])
+            self.assertTrue(persisted["_meta"]["untrusted"])
             self.assertEqual(validate_stage("repro_tasks", persisted), [])
-            self.assertNotIn(
-                "cache",
-                downstream_tasks.get("_meta", {}),
-            )
+            self.assertEqual(persisted, preliminary)
+            self.assertEqual(downstream_tasks, preliminary)
     def test_pipeline_does_not_expose_codex_session_wall_clock_limits(self) -> None:
         removed_parameters = {
             "project_timeout",
@@ -522,399 +503,11 @@ class PipelineTests(unittest.TestCase):
                     )
                 )
 
-    def test_optional_architecture_candidate_does_not_repair_execution_gaps(self) -> None:
-        with TemporaryDirectory() as temp_dir:
-            output_dir = Path(temp_dir) / "case"
-            audit_dir = output_dir / "audit"
-            audit_dir.mkdir(parents=True)
-            experiment_index = {
-                "experiments": [
-                    {
-                        "task_id": "reproduce_fig_4",
-                        "experiment_id": "exp_reproduce_fig_4",
-                    }
-                ]
-            }
-            write_json(output_dir / "experiment_index.json", experiment_index)
-            advisory_candidate = architecture_doc(output_dir)
-            advisory_candidate["components"][0]["basis"] = {
-                "status": "paper_explicit",
-                "evidence_facts": [
-                    {"type": "channel_model", "name": "missing paper evidence"}
-                ],
-                "assumption_refs": [],
-                "note": "This evidence reference is intentionally unresolved.",
-            }
-            blocked_candidate = json.loads(json.dumps(advisory_candidate))
-            blocked_candidate["components"][0]["module"] = "../system.py"
-            captured: dict[str, list] = {}
 
-            def fake_stage(**kwargs):
-                validate_candidate = kwargs["candidate_extra_validation"]
-                captured["advisory"] = validate_candidate(advisory_candidate)
-                captured["blocked"] = validate_candidate(blocked_candidate)
-                write_json(kwargs["output_path"], advisory_candidate)
-                return advisory_candidate
 
-            pipeline = ReviewPipeline()
-            with (
-                patch(
-                    "geng_agent.preflight.architecture_capability_inventory",
-                    return_value={
-                        "evidence_class": "host_capability_only_not_paper_evidence",
-                        "installed_reproduction_packages": [],
-                    },
-                ),
-                patch.object(
-                    pipeline,
-                    "_load_or_create_analysis_stage_json",
-                    side_effect=fake_stage,
-                ),
-            ):
-                pipeline._load_or_create_scientific_architecture(
-                    output_dir=output_dir,
-                    audit_dir=audit_dir,
-                    facts=fact_doc(fact("figure_claim", "Fig. 4")),
-                    tasks=task_doc(task("reproduce_fig_4", "Fig. 4")),
-                    experiment_index=experiment_index,
-                    paper_thesis=None,
-                    paper_context="paper context",
-                    paper_images=[],
-                    resume=False,
-                    max_attempts=1,
-                    analysis_backend=CODEX_ANALYSIS_BACKEND,
-                )
 
-            self.assertEqual(captured["advisory"], [])
-            self.assertEqual(captured["blocked"], [])
-            audit = json.loads(
-                (audit_dir / "02f_scientific_architecture_normalization.json").read_text(
-                    encoding="utf-8"
-                )
-            )
-            self.assertTrue(audit["ok"])
-            self.assertEqual(audit["execution_blocker_count"], 0)
-            self.assertTrue(
-                any(
-                    issue["path"] == "$.components[0].basis.evidence_facts[0]"
-                    for issue in audit["groups"]["cross_document_diagnostics"]
-                )
-            )
 
-    def test_strong_only_malformed_binding_is_warned_then_downgraded(self) -> None:
-        with TemporaryDirectory() as temp_dir:
-            output_dir = Path(temp_dir) / "case"
-            audit_dir = output_dir / "audit"
-            audit_dir.mkdir(parents=True)
-            tasks = task_doc(
-                task("task_a", "Claim A"),
-                task("task_b", "Claim B"),
-            )
-            tasks["execution_relationships"] = [
-                {
-                    "relationship_id": "strong_ab",
-                    "kind": "same_run_outputs",
-                    "strength": "strong",
-                    "task_ids": ["task_a", "task_b"],
-                    "producer_task_id": None,
-                    "consumer_task_ids": [],
-                    "artifact_ids": [],
-                }
-            ]
-            experiment_index = {
-                "experiments": [
-                    {"task_id": "task_a", "experiment_id": "exp_task_a"},
-                    {"task_id": "task_b", "experiment_id": "exp_task_b"},
-                ]
-            }
-            write_json(output_dir / "experiment_index.json", experiment_index)
-            malformed = architecture_doc(output_dir)
-            malformed["bindings"] = [malformed["bindings"][0]]
-            captured: dict[str, list] = {}
 
-            def fake_stage(**kwargs):
-                captured["candidate_issues"] = kwargs[
-                    "candidate_extra_validation"
-                ](malformed)
-                write_json(kwargs["output_path"], malformed)
-                return malformed
-
-            pipeline = ReviewPipeline()
-            with (
-                patch(
-                    "geng_agent.preflight.architecture_capability_inventory",
-                    return_value={
-                        "evidence_class": "host_capability_only_not_paper_evidence",
-                        "installed_reproduction_packages": [],
-                    },
-                ),
-                patch.object(
-                    pipeline,
-                    "_load_or_create_analysis_stage_json",
-                    side_effect=fake_stage,
-                ),
-            ):
-                with self.assertRaisesRegex(
-                    RuntimeError,
-                    "continue with task-local Writers without Foundation",
-                ):
-                    pipeline._load_or_create_scientific_architecture(
-                        output_dir=output_dir,
-                        audit_dir=audit_dir,
-                        facts=fact_doc(fact("figure_claim", "Fig. 4")),
-                        tasks=tasks,
-                        experiment_index=experiment_index,
-                        paper_thesis=None,
-                        paper_context="paper context",
-                        paper_images=[],
-                        resume=False,
-                        max_attempts=1,
-                        analysis_backend=CODEX_ANALYSIS_BACKEND,
-                    )
-
-            audit = json.loads(
-                (audit_dir / "02f_scientific_architecture_normalization.json").read_text(
-                    encoding="utf-8"
-                )
-            )
-
-        self.assertEqual(captured["candidate_issues"], [])
-        self.assertTrue(audit["ok"])
-        self.assertEqual(audit["execution_blocker_count"], 0)
-        self.assertTrue(
-            any(
-                issue["path"] == "$.bindings"
-                for issue in audit["groups"]["optional_execution_gaps"]
-            )
-        )
-
-    def test_material_weak_architecture_keeps_execution_gap_repair_blocker(self) -> None:
-        with TemporaryDirectory() as temp_dir:
-            output_dir = Path(temp_dir) / "case"
-            audit_dir = output_dir / "audit"
-            audit_dir.mkdir(parents=True)
-            tasks = task_doc(
-                task("task_a", "Claim A"),
-                task("task_b", "Claim B"),
-            )
-            tasks["execution_relationships"] = [
-                {
-                    "relationship_id": "weak_ab",
-                    "kind": "shared_definition",
-                    "strength": "weak",
-                    "task_ids": ["task_a", "task_b"],
-                    "producer_task_id": None,
-                    "consumer_task_ids": [],
-                    "artifact_ids": ["shared_definition"],
-                }
-            ]
-            experiment_index = {
-                "experiments": [
-                    {"task_id": "task_a", "experiment_id": "exp_task_a"},
-                    {"task_id": "task_b", "experiment_id": "exp_task_b"},
-                ]
-            }
-            write_json(output_dir / "experiment_index.json", experiment_index)
-            valid = architecture_doc(output_dir)
-            invalid = json.loads(json.dumps(valid))
-            invalid["components"][0]["module"] = "../shared.py"
-            captured: dict[str, list] = {}
-
-            def fake_stage(**kwargs):
-                captured["candidate_issues"] = kwargs[
-                    "candidate_extra_validation"
-                ](invalid)
-                write_json(kwargs["output_path"], valid)
-                return valid
-
-            pipeline = ReviewPipeline()
-            with (
-                patch(
-                    "geng_agent.preflight.architecture_capability_inventory",
-                    return_value={
-                        "evidence_class": "host_capability_only_not_paper_evidence",
-                        "installed_reproduction_packages": [],
-                    },
-                ),
-                patch.object(
-                    pipeline,
-                    "_load_or_create_analysis_stage_json",
-                    side_effect=fake_stage,
-                ),
-            ):
-                pipeline._load_or_create_scientific_architecture(
-                    output_dir=output_dir,
-                    audit_dir=audit_dir,
-                    facts=fact_doc(fact("figure_claim", "Fig. 4")),
-                    tasks=tasks,
-                    experiment_index=experiment_index,
-                    paper_thesis=None,
-                    paper_context="paper context",
-                    paper_images=[],
-                    resume=False,
-                    max_attempts=1,
-                    analysis_backend=CODEX_ANALYSIS_BACKEND,
-                )
-
-        self.assertTrue(
-            any(
-                issue.path == "$.components[0].module"
-                for issue in captured["candidate_issues"]
-            )
-        )
-
-    def test_resume_preserves_generation_host_inventory_and_records_current_host_separately(self) -> None:
-        with TemporaryDirectory() as temp_dir:
-            output_dir = Path(temp_dir) / "case"
-            audit_dir = output_dir / "audit"
-            audit_dir.mkdir(parents=True)
-            write_json(
-                output_dir / "workflow.json",
-                {
-                    "workflow_version": "2",
-                    "architecture_contract": "scientific_architecture/1.1",
-                },
-            )
-            experiment_index = {
-                "experiments": [
-                    {
-                        "task_id": "reproduce_fig_4",
-                        "experiment_id": "exp_reproduce_fig_4",
-                    }
-                ]
-            }
-            write_json(output_dir / "experiment_index.json", experiment_index)
-            architecture = architecture_doc(output_dir)
-            write_json(output_dir / "scientific_architecture.json", architecture)
-            write_json(
-                audit_dir / "02f_architecture_host_capabilities.json",
-                {"marker": "generation"},
-            )
-            current_inventory = {
-                "marker": "current",
-                "python_runtime_registry": [],
-                "external_runtime_registry": [],
-                "accelerators": {"devices": []},
-            }
-            pipeline = ReviewPipeline()
-
-            with (
-                patch(
-                    "geng_agent.preflight.architecture_capability_inventory",
-                    return_value=current_inventory,
-                ),
-                patch.object(
-                    pipeline,
-                    "_load_or_create_analysis_stage_json",
-                    return_value=architecture,
-                ),
-            ):
-                pipeline._load_or_create_scientific_architecture(
-                    output_dir=output_dir,
-                    audit_dir=audit_dir,
-                    facts=fact_doc(fact("figure_claim", "Fig. 4")),
-                    tasks=task_doc(task("reproduce_fig_4", "Fig. 4")),
-                    experiment_index=experiment_index,
-                    paper_thesis=None,
-                    paper_context="paper context",
-                    paper_images=[],
-                    resume=True,
-                    max_attempts=1,
-                    analysis_backend=CODEX_ANALYSIS_BACKEND,
-                )
-
-            generation = json.loads(
-                (audit_dir / "02f_architecture_host_capabilities.json").read_text(
-                    encoding="utf-8"
-                )
-            )
-            current = json.loads(
-                (audit_dir / "02f_architecture_host_capabilities_current.json").read_text(
-                    encoding="utf-8"
-                )
-            )
-            gaps = json.loads(
-                (audit_dir / "02f_architecture_execution_capability_gaps.json").read_text(
-                    encoding="utf-8"
-                )
-            )
-            self.assertEqual(generation["marker"], "generation")
-            self.assertEqual(current["marker"], "current")
-            self.assertTrue(gaps["ok"])
-            self.assertEqual(gaps["gap_count"], 0)
-
-    def test_resume_salvages_a_normalizable_failed_candidate_before_cleanup(self) -> None:
-        with TemporaryDirectory() as temp:
-            output = Path(temp) / "case"
-            audit = output / "audit"
-            audit.mkdir(parents=True)
-            candidate = fact_doc(fact("channel_model", "AWGN"))
-            cache_inputs = {"paper_source_sha256": "a" * 64}
-            stage_options = dict(
-                output_path=output / "engineering_facts.json", output_dir=output, audit_dir=audit,
-                prompt="must not run", stage_label="probe", cleanup_stage="facts",
-                schema_stage="engineering_facts", max_attempts=1,
-                candidate_normalizer=lambda value: value, salvage_failed_candidates=True,
-                cache_inputs=cache_inputs, backend=CODEX_ANALYSIS_BACKEND,
-            )
-            # Obtain a real stage cache envelope through the mocked generation
-            # boundary. Contract additions must not make this test call an LLM.
-            with patch("geng_agent.pipeline.run_codex_json_stage", return_value=candidate):
-                candidate = ReviewPipeline()._load_or_create_stage_json(resume=False, **stage_options)
-            candidate_path = audit / "normalized_probe_attempt_1.json"
-            write_json(candidate_path, candidate)
-            (output / "engineering_facts.json").unlink()
-            with patch("geng_agent.pipeline.run_codex_json_stage", side_effect=AssertionError("salvage must never call an LLM")):
-                result = ReviewPipeline()._load_or_create_stage_json(resume=True, **stage_options)
-
-            self.assertEqual(result["engineering_facts"][0]["name"], "AWGN")
-            self.assertEqual(result["_meta"]["analysis_resume_source"], candidate_path.name)
-            self.assertTrue((audit / "resume_probe.json").is_file())
-            self.assertTrue((output / "engineering_facts.json").is_file())
-
-    def test_resume_rejects_salvage_candidate_from_different_scientific_inputs(self) -> None:
-        with TemporaryDirectory() as temp:
-            output = Path(temp) / "case"
-            audit = output / "audit"
-            audit.mkdir(parents=True)
-            old_inputs = {"paper_source_sha256": "a" * 64}
-            current_inputs = {"paper_source_sha256": "b" * 64}
-            stale = fact_doc(fact("channel_model", "stale AWGN"))
-            stale["_meta"] = {
-                "cache": build_stage_cache_metadata(
-                    stage_label="probe",
-                    schema_stage="engineering_facts",
-                    prompt="same semantic stage",
-                    policy_version=SCIENTIFIC_POLICY_ID,
-                    inputs=old_inputs,
-                )
-            }
-            write_json(audit / "normalized_probe_attempt_1.json", stale)
-            fresh = fact_doc(fact("channel_model", "fresh Rayleigh"))
-
-            with patch(
-                "geng_agent.pipeline.run_codex_json_stage",
-                return_value=fresh,
-            ) as run_stage:
-                result = ReviewPipeline()._load_or_create_stage_json(
-                    output_path=output / "engineering_facts.json",
-                    output_dir=output,
-                    audit_dir=audit,
-                    prompt="same semantic stage",
-                    stage_label="probe",
-                    cleanup_stage="facts",
-                    schema_stage="engineering_facts",
-                    max_attempts=1,
-                    resume=True,
-                    candidate_normalizer=lambda value: value,
-                    salvage_failed_candidates=True,
-                    cache_inputs=current_inputs,
-                    backend=CODEX_ANALYSIS_BACKEND,
-                )
-
-            run_stage.assert_called_once()
-            self.assertEqual(result["engineering_facts"][0]["name"], "fresh Rayleigh")
-            self.assertEqual(len(list(audit.glob("resume_rejected_probe_*.json"))), 1)
 
     def test_analysis_width_and_round_caps_are_not_public_pipeline_options(self) -> None:
         run_params = inspect.signature(ReviewPipeline.run).parameters
@@ -1058,31 +651,24 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("run_codex_task_reporter_workflow(", execution_source)
         self.assertNotIn("revision_target", execution_source + report_source)
         self.assertIn("apply_verified_result(", report_source)
-        self.assertIn('not verification_result.get("all_terminal")', report_source)
+        self.assertNotIn('not verification_result.get("all_terminal")', report_source)
         self.assertIn("report_runner = run_codex_report_editor_workflow", report_source)
         self.assertIn("writer_session_count", report_source)
-        self.assertIn('report_editor_result.get(\n        "retryable"', report_source)
-        self.assertIn("repair_context=report_editor_result", report_source)
+        self.assertIn("run_supervised_report_editor(", report_source)
+        self.assertIn("run_supervised_report_editor", report_source)
         self.assertNotIn("allow_fallback=True", report_source)
-        self.assertIn("report_editor_invocations += int(", report_source)
+        self.assertIn("report_editor_invocations", report_source)
         self.assertNotIn("Report editor failed.", report_source)
-        self.assertIn("04b_reproducibility_verdict_fallback.json", report_source)
+        self.assertNotIn("04b_reproducibility_verdict_fallback.json", report_source)
 
     def test_report_editor_exception_is_recorded_without_stopping_pipeline(self) -> None:
         with TemporaryDirectory() as temp_dir:
-            valid_verdict = {
-                "verdict": "inconclusive",
-                "confidence": "low",
-                "reasons": ["fixture verdict"],
-                "recommended_action": "inspect task-level evidence",
-            }
             result, output_dir = _run_minimal_full_pipeline(
                 Path(temp_dir),
                 report_editor_error=RuntimeError("editor boom"),
-                verdict_candidate=valid_verdict,
             )
 
-            self.assertEqual(result.reproducibility_verdict, valid_verdict)
+            self.assertIsNone(result.reproducibility_verdict)
             risk_report = json.loads(
                 (output_dir / "risk_report.json").read_text(encoding="utf-8")
             )
@@ -1102,7 +688,7 @@ class PipelineTests(unittest.TestCase):
                 "report_editor_exception",
             )
 
-    def test_invalid_verdict_is_audited_and_replaced_by_valid_inconclusive(self) -> None:
+    def test_editor_delivery_does_not_invent_a_python_scientific_verdict(self) -> None:
         with TemporaryDirectory() as temp_dir:
             editor_result = {
                 "ok": True,
@@ -1114,25 +700,16 @@ class PipelineTests(unittest.TestCase):
                 "codex_status": {"ok": True, "role": "report_editor"},
                 "result_review_result": {"enabled": True, "passed": True},
             }
-            invalid_candidate = {"verdict": "unsupported_label"}
             result, output_dir = _run_minimal_full_pipeline(
                 Path(temp_dir),
                 report_editor_result=editor_result,
-                verdict_candidate=invalid_candidate,
             )
 
             fallback_path = (
                 output_dir / "audit" / "04b_reproducibility_verdict_fallback.json"
             )
-            fallback_audit = json.loads(fallback_path.read_text(encoding="utf-8"))
-            self.assertTrue(fallback_audit["advisory"])
-            self.assertEqual(fallback_audit["candidate"], invalid_candidate)
-            self.assertTrue(fallback_audit["errors"])
-            self.assertEqual(result.reproducibility_verdict["verdict"], "inconclusive")
-            self.assertEqual(
-                validate_stage("reproducibility_verdict", result.reproducibility_verdict),
-                [],
-            )
+            self.assertFalse(fallback_path.exists())
+            self.assertIsNone(result.reproducibility_verdict)
             risk_report = json.loads(
                 (output_dir / "risk_report.json").read_text(encoding="utf-8")
             )
@@ -1141,7 +718,7 @@ class PipelineTests(unittest.TestCase):
                 result.reproducibility_verdict,
             )
     def test_foundation_failure_falls_back_to_task_writers_for_all_architecture_versions(self) -> None:
-        class WriterReached(RuntimeError):
+        class WriterReached(BaseException):
             pass
 
         def exercise(*, schema_version: str, architecture_contract: str, resume: bool) -> None:
@@ -1183,17 +760,6 @@ class PipelineTests(unittest.TestCase):
                     write_json(kwargs["output_path"], document)
                     return document
 
-                def fake_thesis(**kwargs):
-                    document = {
-                        "central_claim": "BER decreases with SNR",
-                        "proposed_method": "test method",
-                        "mechanism": "higher SNR improves decoding",
-                        "comparisons": [],
-                        "headline_shape": "decreasing",
-                        "caveats": [],
-                    }
-                    write_json(kwargs["output_dir"] / "paper_thesis.json", document)
-                    return document
 
                 def fake_experiment_index(**kwargs):
                     document = {
@@ -1207,11 +773,6 @@ class PipelineTests(unittest.TestCase):
                     write_json(kwargs["output_dir"] / "experiment_index.json", document)
                     return document
 
-                def fake_architecture(**kwargs):
-                    document = architecture_doc(kwargs["output_dir"])
-                    document["schema_version"] = schema_version
-                    write_json(kwargs["output_dir"] / "scientific_architecture.json", document)
-                    return document
 
                 pipeline = ReviewPipeline()
                 mineru_result = {
@@ -1235,18 +796,8 @@ class PipelineTests(unittest.TestCase):
                     ),
                     patch.object(
                         pipeline,
-                        "_load_or_create_paper_thesis",
-                        side_effect=fake_thesis,
-                    ),
-                    patch.object(
-                        pipeline,
                         "_load_or_create_experiment_index",
                         side_effect=fake_experiment_index,
-                    ),
-                    patch.object(
-                        pipeline,
-                        "_load_or_create_scientific_architecture",
-                        side_effect=fake_architecture,
                     ),
                     patch(
                         "geng_agent.case_runtime.ensure_case_runtime",
@@ -1272,8 +823,8 @@ class PipelineTests(unittest.TestCase):
                         encoding="utf-8"
                     )
                 )
-                self.assertEqual(fallback["decision"], "fallback")
-                self.assertTrue(fallback["pipeline_can_continue"])
+                self.assertEqual(fallback["decision"], "supervisor_omitted_optional_foundation")
+                self.assertEqual(fallback["moderation"]["action"], "start")
 
         exercise(
             schema_version="1.1",
@@ -1286,7 +837,7 @@ class PipelineTests(unittest.TestCase):
             resume=True,
         )
 
-    def test_planner_revision_preserves_targets_and_replaces_old_graph(self) -> None:
+    def test_planner_revision_is_preserved_without_host_merging_old_tasks(self) -> None:
         from types import SimpleNamespace
         from geng_agent.consolidated_analysis import load_experiment_plan
         from geng_agent.execution_plan import compile_execution_plan
@@ -1328,22 +879,23 @@ class PipelineTests(unittest.TestCase):
             pipeline = ReviewPipeline()
             context = SimpleNamespace(output_dir=root, audit_dir=root / "audit", options=SimpleNamespace(
                 json_repair_attempts=0, resume=False, tasks_timeout=1, analysis_backend="codex", analysis_fallback=False))
-            with patch.object(pipeline, "_load_or_create_analysis_stage_json",
-                              side_effect=lambda **kw: kw["candidate_normalizer"](candidate)):
+            with patch.object(pipeline, "_load_or_create_analysis_stage_json", return_value=candidate) as planner:
                 result = load_experiment_plan(pipeline, context, facts=fact_doc(), paper_thesis=thesis_doc(),
                     paper={}, paper_context="paper", paper_images=[], figure_index={}, host_capabilities={},
                     previous_plan={"tasks": base_tasks, "scientific_architecture": None}, round_index=1)
             final_tasks = result["tasks"]
             plan = compile_execution_plan(final_tasks)
-            self.assertEqual([item["task_id"] for item in final_tasks["repro_tasks"]], ["task_a", "task_b", "task_c"])
+            self.assertEqual(result, candidate)
+            self.assertEqual(planner.call_args.kwargs["cache_inputs"]["previous_plan"]["tasks"], base_tasks)
+            self.assertEqual([item["task_id"] for item in final_tasks["repro_tasks"]], ["task_a", "task_c"])
             self.assertEqual([item["relationship_id"] for item in final_tasks["execution_relationships"]], ["new_ac"])
             self.assertEqual(final_tasks["repro_tasks"][0]["figure_or_claim"], "Claim A refined")
             self.assertEqual(base_tasks["repro_tasks"][0]["figure_or_claim"], "Claim A")
-            self.assertEqual(plan["logical_task_count"], 3)
-            self.assertEqual(plan["execution_unit_count"], 2)
+            self.assertEqual(plan["logical_task_count"], 2)
+            self.assertEqual(plan["execution_unit_count"], 1)
 
     def test_optional_foundation_environment_failure_falls_back(self) -> None:
-        class WriterReached(RuntimeError):
+        class WriterReached(BaseException):
             pass
 
         with TemporaryDirectory() as temp_dir:
@@ -1376,9 +928,8 @@ class PipelineTests(unittest.TestCase):
 
         foundation.assert_called_once()
         task_writer.assert_called_once()
-        self.assertEqual(fallback["decision"], "fallback")
-        self.assertTrue(fallback["pipeline_can_continue"])
-        self.assertEqual(fallback["category"], "optional_foundation_dependency")
+        self.assertEqual(fallback["decision"], "supervisor_omitted_optional_foundation")
+        self.assertEqual(fallback["moderation"]["action"], "start")
 
     def test_material_weak_foundation_environment_failure_still_stops(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -1407,7 +958,7 @@ class PipelineTests(unittest.TestCase):
             )
             task_writer = Mock()
 
-            with self.assertRaises(EnvironmentResolutionError) as caught:
+            with self.assertRaises(StageBlocked):
                 _run_to_task_writer_boundary(
                     root,
                     resume=False,
@@ -1420,16 +971,14 @@ class PipelineTests(unittest.TestCase):
                 )
 
             audit = json.loads(
-                (output_dir / "audit" / "03a_environment_blocked.json").read_text(
+                (output_dir / "audit" / "execution_tool_failures.json").read_text(
                     encoding="utf-8"
                 )
             )
 
-        self.assertEqual(caught.exception.category, "material_foundation_dependency")
         foundation.assert_called_once()
         task_writer.assert_not_called()
-        self.assertEqual(audit["source"], "foundation_writer")
-        self.assertFalse(audit["pipeline_can_continue"])
+        self.assertIn("material Foundation dependency unavailable", audit["foundation"]["error"])
 
     def test_initial_case_environment_failure_stops_before_writers(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -1445,7 +994,7 @@ class PipelineTests(unittest.TestCase):
             foundation = Mock()
             task_writer = Mock()
 
-            with self.assertRaises(EnvironmentResolutionError) as caught:
+            with self.assertRaises(StageBlocked):
                 _run_to_task_writer_boundary(
                     root,
                     resume=False,
@@ -1460,17 +1009,15 @@ class PipelineTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual(caught.exception.category, "trusted_source_unavailable")
         foundation.assert_not_called()
         task_writer.assert_not_called()
-        self.assertEqual(audit["decision"], "stop")
-        self.assertEqual(audit["stop_class"], "blocked_environment")
+        self.assertEqual(audit["decision"], "awaiting_supervisor")
         self.assertFalse(audit["pipeline_can_continue"])
-        self.assertEqual(audit["source"], "initial_resolution")
+        self.assertEqual(audit["node_id"], "environment")
         self.assertEqual(audit["category"], "trusted_source_unavailable")
 
-    def test_task_writer_environment_extension_restarts_foundation_and_all_writers(self) -> None:
-        class WriterReached(RuntimeError):
+    def test_environment_extension_resumes_writers_without_rebuilding_foundation(self) -> None:
+        class WriterReached(BaseException):
             pass
 
         with TemporaryDirectory() as temp_dir:
@@ -1507,11 +1054,11 @@ class PipelineTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual([call.kwargs["resume"] for call in foundation.call_args_list], [True, True])
+        self.assertEqual([call.kwargs["resume"] for call in foundation.call_args_list], [True])
         self.assertEqual([call.kwargs["resume"] for call in task_writer.call_args_list], [True, True])
         self.assertEqual(
             [call.kwargs["case_runtime"] for call in foundation.call_args_list],
-            [runtime_0, runtime_1],
+            [runtime_0],
         )
         self.assertEqual(
             [call.kwargs["case_runtime"] for call in task_writer.call_args_list],
@@ -1524,78 +1071,6 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(extension["extension_count"], 1)
         self.assertEqual(extension["latest_source"], "task_writers")
         self.assertEqual(extension["environment_lock_hash"], "1" * 64)
-
-    def test_repeated_environment_request_without_hash_progress_stops(self) -> None:
-        with TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            output_dir = root / "case"
-            runtime_0 = case_runtime_fixture(output_dir, "0" * 64)
-            runtime_1 = case_runtime_fixture(output_dir, "1" * 64)
-            pending = EnvironmentRequestRequired(
-                [RequirementRequest("scipy>=1.11")],
-                source="task_writers",
-            )
-            environment = Mock(side_effect=[runtime_0, runtime_1, runtime_1])
-            foundation = Mock(return_value={"manifest": {"files": []}})
-            task_writer = Mock(side_effect=[pending, pending])
-
-            with self.assertRaises(EnvironmentResolutionError) as caught:
-                _run_to_task_writer_boundary(
-                    root,
-                    resume=True,
-                    environment_mock=environment,
-                    foundation_mock=foundation,
-                    task_writer_mock=task_writer,
-                )
-
-            audit = json.loads(
-                (output_dir / "audit" / "03a_environment_blocked.json").read_text(
-                    encoding="utf-8"
-                )
-            )
-
-        self.assertEqual(caught.exception.category, "resolution_stalled")
-        self.assertEqual(task_writer.call_count, 2)
-        self.assertEqual(foundation.call_count, 2)
-        self.assertEqual(environment.call_count, 3)
-        self.assertEqual(audit["source"], "task_writers")
-        self.assertEqual(audit["category"], "resolution_stalled")
-
-    def test_revision_dependency_failure_keeps_prior_foundation_and_reaches_reportable_writer_boundary(self) -> None:
-        from geng_agent.foundation_revision import FoundationRevisionRequired
-
-        class WriterReached(RuntimeError):
-            pass
-
-        with TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            output_dir = root / "case"
-            runtime = case_runtime_fixture(output_dir, "0" * 64)
-            extended_runtime = case_runtime_fixture(output_dir, "1" * 64)
-            prior = {"snapshot_hash": "old-science", "manifest": {"snapshot_hash": "old-science", "files": []}}
-            request = {"request_id": "noise-repair", "component_ids": ["system"],
-                       "affected_task_ids": ["reproduce_fig_4"], "evidence_root": str(root / "evidence")}
-            environment = Mock(side_effect=[runtime, EnvironmentResolutionError("offline", "dependency unavailable"), extended_runtime])
-            foundation = Mock(side_effect=[prior,
-                EnvironmentRequestRequired([RequirementRequest("scipy>=1.11")], source="foundation_writer"), prior, prior])
-            task_writer = Mock(side_effect=[FoundationRevisionRequired(request),
-                EnvironmentRequestRequired([RequirementRequest("matplotlib>=3.8")], source="task_writers"),
-                WriterReached("reportable terminal")])
-            with self.assertRaises(WriterReached):
-                _run_to_task_writer_boundary(root, resume=True, environment_mock=environment,
-                                            foundation_mock=foundation, task_writer_mock=task_writer)
-            failure = json.loads((output_dir / "audit/03b_foundation_revision_failures/noise-repair.json").read_text())
-            self.assertEqual(failure["decision"], "retain_previous_version_and_report_unresolved_science")
-            blocked = json.loads((output_dir / "audit/03a_environment_blocked.json").read_text())
-            self.assertTrue(blocked["pipeline_can_continue"])
-            self.assertEqual(blocked["scope"], "foundation_revision")
-            resumed = task_writer.call_args_list[-1].kwargs
-            self.assertEqual(resumed["declined_foundation_revision_ids"], {"noise-repair"})
-            self.assertEqual(resumed["force_task_ids"], set())
-            self.assertIs(resumed["foundation"], prior)
-            self.assertEqual(foundation.call_count, 4)
-            self.assertEqual(environment.call_count, 3)
-            self.assertEqual([item.requirement for item in environment.call_args_list[-1].kwargs["extra_requirements"]], ["matplotlib>=3.8"])
 
     def test_analysis_agent_width_is_not_a_pipeline_option(self) -> None:
         self.assertNotIn("analysis_agent_width", inspect.signature(ReviewPipeline.run).parameters)
@@ -1703,22 +1178,10 @@ class PipelineTests(unittest.TestCase):
                 write_json(kwargs["output_path"], document)
                 return document
 
-            def fake_thesis(**kwargs):
-                document = {
-                    "central_claim": "throughput increases with SNR",
-                    "proposed_method": "method",
-                    "mechanism": "higher SNR improves decoding",
-                    "comparisons": [],
-                    "headline_shape": "increasing",
-                    "caveats": [],
-                }
-                write_json(kwargs["output_dir"] / "paper_thesis.json", document)
-                return document
 
             pipeline = ReviewPipeline()
             with (
                 patch.object(pipeline, "_load_or_create_analysis_stage_json", side_effect=fake_analysis_stage),
-                patch.object(pipeline, "_load_or_create_paper_thesis", side_effect=fake_thesis),
             ):
                 result = pipeline.run(paper_path, output_dir, resume=False, analysis_only=True)
 
@@ -1866,30 +1329,14 @@ class PipelineTests(unittest.TestCase):
             def fake_analysis_stage(**kwargs):
                 label = kwargs["stage_label"]
                 calls.append(label)
-                if label == "02f_design_scientific_architecture":
-                    document = architecture_doc(kwargs["output_dir"])
-                    write_json(kwargs["output_path"], document)
-                    return document
                 document = documents[label]
                 write_json(kwargs["output_path"], document)
                 return document
 
-            def fake_thesis(**kwargs):
-                document = {
-                    "central_claim": "throughput increases with SNR",
-                    "proposed_method": "method",
-                    "mechanism": "higher SNR improves decoding",
-                    "comparisons": [],
-                    "headline_shape": "increasing",
-                    "caveats": [],
-                }
-                write_json(kwargs["output_dir"] / "paper_thesis.json", document)
-                return document
 
             pipeline = ReviewPipeline()
             with (
                 patch.object(pipeline, "_load_or_create_analysis_stage_json", side_effect=fake_analysis_stage),
-                patch.object(pipeline, "_load_or_create_paper_thesis", side_effect=fake_thesis),
             ):
                 pipeline.run(paper_path, output_dir, resume=False, analysis_only=True)
 
@@ -1899,28 +1346,21 @@ class PipelineTests(unittest.TestCase):
             )
             self.assertEqual(summary["round_count"], 2)
             self.assertEqual(summary["terminal_unresolved_count"], 1)
-            self.assertEqual(summary["stop_reason"], "task_expert_handoff_ready")
+            self.assertEqual(summary["stop_reason"], "planner_ready_handoff")
             analysis_result = json.loads(
                 (output_dir / "analysis_result.json").read_text(encoding="utf-8")
             )
             self.assertEqual(analysis_result["analysis_stage_invocations"], 6)
-            diagnostics = json.loads(
-                (output_dir / "audit" / "02c_terminal_gap_diagnostics.json").read_text(encoding="utf-8")
-            )
-            self.assertTrue(diagnostics["advisory"])
-            self.assertFalse(diagnostics["passed"])
-            self.assertGreaterEqual(diagnostics["issue_count"], 1)
-            warnings = json.loads(
-                (output_dir / "analysis_warnings.json").read_text(
-                    encoding="utf-8"
-                )
-            )
-            self.assertTrue(warnings["advisory_only"])
-            self.assertGreaterEqual(warnings["warning_count"], 1)
-            self.assertIn(
-                "terminal_gap",
-                {item["category"] for item in warnings["warnings"]},
-            )
+            ledger = json.loads((output_dir / "audit" / "02b_backfill_search_ledger.json").read_text(encoding="utf-8"))
+            latest = {item["field_id"]: item for item in ledger["latest"]}
+            self.assertEqual(latest["normalization"]["status"], "resolved_explicit")
+            self.assertEqual(latest["normalization"]["round"], 1)
+            self.assertEqual(latest["trial_count"]["status"], "not_found_in_paper")
+            self.assertEqual(latest["trial_count"]["round"], 2)
+            before_planner = json.loads((output_dir / "audit" / "02b_round_02_facts_before_planner.json").read_text(encoding="utf-8"))
+            self.assertIn(setup_fact, before_planner["engineering_facts"])
+            self.assertTrue(all(item in before_planner["engineering_facts"] for item in initial["engineering_facts"]))
+            self.assertFalse((output_dir / "audit" / "02c_terminal_gap_diagnostics.json").exists())
             final_tasks = json.loads((output_dir / "repro_tasks.json").read_text(encoding="utf-8"))
             self.assertTrue(
                 final_tasks["_meta"]["scientific_acceptance_finalization"]["structure_is_advisory"]

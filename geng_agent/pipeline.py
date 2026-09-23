@@ -23,13 +23,13 @@ from .pipeline_json_stage import (
     load_or_create_stage_json as _load_or_create_stage_json_impl,
 )
 from .pipeline_models import PipelineResult, PipelineRunOptions
+from .pipeline_supervision import run_supervised_pipeline
+from .supervisor import RunSupervisor
 from .pipeline_report_delivery import generate_docx_reports
 from .pipeline_report_flow import run_report_flow
 from .pipeline_scientific_stages import (
     load_or_create_experiment_index as _load_or_create_experiment_index_impl,
     load_or_create_paper as _load_or_create_paper_impl,
-    load_or_create_paper_thesis as _load_or_create_paper_thesis_impl,
-    load_or_create_scientific_architecture as _load_or_create_scientific_architecture_impl,
     render_paper_images as _render_paper_images_impl,
 )
 from .progress import NullProgressReporter, PhaseProgressTracker, ProgressReporter
@@ -37,7 +37,6 @@ from .prompts import PromptBook
 from .provenance import build_automation_provenance
 from .schemas import ValidationIssue
 from .targeted_backfill_loop import run_targeted_backfill_loop
-from .verdict import derive_reproducibility_verdict
 
 # Re-export split helpers so existing imports continue to resolve while callers
 # migrate to their responsibility-specific modules.
@@ -54,15 +53,7 @@ from .pipeline_helpers import (
 )
 from .risk_report import (
     _build_run_cost,
-    _count_missing_baselines,
-    _dimension,
-    _local_stage_fallbacks,
-    _result_alignment_level,
-    build_risk_dimensions,
     build_risk_report,
-    build_scientific_check,
-    combine_risk_dimensions,
-    detect_nondeterminism_findings,
 )
 from .runtime_status import (
     _load_valid_stage_cache,
@@ -274,22 +265,22 @@ class ReviewPipeline:
         write_json(audit_dir / "model_config.json", model_snapshot)
         with model_config_scope(model_configs):
             try:
-                analysis = run_analysis_flow(
-                    self,
-                    context,
-                    mineru_stage=run_mineru_layout_stage,
-                    backfill_loop_runner=run_targeted_backfill_loop,
-                )
-                if analysis_only:
-                    return finish_analysis_only(context, analysis)
-                execution = run_execution_flow(context, analysis)
-                return run_report_flow(
-                    self,
-                    context,
-                    analysis,
-                    execution,
-                    derive_verdict=derive_reproducibility_verdict,
-                    provenance_builder=build_automation_provenance,
+                supervisor = RunSupervisor(output_dir, audit_dir, goal={
+                    "paper": str(paper_path.resolve()),
+                    "paper_sha256": _sha256_file(paper_path) if paper_path.is_file() else None,
+                    "run_repro": run_repro, "analysis_only": analysis_only,
+                    "model": model_configs.identity(),
+                    "objective": "忠实检验选定论文任务；保留未复现、信息不足和假设，交付复现项目及两份中文报告。",
+                }, reporter=context.progress_tracker.reporter)
+                return run_supervised_pipeline(
+                    context=context, supervisor=supervisor,
+                    analyze=lambda: run_analysis_flow(self, context,
+                        mineru_stage=run_mineru_layout_stage,
+                        backfill_loop_runner=run_targeted_backfill_loop),
+                    execute=lambda analysis: run_execution_flow(context, analysis),
+                    report=lambda analysis, execution: run_report_flow(self, context, analysis, execution,
+                        provenance_builder=build_automation_provenance),
+                    finish_analysis=lambda analysis: finish_analysis_only(context, analysis),
                 )
             finally:
                 try:
@@ -414,32 +405,6 @@ class ReviewPipeline:
             cache_inputs=cache_inputs,
         )
 
-    def _load_or_create_paper_thesis(
-        self,
-        *,
-        output_dir: Path,
-        audit_dir: Path,
-        facts: dict[str, Any],
-        paper_context: str,
-        paper_images: list[Any],
-        resume: bool,
-        max_attempts: int,
-        analysis_backend: str = "llm",
-        paper_source_sha256: str | None = None,
-    ) -> dict[str, Any] | None:
-        return _load_or_create_paper_thesis_impl(
-            self,
-            output_dir=output_dir,
-            audit_dir=audit_dir,
-            facts=facts,
-            paper_context=paper_context,
-            paper_images=paper_images,
-            resume=resume,
-            max_attempts=max_attempts,
-            analysis_backend=analysis_backend,
-            paper_source_sha256=paper_source_sha256,
-        )
-
     def _load_or_create_experiment_index(
         self,
         *,
@@ -461,40 +426,6 @@ class ReviewPipeline:
             resume=resume,
         )
 
-    def _load_or_create_scientific_architecture(
-        self,
-        *,
-        output_dir: Path,
-        audit_dir: Path,
-        facts: dict[str, Any],
-        tasks: dict[str, Any],
-        experiment_index: dict[str, Any],
-        paper_thesis: dict[str, Any] | None,
-        paper_context: str,
-        paper_images: list[Any],
-        resume: bool,
-        max_attempts: int,
-        analysis_backend: str,
-        execution_plan: dict[str, Any] | None = None,
-        paper_source_sha256: str | None = None,
-    ) -> dict[str, Any]:
-        return _load_or_create_scientific_architecture_impl(
-            self,
-            output_dir=output_dir,
-            audit_dir=audit_dir,
-            facts=facts,
-            tasks=tasks,
-            experiment_index=experiment_index,
-            paper_thesis=paper_thesis,
-            paper_context=paper_context,
-            paper_images=paper_images,
-            resume=resume,
-            max_attempts=max_attempts,
-            analysis_backend=analysis_backend,
-            execution_plan=execution_plan,
-            paper_source_sha256=paper_source_sha256,
-        )
-
     def _render_paper_images(self, *, paper_path: Path, paper: dict[str, Any]) -> list[Any]:
         return _render_paper_images_impl(self, paper_path=paper_path, paper=paper)
 
@@ -508,13 +439,8 @@ class ReviewPipeline:
         input_observer: Callable[[str, list[Any], dict[str, Any]], None] | None = None,
     ) -> str:
         return _complete_maybe_multimodal_impl(
-            self,
-            prompt,
-            schema_stage=schema_stage,
-            images=images,
-            client=client,
-            system_message=SYSTEM_MESSAGE,
-            input_observer=input_observer,
+            self, prompt, schema_stage=schema_stage, images=images, client=client,
+            system_message=SYSTEM_MESSAGE, input_observer=input_observer,
         )
 
     def _call_validated_json(

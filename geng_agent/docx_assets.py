@@ -50,14 +50,13 @@ def _image_pixel_size(path: Path) -> tuple[int, int] | None:
         return None
 
 
-def _can_compare_side_by_side(row: list[str], base_dir: Path | None) -> bool:
-    """Use columns only for two similarly shaped, single landscape/square images.
+def _can_compare_side_by_side(row: list[str], base_dir: Path | None, *, page_width_in: float) -> bool:
+    """Keep an editor-requested pair in columns when each image has usable width.
 
-    Geometry cannot identify a square multi-panel chart. The editor can request
-    full-width presentation by emitting separate Markdown image blocks for it.
-    Unknown, portrait, wide, or multiple images use a conservative stacked layout.
+    The editor chooses whether figure labels remain legible; geometry only catches
+    narrow pages, full-page evidence, extreme aspect ratios and multiple images.
     """
-    if len(row) != 2:
+    if len(row) != 2 or page_width_in / 2 - 2 * _CELL_PADDING_IN < 2.6:
         return False
     ratios: list[float] = []
     for value in row:
@@ -70,10 +69,10 @@ def _can_compare_side_by_side(row: list[str], base_dir: Path | None) -> bool:
             return False
         width, height = size
         ratio = width / height
-        if not 0.9 <= ratio <= 1.6:
+        if not 0.85 <= ratio <= 2.05:
             return False
         ratios.append(ratio)
-    return max(ratios) / min(ratios) <= 1.25
+    return max(ratios) / min(ratios) <= 1.6
 
 
 def _add_image_comparison_table(
@@ -105,13 +104,14 @@ def _add_image_comparison_table(
     table._tbl.tblPr.append(borders)
 
     repeat_parallel_header = all(
-        _can_compare_side_by_side((row + [""] * column_count)[:column_count], base_dir)
+        _can_compare_side_by_side((row + [""] * column_count)[:column_count], base_dir,
+                                  page_width_in=page_width)
         for row in rows
     )
 
     for row in rows:
         values = (row + [""] * column_count)[:column_count]
-        if _can_compare_side_by_side(values, base_dir):
+        if _can_compare_side_by_side(values, base_dir, page_width_in=page_width):
             heading_row = table.add_row()
             for cell, header in zip(heading_row.cells, headers):
                 _add_image_source_label(cell, header)

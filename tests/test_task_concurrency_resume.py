@@ -18,7 +18,7 @@ def _verdict(task_id, outcome="reproduced"):
 def _record(index, root):
     task_id = f"t{index}"
     return {"index": index, "task_id": task_id, "sandbox": str(root),
-            "writer_completed": True, "task_writer_status": "ready_for_review",
+            "writer_completed": True, "host_execution": {"passed": True}, "task_writer_status": "ready_for_review",
             "writer_session_count": index, "task_reporter_successful": True,
             "task_reporter_terminal": True,
             "task_verification": _verdict(task_id)["task_verification"]}
@@ -65,6 +65,29 @@ def test_partial_resume_validates_reporters_while_another_writer_runs(monkeypatc
     assert [record["index"] for record in records] == [1, 2, 3]
     assert all(record["task_verification"]["outcome"] == "not_reproduced" for record in records[1:])
     assert audit["cached_writer_reporter_validation_unit_ids"] == ["shared"]
+
+
+def test_resume_hands_failed_execution_to_reporter_without_relaunching_writer(monkeypatch, tmp_path):
+    pair = ({"task_id": "t1"}, {"task_id": "t1"})
+    saved = _record(1, tmp_path / "writer")
+    saved["host_execution"] = {"passed": False, "issues": ["source changed after full execution"]}
+    launches = []
+
+    def unexpected_launch(**kwargs):
+        launches.append(kwargs)
+        raise AssertionError("observed Writer output must be handed to Reporter")
+
+    monkeypatch.setattr("geng_agent.task_writer_dispatch._run_one_task_writer", unexpected_launch)
+    records, audit = _dispatch(
+        tmp_path, [pair], initial_records_by_index={1: saved},
+        task_review_callback=lambda _index, _task, record, _round: (
+            _verdict(record["task_id"], "not_reproduced")
+        ),
+    )
+    assert not launches
+    assert records[0]["host_execution"]["passed"] is False
+    assert records[0]["task_verification"]["outcome"] == "not_reproduced"
+    assert audit["cached_writer_reporter_validation_unit_ids"] == ["unit_task_01_t1"]
 
 
 @pytest.mark.parametrize("fails", [False, True])
@@ -149,3 +172,36 @@ def test_partial_resume_replays_causal_revision_once_and_does_not_repeat_model_r
         task_review_callback=callback, experiment_index={}, review_feedback={},
     )
     assert len(result) == 2
+
+
+def test_cached_shared_revision_precedes_private_writer_continuation(monkeypatch, tmp_path):
+    from geng_agent.task_writer_dispatch import _resume_or_run_writer
+
+    members = [(i, {"task_id": f"t{i}"}, {}) for i in (1, 2)]
+    records = {i: _record(i, tmp_path / "shared") for i in (1, 2)}
+    barrier = Barrier(2)
+    completed = set()
+    lock = Lock()
+
+    def callback(index, task, record, round_no):
+        barrier.wait(timeout=5)
+        with lock:
+            completed.add(index)
+        return _verdict(task["task_id"])
+
+    def attach(**kwargs):
+        assert completed == {1, 2}
+        kwargs["record"]["task_reporter"] = kwargs["callback"]()
+        if kwargs["index"] == 1:
+            kwargs["record"]["foundation_revision_request"] = {"request_id": "shared-fix"}
+            return "terminal", None
+        return "writer_revision", {"causal_change": "private-fix"}
+
+    monkeypatch.setattr(runner, "_attach_task_reporter_review", attach)
+    result = _resume_or_run_writer(
+        writer_runner=lambda **kwargs: pytest.fail("must hand shared revision to host before preparing Writer"),
+        cached_members=members, cached_records=records, task_review_callback=callback,
+        experiment_index={}, review_feedback={},
+    )
+    assert result[0]["foundation_revision_request"]["request_id"] == "shared-fix"
+    assert result[1]["task_reporter"]["ok"]

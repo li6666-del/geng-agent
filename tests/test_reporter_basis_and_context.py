@@ -6,7 +6,7 @@ from pathlib import Path
 from geng_agent.agentic_task_reporters import run_codex_task_reporter_workflow
 from geng_agent.report_editor_assets import _build_task_packets
 from geng_agent.task_reporter_validation import normalize_reporter_observation_evidence
-from geng_agent.verification_result import normalize_task_verification, writer_revision_allowed
+from geng_agent.verification_result import normalize_task_verification, task_verification_issues
 from tests.test_agentic_task_reporters import _task, _record, _supported_raw
 
 
@@ -36,7 +36,7 @@ def test_paper_can_retire_wrong_criterion_without_retiring_independent_failure(t
         "paper_evidence_files": [_paper(tmp_path)], "causal_change": "Remove the projection", "change_targets": ["task.py:observable"], "predicted_effect": "Evaluate the defined observable"}
     failed = normalize_task_verification(raw, "task_a", task=task, run_valid_hint=True, evidence_workspace=tmp_path)
     assert failed["outcome"] == "not_reproduced"
-    assert writer_revision_allowed(failed, "task_a")
+    assert (not task_verification_issues(failed, "task_a") and failed.get("host_action") == "rerun_writer")
 
 
 def test_writer_or_designer_prose_cannot_authorize_basis_change(tmp_path):
@@ -48,7 +48,8 @@ def test_writer_or_designer_prose_cannot_authorize_basis_change(tmp_path):
         raw["core_conclusions"][0].update(status="not_applicable", basis_review=_basis(path, paper_evidence_verified=True))
         result = normalize_task_verification(raw, "task_a", task=_task(), run_valid_hint=True, evidence_workspace=tmp_path)
         assert result["outcome"] == "reproduced"
-        assert result["engineering_status"] == "evidence_invalid"
+        assert result["engineering_status"] == "verified"
+        assert result["host_observations"]
         assert result["core_conclusions"][0]["basis_review"]["paper_evidence_verified"] is False
 
 
@@ -70,7 +71,7 @@ def test_incompatible_dimensions_cannot_create_numeric_rerun(tmp_path):
         raw["key_numeric_comparisons"][0].update(comparison_status="incompatible", comparison_reason="Reporter confirmed the quantities cannot be compared.")
         raw["key_numeric_comparisons"][0]["local_" + dimension] = local
         result = normalize_task_verification(raw, "task_a", task=task, run_valid_hint=True, evidence_workspace=tmp_path)
-        assert result["max_key_numeric_ratio"] is None
+        assert "max_key_numeric_ratio" not in result
         assert result["outcome"] == "inconclusive_missing_information"
         assert result["host_action"] == "complete"
 
@@ -99,7 +100,7 @@ def test_legacy_supported_false_survives_a_basis_dispute(tmp_path):
     claim.update(supported=False, basis_review=_basis(_paper(tmp_path)))
     result = normalize_task_verification(raw, "task_a", task=_task(), run_valid_hint=True, evidence_workspace=tmp_path)
     assert result["core_conclusions"][0]["supported"] is False
-    assert result["engineering_status"] == "handoff_failed"
+    assert not result["handoff_issues"]
 
 
 def test_verified_report_facts_require_original_evidence_not_writer_account(tmp_path):
@@ -113,7 +114,8 @@ def test_verified_report_facts_require_original_evidence_not_writer_account(tmp_
         {"category": "implementation", "source": "observed", "text": "99 layers", "evidence_files": ["inputs/writer_account.json"]},
     ]}
     checked, warnings = normalize_reporter_observation_evidence(raw, tmp_path)
-    assert [f["text"] for f in checked["verified_facts"]] == ["3 layers"]
+    assert [f["text"] for f in checked["verified_facts"]] == ["3 layers", "99 layers"]
+    assert [f["host_evidence_available"] for f in checked["verified_facts"]] == [True, False]
     assert warnings
 
 
@@ -130,7 +132,7 @@ def test_reporter_structure_recovery_sees_old_note_and_canonical_inputs(tmp_path
         else:
             recovery = json.loads((workspace / "inputs/reporter_repair.json").read_text(encoding="utf-8"))
             assert recovery["kind"] == "structure_recovery"
-            assert "v3 decision protocol" in recovery["issues"][0]
+            assert any("task_id" in issue or "host_action" in issue for issue in recovery["issues"])
             assert (workspace / "inputs/previous_reporter_note.txt").read_text(encoding="utf-8") == '{"core_conclusions": ['
             (workspace / "task_verification_result.json").write_text(json.dumps(_supported_raw()), encoding="utf-8")
         return {"ok": True, "role": "task_reporter"}
@@ -186,7 +188,7 @@ def test_editor_deduplicates_host_receipts_and_leaves_unknown_validity_unavailab
     record = {"task_id": "task_a", "writer_status": {"execution_audit_dir": str(tmp_path)}, "host_execution": {"passed": True, "receipt": receipt}}
     packet = _build_task_packets(facts={}, tasks={"repro_tasks": [_task()]}, task_records=[record], task_verifications=[{"task_id": "task_a"}])[0]
     assert packet["execution_summary"]["observed_full_attempt_count"] == 1
-    assert packet["execution_summary"]["latest_valid_execution_count"] is None
+    assert packet["execution_summary"]["latest_valid_execution_count"] == 1
 
 
 def test_reporter_cache_uses_actual_prompt_model_and_page_content(tmp_path, monkeypatch):

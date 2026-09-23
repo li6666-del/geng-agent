@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import unittest
 
-from geng_agent.verification_result import normalize_task_verification, writer_revision_allowed
+from geng_agent.verification_result import normalize_task_verification, task_verification_issues
 
 
 class ScientificCalibrationTests(unittest.TestCase):
@@ -39,7 +39,7 @@ class ScientificCalibrationTests(unittest.TestCase):
                     raw, case["task_id"], task=case["task"], run_valid_hint=True
                 )
                 self.assertEqual(result["outcome"], label["expected_outcome"])
-                self.assertEqual(writer_revision_allowed(result, case["task_id"]), label["expected_rerun_allowed"])
+                self.assertEqual((not task_verification_issues(result, case["task_id"]) and result.get("host_action") == "rerun_writer"), label["expected_rerun_allowed"])
 
 
 if __name__ == "__main__":

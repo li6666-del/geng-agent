@@ -14,10 +14,11 @@ from .agentic_foundation import _assert_foundation_sandbox_layout_safe, foundati
 from .case_environment import EnvironmentPolicyError
 from .case_runtime import CaseRuntime, read_environment_request, requirements_missing_from_lock
 from .codex_runner import run_codex_subprocess
-from .execution_receipts import ExecutionBroker, trusted_input_snapshot
-from .foundation_revision import read_foundation_revision_request, validate_foundation_revision_request
+from .execution_receipts import ExecutionBroker, trusted_input_snapshot, find_host_execution
+from .foundation_revision import read_foundation_revision_request
 from .config import get_config_value
 from .outputs import write_json, write_text
+from .progress import PipelineCancelled
 from .paper_evidence import safe_label
 from .security import redact_text
 from .task_writer_contracts import DEFAULT_MAX_EVIDENCE_RERUNS, TASK_WRITER_TERMINAL_STATUS
@@ -41,8 +42,10 @@ from .task_writer_state import (
 )
 from .task_writer_support import PAPER_EVIDENCE_DIR, _restore_trusted_files
 from .task_writer_units import _execution_unit_sandbox, _public_execution_unit
-from .verification_result import rerun_evidence_path_issues, task_verification_issues, writer_revision_allowed
+from .verification_result import rerun_evidence_path_issues, task_verification_issues
 from .writer_recovery import localize_writer_feedback, writer_recovery_context, archive_satisfied_environment_request
+from .task_recovery import recovery_state_id, recover_writer_stall, resolve_revision_owner
+from .supervisor import NodeFailure, StageBlocked, REPLAY_REQUIRED, current_supervisor, supervised_call
 
 
 def _external_writer_rerun_budget() -> int:
@@ -89,6 +92,48 @@ def _execution_unit_rerun_fingerprints(
     }
 
 
+class _PreparedReporterResult(dict):
+    """In-memory routing for this callback/replay, never a persisted authority."""
+
+    revision_route: dict[str, Any] | None = None
+    prepared_state: str | None = None
+
+
+def _obtain_reporter_review(callback, index, task, record, round_no):
+    reporter = callback(index, task, record, round_no)
+    return _prepare_reporter_review(reporter, callback, index, task, record, round_no)
+
+
+def _prepare_reporter_review(reporter, callback, index, task, record, round_no,
+                             *, clarification_allowed=True):
+    if not isinstance(reporter, dict) or not reporter.get("ok"):
+        return reporter
+    verification = reporter.get("task_verification")
+    task_id = str(task.get("task_id") or record.get("task_id") or "")
+    if not isinstance(verification, dict) or verification.get("host_action") != "rerun_writer":
+        return reporter
+    if isinstance(reporter, _PreparedReporterResult):
+        # Only an exceptional decision carries in-memory authority, bound to
+        # the exact evidence generation. Explicit routes retain the raw result.
+        if reporter.prepared_state == recovery_state_id(record, "revision_owner"):
+            return reporter
+    prepared = _PreparedReporterResult(reporter)
+    route = resolve_revision_owner(record=record, reporter=reporter, verification=verification)
+    if route["action"] == "repair_reporter" and clarification_allowed:
+        record["task_reporter"] = reporter
+        record["moderator_review_request"] = dict(route.get("decision") or {})
+        clarified = callback(index, task, record, round_no)
+        return _prepare_reporter_review(clarified, callback, index, task, record, round_no,
+                                         clarification_allowed=False)
+    if route["action"] == "repair_reporter":
+        route = {**route, "action": "stop", "reason": "moderator_reporter_clarification_exhausted"}
+    if not route.get("decision"):
+        return reporter
+    prepared.prepared_state = recovery_state_id(record, "revision_owner")
+    prepared.revision_route = route
+    return prepared
+
+
 def _review_task_records(
     *,
     work: list[tuple[int, dict[str, Any], dict[str, Any], int]],
@@ -99,7 +144,7 @@ def _review_task_records(
         return []
     with ThreadPoolExecutor(max_workers=len(work)) as executor:
         futures = [
-            executor.submit(copy_context().run, callback, index, task, record, round_no)
+            executor.submit(copy_context().run, _obtain_reporter_review, callback, index, task, record, round_no)
             for index, task, record, round_no in work
         ]
     # Waiting for the entire batch also protects shared Writer input snapshots
@@ -140,6 +185,180 @@ def _review_execution_unit_tasks(
         if action == "writer_revision" and isinstance(returned, dict):
             requested[str(record.get("task_id") or "")] = returned
     return requested
+
+
+def _recover_writer_exceptions(*, work, trigger, writer_budget_available, callback, session_round):
+    """One recovery entry for repeated requests and ineffective continuations.
+
+    Decisions and optional Reporter clarifications run independently. Only once
+    all callbacks finish may feedback files be localized in a shared sandbox.
+    """
+    def prepare(index, task, record, verification):
+        try:
+            route = recover_writer_stall(record=record, verification=verification, trigger=trigger,
+                                         writer_budget_available=writer_budget_available)
+        except PipelineCancelled:
+            raise
+        except Exception as exc:
+            record["moderator_error"] = redact_text(f"{type(exc).__name__}: {exc}")[:1000]
+            return {"action": "stop", "reason": "moderator_recovery_failed"}
+        if route["action"] == "repair_reporter" and callback is not None:
+            record["moderator_review_request"] = dict(route.get("decision") or {})
+            try:
+                reporter = _obtain_reporter_review(callback, index, task, record, session_round)
+            except PipelineCancelled:
+                raise
+            except Exception as exc:
+                reporter = {"ok": False, "error": redact_text(f"{type(exc).__name__}: {exc}")[:1000]}
+            return {"action": "reporter_result", "reporter": reporter}
+        return route
+
+    if not work:
+        return {}
+    with ThreadPoolExecutor(max_workers=len(work)) as executor:
+        futures = [executor.submit(copy_context().run, prepare, *item) for item in work]
+    requested = {}
+    for (index, task, record, verification), future in zip(work, futures):
+        route = future.result()
+        task_id = str(record.get("task_id") or task.get("task_id") or "")
+        if route["action"] == "reporter_result":
+            action, feedback = _attach_task_reporter_review(
+                callback=lambda *_args, value=route["reporter"]: value,
+                index=index, task=task, record=record, session_round=session_round,
+                writer_revision_permitted=writer_budget_available,
+            )
+            if action == "writer_revision" and writer_budget_available:
+                requested[task_id] = feedback
+            elif action == "writer_revision":
+                _terminalize_rerun_request(record=record, verification=feedback,
+                    stop_reason="external_rerun_budget_exhausted",
+                    uncertainty="Reporter clarification cannot increase the operational Writer rerun budget.")
+            continue
+        if route["action"] == "revise_foundation":
+            record["foundation_revision_request"] = route["request"]
+            record["task_reporter_terminal"] = False
+            continue
+        if route["action"] == "revise_writer" and writer_budget_available:
+            reporter = record.get("task_reporter") or {}
+            requested[task_id] = localize_writer_feedback(
+                route["feedback"], reporter_root=Path(str(reporter.get("workspace") or record.get("sandbox") or "")),
+                sandbox=Path(str(record.get("sandbox") or "")),
+                output_subdir=str(record.get("output_subdir") or task_id),
+            )
+            continue
+        _terminalize_rerun_request(record=record, verification=record.get("task_verification") or verification,
+            stop_reason=trigger,
+            uncertainty="The recovery coordinator stopped this repair; no new full run is authorized and the scientific conclusion is retained.")
+    return requested
+
+
+def _supervise_writer_delivery(*, node_id, produce, archive, tasks, sandbox, analysis_snapshot_hash, reconcile_first=False):
+    """Approve one actual Writer handoff, retaining local failure evidence.
+
+    Called inside each existing worker thread, never around the dispatcher.
+    The original Writer is the only actor allowed to repair scientific files.
+    """
+    latest = None
+    reconciled = None
+    supervisor = current_supervisor()
+    dispatch_assignment = (supervisor.current_instruction("tool:writers:" + node_id.rsplit(":round:", 1)[0])
+                           if supervisor is not None else None)
+    instructions = dispatch_assignment
+    attempt = 1
+    handoff_failed = False
+    recheck_on_retry = False
+
+    def operation():
+        nonlocal latest, reconciled, handoff_failed, recheck_on_retry, reconcile_first
+        if reconcile_first and reconciled is None:
+            reconciled = produce(None, 0)
+        reconcile_first = False
+        if reconciled is not None:
+            latest = reconciled
+        elif recheck_on_retry:
+            candidate = produce(instructions, 0)
+            candidate_status, candidate_records = candidate
+            ready = bool(candidate_records) and not candidate_status.get("error_kind") and all(
+                record.get("writer_completed") and isinstance(record.get("host_execution"), dict)
+                and record["host_execution"].get("passed") is True for record in candidate_records)
+            latest = candidate if ready else produce(instructions, attempt)
+        else:
+            latest = produce(instructions, attempt)
+        reconciled = None
+        recheck_on_retry = False
+        handoff_failed = False
+        status, records = latest
+        routed = status.get("error_kind") in {"environment_request", "foundation_revision"}
+        if current_supervisor() is not None and not routed and not any(
+            record.get("writer_completed") for record in records
+        ):
+            handoff_failed = True
+            raise NodeFailure("Writer produced no usable delivery for downstream review", result={
+                "writer_status": status, "task_records": records})
+        return latest
+
+    def repair(decision):
+        nonlocal instructions, attempt, recheck_on_retry
+        preserved = {}
+        if latest is not None:
+            status, records = latest
+            if status.get("execution_receipts_required") and status.get("execution_audit_dir") and records:
+                try:
+                    observed = {
+                        str(record["task_id"]): find_host_execution(
+                            sandbox, Path(status["execution_audit_dir"]), str(record["task_id"]))
+                        for record in records
+                    }
+                    if all(item.get("passed") is True for item in observed.values()):
+                        preserved = {task_id: item["run_id"] for task_id, item in observed.items()}
+                except (OSError, ValueError, KeyError):
+                    preserved = {}
+            if not preserved:
+                archive(status, attempt)
+        instructions = {**decision, "preserved_full_receipts": preserved}
+        # A failed mechanical handoff may already be recoverable from the
+        # same full. Reinspect locally before reopening the original Writer.
+        recheck_on_retry = bool(preserved) and handoff_failed
+        attempt += 1
+
+    def reconcile(_state):
+        nonlocal reconciled
+        # Attempt zero only recollects the current files and checks host-owned
+        # receipts. An invalid/missing delivery is diagnosed before any new run.
+        reconciled = produce(None, 0)
+        return REPLAY_REQUIRED
+
+    try:
+        return supervised_call(
+            node_id, operation,
+            inputs={"owner": "task_writer", "tasks": tasks, "analysis_snapshot_hash": analysis_snapshot_hash,
+                    "dispatch_assignment": dispatch_assignment,
+                    "instruction": "Review this Writer handoff before independent Reporter review. Do not make or override the scientific verdict."},
+            evidence_roots={"writer": sandbox},
+            summarize=lambda value: {"writer_status": value[0], "task_records": [{
+                key: record.get(key) for key in ("task_id", "writer_completed", "writer_error_kind",
+                    "task_writer_status", "execution_summary", "result_json", "artifacts")
+            } for record in value[1]]},
+            repair=repair,
+            reconcile=reconcile,
+        )
+    except StageBlocked as exc:
+        if latest is None:
+            raise
+        for record in latest[1]:
+            record["supervisor_blocked"] = exc.decision
+            record["blocked_reason"] = str(exc)
+            record["task_reporter_terminal"] = False
+        return latest
+
+
+def _supervisor_writer_prompt(prompt, instructions):
+    if not instructions:
+        return prompt
+    return prompt + ("\n\n## Project supervisor repair assignment\n"
+        "Repair only the assigned task's implementation or handoff. Preserve the frozen Foundation, "
+        "paper goals, and acceptance criteria. A changed executable input or output requires a new host receipt.\n"
+        + json.dumps(instructions, ensure_ascii=False))
 
 
 def _run_one_execution_unit_writer(
@@ -230,7 +449,9 @@ def _run_one_execution_unit_writer(
     }
     recovery_reason = "environment_or_runtime_refresh" if runtime_refresh_required else "resume_incomplete_delivery"
 
-    if reuse_existing:
+    reconcile_first = bool(reuse_existing and current_supervisor() is not None
+                           and not runtime_refresh_required and not current_feedback)
+    if reuse_existing and not reconcile_first:
         existing_records: list[dict[str, Any]] = []
         for index, task, entry in members:
             record = _collect_task_writer_delivery(
@@ -266,7 +487,18 @@ def _run_one_execution_unit_writer(
                     callback=task_review_callback,
                     session_round=session_round,
                 )
+                if any(record.get("foundation_revision_request") for record in existing_records):
+                    return existing_records
                 if not requested:
+                    return existing_records
+                if rerun_budget <= 0:
+                    _recover_writer_exceptions(
+                        work=[(index, task, record, requested[str(record["task_id"])])
+                              for (index, task, _entry), record in zip(members, existing_records)
+                              if str(record.get("task_id") or "") in requested],
+                        trigger="external_rerun_budget_exhausted", writer_budget_available=False,
+                        callback=task_review_callback, session_round=session_round,
+                    )
                     return existing_records
                 seen_rerun_requests.update(
                     _execution_unit_rerun_fingerprints(requested, sandbox)
@@ -313,91 +545,118 @@ def _run_one_execution_unit_writer(
                     task_ids=[str(task.get("task_id") or entry.get("task_id") or "") for _, task, entry in members]),
             )
         )
-        # Some case volumes expose sub-second mtimes with a coarse rounding
-        # boundary. Active compound outputs were emptied immediately above, so
-        # a one-second allowance cannot admit a previous generation but avoids
-        # rejecting files written in the first filesystem tick of this session.
-        session_started_at = time.time()
-        writer_status = _run_task_writer_codex_session(
-            label=(label_base if session_round == 1 else f"{label_base}_continue_{session_round:03d}"),
-            prompt=prompt,
-            sandbox=sandbox,
-            audit_dir=audit_dir,
-            case_runtime=case_runtime,
-            request_source=f"execution_unit_writer:{unit_id}",
-            require_execution_receipt=run_repro,
-        )
-        if writer_status.get("error_kind") in {
-            "environment_request",
-            "environment_request_invalid",
-            "foundation_revision",
-        }:
-            return [
-                {
-                    "index": index,
-                    "task_id": str(task.get("task_id") or entry.get("task_id") or f"task_{index}"),
-                    "module": str(entry.get("module") or ""),
-                    "output_subdir": str(entry.get("output_subdir") or task.get("task_id") or ""),
-                    "sandbox": str(sandbox),
-                    "execution_unit_id": unit_id,
-                    "task_writer_status": "blocked_environment",
-                    "writer_completed": False,
-                    "writer_error_kind": writer_status.get("error_kind"),
-                    "writer_status": writer_status,
-                    "environment_requests": writer_status.get("environment_requests", []),
-                    "foundation_revision_request": writer_status.get("foundation_revision_request"),
-                    "analysis_snapshot_hash": analysis_snapshot_hash,
-                    "writer_session_count": session_round,
-                    "runtime_refresh_required": bool(runtime_refresh_required),
-                    "runtime_refresh_completed": False,
-                    "environment_refresh_required": bool(runtime_refresh_required),
-                    "environment_refresh_completed": False,
-                }
-                for index, task, entry in members
-            ]
-        if foundation is not None:
-            frozen_issues = foundation_violations(sandbox, foundation)
-            if frozen_issues:
-                restore_foundation_snapshot(sandbox, foundation)
-                writer_status = {
-                    **writer_status,
-                    "ok": False,
-                    "error_kind": "foundation_modified",
-                    "blocked_reason": "execution-unit writer changed the frozen scientific Foundation",
-                    "foundation_violations": frozen_issues,
-                }
-        unit_manifest = {
-            "version": 1,
-            "execution_plan_version": "1.0",
-            "execution_units": [_public_execution_unit(unit)],
-            "tasks": [entry for _index, _task, entry in members],
-        }
-        _restore_trusted_files(sandbox, unit_manifest)
-        write_json(sandbox / "execution_unit.json", _public_execution_unit(unit))
-        records: list[dict[str, Any]] = []
-        for index, task, entry in members:
-            record = _collect_task_writer_delivery(
-                index=index,
-                task=task,
-                manifest_entry=entry,
-                sandbox=sandbox,
-                writer_status=writer_status,
-                require_stopping_assessment=False,
-                allow_root_result_fallback=False,
-                fresh_since=session_started_at,
-            )
-            record["analysis_snapshot_hash"] = analysis_snapshot_hash
-            record["writer_session_count"] = session_round
-            record["execution_unit_id"] = unit_id
-            record["execution_unit_member_count"] = len(members)
-            records.append(record)
+        # Previous outputs were archived above. The collector only tolerates
+        # one floating-point timestamp step; actual full receipts remain bound.
+        def produce_delivery(supervisor_feedback, supervisor_attempt):
+            # Only a host-validated full allows old artifact timestamps. The
+            # collector still verifies source/config/input/output hashes after
+            # this continuation, so scientific edits require a new full receipt.
+            preserve_full = bool((supervisor_feedback or {}).get("preserved_full_receipts"))
+            session_started_at = None if supervisor_attempt == 0 or preserve_full else time.time()
+            if supervisor_attempt == 0:
+                writer_status = _inspect_task_writer_completion(
+                    status={"ok": True, "reconciled_delivery": True}, sandbox=sandbox, audit_dir=audit_dir,
+                    case_runtime=case_runtime, request_source=f"execution_unit_writer:{unit_id}",
+                    require_execution_receipt=run_repro)
+            else:
+                writer_status = _run_task_writer_codex_session(
+                    label=((label_base if session_round == 1 else f"{label_base}_continue_{session_round:03d}")
+                           + (f"_supervisor_{supervisor_attempt:03d}" if supervisor_attempt > 1 else "")),
+                    prompt=_supervisor_writer_prompt(prompt, supervisor_feedback),
+                    sandbox=sandbox,
+                    audit_dir=audit_dir,
+                    case_runtime=case_runtime,
+                    request_source=f"execution_unit_writer:{unit_id}",
+                    require_execution_receipt=run_repro,
+                )
+            if writer_status.get("error_kind") in {
+                "environment_request",
+                "environment_request_invalid",
+                "sandbox_inspection_failed",
+                "foundation_revision",
+            }:
+                return writer_status, [
+                    {
+                        "index": index,
+                        "task_id": str(task.get("task_id") or entry.get("task_id") or f"task_{index}"),
+                        "module": str(entry.get("module") or ""),
+                        "output_subdir": str(entry.get("output_subdir") or task.get("task_id") or ""),
+                        "sandbox": str(sandbox),
+                        "execution_unit_id": unit_id,
+                        "task_writer_status": "blocked_environment",
+                        "writer_completed": False,
+                        "writer_error_kind": writer_status.get("error_kind"),
+                        "writer_status": writer_status,
+                        "environment_requests": writer_status.get("environment_requests", []),
+                        "foundation_revision_request": writer_status.get("foundation_revision_request"),
+                        "analysis_snapshot_hash": analysis_snapshot_hash,
+                        "writer_session_count": session_round,
+                        "runtime_refresh_required": bool(runtime_refresh_required),
+                        "runtime_refresh_completed": False,
+                        "environment_refresh_required": bool(runtime_refresh_required),
+                        "environment_refresh_completed": False,
+                    }
+                    for index, task, entry in members
+                ]
+            if foundation is not None:
+                frozen_issues = foundation_violations(sandbox, foundation)
+                if frozen_issues:
+                    restore_foundation_snapshot(sandbox, foundation)
+                    writer_status = {
+                        **writer_status,
+                        "ok": False,
+                        "error_kind": "foundation_modified",
+                        "blocked_reason": "execution-unit writer changed the frozen scientific Foundation",
+                        "foundation_violations": frozen_issues,
+                    }
+            unit_manifest = {
+                "version": 1,
+                "execution_plan_version": "1.0",
+                "execution_units": [_public_execution_unit(unit)],
+                "tasks": [entry for _index, _task, entry in members],
+            }
+            _restore_trusted_files(sandbox, unit_manifest)
+            write_json(sandbox / "execution_unit.json", _public_execution_unit(unit))
+            records: list[dict[str, Any]] = []
+            for index, task, entry in members:
+                record = _collect_task_writer_delivery(
+                    index=index,
+                    task=task,
+                    manifest_entry=entry,
+                    sandbox=sandbox,
+                    writer_status=writer_status,
+                    require_stopping_assessment=False,
+                    allow_root_result_fallback=False,
+                    fresh_since=session_started_at,
+                )
+                record["analysis_snapshot_hash"] = analysis_snapshot_hash
+                record["writer_session_count"] = session_round
+                record["execution_unit_id"] = unit_id
+                record["execution_unit_member_count"] = len(members)
+                records.append(record)
 
-        _complete_execution_unit_runtime_refresh(
-            records=records,
-            marker=refresh_marker,
-            required=runtime_refresh_required,
-            writer_status=writer_status,
+            _complete_execution_unit_runtime_refresh(
+                records=records,
+                marker=refresh_marker,
+                required=runtime_refresh_required,
+                writer_status=writer_status,
+            )
+
+            return writer_status, records
+
+        writer_status, records = _supervise_writer_delivery(
+            node_id=f"writer:{unit_id}:round:{session_round}", produce=produce_delivery,
+            archive=lambda status, _attempt: _archive_execution_unit_delivery(
+                sandbox=sandbox, members=members, execution_unit_id=unit_id,
+                round_no=_next_writer_progress_round(sandbox), session_status=status),
+            tasks=[task for _index, task, _entry in members], sandbox=sandbox,
+            analysis_snapshot_hash=analysis_snapshot_hash, reconcile_first=reconcile_first,
         )
+        reconcile_first = False
+        if any(record.get("supervisor_blocked") for record in records):
+            return records
+        if writer_status.get("error_kind") in {"environment_request", "environment_request_invalid", "foundation_revision", "sandbox_inspection_failed"}:
+            return records
 
         requested_feedback: dict[str, dict[str, Any]] = {}
         if run_repro and task_review_callback is not None:
@@ -407,24 +666,24 @@ def _run_one_execution_unit_writer(
                 callback=task_review_callback,
                 session_round=session_round,
             )
+        if any(record.get("foundation_revision_request") for record in records):
+            return records
 
+        recovery_applied = False
         if required_change_baseline is not None:
             current_state = _writer_source_config_fingerprint(sandbox)
             if current_state == required_change_baseline:
-                for record in records:
-                    task_id = str(record.get("task_id") or "")
-                    feedback = requested_feedback.get(task_id) or current_feedback.get(task_id)
-                    if feedback:
-                        _terminalize_rerun_request(
-                            record=record,
-                            verification=feedback,
-                            stop_reason="execution_unit_continuation_without_source_change",
-                            uncertainty=(
-                                "The compound Writer changed neither unit source nor configuration; "
-                                "the host retained the latest scientifically honest result."
-                            ),
-                        )
-                return records
+                requested_feedback = _recover_writer_exceptions(
+                    work=[(index, task, record, record.get("task_verification") or requested_feedback[str(record["task_id"])])
+                          for (index, task, _entry), record in zip(members, records)
+                          if str(record.get("task_id") or "") in requested_feedback],
+                    trigger="execution_unit_continuation_without_source_change",
+                    writer_budget_available=evidence_based_reruns < rerun_budget,
+                    callback=task_review_callback, session_round=session_round,
+                )
+                if any(record.get("foundation_revision_request") for record in records) or not requested_feedback:
+                    return records
+                recovery_applied = True
             required_change_baseline = None
         if not run_repro or task_review_callback is None:
             return records
@@ -435,25 +694,22 @@ def _run_one_execution_unit_writer(
         repeated_request = bool(fingerprints) and fingerprints.issubset(
             seen_rerun_requests
         )
-        if repeated_request or evidence_based_reruns >= rerun_budget:
+        if not recovery_applied and (repeated_request or evidence_based_reruns >= rerun_budget):
             stop_reason = (
                 "repeated_execution_unit_rerun_request_without_new_causal_plan"
                 if repeated_request
                 else "external_rerun_budget_exhausted"
             )
-            for record in records:
-                feedback = requested_feedback.get(str(record.get("task_id") or ""))
-                if feedback:
-                    _terminalize_rerun_request(
-                        record=record,
-                        verification=feedback,
-                        stop_reason=stop_reason,
-                        uncertainty=(
-                            "The execution unit stopped because another full shared run lacked "
-                            "a new paper-grounded causal change."
-                        ),
-                    )
-            return records
+            requested_feedback = _recover_writer_exceptions(
+                work=[(index, task, record, record.get("task_verification") or requested_feedback[str(record["task_id"])])
+                      for (index, task, _entry), record in zip(members, records)
+                      if str(record.get("task_id") or "") in requested_feedback],
+                trigger=stop_reason, writer_budget_available=evidence_based_reruns < rerun_budget,
+                callback=task_review_callback, session_round=session_round,
+            )
+            if any(record.get("foundation_revision_request") for record in records) or not requested_feedback:
+                return records
+            fingerprints = _execution_unit_rerun_fingerprints(requested_feedback, sandbox)
         seen_rerun_requests.update(fingerprints)
         evidence_based_reruns += 1
         current_feedback = requested_feedback
@@ -561,12 +817,15 @@ def _run_one_task_writer(
     evidence_based_reruns = 0
     rerun_budget = _external_writer_rerun_budget()
     required_change_baseline: str | None = None
+    last_reporter: dict[str, Any] | None = None
     recovery_reason = "environment_or_runtime_refresh" if runtime_refresh_required else "resume_incomplete_delivery"
-    if reuse_existing:
+    reconcile_first = bool(reuse_existing and current_supervisor() is not None
+                           and not runtime_refresh_required and not review_feedback)
+    if reuse_existing and not reconcile_first:
         archive_round = _next_writer_progress_round(sandbox)
         if runtime_refresh_required:
             session_round = archive_round
-        elif task_review_callback is None:
+        elif task_review_callback is None and not review_feedback:
             existing_record = _collect_task_writer_delivery(
                 index=index,
                 task=task,
@@ -576,9 +835,10 @@ def _run_one_task_writer(
             )
             existing_record['analysis_snapshot_hash'] = analysis_snapshot_hash
             existing_record['writer_session_count'] = max(1, archive_round)
+            existing_record['execution_unit_id'] = unit_id
             if existing_record.get('task_writer_status') == TASK_WRITER_TERMINAL_STATUS:
                 return existing_record
-        if not runtime_refresh_required and task_review_callback is not None:
+        if not runtime_refresh_required and task_review_callback is not None and not review_feedback:
             existing_record = _collect_task_writer_delivery(
                 index=index,
                 task=task,
@@ -588,6 +848,7 @@ def _run_one_task_writer(
             )
             existing_record["analysis_snapshot_hash"] = analysis_snapshot_hash
             existing_record["writer_session_count"] = max(1, archive_round)
+            existing_record["execution_unit_id"] = unit_id
             if existing_record.get("task_writer_status") == TASK_WRITER_TERMINAL_STATUS:
                 review_action, returned_feedback = _attach_task_reporter_review(
                     callback=task_review_callback,
@@ -596,9 +857,17 @@ def _run_one_task_writer(
                     record=existing_record,
                     session_round=archive_round,
                 )
+                last_reporter = existing_record.get("task_reporter")
                 if review_action in {"terminal", "failed"}:
                     return existing_record
                 if review_action == "writer_revision":
+                    if rerun_budget <= 0:
+                        _recover_writer_exceptions(
+                            work=[(index, task, existing_record, existing_record.get("task_verification") or returned_feedback)],
+                            trigger="external_rerun_budget_exhausted", writer_budget_available=False,
+                            callback=task_review_callback, session_round=archive_round,
+                        )
+                        return existing_record
                     evidence = (
                         returned_feedback.get("rerun_evidence")
                         if isinstance(returned_feedback, dict)
@@ -613,6 +882,8 @@ def _run_one_task_writer(
                         sandbox,
                     )
         if not runtime_refresh_required:
+            if review_feedback:
+                recovery_reason = "requested_delivery_revision"
             _archive_nonterminal_writer_delivery(
                 sandbox=sandbox,
                 output_subdir=output_subdir,
@@ -636,79 +907,108 @@ def _run_one_task_writer(
                 recovery_context=writer_recovery_context(sandbox, reason=recovery_reason, task_ids=[task_id]),
             )
         )
-        session_started_at = time.time()
-        writer_status = _run_task_writer_codex_session(
-            label=label,
-            prompt=prompt,
-            sandbox=sandbox,
-            audit_dir=audit_dir,
-            case_runtime=case_runtime,
-            request_source=f"task_writer:{task_id}",
-            require_execution_receipt=run_repro,
-        )
+        def produce_delivery(supervisor_feedback, supervisor_attempt):
+            # Only a host-validated full allows old artifact timestamps. The
+            # collector still verifies source/config/input/output hashes after
+            # this continuation, so scientific edits require a new full receipt.
+            preserve_full = bool((supervisor_feedback or {}).get("preserved_full_receipts"))
+            session_started_at = None if supervisor_attempt == 0 or preserve_full else time.time()
+            if supervisor_attempt == 0:
+                writer_status = _inspect_task_writer_completion(
+                    status={"ok": True, "reconciled_delivery": True}, sandbox=sandbox, audit_dir=audit_dir,
+                    case_runtime=case_runtime, request_source=f"task_writer:{task_id}",
+                    require_execution_receipt=run_repro)
+            else:
+                writer_status = _run_task_writer_codex_session(
+                    label=label + (f"_supervisor_{supervisor_attempt:03d}" if supervisor_attempt > 1 else ""),
+                    prompt=_supervisor_writer_prompt(prompt, supervisor_feedback),
+                    sandbox=sandbox,
+                    audit_dir=audit_dir,
+                    case_runtime=case_runtime,
+                    request_source=f"task_writer:{task_id}",
+                    require_execution_receipt=run_repro,
+                )
 
-        if writer_status.get("error_kind") in {
-            "environment_request",
-            "environment_request_invalid",
-            "foundation_revision",
+            if writer_status.get("error_kind") in {
+                "environment_request",
+                "environment_request_invalid",
+                "sandbox_inspection_failed",
+                "foundation_revision",
+            }:
+                return writer_status, [{
+                    "index": index,
+                    "task_id": task_id,
+                    "module": module,
+                    "output_subdir": output_subdir,
+                    "sandbox": str(sandbox),
+                    "task_writer_status": "blocked_environment",
+                    "writer_completed": False,
+                    "writer_error_kind": writer_status.get("error_kind"),
+                    "writer_status": writer_status,
+                    "environment_requests": writer_status.get("environment_requests", []),
+                    "foundation_revision_request": writer_status.get("foundation_revision_request"),
+                    "analysis_snapshot_hash": analysis_snapshot_hash,
+                    "writer_session_count": session_round,
+                }]
+
+            if foundation is not None:
+                frozen_issues = foundation_violations(sandbox, foundation)
+                if frozen_issues:
+                    restore_foundation_snapshot(sandbox, foundation)
+                    writer_status = {
+                        **writer_status,
+                        "ok": False,
+                        "error_kind": "foundation_modified",
+                        "blocked_reason": "task writer changed the frozen scientific foundation",
+                        "foundation_violations": frozen_issues,
+                    }
+            _restore_trusted_files(sandbox, {"version": 1, "tasks": [manifest_entry]})
+            record = _collect_task_writer_delivery(
+                index=index,
+                task=task,
+                manifest_entry=manifest_entry,
+                sandbox=sandbox,
+                writer_status=writer_status,
+                require_stopping_assessment=False,
+                fresh_since=session_started_at,
+            )
+            record["analysis_snapshot_hash"] = analysis_snapshot_hash
+            record["writer_session_count"] = session_round
+            record["execution_unit_id"] = unit_id
+            return writer_status, [record]
+
+        writer_status, delivery_records = _supervise_writer_delivery(
+            node_id=f"writer:{unit_id}:round:{session_round}", produce=produce_delivery,
+            archive=lambda status, _attempt: _archive_nonterminal_writer_delivery(
+                sandbox=sandbox, output_subdir=output_subdir,
+                round_no=_next_writer_progress_round(sandbox), session_status=status),
+            tasks=[task], sandbox=sandbox, analysis_snapshot_hash=analysis_snapshot_hash,
+            reconcile_first=reconcile_first,
+        )
+        reconcile_first = False
+        record = delivery_records[0]
+        if record.get("supervisor_blocked") or writer_status.get("error_kind") in {
+            "environment_request", "environment_request_invalid", "foundation_revision", "sandbox_inspection_failed",
         }:
-            return {
-                "index": index,
-                "task_id": task_id,
-                "module": module,
-                "output_subdir": output_subdir,
-                "sandbox": str(sandbox),
-                "task_writer_status": "blocked_environment",
-                "writer_completed": False,
-                "writer_error_kind": writer_status.get("error_kind"),
-                "writer_status": writer_status,
-                "environment_requests": writer_status.get("environment_requests", []),
-                "foundation_revision_request": writer_status.get("foundation_revision_request"),
-                "analysis_snapshot_hash": analysis_snapshot_hash,
-                "writer_session_count": session_round,
-            }
-
-        if foundation is not None:
-            frozen_issues = foundation_violations(sandbox, foundation)
-            if frozen_issues:
-                restore_foundation_snapshot(sandbox, foundation)
-                writer_status = {
-                    **writer_status,
-                    "ok": False,
-                    "error_kind": "foundation_modified",
-                    "blocked_reason": "task writer changed the frozen scientific foundation",
-                    "foundation_violations": frozen_issues,
-                }
-        _restore_trusted_files(sandbox, {"version": 1, "tasks": [manifest_entry]})
-        record = _collect_task_writer_delivery(
-            index=index,
-            task=task,
-            manifest_entry=manifest_entry,
-            sandbox=sandbox,
-            writer_status=writer_status,
-            require_stopping_assessment=False,
-            fresh_since=session_started_at,
-        )
-        record["analysis_snapshot_hash"] = analysis_snapshot_hash
-        record["writer_session_count"] = session_round
+            return record
+        recovered_feedback = None
         if required_change_baseline is not None:
             current_state = _record_source_config_fingerprint(record, sandbox)
             if current_state == required_change_baseline:
-                _terminalize_rerun_request(
-                    record=record,
-                    verification=review_feedback,
-                    stop_reason="writer_continuation_without_source_change",
-                    uncertainty=(
-                        "The Reporter-authorized continuation changed neither task source "
-                        "nor run configuration; the flow stopped instead of spending "
-                        "another unchanged scientific run."
-                    ),
+                if isinstance(last_reporter, dict):
+                    record["task_reporter"] = last_reporter
+                recovery_feedback = (last_reporter or {}).get("task_verification") or review_feedback
+                recovered = _recover_writer_exceptions(
+                    work=[(index, task, record, recovery_feedback)],
+                    trigger="writer_continuation_without_source_change",
+                    writer_budget_available=evidence_based_reruns < rerun_budget,
+                    callback=task_review_callback, session_round=session_round,
                 )
-                return _complete_task_writer_runtime_refresh(
-                    record=record,
-                    marker=refresh_marker,
-                    required=runtime_refresh_required,
-                )
+                recovered_feedback = recovered.get(task_id)
+                if not recovered_feedback:
+                    return _complete_task_writer_runtime_refresh(
+                        record=record, marker=refresh_marker, required=runtime_refresh_required,
+                    )
             required_change_baseline = None
         if not run_repro or task_review_callback is None:
             return _complete_task_writer_runtime_refresh(
@@ -716,13 +1016,13 @@ def _run_one_task_writer(
                 marker=refresh_marker,
                 required=runtime_refresh_required,
             )
-        review_action, returned_feedback = _attach_task_reporter_review(
-            callback=task_review_callback,
-            index=index,
-            task=task,
-            record=record,
-            session_round=session_round,
-        )
+        if recovered_feedback:
+            review_action, returned_feedback = "writer_revision", recovered_feedback
+        else:
+            review_action, returned_feedback = _attach_task_reporter_review(
+                callback=task_review_callback, index=index, task=task, record=record, session_round=session_round,
+            )
+        last_reporter = record.get("task_reporter")
         if review_action in {"terminal", "failed"}:
             return _complete_task_writer_runtime_refresh(
                 record=record,
@@ -736,37 +1036,21 @@ def _run_one_task_writer(
                 else None
             )
             rerun_fingerprint = _rerun_evidence_fingerprint(evidence, _writer_progress_fingerprint(sandbox))
-            if rerun_fingerprint in seen_rerun_requests:
-                _terminalize_rerun_request(
-                    record=record,
-                    verification=returned_feedback,
-                    stop_reason="repeated_rerun_request_without_new_causal_plan",
-                    uncertainty=(
-                        "The same causal rerun request recurred after one Writer attempt; "
-                        "the flow stopped instead of repeating unchanged work."
-                    ),
+            repeated = rerun_fingerprint in seen_rerun_requests
+            if not recovered_feedback and (repeated or evidence_based_reruns >= rerun_budget):
+                recovered = _recover_writer_exceptions(
+                    work=[(index, task, record, record.get("task_verification") or returned_feedback)],
+                    trigger="repeated_rerun_request_without_new_causal_plan" if repeated else "external_rerun_budget_exhausted",
+                    writer_budget_available=evidence_based_reruns < rerun_budget,
+                    callback=task_review_callback, session_round=session_round,
                 )
-                return _complete_task_writer_runtime_refresh(
-                    record=record,
-                    marker=refresh_marker,
-                    required=runtime_refresh_required,
-                )
-            if (
-                evidence_based_reruns >= rerun_budget
-            ):
-                _terminalize_rerun_request(
-                    record=record,
-                    verification=returned_feedback,
-                    stop_reason="external_rerun_budget_exhausted",
-                    uncertainty=(
-                        "The externally configured operational rerun budget was exhausted; "
-                        "the latest scientific result was retained for reporting."
-                    ),
-                )
-                return _complete_task_writer_runtime_refresh(
-                    record=record,
-                    marker=refresh_marker,
-                    required=runtime_refresh_required,
+                returned_feedback = recovered.get(task_id)
+                if not returned_feedback:
+                    return _complete_task_writer_runtime_refresh(
+                        record=record, marker=refresh_marker, required=runtime_refresh_required,
+                    )
+                rerun_fingerprint = _rerun_evidence_fingerprint(
+                    returned_feedback.get("rerun_evidence"), _writer_progress_fingerprint(sandbox),
                 )
             seen_rerun_requests.add(rerun_fingerprint)
             evidence_based_reruns += 1
@@ -809,10 +1093,13 @@ def _attach_task_reporter_review(
     task: dict[str, Any],
     record: dict[str, Any],
     session_round: int,
+    writer_revision_permitted: bool = True,
 ) -> tuple[str, dict[str, Any] | None]:
     expected_task_id = str(task.get("task_id") or record.get("task_id") or "")
     try:
-        task_reporter = callback(index, task, record, session_round)
+        task_reporter = _obtain_reporter_review(callback, index, task, record, session_round)
+    except PipelineCancelled:
+        raise
     except Exception as exc:
         _clear_previous_reporter_decision(record)
         message = redact_text(f"{type(exc).__name__}: {exc}")[:1000]
@@ -854,46 +1141,26 @@ def _attach_task_reporter_review(
             warnings.append("task Reporter produced no note; preserving the Writer delivery")
         return "failed", None
     if verification.get("host_action") == "rerun_writer":
-        path_issues = rerun_evidence_path_issues(
-            verification,
-            task_reporter.get("workspace"),
-        )
-        if path_issues:
-            warnings = record.setdefault("delivery_warnings", [])
-            if isinstance(warnings, list):
-                warnings.extend(path_issues)
-            _terminalize_rerun_request(
-                record=record,
-                verification=verification,
-                stop_reason="untrusted_rerun_paper_evidence",
-                uncertainty=(
-                    "Reporter suggested a rerun without trusted existing paper evidence; "
-                    "the host declined it and retained a terminal outcome."
-                ),
-            )
-        elif writer_revision_allowed(verification, expected_task_id):
-            request = _reporter_foundation_revision(record, task_reporter, verification)
-            if request is not None:
-                record["foundation_revision_request"] = request
-                record["task_reporter_terminal"] = False
-                return "terminal", None
+        route = getattr(task_reporter, "revision_route", None)
+        if route is None:
+            route = resolve_revision_owner(record=record, reporter=task_reporter, verification=verification)
+        if route["action"] == "revise_foundation":
+            record["foundation_revision_request"] = route["request"]
+            record["task_reporter_terminal"] = False
+            return "terminal", None
+        if route["action"] == "revise_writer" and writer_revision_permitted:
             feedback = localize_writer_feedback(
-                verification, reporter_root=Path(str(task_reporter.get("workspace") or "")),
+                route["feedback"], reporter_root=Path(str(task_reporter.get("workspace") or "")),
                 sandbox=Path(str(record.get("sandbox") or "")),
                 output_subdir=str(record.get("output_subdir") or expected_task_id),
             )
             return "writer_revision", feedback
-        else:
-            # A malformed rerun request is not a reason to burn another full run.
-            _terminalize_rerun_request(
-                record=record,
-                verification=verification,
-                stop_reason="incomplete_causal_rerun_plan",
-                uncertainty=(
-                    "Reporter suggested a rerun without a complete causal plan; "
-                    "the host recorded a terminal outcome."
-                ),
-            )
+        _terminalize_rerun_request(
+            record=record, verification=verification,
+            stop_reason=("external_rerun_budget_exhausted" if not writer_revision_permitted
+                         else route.get("reason") or "moderator_stopped_revision"),
+            uncertainty="The coordination decision ended this repair; the original Reporter request is preserved.",
+        )
     issues = task_verification_issues(record.get("task_verification"), expected_task_id)
     if issues:
         warnings = record.setdefault("delivery_warnings", [])
@@ -905,33 +1172,6 @@ def _attach_task_reporter_review(
     record["task_reporter_terminal"] = True
     return "terminal", None
 
-
-def _reporter_foundation_revision(record, reporter, verification):
-    """Route a concrete frozen-module correction to its owner, not back to Writer."""
-    sandbox = Path(str(record.get("sandbox") or ""))
-    architecture_path = sandbox / PAPER_EVIDENCE_DIR / "analysis_artifacts" / "scientific_architecture.json"
-    if not architecture_path.is_file() or not (sandbox / "foundation_manifest.json").is_file():
-        return None
-    architecture = json.loads(architecture_path.read_text(encoding="utf-8-sig"))
-    evidence = verification.get("rerun_evidence") or {}
-    targets = [str(p).replace("\\", "/") for p in evidence.get("change_targets", [])]
-    ids = [str(c.get("id")) for c in architecture.get("components", [])
-           if isinstance(c, dict) and any(str(c.get("module") or "__missing__") in target or str(c.get("id") or "__missing__") == target for target in targets)]
-    if not ids:
-        return None
-    plan_path = architecture_path.with_name("execution_plan.json")
-    plan = json.loads(plan_path.read_text(encoding="utf-8-sig")) if plan_path.is_file() else None
-    workspace = Path(str(reporter.get("workspace") or ""))
-    try:
-        request = validate_foundation_revision_request({"component_ids": ids,
-            "paper_evidence_files": evidence.get("paper_evidence_files", []),
-            "causal_change": evidence.get("proposed_change") or evidence.get("causal_change") or evidence.get("local_observation"),
-            "predicted_effect": evidence.get("expected_effect") or evidence.get("predicted_effect")},
-            architecture=architecture, evidence_root=workspace, execution_plan=plan)
-    except (ValueError, OSError):
-        return None
-    request["evidence_root"] = str(workspace)
-    return request
 
 def _run_task_writer_codex_session(
     *,
@@ -986,6 +1226,14 @@ def _run_task_writer_codex_session(
             image_paths=unique_image_paths(sorted(path.resolve() for path in (sandbox / PAPER_EVIDENCE_DIR / "full_paper_pages").glob("paper_page_*.png") if path.is_file())),
             extra_env=runtime_env, path_prepend=[python_dir],
         )
+    return _inspect_task_writer_completion(status=status, sandbox=sandbox, audit_dir=audit_dir,
+        case_runtime=case_runtime, request_source=request_source,
+        require_execution_receipt=require_execution_receipt, evidence_before=evidence_before)
+
+
+def _inspect_task_writer_completion(*, status, sandbox, audit_dir, case_runtime,
+                                    request_source, require_execution_receipt, evidence_before=None):
+    """Read-only hard checks shared by a new session and local reconciliation."""
     status.update(execution_receipts_required=require_execution_receipt, execution_audit_dir=str(audit_dir))
     try:
         # This no-follow walk must precede every read of Writer-controlled
@@ -995,12 +1243,28 @@ def _run_task_writer_codex_session(
         return {
             **status,
             "ok": False,
-            "error_kind": "environment_request_invalid",
-            "blocked_reason": "task writer sandbox contains an unsafe filesystem entry",
+            "error_kind": "sandbox_inspection_failed",
+            "blocked_reason": f"Writer sandbox inspection failed: {type(exc).__name__}: {redact_text(str(exc))}",
+            "inspection_error": {
+                "type": type(exc).__name__, "message": redact_text(str(exc)),
+                "path": str(getattr(exc, "filename", "") or ""),
+                "errno": getattr(exc, "errno", None), "winerror": getattr(exc, "winerror", None),
+            },
         }
-    if trusted_input_snapshot(sandbox, (PAPER_EVIDENCE_DIR,)) != evidence_before:
-        return {**status, "ok": False, "error_kind": "evidence_modified",
-                "blocked_reason": "Writer changed trusted paper inputs; the delivery cannot establish reproduction"}
+    if evidence_before is not None:
+        evidence_after = trusted_input_snapshot(sandbox, (PAPER_EVIDENCE_DIR,))
+        changed = sorted(path for path, digest in evidence_before.items()
+                         if evidence_after.get(path) != digest)
+        added = sorted(set(evidence_after) - set(evidence_before))
+        if added:
+            # Reporter receives a fresh copy of the original paper, not this
+            # Writer directory. Extra scratch files are observations, not a
+            # reason to suppress an otherwise usable scientific handoff.
+            status["paper_evidence_added_files"] = added
+        if changed:
+            status = {**status, "ok": False, "error_kind": "evidence_modified",
+                      "blocked_reason": "Original paper evidence changed during Writer execution",
+                      "paper_evidence_changed_files": changed}
     try:
         requests = read_environment_request(sandbox=sandbox, source=request_source)
     except EnvironmentPolicyError as exc:

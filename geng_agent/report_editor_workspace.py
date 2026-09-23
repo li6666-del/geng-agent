@@ -10,6 +10,7 @@ from typing import Any
 
 
 REPORT_MARKDOWN_FILES = ("review.md", "reproduction_report.md", "result_review.md")
+REQUIRED_REPORT_MARKDOWN_FILES = ("reproduction_report.md", "result_review.md")
 REPORT_ASSETS_DIR = "report_assets"
 REPORT_FILE_ALIASES = {
     "review.md": ("main_report.md", "final_review.md", "主报告.md", "审查报告.md"),
@@ -23,7 +24,7 @@ def _repair_targets(context: dict[str, Any] | None) -> list[str]:
         return []
     values = context.get("missing_outputs") if isinstance(context.get("missing_outputs"), list) else []
     targets = [name for name in REPORT_MARKDOWN_FILES if name in values]
-    return targets or list(REPORT_MARKDOWN_FILES)
+    return targets or list(REQUIRED_REPORT_MARKDOWN_FILES)
 
 
 def _repair_issues(context: dict[str, Any] | None) -> list[str]:
@@ -201,22 +202,24 @@ def _inspect_report_editor_outputs(
 ) -> dict[str, list[str]]:
     missing: list[str] = []
     hard_issues: list[str] = []
+    observations: list[str] = []
     for name in REPORT_MARKDOWN_FILES:
+        issues = hard_issues if name in REQUIRED_REPORT_MARKDOWN_FILES else observations
         path = workspace / name
         try:
             if path.is_symlink():
-                hard_issues.append(f"{name} must not be a symbolic link")
+                issues.append(f"{name} must not be a symbolic link")
             elif not path.exists():
-                missing.append(name)
+                (missing if name in REQUIRED_REPORT_MARKDOWN_FILES else observations).append(name)
             elif not path.is_file():
-                hard_issues.append(f"{name} must be a regular file")
+                issues.append(f"{name} must be a regular file")
             elif path.stat().st_size > max_bytes:
-                hard_issues.append(f"{name} exceeds the report resource limit")
+                issues.append(f"{name} exceeds the report resource limit")
             elif not path.read_text(encoding="utf-8").strip():
-                missing.append(name)
+                (missing if name in REQUIRED_REPORT_MARKDOWN_FILES else observations).append(name)
         except (OSError, UnicodeError) as exc:
-            hard_issues.append(f"{name} could not be read safely: {type(exc).__name__}")
-    return {"missing": missing, "hard_issues": hard_issues}
+            issues.append(f"{name} could not be read safely: {type(exc).__name__}")
+    return {"missing": missing, "hard_issues": hard_issues, "observations": observations}
 
 def _clear_editor_outputs(output_dir: Path) -> None:
     for name in (*REPORT_MARKDOWN_FILES, "review.docx", "reproduction_report.docx", "result_review.docx", "report_editor_error.json"):
@@ -232,9 +235,10 @@ def _report_outputs_fingerprint(
     *,
     max_bytes: int = REPORT_MARKDOWN_MAX_BYTES,
 ) -> str | None:
-    paths = [output_dir / name for name in REPORT_MARKDOWN_FILES]
-    if not all(_nonempty_file(path, max_bytes=max_bytes) for path in paths):
+    if not all(_nonempty_file(output_dir / name, max_bytes=max_bytes) for name in REQUIRED_REPORT_MARKDOWN_FILES):
         return None
+    paths = [output_dir / name for name in REPORT_MARKDOWN_FILES
+             if _nonempty_file(output_dir / name, max_bytes=max_bytes)]
     digest = hashlib.sha256()
     try:
         for path in paths:

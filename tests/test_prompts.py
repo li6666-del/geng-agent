@@ -22,74 +22,29 @@ class PromptTests(unittest.TestCase):
 
     def test_active_analysis_prompts_render(self) -> None:
         book = PromptBook()
+        architecture = "## Contract rules" + book.load("design_scientific_architecture.md").split("## Contract rules", 1)[1].split("## Host capability inventory", 1)[0]
         rendered = {
-            "facts": book.render("extract_engineering_facts.md", paper_chunks_json="[]"),
-            "backfill": book.render(
-                "targeted_fact_backfill.md",
-                round_index="1",
-                existing_facts_json="{}",
-                targeted_requests_json="[]",
-                current_tasks_json="{}",
-                search_ledger_json="{}",
-                paper_context_json="[]",
-            ),
-            "thesis": book.render(
-                "extract_paper_thesis.md",
-                engineering_facts_json="{}",
-                paper_chunks_json="[]",
-            ),
-            "tasks": book.render(
-                "build_repro_tasks.md",
-                engineering_facts_json="{}",
-                fact_coverage_json="{}",
-                paper_context_json="[]",
-            ),
-            "finalize_tasks": book.render(
-                "finalize_repro_tasks.md",
-                round_index="1",
-                current_tasks_json="{}",
-                final_engineering_facts_json="{}",
-                backfill_resolution_json="{}",
-                search_ledger_json="{}",
-                paper_context_json="[]",
-                paper_thesis_json="{}",
-            ),
-            "architecture": book.render(
-                "design_scientific_architecture.md",
-                engineering_facts_json="{}",
-                repro_tasks_json="{}",
-                paper_thesis_json="{}",
-                experiment_index_json="{}",
-                execution_plan_json="{}",
-                host_capabilities_json="{}",
-                paper_chunks_json="[]",
-            ),
+            "understanding": book.render("understand_paper.md", paper_context="original paper evidence"),
+            "planning": book.render("plan_experiments.md", architecture_rules=architecture,
+                paper_context="original paper evidence", understanding="{}", revision_context="{}", host_capabilities="{}"),
+            "backfill": book.render("targeted_fact_backfill.md", round_index="1", existing_facts_json="{}",
+                targeted_requests_json="[]", current_tasks_json="{}", search_ledger_json="{}", paper_context_json="[]"),
         }
-
         for name, prompt in rendered.items():
             self.assertTrue(prompt.strip(), name)
             self.assertNotIn("{{", prompt, name)
-
-        self.assertIn("JSON", rendered["facts"])
-        self.assertIn("机制", rendered["thesis"])
-        self.assertIn("required_facts", rendered["tasks"])
-        self.assertIn("missing_fact_requests", rendered["tasks"])
-        self.assertIn("backfill_handoff", rendered["tasks"])
-        self.assertIn("ready_for_writer", rendered["tasks"])
-        self.assertIn("scientific_acceptance", rendered["tasks"])
-        self.assertIn("只进行这一轮全局扫描", rendered["facts"])
-        self.assertIn("允许只交付", rendered["backfill"])
-        self.assertNotIn("都必须输出且只输出", rendered["backfill"])
-        self.assertIn("定向", rendered["backfill"])
+        self.assertIn("engineering_facts", rendered["understanding"])
+        self.assertIn("central scientific claims", rendered["understanding"])
+        self.assertIn("never label that correction as literal paper text", rendered["understanding"])
+        self.assertIn("missing_fact_requests", rendered["planning"])
+        self.assertIn("backfill_handoff", rendered["planning"])
+        self.assertIn("scientific_acceptance", rendered["planning"])
+        self.assertIn("schedulable dependencies", rendered["planning"])
+        self.assertIn("multiple architecture bindings", rendered["planning"])
+        self.assertIn("environment gap, never permission to replace the scientific algorithm", rendered["planning"])
+        self.assertNotIn("exactly one host experiment entry per task", rendered["planning"])
         self.assertIn("request_resolutions", rendered["backfill"])
-        self.assertIn("required_fields", rendered["finalize_tasks"])
-        self.assertIn("backfill_handoff", rendered["finalize_tasks"])
-        self.assertIn("ready_for_writer", rendered["finalize_tasks"])
-        self.assertIn("paper_thesis_json", rendered["finalize_tasks"])
-        self.assertNotIn("不能用空数组掩盖未知", rendered["finalize_tasks"])
-        self.assertIn("schema_version: \"1.1\"", rendered["architecture"])
-        self.assertIn("Host capability inventory", rendered["architecture"])
-        self.assertIn("must not replace that learned scientific component", rendered["architecture"])
+        self.assertIn("定向", rendered["backfill"])
 
 
 if __name__ == "__main__":

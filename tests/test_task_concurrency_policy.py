@@ -89,5 +89,5 @@ def test_actual_combined_planner_receives_independence_and_state_protection(monk
     assert "Preserve every scientifically necessary dependency" in prompt
     assert "does not reinterpret prose to weaken them" in prompt
     # These architecture rules are injected by the real combined entry point.
-    assert "same-run CSVs merely to agree numerically" in prompt
-    assert "unnecessary draft edge is not an immutable scientific fact" in prompt
+    assert "Shared deterministic definitions can normally run in independent Writers" in prompt
+    assert "do not drop scientifically necessary state to gain concurrency" in prompt

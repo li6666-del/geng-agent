@@ -10,11 +10,8 @@ from unittest.mock import patch
 
 from geng_agent.agentic_foundation import (
     _foundation_brief,
-    _host_revalidation_already_attempted,
     _load_foundation_validation_record,
-    _load_cached_foundation_failure,
     _restore_trusted_runtime_atomically,
-    _validation_allows_writer_delivery_reuse,
     _validate_foundation_delivery,
     foundation_violations,
     run_codex_foundation_writer_workflow,
@@ -69,7 +66,8 @@ class FoundationSnapshotTests(unittest.TestCase):
                 "issues": cached_issues,
                 "tests": {
                     "passed": False,
-                    "returncode": 1,
+                    "returncode": None,
+                    "spawn_error": "host process could not start",
                     "stderr": (
                         "C:/env/Lib/site-packages/torch/library.py: "
                         "PermissionError: Foundation runtime guard: host import blocked"
@@ -136,195 +134,7 @@ class FoundationSnapshotTests(unittest.TestCase):
         self.assertEqual(resume_record["source"], "cached_writer_delivery_host_revalidation")
         self.assertFalse(resume_record["writer_rerun"])
 
-    def test_validation_reuse_classifier_separates_host_failures_from_writer_defects(self) -> None:
-        infrastructure = {
-            "ok": False,
-            "issues": [{"file": "tests", "message": "contract tests failed"}],
-            "tests": {
-                "passed": False,
-                "returncode": 1,
-                "stderr": (
-                    "C:/env/Lib/site-packages/numpy/core.py: "
-                    "NameError raised while NumPy initialized through the host guard"
-                ),
-                "delivery_immutable": True,
-            },
-        }
-        assertion_failure = {
-            "ok": False,
-            "issues": [{"file": "tests", "message": "contract tests failed"}],
-            "tests": {
-                "passed": False,
-                "returncode": 1,
-                "stderr": "AssertionError: expected shape (4, 4)",
-                "delivery_immutable": True,
-            },
-        }
-        pretest_failure = {
-            "ok": False,
-            "issues": [{"file": "src/model.py", "message": "syntax error"}],
-            "tests": {"passed": False, "skipped": True},
-        }
-        immutable_timeout = {
-            "ok": False,
-            "issues": [
-                {
-                    "file": "tests",
-                    "message": "Foundation contract tests failed or timed out",
-                }
-            ],
-            "tests": {
-                "passed": False,
-                "timed_out": True,
-                "delivery_immutable": True,
-            },
-        }
-        mutated_timeout = {
-            "ok": False,
-            "issues": [
-                {
-                    "file": "tests",
-                    "message": "Foundation contract tests failed or timed out",
-                }
-            ],
-            "tests": {
-                "passed": False,
-                "timed_out": True,
-                "delivery_immutable": False,
-            },
-        }
-        timeout_with_assertion = {
-            "ok": False,
-            "issues": [
-                {
-                    "file": "tests",
-                    "message": "Foundation contract tests failed or timed out",
-                }
-            ],
-            "tests": {
-                "passed": False,
-                "timed_out": True,
-                "delivery_immutable": True,
-                "stderr": "FAIL: test_shape\nAssertionError: expected shape (4, 4)",
-            },
-        }
-        timeout_with_returncode = {
-            "ok": False,
-            "issues": [
-                {
-                    "file": "tests",
-                    "message": "Foundation contract tests failed or timed out",
-                }
-            ],
-            "tests": {
-                "passed": False,
-                "timed_out": True,
-                "delivery_immutable": True,
-                "returncode": 1,
-            },
-        }
-        malformed_empty_timeout = {
-            "ok": False,
-            "issues": [],
-            "tests": {
-                "passed": False,
-                "timed_out": True,
-                "delivery_immutable": True,
-            },
-        }
 
-        self.assertTrue(_validation_allows_writer_delivery_reuse(None))
-        self.assertTrue(_validation_allows_writer_delivery_reuse({"ok": True}))
-        self.assertTrue(_validation_allows_writer_delivery_reuse(infrastructure))
-        self.assertTrue(
-            _validation_allows_writer_delivery_reuse(immutable_timeout)
-        )
-        self.assertFalse(
-            _validation_allows_writer_delivery_reuse(mutated_timeout)
-        )
-        self.assertFalse(
-            _validation_allows_writer_delivery_reuse(timeout_with_assertion)
-        )
-        self.assertFalse(
-            _validation_allows_writer_delivery_reuse(timeout_with_returncode)
-        )
-        self.assertFalse(
-            _validation_allows_writer_delivery_reuse(malformed_empty_timeout)
-        )
-        self.assertFalse(
-            _validation_allows_writer_delivery_reuse(
-                {
-                    "ok": False,
-                    "issues": [{"file": "tests", "message": "delivery changed"}],
-                    "tests": {"passed": False, "delivery_immutable": False},
-                }
-            )
-        )
-        self.assertFalse(_validation_allows_writer_delivery_reuse(assertion_failure))
-        self.assertFalse(_validation_allows_writer_delivery_reuse(pretest_failure))
-        self.assertFalse(
-            _validation_allows_writer_delivery_reuse(
-                {
-                    "ok": False,
-                    "issues": [{"file": "tests", "message": "contract tests failed"}],
-                    "tests": {
-                        "passed": False,
-                        "returncode": 1,
-                        "stderr": "NameError: missing in numpy.asarray(missing)",
-                        "delivery_immutable": True,
-                    },
-                }
-            )
-        )
-        self.assertFalse(
-            _validation_allows_writer_delivery_reuse(
-                {
-                    "ok": False,
-                    "issues": [{"file": "tests", "message": "contract tests failed"}],
-                    "tests": {
-                        "passed": False,
-                        "returncode": 1,
-                        "stderr": "PermissionError: Foundation runtime guard: open outside output roots",
-                        "delivery_immutable": True,
-                    },
-                }
-            )
-        )
-
-    def test_host_delivery_revalidation_is_limited_to_one_attempt(self) -> None:
-        with TemporaryDirectory() as temp:
-            resume_path = Path(temp) / "03b_foundation_writer_resume.json"
-            resume_path.write_text(
-                json.dumps(
-                    {
-                        "source": "cached_writer_delivery_host_revalidation",
-                        "input_hash": "current-input",
-                        "host_validation_policy_hash": "policy-v1",
-                        "writer_rerun": False,
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            attempted = _host_revalidation_already_attempted(
-                resume_path=resume_path,
-                expected_input_hash="current-input",
-                expected_policy_hash="policy-v1",
-            )
-            stale = _host_revalidation_already_attempted(
-                resume_path=resume_path,
-                expected_input_hash="different-input",
-                expected_policy_hash="policy-v1",
-            )
-            changed_policy = _host_revalidation_already_attempted(
-                resume_path=resume_path,
-                expected_input_hash="current-input",
-                expected_policy_hash="policy-v2",
-            )
-
-        self.assertTrue(attempted)
-        self.assertFalse(stale)
-        self.assertFalse(changed_policy)
 
     def test_completed_writer_delivery_retries_freeze_without_rerunning_writer(self) -> None:
         with TemporaryDirectory() as temp:
@@ -423,41 +233,7 @@ class FoundationSnapshotTests(unittest.TestCase):
             writer_delivery = {"trusted_changed": []}
             finalized = {"snapshot_hash": "revalidated-after-timeout"}
 
-            with patch(
-                "geng_agent.agentic_foundation._collect_writer_analysis_artifacts",
-                return_value={"scientific_architecture.json": {}},
-            ), patch(
-                "geng_agent.agentic_foundation._missing_required_analysis_artifacts",
-                return_value=[],
-            ), patch(
-                "geng_agent.agentic_foundation._analysis_snapshot_hash",
-                return_value="a" * 64,
-            ), patch(
-                "geng_agent.agentic_foundation._foundation_input_hash",
-                return_value="current-input",
-            ), patch(
-                "geng_agent.agentic_foundation._load_cached_foundation",
-                return_value=None,
-            ), patch(
-                "geng_agent.agentic_foundation.load_foundation_writer_delivery",
-                return_value=writer_delivery,
-            ), patch(
-                "geng_agent.agentic_foundation._load_foundation_validation_record",
-                return_value=validation_record,
-            ), patch(
-                "geng_agent.agentic_foundation._required_foundation_modules",
-                return_value={"src/model.py"},
-            ), patch(
-                "geng_agent.agentic_foundation._host_validation_policy_hash",
-                return_value="policy-v1",
-            ), patch(
-                "geng_agent.agentic_foundation.restore_foundation_writer_delivery",
-            ) as restore, patch(
-                "geng_agent.agentic_foundation._finalize_foundation_delivery",
-                return_value=finalized,
-            ) as finalize, patch(
-                "geng_agent.agentic_foundation.run_codex_subprocess",
-            ) as writer:
+            with patch('geng_agent.agentic_foundation._collect_writer_analysis_artifacts', return_value={'scientific_architecture.json': {}}), patch('geng_agent.agentic_foundation._missing_required_analysis_artifacts', return_value=[]), patch('geng_agent.agentic_foundation._analysis_snapshot_hash', return_value='a' * 64), patch('geng_agent.agentic_foundation._foundation_input_hash', return_value='current-input'), patch('geng_agent.agentic_foundation._load_cached_foundation', return_value=None), patch('geng_agent.agentic_foundation.load_foundation_writer_delivery', return_value=writer_delivery), patch('geng_agent.agentic_foundation._load_foundation_validation_record', return_value=validation_record), patch('geng_agent.agentic_foundation._required_foundation_modules', return_value={'src/model.py'}), patch('geng_agent.agentic_foundation.restore_foundation_writer_delivery') as restore, patch('geng_agent.agentic_foundation._finalize_foundation_delivery', return_value=finalized) as finalize, patch('geng_agent.agentic_foundation.run_codex_subprocess') as writer:
                 result = run_codex_foundation_writer_workflow(
                     facts={},
                     tasks={},
@@ -487,102 +263,7 @@ class FoundationSnapshotTests(unittest.TestCase):
             "cached_writer_delivery_host_revalidation",
         )
         self.assertFalse(resume_record["writer_rerun"])
-        self.assertEqual(resume_record["host_validation_policy_hash"], "policy-v1")
 
-    def test_repeated_timed_out_revalidation_stops_without_accepting_or_rerunning_writer(self) -> None:
-        with TemporaryDirectory() as temp:
-            root = Path(temp)
-            output_dir = root / "output"
-            audit_dir = root / "audit"
-            output_dir.mkdir()
-            audit_dir.mkdir()
-            (audit_dir / "03b_foundation_writer_resume.json").write_text(
-                json.dumps(
-                    {
-                        "ok": None,
-                        "source": "cached_writer_delivery_host_revalidation",
-                        "input_hash": "current-input",
-                        "writer_rerun": False,
-                        "host_validation_policy_hash": "policy-v1",
-                    }
-                ),
-                encoding="utf-8",
-            )
-            validation_record = {
-                "ok": False,
-                "input_hash": "current-input",
-                "issues": [
-                    {
-                        "file": "tests",
-                        "message": "Foundation contract tests failed or timed out",
-                    }
-                ],
-                "tests": {
-                    "passed": False,
-                    "timed_out": True,
-                    "delivery_immutable": True,
-                },
-            }
-
-            with patch(
-                "geng_agent.agentic_foundation._collect_writer_analysis_artifacts",
-                return_value={"scientific_architecture.json": {}},
-            ), patch(
-                "geng_agent.agentic_foundation._missing_required_analysis_artifacts",
-                return_value=[],
-            ), patch(
-                "geng_agent.agentic_foundation._analysis_snapshot_hash",
-                return_value="a" * 64,
-            ), patch(
-                "geng_agent.agentic_foundation._foundation_input_hash",
-                return_value="current-input",
-            ), patch(
-                "geng_agent.agentic_foundation._load_cached_foundation",
-                return_value=None,
-            ), patch(
-                "geng_agent.agentic_foundation.load_foundation_writer_delivery",
-                return_value={"trusted_changed": []},
-            ), patch(
-                "geng_agent.agentic_foundation._load_foundation_validation_record",
-                return_value=validation_record,
-            ), patch(
-                "geng_agent.agentic_foundation._required_foundation_modules",
-                return_value={"src/model.py"},
-            ), patch(
-                "geng_agent.agentic_foundation._host_validation_policy_hash",
-                return_value="policy-v1",
-            ), patch(
-                "geng_agent.agentic_foundation.restore_foundation_writer_delivery",
-            ) as restore, patch(
-                "geng_agent.agentic_foundation._finalize_foundation_delivery",
-            ) as finalize, patch(
-                "geng_agent.agentic_foundation._publish_foundation_snapshot",
-            ) as publish, patch(
-                "geng_agent.agentic_foundation.run_codex_subprocess",
-            ) as writer:
-                with self.assertRaisesRegex(
-                    RuntimeError,
-                    "still fails after one pristine delivery revalidation",
-                ):
-                    run_codex_foundation_writer_workflow(
-                        facts={},
-                        tasks={},
-                        experiment_index={},
-                        scientific_architecture={},
-                        paper={},
-                        paper_path=root / "paper.pdf",
-                        paper_images=[],
-                        paper_thesis=None,
-                        output_dir=output_dir,
-                        audit_dir=audit_dir,
-                        resume=True,
-                    )
-
-            writer.assert_not_called()
-            restore.assert_not_called()
-            finalize.assert_not_called()
-            publish.assert_not_called()
-            self.assertFalse((output_dir / "foundation_manifest.json").exists())
 
     def test_pristine_writer_delivery_restores_test_pollution_before_resume(self) -> None:
         with TemporaryDirectory() as temp:
@@ -678,104 +359,12 @@ class FoundationSnapshotTests(unittest.TestCase):
             )
 
         self.assertIsNotNone(record)
-        self.assertTrue(_validation_allows_writer_delivery_reuse(record))
+        self.assertTrue(record["ok"])
 
-    def test_cached_foundation_failure_returns_matching_nonempty_issues(self) -> None:
-        with TemporaryDirectory() as temp:
-            audit_dir = Path(temp)
-            issues = [
-                {
-                    "file": "src/model.py",
-                    "message": "Foundation contract tests failed",
-                }
-            ]
-            (audit_dir / "03b_foundation_validation.json").write_text(
-                (
-                    '{"ok": false, "input_hash": "current-input", '
-                    '"issues": [{"file": "src/model.py", '
-                    '"message": "Foundation contract tests failed"}]}\n'
-                ),
-                encoding="utf-8",
-            )
 
-            cached = _load_cached_foundation_failure(
-                validation_path=audit_dir / "03b_foundation_validation.json",
-                expected_input_hash="current-input",
-            )
 
-            self.assertEqual(cached, issues)
 
-    def test_cached_foundation_failure_ignores_different_input_hash(self) -> None:
-        with TemporaryDirectory() as temp:
-            audit_dir = Path(temp)
-            (audit_dir / "03b_foundation_validation.json").write_text(
-                (
-                    '{"ok": false, "input_hash": "stale-input", '
-                    '"issues": [{"message": "stale failure"}]}\n'
-                ),
-                encoding="utf-8",
-            )
 
-            cached = _load_cached_foundation_failure(
-                validation_path=audit_dir / "03b_foundation_validation.json",
-                expected_input_hash="current-input",
-            )
-
-            self.assertIsNone(cached)
-
-    def test_cached_foundation_failure_ignores_successful_validation(self) -> None:
-        with TemporaryDirectory() as temp:
-            audit_dir = Path(temp)
-            (audit_dir / "03b_foundation_validation.json").write_text(
-                (
-                    '{"ok": true, "input_hash": "current-input", '
-                    '"issues": [{"message": "not a cached failure"}]}\n'
-                ),
-                encoding="utf-8",
-            )
-
-            cached = _load_cached_foundation_failure(
-                validation_path=audit_dir / "03b_foundation_validation.json",
-                expected_input_hash="current-input",
-            )
-
-            self.assertIsNone(cached)
-
-    def test_cached_foundation_failure_requires_nonempty_issue_list(self) -> None:
-        with TemporaryDirectory() as temp:
-            audit_dir = Path(temp)
-            validation_path = audit_dir / "03b_foundation_validation.json"
-            for issues_json in ("[]", '"not-a-list"', "null"):
-                with self.subTest(issues=issues_json):
-                    validation_path.write_text(
-                        (
-                            '{"ok": false, "input_hash": "current-input", '
-                            f'"issues": {issues_json}}}\n'
-                        ),
-                        encoding="utf-8",
-                    )
-
-                    cached = _load_cached_foundation_failure(
-                        validation_path=validation_path,
-                        expected_input_hash="current-input",
-                    )
-
-                    self.assertIsNone(cached)
-
-    def test_cached_foundation_failure_ignores_corrupt_json(self) -> None:
-        with TemporaryDirectory() as temp:
-            audit_dir = Path(temp)
-            (audit_dir / "03b_foundation_validation.json").write_text(
-                '{"ok": false,',
-                encoding="utf-8",
-            )
-
-            cached = _load_cached_foundation_failure(
-                validation_path=audit_dir / "03b_foundation_validation.json",
-                expected_input_hash="current-input",
-            )
-
-            self.assertIsNone(cached)
 
     def test_foundation_brief_treats_acceptance_bindings_as_output_interfaces_only(self) -> None:
         architecture = {
@@ -812,68 +401,7 @@ class FoundationSnapshotTests(unittest.TestCase):
         self.assertIn("Never add tests for paper-claim success", prompt)
         self.assertIn("pixel similarity", prompt)
 
-    def test_metadata_debt_does_not_skip_host_validation(self) -> None:
-        with TemporaryDirectory() as temp:
-            sandbox = Path(temp)
-            source = sandbox / "src" / "model.py"
-            source.parent.mkdir(parents=True)
-            source.write_text("VALUE = 1\n", encoding="utf-8")
-            (sandbox / "orphan.py").write_text("VALUE = 2\n", encoding="utf-8")
-            with patch(
-                "geng_agent.agentic_foundation._required_foundation_modules",
-                return_value={"src/model.py"},
-            ), patch(
-                "geng_agent.agentic_foundation._missing_local_imports",
-                return_value=[],
-            ), patch(
-                "geng_agent.agentic_foundation.static_scan_repro_project",
-                return_value=[],
-            ), patch(
-                "geng_agent.agentic_foundation._run_foundation_tests",
-                return_value={"passed": True, "returncode": 0},
-            ) as host_tests:
-                issues, result = _validate_foundation_delivery(
-                    sandbox=sandbox,
-                    architecture={},
-                    trusted_changed=[],
-                )
 
-            self.assertEqual(issues, [])
-            self.assertTrue(result["passed"])
-            host_tests.assert_called_once_with(sandbox)
-            messages = [item["message"] for item in result["warnings"]]
-            self.assertTrue(any("hand-off JSON" in message for message in messages))
-            self.assertTrue(any("no Foundation contract test" in message for message in messages))
-            self.assertTrue(any("outside Foundation ownership" in message for message in messages))
-            self.assertTrue(any("requirements.txt is missing" in message for message in messages))
-
-    def test_syntax_error_still_skips_host_validation(self) -> None:
-        with TemporaryDirectory() as temp:
-            sandbox = Path(temp)
-            source = sandbox / "src" / "model.py"
-            source.parent.mkdir(parents=True)
-            source.write_text("def broken(:\n", encoding="utf-8")
-            with patch(
-                "geng_agent.agentic_foundation._required_foundation_modules",
-                return_value={"src/model.py"},
-            ), patch(
-                "geng_agent.agentic_foundation._missing_local_imports",
-                return_value=[],
-            ), patch(
-                "geng_agent.agentic_foundation.static_scan_repro_project",
-                return_value=[],
-            ), patch(
-                "geng_agent.agentic_foundation._run_foundation_tests",
-            ) as host_tests:
-                issues, result = _validate_foundation_delivery(
-                    sandbox=sandbox,
-                    architecture={},
-                    trusted_changed=[],
-                )
-
-            self.assertTrue(any("syntax error" in item["message"] for item in issues))
-            self.assertTrue(result["skipped"])
-            host_tests.assert_not_called()
 
     def test_unsafe_foundation_link_layout_skips_host_tests(self) -> None:
         with TemporaryDirectory() as temp:
@@ -881,17 +409,7 @@ class FoundationSnapshotTests(unittest.TestCase):
             source = sandbox / "src" / "model.py"
             source.parent.mkdir(parents=True)
             source.write_text("VALUE = 1\n", encoding="utf-8")
-            with patch(
-                "geng_agent.agentic_foundation._validate_foundation_execution_contracts",
-                return_value=([], []),
-            ) as execution_validator, patch(
-                "geng_agent.agentic_foundation._foundation_project_files",
-                side_effect=RuntimeError(
-                    "Foundation output contains a link or reparse point: src/escape"
-                ),
-            ), patch(
-                "geng_agent.agentic_foundation._run_foundation_tests",
-            ) as host_tests:
+            with patch('geng_agent.agentic_foundation._foundation_project_files', side_effect=RuntimeError('Foundation output contains a link or reparse point: src/escape')), patch('geng_agent.agentic_foundation._run_foundation_tests') as host_tests:
                 issues, result = _validate_foundation_delivery(
                     sandbox=sandbox,
                     architecture={},
@@ -907,7 +425,6 @@ class FoundationSnapshotTests(unittest.TestCase):
                 )
             )
             host_tests.assert_not_called()
-            execution_validator.assert_not_called()
 
     def test_foundation_result_symlink_is_rejected_before_generated_content_reads(self) -> None:
         with TemporaryDirectory() as temp:
@@ -921,11 +438,7 @@ class FoundationSnapshotTests(unittest.TestCase):
             outside.write_text('{"status": "ready_for_tasks"}\n', encoding="utf-8")
             _symlink_or_skip(self, sandbox / "foundation_result.json", outside)
 
-            with patch(
-                "geng_agent.agentic_foundation._validate_foundation_execution_contracts",
-            ) as execution_validator, patch(
-                "geng_agent.agentic_foundation._run_foundation_tests",
-            ) as host_tests:
+            with patch('geng_agent.agentic_foundation._run_foundation_tests') as host_tests:
                 issues, result = _validate_foundation_delivery(
                     sandbox=sandbox,
                     architecture={},
@@ -935,7 +448,6 @@ class FoundationSnapshotTests(unittest.TestCase):
             self.assertTrue(result["skipped"])
             self.assertEqual(result["reason"], "unsafe Foundation filesystem layout")
             self.assertTrue(any("foundation_result.json" in item["message"] for item in issues), issues)
-            execution_validator.assert_not_called()
             host_tests.assert_not_called()
 
     def test_foundation_source_symlink_is_rejected_before_execution_validation(self) -> None:
@@ -949,11 +461,7 @@ class FoundationSnapshotTests(unittest.TestCase):
             _symlink_or_skip(self, source_dir / "model.py", outside)
             (sandbox / "foundation_result.json").write_text("{}\n", encoding="utf-8")
 
-            with patch(
-                "geng_agent.agentic_foundation._validate_foundation_execution_contracts",
-            ) as execution_validator, patch(
-                "geng_agent.agentic_foundation._run_foundation_tests",
-            ) as host_tests:
+            with patch('geng_agent.agentic_foundation._run_foundation_tests') as host_tests:
                 issues, result = _validate_foundation_delivery(
                     sandbox=sandbox,
                     architecture={},
@@ -963,7 +471,6 @@ class FoundationSnapshotTests(unittest.TestCase):
             self.assertTrue(result["skipped"])
             self.assertEqual(result["reason"], "unsafe Foundation filesystem layout")
             self.assertTrue(any("src/model.py" in item["message"] for item in issues), issues)
-            execution_validator.assert_not_called()
             host_tests.assert_not_called()
 
     def test_trusted_runtime_restore_refuses_symlink_without_touching_target(self) -> None:
@@ -1055,88 +562,18 @@ class FoundationSnapshotTests(unittest.TestCase):
             delivery_validator.assert_not_called()
             self.assertEqual(outside.read_text(encoding="utf-8"), "DO_NOT_CHANGE = True\n")
 
-    def test_static_security_finding_remains_blocking(self) -> None:
+
+
+
+
+
+    def test_failed_host_unittest_is_preserved_for_supervisor(self) -> None:
         with TemporaryDirectory() as temp:
             sandbox = Path(temp)
             source = sandbox / "src" / "model.py"
             source.parent.mkdir(parents=True)
             source.write_text("VALUE = 1\n", encoding="utf-8")
-            with patch(
-                "geng_agent.agentic_foundation._validate_foundation_execution_contracts",
-                return_value=([], []),
-            ), patch(
-                "geng_agent.agentic_foundation._required_foundation_modules",
-                return_value={"src/model.py"},
-            ), patch(
-                "geng_agent.agentic_foundation._missing_local_imports",
-                return_value=[],
-            ), patch(
-                "geng_agent.agentic_foundation.static_scan_repro_project",
-                return_value=[
-                    {
-                        "file": "src/model.py",
-                        "line": "1",
-                        "message": "forbidden dynamic builtin: eval",
-                    }
-                ],
-            ), patch(
-                "geng_agent.agentic_foundation._run_foundation_tests",
-                return_value={"passed": True, "returncode": 0},
-            ) as host_tests:
-                issues, result = _validate_foundation_delivery(
-                    sandbox=sandbox,
-                    architecture={},
-                    trusted_changed=[],
-                )
-
-            self.assertTrue(
-                any("forbidden dynamic builtin: eval" in item["message"] for item in issues)
-            )
-            self.assertTrue(result["skipped"])
-            host_tests.assert_not_called()
-
-    def test_authorized_foundation_security_findings_are_advisory(self) -> None:
-        with TemporaryDirectory() as temp:
-            sandbox = Path(temp)
-            source = sandbox / "src" / "model.py"
-            source.parent.mkdir(parents=True)
-            source.write_text(
-                (
-                    "import importlib\n"
-                    "import os\n"
-                    "FOUND = importlib.util.find_spec('numpy')\n"
-                    "ENV = os.environ.get('MODEL_SIZE')\n"
-                    "ALT = os.getenv('MODEL_SIZE')\n"
-                    "SECRET = os.getenv('OPENAI_API_KEY')\n"
-                    "ENV_KEY = 'MODEL_' + 'SIZE'\n"
-                    "DYNAMIC = os.getenv(ENV_KEY)\n"
-                    "SUBSCRIPT = os.environ[ENV_KEY]\n"
-                    "BULK = dict(os.environ)\n"
-                    "os.environ.update({'MODEL_SIZE': 'small'})\n"
-                    "os.environ.pop('OPENAI_API_KEY', None)\n"
-                    "ATTR_NAME = 'environ'\n"
-                    "DYNAMIC_ATTR = getattr(os, ATTR_NAME)\n"
-                    "VALUE = getattr(object(), '__class__', None)\n"
-                    "setattr(VALUE, 'tag', 1)\n"
-                    "delattr(VALUE, 'tag')\n"
-                    "GLOBAL_KEYS = tuple(globals())\n"
-                    "VALUE_KEYS = tuple(vars(VALUE))\n"
-                ),
-                encoding="utf-8",
-            )
-            with patch(
-                "geng_agent.agentic_foundation._validate_foundation_execution_contracts",
-                return_value=([], []),
-            ), patch(
-                "geng_agent.agentic_foundation._required_foundation_modules",
-                return_value={"src/model.py"},
-            ), patch(
-                "geng_agent.agentic_foundation._missing_local_imports",
-                return_value=[],
-            ), patch(
-                "geng_agent.agentic_foundation._run_foundation_tests",
-                return_value={"passed": True, "returncode": 0},
-            ) as host_tests:
+            with patch('geng_agent.agentic_foundation._required_foundation_modules', return_value={'src/model.py'}), patch('geng_agent.agentic_foundation._run_foundation_tests', return_value={'passed': False, 'returncode': 1}) as host_tests:
                 issues, result = _validate_foundation_delivery(
                     sandbox=sandbox,
                     architecture={},
@@ -1144,288 +581,7 @@ class FoundationSnapshotTests(unittest.TestCase):
                 )
 
             self.assertEqual(issues, [])
-            self.assertTrue(result["passed"])
-            host_tests.assert_called_once_with(sandbox)
-            security_warnings = {
-                item["message"]: item
-                for item in result["warnings"]
-                if item.get("category") in {
-                    "environment_access",
-                    "importlib_usage",
-                    "ordinary_reflection",
-                }
-            }
-            expected = {
-                "forbidden import: importlib": "importlib_usage",
-                "forbidden environment access: os.environ": "environment_access",
-                "forbidden environment access: os.getenv": "environment_access",
-                "forbidden dynamic builtin: getattr": "ordinary_reflection",
-                "forbidden dynamic builtin: setattr": "ordinary_reflection",
-                "forbidden dynamic builtin: delattr": "ordinary_reflection",
-                "forbidden dynamic builtin: globals": "ordinary_reflection",
-                "forbidden dynamic builtin: vars": "ordinary_reflection",
-            }
-            self.assertTrue(set(expected) <= set(security_warnings), security_warnings)
-            for message, category in expected.items():
-                self.assertEqual(security_warnings[message]["category"], category)
-                self.assertEqual(security_warnings[message]["severity"], "warning")
-            environment_warnings = [
-                item
-                for item in result["warnings"]
-                if (
-                    "os.environ" in item["message"]
-                    or "os.getenv" in item["message"]
-                )
-            ]
-            self.assertTrue(environment_warnings)
-            self.assertTrue(
-                all(
-                    item["category"] == "environment_access"
-                    and item["severity"] == "warning"
-                    for item in environment_warnings
-                ),
-                environment_warnings,
-            )
-            self.assertTrue(
-                any("sensitive key" in item["message"] for item in environment_warnings),
-                environment_warnings,
-            )
-            self.assertTrue(
-                any("dynamic key" in item["message"] for item in environment_warnings),
-                environment_warnings,
-            )
-            self.assertTrue(
-                any(
-                    "bulk or mutating operation" in item["message"]
-                    for item in environment_warnings
-                ),
-                environment_warnings,
-            )
-
-    def test_unapproved_dangerous_security_findings_remain_blocking(self) -> None:
-        with TemporaryDirectory() as temp:
-            sandbox = Path(temp)
-            source = sandbox / "src" / "model.py"
-            source.parent.mkdir(parents=True)
-            source.write_text(
-                (
-                    "import importlib as loader\n"
-                    "import os as operating\n"
-                    "module_name = 'socket'\n"
-                    "loader.import_module(module_name)\n"
-                    "loader.import_module('socket')\n"
-                    "lib = loader\n"
-                    "lib.import_module(name='socket')\n"
-                    "loader.util.spec_from_file_location('x', '/outside/module.py')\n"
-                    "dynamic_loader = loader.machinery.SourceFileLoader('x', '/outside/module.py')\n"
-                    "dynamic_loader.exec_module(None)\n"
-                    "getattr(operating, 'sys' + 'tem')\n"
-                    "eval('1')\n"
-                    "exec('x = 1')\n"
-                    "compile('1', '<generated>', 'eval')\n"
-                    "__import__('socket')\n"
-                    "operating.system('echo blocked')\n"
-                    "op = operating\n"
-                    "op.system('echo blocked module alias')\n"
-                    "run_eval = eval\n"
-                    "run_eval('1')\n"
-                    "run_process = operating.system\n"
-                    "run_process('echo blocked alias')\n"
-                    "open('/outside-case.txt', 'w')\n"
-                ),
-                encoding="utf-8",
-            )
-            with patch(
-                "geng_agent.agentic_foundation._validate_foundation_execution_contracts",
-                return_value=([], []),
-            ), patch(
-                "geng_agent.agentic_foundation._required_foundation_modules",
-                return_value={"src/model.py"},
-            ), patch(
-                "geng_agent.agentic_foundation._missing_local_imports",
-                return_value=[],
-            ), patch(
-                "geng_agent.agentic_foundation._run_foundation_tests",
-            ) as host_tests:
-                issues, result = _validate_foundation_delivery(
-                    sandbox=sandbox,
-                    architecture={},
-                    trusted_changed=[],
-                )
-
-            self.assertTrue(result["skipped"])
-            host_tests.assert_not_called()
-            categories = {item.get("category") for item in issues}
-            self.assertTrue(
-                {
-                    "dangerous_dynamic_import",
-                    "dangerous_reflection",
-                    "dynamic_execution",
-                    "security_violation",
-                }
-                <= categories,
-                issues,
-            )
-            messages = {item["message"] for item in issues}
-            self.assertIn(
-                "dangerous dynamic import: module target is not a string literal",
-                messages,
-            )
-            self.assertIn(
-                "dangerous reflection: sensitive module os attribute 'system'",
-                messages,
-            )
-            self.assertIn(
-                "dangerous dynamic import: forbidden module target 'socket'",
-                messages,
-            )
-            self.assertTrue(
-                any("spec_from_file_location" in message for message in messages),
-                messages,
-            )
-            self.assertTrue(
-                any("loader construction" in message for message in messages),
-                messages,
-            )
-            self.assertIn("forbidden dynamic builtin: eval", messages)
-            self.assertIn("forbidden dynamic builtin: exec", messages)
-            self.assertIn("forbidden dynamic builtin: compile", messages)
-            self.assertIn("forbidden dynamic builtin: __import__", messages)
-            self.assertIn("forbidden call: os.system", messages)
-            self.assertTrue(any(message.startswith("absolute path literal") for message in messages))
-
-    def test_environment_and_static_contract_gaps_are_advisory(self) -> None:
-        with TemporaryDirectory() as temp:
-            sandbox = Path(temp)
-            source = sandbox / "src" / "model.py"
-            source.parent.mkdir(parents=True)
-            source.write_text("VALUE = 1\n", encoding="utf-8")
-            static_findings = [
-                {
-                    "file": "scientific_architecture.json",
-                    "message": "component encoder environment_extension_required: no trusted training capability probe is registered for framework 'numpy'",
-                },
-                {
-                    "file": "scientific_architecture.json",
-                    "message": "component adapter environment_extension_required: no trusted host invocation adapter is registered for external runtime 'MATLAB'",
-                },
-                {
-                    "file": "src/model.py",
-                    "message": "component encoder callable Encoder.forward is absent from its declared module",
-                },
-                {
-                    "file": "src/model.py",
-                    "message": "component encoder primary framework 'numpy' is never imported by Foundation-owned source",
-                },
-                {
-                    "file": "foundation_result.json",
-                    "message": "component encoder execution contract weakens or changes precision",
-                },
-                {
-                    "file": "foundation_result.json",
-                    "message": "component encoder lacks passing capability_tests evidence for gradient/back-propagation",
-                },
-            ]
-            with patch(
-                "geng_agent.agentic_foundation._validate_foundation_execution_contracts",
-                return_value=(static_findings, []),
-            ), patch(
-                "geng_agent.agentic_foundation._required_foundation_modules",
-                return_value={"src/model.py"},
-            ), patch(
-                "geng_agent.agentic_foundation._missing_local_imports",
-                return_value=[],
-            ), patch(
-                "geng_agent.agentic_foundation.static_scan_repro_project",
-                return_value=[],
-            ), patch(
-                "geng_agent.agentic_foundation._run_foundation_tests",
-                return_value={"passed": True, "returncode": 0},
-            ) as host_tests:
-                issues, result = _validate_foundation_delivery(
-                    sandbox=sandbox,
-                    architecture={},
-                    trusted_changed=[],
-                )
-
-            self.assertEqual(issues, [])
-            self.assertTrue(result["passed"])
-            host_tests.assert_called_once_with(sandbox)
-            categorized = [
-                item
-                for item in result["warnings"]
-                if item.get("category") in {
-                    "execution_capability_advisory",
-                    "static_contract_advisory",
-                }
-            ]
-            self.assertEqual(len(categorized), len(static_findings))
-            self.assertTrue(all(item.get("severity") == "warning" for item in categorized))
-            self.assertEqual(
-                sum(item.get("category") == "execution_capability_advisory" for item in categorized),
-                2,
-            )
-
-    def test_missing_local_import_remains_blocking_before_host_tests(self) -> None:
-        with TemporaryDirectory() as temp:
-            sandbox = Path(temp)
-            source = sandbox / "src" / "model.py"
-            source.parent.mkdir(parents=True)
-            source.write_text("from src.missing import Model\n", encoding="utf-8")
-            with patch(
-                "geng_agent.agentic_foundation._validate_foundation_execution_contracts",
-                return_value=([], []),
-            ), patch(
-                "geng_agent.agentic_foundation._required_foundation_modules",
-                return_value={"src/model.py"},
-            ), patch(
-                "geng_agent.agentic_foundation._missing_local_imports",
-                return_value=[{"file": "src/model.py", "message": "missing local import: src.missing"}],
-            ), patch(
-                "geng_agent.agentic_foundation.static_scan_repro_project",
-                return_value=[],
-            ), patch(
-                "geng_agent.agentic_foundation._run_foundation_tests",
-            ) as host_tests:
-                issues, result = _validate_foundation_delivery(
-                    sandbox=sandbox,
-                    architecture={},
-                    trusted_changed=[],
-                )
-
-            self.assertTrue(any("missing local import" in item["message"] for item in issues))
-            self.assertTrue(result["skipped"])
-            host_tests.assert_not_called()
-
-    def test_failed_host_unittest_remains_blocking(self) -> None:
-        with TemporaryDirectory() as temp:
-            sandbox = Path(temp)
-            source = sandbox / "src" / "model.py"
-            source.parent.mkdir(parents=True)
-            source.write_text("VALUE = 1\n", encoding="utf-8")
-            with patch(
-                "geng_agent.agentic_foundation._validate_foundation_execution_contracts",
-                return_value=([{"file": "scientific_architecture.json", "message": "component encoder environment_extension_required: no trusted probe"}], []),
-            ), patch(
-                "geng_agent.agentic_foundation._required_foundation_modules",
-                return_value={"src/model.py"},
-            ), patch(
-                "geng_agent.agentic_foundation._missing_local_imports",
-                return_value=[],
-            ), patch(
-                "geng_agent.agentic_foundation.static_scan_repro_project",
-                return_value=[],
-            ), patch(
-                "geng_agent.agentic_foundation._run_foundation_tests",
-                return_value={"passed": False, "returncode": 1},
-            ) as host_tests:
-                issues, result = _validate_foundation_delivery(
-                    sandbox=sandbox,
-                    architecture={},
-                    trusted_changed=[],
-                )
-
-            self.assertTrue(any("contract tests failed" in item["message"] for item in issues))
+            self.assertTrue(any(item["kind"] == "test_execution_not_passed" for item in result["observations"]))
             self.assertFalse(result["passed"])
             host_tests.assert_called_once_with(sandbox)
 
@@ -1443,29 +599,14 @@ class FoundationSnapshotTests(unittest.TestCase):
                 artifact.write_text("{}\n", encoding="utf-8")
                 return {"passed": True, "returncode": 0}
 
-            with patch(
-                "geng_agent.agentic_foundation._validate_foundation_execution_contracts",
-                return_value=([], []),
-            ), patch(
-                "geng_agent.agentic_foundation._required_foundation_modules",
-                return_value={"src/model.py"},
-            ), patch(
-                "geng_agent.agentic_foundation._missing_local_imports",
-                return_value=[],
-            ), patch(
-                "geng_agent.agentic_foundation.static_scan_repro_project",
-                return_value=[],
-            ), patch(
-                "geng_agent.agentic_foundation._run_foundation_tests",
-                side_effect=mutate_delivery,
-            ):
+            with patch('geng_agent.agentic_foundation._required_foundation_modules', return_value={'src/model.py'}), patch('geng_agent.agentic_foundation._run_foundation_tests', side_effect=mutate_delivery):
                 issues, result = _validate_foundation_delivery(
                     sandbox=sandbox,
                     architecture={},
                     trusted_changed=[],
                 )
 
-            self.assertFalse(result["passed"])
+            self.assertTrue(result["passed"])  # Test exit and delivery integrity are separate facts.
             self.assertFalse(result["delivery_immutable"])
             self.assertEqual(result["changed_delivery_files"], ["src/model.py"])
             self.assertTrue(

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-from copy import deepcopy
 import json
 import re
 from pathlib import Path
@@ -13,12 +12,6 @@ from .codex_runner import run_codex_subprocess
 from .json_utils import parse_json_object
 from .llm import LLMImage
 from .outputs import write_json, write_text
-from .pipeline_helpers import (
-    build_json_inline_retry_prompt, build_json_scientific_retry_prompt,
-    build_json_preservation_retry_prompt,
-)
-from .analysis_repair import preserved_science_issues, scientific_correction_paths
-from .schema_models import model_for_stage
 from .schemas import ValidationIssue, format_issues, validate_stage
 
 
@@ -31,6 +24,7 @@ ANALYSIS_DOCUMENTS = {
 
 def _read_analysis_documents(workspace: Path, documents: dict[str, str]) -> str:
     values = {}
+    observations = []
     for key, name in documents.items():
         path = workspace / name
         if not path.exists():
@@ -42,231 +36,82 @@ def _read_analysis_documents(workspace: Path, documents: dict[str, str]) -> str:
         try:
             values[key] = json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError) as exc:
-            raise ValueError(f"Cannot read {name}: {exc}") from exc
+            if key in {"facts", "tasks"}:
+                raise ValueError(f"Cannot read {name}: {exc}") from exc
+            observations.append({"document": name, "path": str(path),
+                                 "observation": f"Optional document could not be decoded: {exc}"})
+    if observations:
+        values["_meta"] = {"document_observations": observations}
     return json.dumps(values, ensure_ascii=False)
 
 
 def run_codex_json_stage(
-    *,
-    prompt: str,
-    stage_label: str,
-    schema_stage: str,
-    output_dir: Path,
-    audit_dir: Path,
-    max_attempts: int,
-    pre_validation: Callable[[dict[str, Any]], list[ValidationIssue]] | None = None,
-    extra_validation: Callable[[dict[str, Any]], list[ValidationIssue]] | None = None,
-    candidate_normalizer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
-    repair_preservation_validator: Callable[[dict[str, Any], dict[str, Any]], list[ValidationIssue]] | None = None,
-    truncation_recovery: Callable[[str], dict[str, Any] | None] | None = None,
+    *, prompt: str, stage_label: str, schema_stage: str, output_dir: Path,
+    audit_dir: Path, max_attempts: int,
+    pre_validation: Callable | None = None, extra_validation: Callable | None = None,
+    candidate_normalizer: Callable | None = None,
+    repair_preservation_validator: Callable | None = None,
+    truncation_recovery: Callable | None = None,
     images: list[LLMImage] | None = None,
 ) -> dict[str, Any]:
-    """Run one structured analysis stage through Codex CLI.
+    """One owner request; the run supervisor owns diagnosis and retry decisions."""
+    from .supervisor import NodeFailure
+    from .progress import PipelineCancelled
 
-    Codex is the reasoning worker; the harness enforces JSON parsing,
-    deterministic normalization, structural validation, and the stage's
-    execution-critical scientific checks. Repairable findings are returned to
-    the same worker as one aggregated repair request.
-    """
-
-    attempts = max(1, int(max_attempts or 1))
-    schema_path = _write_stage_schema(audit_dir, stage_label, schema_stage)
-    schema_text = schema_path.read_text(encoding="utf-8")
+    invocation = uuid4().hex[:12]
+    snapshot = audit_dir / "analysis_candidates" / stage_label / invocation
+    snapshot.mkdir(parents=True, exist_ok=True)
     image_paths = _write_analysis_images(audit_dir, stage_label, images or [])
-    current_prompt = prompt
-    last_errors = ""
-    repair_mode = False
-    scientific_repair = False
-    authorized_paths: list[str] = []
-    repair_baseline: dict[str, Any] | None = None
     documents = ANALYSIS_DOCUMENTS.get(schema_stage)
-    workspace = audit_dir / f"{stage_label}_documents" / uuid4().hex[:12] if documents else output_dir
+    workspace = audit_dir / f"{stage_label}_documents" / invocation if documents else output_dir
     if documents:
         workspace.mkdir(parents=True)
-
-    for attempt in range(1, attempts + 1):
-        label = f"{stage_label}_codex_attempt_{attempt}"
-        brief = _build_analysis_brief(
-            prompt=current_prompt,
-            stage_label=stage_label,
-            schema_stage=schema_stage,
-            attempt=attempt,
-            max_attempts=attempts,
-            schema_text="" if repair_mode else schema_text,
-        )
-        write_text(audit_dir / f"{label}_brief.md", brief)
-        status = run_codex_subprocess(
-            role="analysis",
-            work_dir=workspace,
-            prompt=brief,
-            audit_dir=audit_dir,
-            label=label,
-            sandbox="workspace-write" if documents else "read-only",
-            command_override=get_config_value("GENG_CODEX_ANALYSIS_CMD"),
-            image_paths=[] if repair_mode and not scientific_repair else image_paths,
-        )
-        if not status.get("ok"):
-            last_errors = status.get("error") or "Codex analysis subprocess failed"
-            write_json(
-                audit_dir / f"validation_{stage_label}_attempt_{attempt}.json",
-                {"ok": False, "errors": [{"path": "$", "message": last_errors}]},
-            )
-            write_json(
-                audit_dir / f"agentic_analysis_error_{stage_label}_attempt_{attempt}.json",
-                {"stage": stage_label, "attempt": attempt, "error": last_errors, "status": status},
-            )
-            if repair_baseline is None:
-                current_prompt = prompt
-                repair_mode = False
-                scientific_repair = False
-            continue
-
-        try:
-            raw = _read_analysis_documents(workspace, documents) if documents else _read_last_message_file(status)
-        except Exception as exc:
-            last_errors = f"Codex analysis did not produce readable {'documents' if documents else 'last message'}: {exc}"
-            write_json(
-                audit_dir / f"validation_{stage_label}_attempt_{attempt}.json",
-                {"ok": False, "errors": [{"path": "$", "message": last_errors}]},
-            )
-            if documents:
-                current_prompt = "Document transport repair: " + last_errors + (
-                    "\nRepair only the named unreadable file. Keep all other completed JSON files intact; "
-                    "do not repeat the paper analysis or change the scientific plan for a JSON syntax error."
-                ) + "\nTrusted schema:\n" + schema_text
-                repair_mode = True
-                scientific_repair = False
-            continue
-
-        raw_path = audit_dir / f"raw_{stage_label}_attempt_{attempt}.txt"
-        write_text(raw_path, raw)
+    label = f"{stage_label}_codex_attempt_1"
+    brief = _build_analysis_brief(prompt=prompt, stage_label=stage_label,
+        schema_stage=schema_stage, attempt=1, max_attempts=1, schema_text="")
+    write_text(audit_dir / f"{label}_brief.md", brief)
+    write_text(snapshot / "brief.md", brief)
+    status = run_codex_subprocess(role="analysis", work_dir=workspace, prompt=brief,
+        audit_dir=audit_dir, label=label,
+        sandbox="workspace-write" if documents else "read-only",
+        command_override=get_config_value("GENG_CODEX_ANALYSIS_CMD"), image_paths=image_paths)
+    if not status.get("ok"):
+        raise NodeFailure(status.get("error") or "Analysis worker did not complete", result={
+            "status": status, "owner_documents": str(workspace), "candidate_snapshot": str(snapshot)})
+    try:
+        raw = _read_analysis_documents(workspace, documents) if documents else _read_last_message_file(status)
+        write_text(snapshot / "raw.txt", raw)
+        write_text(audit_dir / f"raw_{stage_label}_attempt_1.txt", raw)
         write_text(audit_dir / f"raw_{stage_label}.txt", raw)
-
-        try:
-            parsed = parse_json_object(raw)
-        except Exception as exc:
-            recovered = truncation_recovery(raw) if truncation_recovery is not None else None
-            if recovered is None:
-                last_errors = f"JSON parse error: {exc}"
-                write_json(
-                    audit_dir / f"validation_{stage_label}_attempt_{attempt}.json",
-                    {"ok": False, "errors": [{"path": "$", "message": last_errors}]},
-                )
-                current_prompt = build_json_inline_retry_prompt(
-                    candidate_text=raw,
-                    schema_text=schema_text,
-                    issues=[ValidationIssue("$", last_errors)],
-                )
-                repair_mode = True
-                scientific_repair = False
-                continue
-            parsed = recovered
-
-        if candidate_normalizer is not None:
-            parsed = candidate_normalizer(parsed)
-        if repair_baseline is None:
-            repair_baseline = deepcopy(parsed)
-
-        normalization_issues = pre_validation(parsed) if pre_validation is not None else []
-        schema_issues = validate_stage(schema_stage, parsed)
-        preservation_issues: list[ValidationIssue] = []
-        scientific_issues: list[ValidationIssue] = []
-        # Cross-document validators assume the candidate has its declared
-        # shape. Normalization and schema findings are still reported together;
-        # once the shape is usable we additionally collect every applicable
-        # preservation/scientific finding instead of stopping at the first
-        # non-empty category.
-        if not schema_issues and repair_baseline is not None and repair_preservation_validator is not None:
-            preservation_issues = preserved_science_issues(
-                repair_preservation_validator, repair_baseline, parsed, authorized_paths,
-            )
-        if not schema_issues and extra_validation is not None:
-            scientific_issues = extra_validation(parsed)
-        issues = [
-            *normalization_issues,
-            *schema_issues,
-            *preservation_issues,
-            *scientific_issues,
-        ]
-        if not issues:
-            meta = dict(parsed.get("_meta", {})) if isinstance(parsed.get("_meta"), dict) else {}
-            meta.update(
-                {
-                    "analysis_backend": CODEX_ANALYSIS_BACKEND,
-                    "analysis_stage_label": stage_label,
-                    "analysis_attempt": attempt,
-                }
-            )
-            parsed["_meta"] = meta
-            write_json(
-                audit_dir / f"validation_{stage_label}_attempt_{attempt}.json",
-                {"ok": True, "errors": []},
-            )
-            return parsed
-
-        last_errors = format_issues(issues)
-        write_json(
-            audit_dir / f"validation_{stage_label}_attempt_{attempt}.json",
-            {
-                "ok": False,
-                "errors": [issue.as_dict() for issue in issues],
-                "categories": {
-                    "normalization": [issue.as_dict() for issue in normalization_issues],
-                    "schema": [issue.as_dict() for issue in schema_issues],
-                    "preservation": [issue.as_dict() for issue in preservation_issues],
-                    "scientific": [issue.as_dict() for issue in scientific_issues],
-                },
-            },
-        )
-        normalized_path = (
-            audit_dir / f"normalized_{stage_label}_attempt_{attempt}.json"
-        )
-        write_json(normalized_path, parsed)
-        if normalization_issues or preservation_issues or scientific_issues:
-            write_json(
-                audit_dir / f"scientific_validation_{stage_label}_attempt_{attempt}.json",
-                {
-                    "ok": False,
-                    "errors": [issue.as_dict() for issue in issues],
-                    "repair_will_retry": attempt < attempts,
-                },
-            )
-        scientific_repair = bool(scientific_issues or normalization_issues)
-        if scientific_repair:
-            authorized_paths = list(dict.fromkeys([
-                *authorized_paths,
-                *scientific_correction_paths([*scientific_issues, *normalization_issues], parsed, repair_baseline),
-            ]))
-            current_prompt = build_json_scientific_retry_prompt(
-                candidate_text=json.dumps(parsed, ensure_ascii=False, indent=2),
-                schema_text=schema_text, issues=issues, original_task=prompt,
-                authorized_paths=authorized_paths,
-                preservation_baseline_text=(json.dumps(repair_baseline, ensure_ascii=False, indent=2) if preservation_issues else None),
-            )
-        elif preservation_issues:
-            current_prompt = build_json_preservation_retry_prompt(
-                candidate_text=json.dumps(parsed, ensure_ascii=False, indent=2),
-                baseline_text=json.dumps(repair_baseline, ensure_ascii=False, indent=2),
-                schema_text=schema_text, issues=issues, authorized_paths=authorized_paths,
-            )
-        else:
-            current_prompt = build_json_inline_retry_prompt(
-                candidate_text=json.dumps(parsed, ensure_ascii=False, indent=2),
-                schema_text=schema_text, issues=issues,
-            )
-        repair_mode = True
-
-    error_doc = {
-        "ok": False,
-        "backend": CODEX_ANALYSIS_BACKEND,
-        "stage": stage_label,
-        "schema_stage": schema_stage,
-        "attempts": attempt,
-        "error": last_errors,
-    }
-    write_json(audit_dir / f"agentic_analysis_error_{stage_label}.json", error_doc)
-    write_json(audit_dir / "agentic_analysis_error.json", error_doc)
-    raise RuntimeError(f"{stage_label} Codex analysis did not pass JSON validation after {attempt} attempt(s): {last_errors}")
+        parsed = parse_json_object(raw)
+    except PipelineCancelled:
+        raise
+    except Exception as exc:
+        raise NodeFailure(f"{stage_label} cannot hand off readable JSON: {exc}", result={
+            "owner_documents": str(workspace), "candidate_snapshot": str(snapshot)}) from exc
+    # The immutable parsed candidate precedes all runtime annotations.
+    write_json(snapshot / "candidate.json", parsed)
+    if candidate_normalizer is not None:
+        parsed = candidate_normalizer(parsed)
+    write_json(snapshot / "handoff.json", parsed)
+    issues = validate_stage(schema_stage, parsed)
+    observations = []
+    for observer in (pre_validation, extra_validation):
+        if observer is not None:
+            observations.extend(item.as_dict() for item in observer(parsed))
+    write_json(audit_dir / f"validation_{stage_label}_attempt_1.json", {
+        "ok": not issues, "protocol_errors": [item.as_dict() for item in issues],
+        "observations": observations, "decision_owner": "supervisor",
+        "candidate_snapshot": str(snapshot)})
+    if issues:
+        raise NodeFailure(f"{stage_label} handoff protocol is not executable: {format_issues(issues)}",
+            result={"candidate": parsed, "candidate_snapshot": str(snapshot),
+                    "protocol_errors": [item.as_dict() for item in issues]})
+    meta = dict(parsed.get("_meta", {})) if isinstance(parsed.get("_meta"), dict) else {}
+    meta.update({"analysis_backend": CODEX_ANALYSIS_BACKEND, "analysis_stage_label": stage_label,
+                 "analysis_attempt": 1, "host_observations": observations})
+    parsed["_meta"] = meta
+    return parsed
 
 
 def _build_analysis_brief(
@@ -279,16 +124,16 @@ def _build_analysis_brief(
     schema_text: str,
 ) -> str:
     schema_section = (
-        "Trusted structural schema (follow field names, nesting, and types exactly):\n"
+        "Reference document vocabulary (scientific completeness is reviewed by the supervisor):\n"
         f"BEGIN TRUSTED SCHEMA\n{schema_text}\nEND TRUSTED SCHEMA\n\n"
         if schema_text
         else ""
     )
-    output_rule = "Return exactly one JSON object matching the requested schema; no Markdown fences or surrounding prose."
+    output_rule = "Return one JSON object. Preserve the scientific content and identify unresolved information explicitly."
     if schema_stage in ANALYSIS_DOCUMENTS:
         output_rule = ("Write separate UTF-8 JSON files in this isolated workspace, each containing the corresponding top-level schema field: "
             + ", ".join(f"{key} -> {name}" for key, name in ANALYSIS_DOCUMENTS[schema_stage].items())
-            + ". Do not repeat the full documents in the last message. All required documents must exist before completion. "
+            + ". Do not repeat the full documents in the last message. The facts/tasks document is required for host dispatch; optional narrative documents may be omitted. "
             "The final message may be a short completion notice. On repair, inspect the existing files and modify only the affected parts, preserving other evidence. "
             "Do not modify the original paper, case files or anything outside this workspace. A nullable document is the JSON literal null.")
     return f"""
@@ -306,16 +151,6 @@ Rules:
 {schema_section}Stage prompt:
 {prompt}
 """.strip()
-
-
-def _write_stage_schema(audit_dir: Path, stage_label: str, schema_stage: str) -> Path:
-    # Kept for audit and retry prompts. Do not pass this schema to Codex CLI:
-    # analysis schemas intentionally contain free-form dict fields such as
-    # EngineeringFact.value, which strict response_format rejects.
-    schema = model_for_stage(schema_stage).model_json_schema()
-    path = audit_dir / f"{stage_label}.schema.json"
-    write_text(path, json.dumps(schema, ensure_ascii=False, indent=2) + "\n")
-    return path
 
 
 def _write_analysis_images(audit_dir: Path, stage_label: str, images: list[LLMImage]) -> list[Path]:

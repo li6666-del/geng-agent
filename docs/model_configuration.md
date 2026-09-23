@@ -1,10 +1,10 @@
 # 全项目统一模型配置
 
-项目用 Codex CLI 承担文件读写和工具调用，由一份全局配置选择模型服务。一次运行中的事实分析、Foundation、Task Writer、Reporter 和报告编辑器共用同一个服务商、模型、推理强度及凭据来源。智能体职责与工作区仍独立，模型选择不再按角色分配。
+项目用 Codex CLI 承担文件读写和工具调用，由一份全局配置选择模型服务。一次运行中的事实分析、Foundation、Task Writer、Reporter、异常主持人和报告编辑器共用同一个服务商、模型、推理强度及凭据来源。智能体职责与工作区仍独立，模型选择不再按角色分配。
 
 ## 使用方法
 
-从 `configs/models.example.json` 复制一份自己的配置。文件中的 `default` 选择全局 profile；例如改为 `deepseek` 后，五个角色都使用该配置。示例默认仍是 GPT。
+从 `configs/models.example.json` 复制一份自己的配置。文件中的 `default` 选择全局 profile；例如改为 `deepseek` 后，所有角色都使用该配置。示例默认仍是 GPT。
 
 先离线检查（不读取服务商密钥、不发送网络请求、不启动论文）：
 

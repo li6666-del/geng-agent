@@ -1,11 +1,59 @@
 import contextlib
 import io
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from geng_agent.cli import build_parser
 
 
 class CliDefaultsTests(unittest.TestCase):
+    def test_exit_status_distinguishes_delivery_failure_from_unreproduced_science(self) -> None:
+        from geng_agent.cli import main
+        from geng_agent.pipeline_models import PipelineResult
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for status, code, message in (
+                ("complete", 0, "审查完成"),
+                ("partial", 1, "已保留部分交付"),
+                ("blocked", 1, "运行受阻"),
+            ):
+                with self.subTest(status=status):
+                    result = PipelineResult(output_dir=root, review_path=root / "review.md",
+                        repro_project_dir=root / "project", risk_report_path=root / "risk.json",
+                        runtime_passed=False, result_review_passed=False,
+                        delivery_status=status, supervision_path=root / "supervisor.json")
+                    stdout = io.StringIO()
+                    with patch("geng_agent.pipeline.ReviewPipeline.run", return_value=result), \
+                         patch("geng_agent.cli._resolve_case_path_or_error", return_value=root), \
+                         patch("geng_agent.cli._warn_if_environment_incomplete"), \
+                         contextlib.redirect_stdout(stdout):
+                        actual = main(["review", "paper.md", "--out", str(root)])
+                    self.assertEqual(actual, code)
+                    self.assertIn(message, stdout.getvalue())
+                    self.assertIn("主持人运行记录", stdout.getvalue())
+                    if status != "complete":
+                        self.assertNotIn("审查完成", stdout.getvalue())
+
+    def test_analysis_only_does_not_claim_completion_when_blocked(self) -> None:
+        from geng_agent.cli import main
+        from geng_agent.pipeline_models import PipelineResult
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = PipelineResult(output_dir=root, review_path=root / "review.md",
+                repro_project_dir=root / "project", risk_report_path=root / "risk.json",
+                delivery_status="blocked", supervision_path=root / "supervisor.json")
+            stdout = io.StringIO()
+            with patch("geng_agent.pipeline.ReviewPipeline.run", return_value=result), \
+                 patch("geng_agent.cli._resolve_case_path_or_error", return_value=root), \
+                 patch("geng_agent.cli._warn_if_environment_incomplete"), \
+                 contextlib.redirect_stdout(stdout):
+                code = main(["review", "paper.md", "--out", str(root), "--analysis-only"])
+            self.assertEqual(code, 1)
+            self.assertIn("分析尚未完成", stdout.getvalue())
+            self.assertNotIn("前两阶段完成", stdout.getvalue())
+
     def test_review_keeps_codex_moderator_defaults(self) -> None:
         parser = build_parser()
         args = parser.parse_args(["review", "paper.pdf", "--out", "case"])

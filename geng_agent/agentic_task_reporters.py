@@ -13,7 +13,7 @@ from .mineru_adapter import task_figure_candidates
 from .outputs import write_json, write_text
 from .paper_crop import finalize_paper_target
 from .paper_evidence import safe_label
-from .schemas import validate_stage
+from .progress import PipelineCancelled
 from .security import redact_text
 from .task_reporter_context import (
     REPORTER_CONVERGENCE_POLICY,
@@ -130,7 +130,7 @@ def run_codex_task_reporter_workflow(
         output_dir=output_dir,
     )
     status_path = task_audit_dir / "status.json"
-    if resume:
+    if resume and not repair_context:
         cached = _load_task_reporter_cache(
             status_path=status_path,
             output_dir=output_dir,
@@ -184,28 +184,36 @@ def run_codex_task_reporter_workflow(
         )
         write_json(inputs_dir / "task_report_input.json", report_input)
         if repair_context:
+            clarification = repair_context.get("kind") == "moderator_clarification"
             previous = Path(str(repair_context.get("workspace") or "")) / TASK_VERIFICATION_FILE
             previous_note = ""
             if previous.is_file() and not _path_is_link_like(previous) and previous.stat().st_size <= 1024 * 1024:
                 previous_note = previous.read_text(encoding="utf-8-sig", errors="replace")
             write_text(inputs_dir / "previous_reporter_note.txt", previous_note)
             write_json(inputs_dir / "reporter_repair.json", {
-                "kind": "structure_recovery",
-                "issues": repair_context.get("validation_issues") or [repair_context.get("error") or "No readable evidence note was produced"],
+                "kind": "moderator_clarification" if clarification else "structure_recovery",
+                "issues": (repair_context.get("validation_issues") or [] if clarification else
+                           repair_context.get("validation_issues") or [repair_context.get("error") or "No readable evidence note was produced"]),
                 "previous_note": "inputs/previous_reporter_note.txt",
                 "evidence": "inputs/task_report_input.json",
-                "instruction": "Preserve existing scientific observations; repair only the stated delivery problem.",
+                "instruction": (str(repair_context.get("instructions") or "") if clarification else
+                                "Preserve existing scientific observations; repair only the stated delivery problem."),
+                "decision_id": repair_context.get("decision_id") if clarification else None,
+                "authority": "Reporter independently decides the scientific outcome from original evidence.",
             })
         prompt = _build_task_reporter_brief(
             task_id=task_id,
             report_asset_dir=report_input["report_asset_dir"],
             include_all_paper_pages=include_all_paper_pages,
             repair=bool(repair_context),
+            clarification=bool(repair_context and repair_context.get("kind") == "moderator_clarification"),
         )
         write_text(
             task_audit_dir / f"round_{reporter_round_no:03d}_brief.md",
             prompt,
         )
+    except PipelineCancelled:
+        raise
     except Exception as exc:
         return _task_reporter_failure(
             task_id=task_id,
@@ -269,20 +277,14 @@ def run_codex_task_reporter_workflow(
         run_valid_hint=run_valid_hint,
         evidence_workspace=workspace,
     )
-    schema_warnings = [
-        f"{issue.path}: {issue.message}"
-        for issue in validate_stage("task_verification_result", verification)
-    ]
     validation_issues, contract_warnings = partition_task_verification_issues(
         verification,
         task_id,
     )
     validation_warnings = (
-        schema_warnings
-        + contract_warnings
+        contract_warnings
         + rerun_path_issues
         + observation_evidence_warnings
-        + _evidence_path_issues(verification, workspace)
     )
     process_usable = raw_note_available
     scientific_terminal = (
@@ -323,6 +325,8 @@ def run_codex_task_reporter_workflow(
                 candidates=report_input.get("figure_candidates", []),
                 verification=verification,
             )
+        except PipelineCancelled:
+            raise
         except Exception as exc:
             crop_result = {
                 "status": "unresolved",
@@ -344,6 +348,8 @@ def run_codex_task_reporter_workflow(
                 workspace=workspace,
                 task_id=task_id,
             )
+        except PipelineCancelled:
+            raise
         except Exception as exc:
             published_assets = {"local_assets": [], "paper_assets": []}
             materialization_warnings = [

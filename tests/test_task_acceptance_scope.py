@@ -14,7 +14,7 @@ from geng_agent.verification_result import (
     aggregate_task_verifications,
     normalize_task_verification,
     verification_scientifically_successful,
-    writer_revision_allowed,
+    task_verification_issues,
 )
 from tests.test_agentic_task_reporters import _record, _supported_raw, _task
 
@@ -50,10 +50,10 @@ def test_out_of_scope_finding_survives_reporter_to_editor_without_changing_task(
     observation = verified["additional_observations"][0]
     assert observation["observation"] == raw["additional_observations"][0]["observation"]
     assert observation["evidence_files_available"] is not missing_evidence
-    assert not verified["engineering_issues"]
+    assert not verified["handoff_issues"]
     summary = aggregate_task_verifications([verified])
     assert summary["all_successful"]
-    assert not validate_stage("verification_result", summary)
+    assert summary["tasks"][0] == verified
     packet = _build_task_packets(facts={}, tasks={"repro_tasks": [task]}, task_records=[record],
                                  task_verifications=summary["tasks"])[0]
     assert packet["terminal_outcome"] == "reproduced"
@@ -64,15 +64,15 @@ def test_out_of_scope_finding_survives_reporter_to_editor_without_changing_task(
         assert reference.is_file()
 
 
-def test_out_of_scope_id_cannot_authorize_a_scientific_rerun():
+def test_out_of_scope_request_is_preserved_for_supervisor_scope_review():
     raw = _supported_raw()
     raw.update(host_action="rerun_writer", additional_observations=[_additional()],
         rerun_evidence={"rerun_reason": "core_conclusion_failed", "contract_item_ids": ["other_local_order"],
             "paper_evidence_files": ["paper_evidence/source/paper.txt"], "causal_change": "Change a separate experiment",
             "change_targets": ["other_task.py"], "predicted_effect": "Fix another ordering"})
     result = normalize_task_verification(raw, "task_a", task=_task(), run_valid_hint=True)
-    assert not writer_revision_allowed(result, "task_a")
-    assert result["engineering_status"] == "handoff_failed"
+    assert (not task_verification_issues(result, "task_a") and result.get("host_action") == "rerun_writer")
+    assert result["engineering_status"] == "verified"
     assert result["outcome"] == "reproduced"  # Host does not replace the Agent's science.
     assert result["additional_observations"] == raw["additional_observations"]
 
@@ -99,9 +99,9 @@ def test_goal_relevant_algorithm_failure_without_designer_id_still_allows_causal
     checked, _ = normalize_reporter_observation_evidence(raw, tmp_path)
     result = normalize_task_verification(checked, "task_a", task=_task(), run_valid_hint=True, evidence_workspace=tmp_path)
     assert result["outcome"] == "not_reproduced"
-    assert writer_revision_allowed(result, "task_a")
+    assert (not task_verification_issues(result, "task_a") and result.get("host_action") == "rerun_writer")
     assert result["core_conclusions"][-1]["goal_relation"] == raw["core_conclusions"][-1]["goal_relation"]
-    assert not validate_stage("task_verification_result", result)
+    assert not task_verification_issues(result, "task_a")
 
 
 def test_host_does_not_infer_scope_from_natural_language_or_rewrite_verdict():
@@ -113,7 +113,7 @@ def test_host_does_not_infer_scope_from_natural_language_or_rewrite_verdict():
     assert result["core_conclusions"] == raw["core_conclusions"]
     legacy = copy.deepcopy(result)
     legacy.pop("additional_observations")
-    assert aggregate_task_verifications([legacy])["tasks"][0]["additional_observations"] == []
+    assert "additional_observations" not in aggregate_task_verifications([legacy])["tasks"][0]
 
 
 def test_agent_instructions_keep_scope_and_extra_findings_separate():

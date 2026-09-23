@@ -52,7 +52,7 @@ def _pair(task_id: str) -> tuple[dict, dict]:
 def _delivery(task_id: str, sandbox: Path) -> dict:
     sandbox.mkdir(parents=True, exist_ok=True)
     return {
-        "task_id": task_id, "sandbox": str(sandbox), "writer_completed": True,
+        "task_id": task_id, "sandbox": str(sandbox), "writer_completed": True, "host_execution": {"passed": True},
         "task_writer_status": "ready_for_review",
         "result_json": {"task_id": task_id, "status": "ready_for_review", "summary": "done",
                         "local_image_paths": ["outputs/plot.png"],
@@ -194,7 +194,7 @@ class AutonomousTaskWriterTests(unittest.TestCase):
         record["task_verification"]["host_action"] = "rerun_writer"
         self.assertFalse(_record_has_terminal_task_verification(record))
 
-    def test_runtime_pass_requires_valid_verification_but_preserves_build_only(self) -> None:
+    def test_runtime_pass_requires_host_observed_execution(self) -> None:
         with TemporaryDirectory() as temp:
             root = Path(temp)
             failed = _delivery("failed", root / "failed")
@@ -205,10 +205,12 @@ class AutonomousTaskWriterTests(unittest.TestCase):
                 "rerun_reason": "none",
                 "run_valid": False,
             }
+            failed["host_execution"] = {"passed": False}
             build_only = _delivery("build_only", root / "build_only")
+            build_only.pop("host_execution")
 
             self.assertFalse(_task_writer_runtime_task_passed(failed))
-            self.assertTrue(_task_writer_runtime_task_passed(build_only))
+            self.assertFalse(_task_writer_runtime_task_passed(build_only))
 
     def test_stopping_assessment_is_advisory(self) -> None:
         with TemporaryDirectory() as temp:
@@ -267,7 +269,7 @@ class AutonomousTaskWriterTests(unittest.TestCase):
         self.assertIn("Core-result stopping policy", prompt)
         self.assertIn("Incomplete handoff", prompt)
         self.assertIn("never a universal acceptance threshold", prompt)
-        self.assertIn("Another Writer run requires", prompt)
+        self.assertIn("A proposed Writer run should explain", prompt)
         self.assertIn("core_conclusion_failed", prompt)
         self.assertIn("material_numeric_discrepancy", prompt)
         self.assertIn("invalid_run", prompt)
@@ -343,11 +345,9 @@ class AutonomousTaskWriterTests(unittest.TestCase):
             record['result_json']['delivery_warnings'] = [
                 'shared_component_advisory: shared_model is not proven by static scanning'
             ]
-            with patch(
-                'geng_agent.task_writer_delivery._task_execution_binding_issues',
-                side_effect=AssertionError('cached delivery must not run the advisory scanner'),
-            ):
-                self.assertTrue(_record_is_valid_current_delivery(record))
+            self.assertTrue(_record_is_valid_current_delivery(record))
+            from geng_agent import task_writer_delivery
+            self.assertNotIn("_task_execution_binding_issues", vars(task_writer_delivery))
 
     def test_concurrency_equals_task_count(self) -> None:
         self.assertEqual(_task_writer_concurrency(7, 1, run_repro=True), 7)
@@ -671,7 +671,7 @@ class AutonomousTaskWriterTests(unittest.TestCase):
         self.assertEqual(set(records), {1})
         self.assertTrue(records[1]["runtime_refresh_required"])
 
-    def test_terminal_success_grants_matched(self) -> None:
+    def test_reporter_note_does_not_reclassify_execution_status(self) -> None:
         with TemporaryDirectory() as temp:
             root = Path(temp)
             record = _delivery("task_1", root / "sandbox")
@@ -721,12 +721,12 @@ class AutonomousTaskWriterTests(unittest.TestCase):
                 repro_project_dir=repro,
             )
 
-            self.assertTrue(runtime["passed"])
-            self.assertEqual(record["task_writer_status"], "matched")
+            self.assertNotIn("passed", runtime)
+            self.assertEqual(record["task_writer_status"], "ready_for_review")
             self.assertEqual(record["scientific_outcome"], "reproduced")
-            self.assertTrue(record["verification_verified"])
+            self.assertFalse(record["verification_verified"])
 
-    def test_verified_result_refreezes_the_final_package_after_config_mutation(self) -> None:
+    def test_verified_result_keeps_frozen_package_unchanged(self) -> None:
         with TemporaryDirectory() as temp:
             root = Path(temp)
             output, audit, repro = _write_frozen_test_project(root)
@@ -768,62 +768,23 @@ class AutonomousTaskWriterTests(unittest.TestCase):
             final_inventory = json.loads(
                 (repro / "source_inventory.json").read_text(encoding="utf-8")
             )
-            self.assertNotEqual(
-                initial_inventory["inventory_sha256"],
-                final_inventory["inventory_sha256"],
-            )
-            self.assertTrue(validate_repro_project_portability(repro)["portable"])
-            self.assertTrue(
-                json.loads((repro / "config.json").read_text(encoding="utf-8"))[
-                    "verification_verified"
-                ]
-            )
-            self.assertEqual(
-                runtime["validation"]["final_package_inventory_sha256"],
-                final_inventory["inventory_sha256"],
-            )
-            self.assertTrue((audit / "03c_project_portability_final.json").is_file())
+            self.assertEqual(initial_inventory, final_inventory)
+            self.assertNotIn("verification_verified", json.loads((repro / "config.json").read_text(encoding="utf-8")))
+            self.assertFalse((audit / "03c_project_portability_final.json").exists())
 
-    def test_failed_package_smoke_persists_diagnostics_before_raising(self) -> None:
+    def test_package_freeze_does_not_launch_relocation_smoke(self) -> None:
         with TemporaryDirectory() as temp:
-            root = Path(temp)
-            output = root / "case"
-            audit = output / "audit"
-            repro = output / "repro_project"
-            audit.mkdir(parents=True)
-            repro.mkdir()
-            (repro / "run_experiment.py").write_text(
-                "raise SystemExit(1)\n",
-                encoding="utf-8",
-            )
-            (repro / "config.json").write_text("{}\n", encoding="utf-8")
-            (repro / "config_smoke.json").write_text('{"smoke": true}\n', encoding="utf-8")
-            audit_path = audit / "03c_project_portability.json"
-
-            with self.assertRaises(ProjectPortabilityError):
-                _freeze_repro_project_package(
-                    repro_project_dir=repro,
-                    output_dir=output,
-                    audit_path=audit_path,
-                    task_manifest={"version": 1, "tasks": []},
-                    expected_paths={
-                        "run_experiment.py",
-                        "config.json",
-                        "config_smoke.json",
-                        "source_inventory.json",
-                    },
-                    analysis_snapshot_hash="analysis-hash",
-                    foundation_snapshot_hash="foundation-hash",
-                    environment_hash="environment-hash",
-                    run_smoke=True,
-                )
-
-            report = json.loads(audit_path.read_text(encoding="utf-8"))
-            self.assertFalse(report["portable"])
-            self.assertEqual(report["smoke"]["returncode"], 1)
-            self.assertTrue(
-                any(item["code"] == "relocated_smoke_failed" for item in report["issues"])
-            )
+            output = Path(temp)
+            project = output / "project"
+            project.mkdir()
+            (project / "run_experiment.py").write_text("raise SystemExit(1)\n", encoding="utf-8")
+            with patch("geng_agent.project_portability._run_relocated_smoke", side_effect=AssertionError("must not rerun")):
+                _manifest, result = _freeze_repro_project_package(
+                    repro_project_dir=project, output_dir=output, audit_path=output / "audit.json",
+                    task_manifest={"tasks": []}, expected_paths={"run_experiment.py"},
+                    analysis_snapshot_hash="a", foundation_snapshot_hash="", environment_hash="e", run_smoke=True)
+            self.assertFalse(result["smoke"]["ran"])
+            self.assertTrue((output / "audit.json").is_file())
 
     def test_cached_writer_workflow_rejects_tree_changed_after_final_inventory(self) -> None:
         with TemporaryDirectory() as temp:
@@ -1027,7 +988,9 @@ class AutonomousTaskWriterTests(unittest.TestCase):
             self.assertTrue(result["status"]["task_reporters_revalidated"])
 
     def test_cached_reporter_revision_replays_once_into_existing_writer_continuation(self) -> None:
-        with TemporaryDirectory() as temp:
+        with patch("geng_agent.task_recovery.request_moderation", return_value={
+            "action": "revise_writer", "decision_id": "offline-owner", "instructions": "Apply the original correction"
+        }), TemporaryDirectory() as temp:
             root = Path(temp)
             output = root / "case"
             audit = output / "audit"
@@ -1093,7 +1056,7 @@ class AutonomousTaskWriterTests(unittest.TestCase):
                 self.assertEqual(kwargs["force_task_ids"], {"task_1"})
                 self.assertIs(kwargs["initial_records_by_index"][1], record)
                 replayed = kwargs["task_review_callback"](1, task, record, 1)
-                self.assertIs(replayed, reporter_result)
+                self.assertEqual(replayed, reporter_result)
                 self.assertEqual(callback_calls, ["task_1"])
                 raise DispatchReached
 
@@ -1136,7 +1099,9 @@ class AutonomousTaskWriterTests(unittest.TestCase):
             )
 
     def test_one_writer_reruns_once_for_complete_causal_request(self) -> None:
-        with TemporaryDirectory() as temp:
+        with patch("geng_agent.task_recovery.request_moderation", return_value={
+            "action": "revise_writer", "decision_id": "offline-owner", "instructions": "Apply the original correction"
+        }), TemporaryDirectory() as temp:
             root = Path(temp)
             records = [
                 _delivery("task_1", root / "sandbox"),

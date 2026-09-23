@@ -25,6 +25,9 @@ class ValidationIssue:
 def validate_stage(
     stage: str, data: dict[str, Any], required_files: set[str] | None = None
 ) -> list[ValidationIssue]:
+    from .analysis_protocol import ANALYSIS_STAGES, analysis_protocol_issues
+    if stage in ANALYSIS_STAGES:
+        return analysis_protocol_issues(stage, data)
     model = model_for_stage(stage)
     issues: list[ValidationIssue] = []
     try:

@@ -11,7 +11,6 @@ from typing import Any
 from .case_runtime import CaseRuntime, environment_request_prompt
 from .foundation_architecture import (
     architecture_components as _architecture_components,
-    architecture_requires_execution_contracts as _architecture_requires_execution_contracts,
 )
 from .foundation_snapshot import (
     FOUNDATION_CONTRACT_VERSION,
@@ -25,17 +24,6 @@ from .prompt_identity import model_identity, text_identity
 
 FOUNDATION_RESULT_STATUS = "ready_for_tasks"
 FOUNDATION_LABEL = "03b_foundation_writer"
-FOUNDATION_CORE_MODULES = {
-    "src/channel.py",
-    "src/modulation.py",
-    "src/transmitter.py",
-    "src/receiver.py",
-    "src/metrics.py",
-    "src/simulator.py",
-    "src/simulation.py",
-    "src/algorithms/__init__.py",
-    "src/baselines/__init__.py",
-}
 
 def _foundation_brief(
     architecture: dict[str, Any],
@@ -82,76 +70,12 @@ def _foundation_brief(
                     "output_quantity_ids": output_ids,
                 }
             )
-    execution_contract_required = _architecture_requires_execution_contracts(architecture)
-    result_template: dict[str, Any] = {
+    result_template = {
         "status": "ready_for_tasks",
-        "summary": "one concise Chinese sentence",
-        "tests_command": "python -m unittest discover -s tests -v",
-        "tested_invariants": ["invariant ids"],
-        "remaining_uncertainties": ["explicit unresolved items only"],
+        "summary": "简述已实现的共享功能",
+        "test_evidence": ["实际测试命令、结果和相关文件；未运行或失败也如实记录"],
+        "remaining_uncertainties": ["需要主持人判断的缺口、失败或任务设计矛盾"],
     }
-    if execution_contract_required:
-        result_template["execution_contracts"] = []
-        capability_templates: list[dict[str, str]] = []
-        for component in _architecture_components(architecture):
-            execution = component.get("execution") if isinstance(component.get("execution"), dict) else {}
-            capabilities = [
-                str(capability)
-                for capability in execution.get("required_capabilities", [])
-                if str(capability).strip()
-            ]
-            if execution.get("trainable") is True:
-                capabilities.append("training_step")
-            if str(execution.get("gradient_mode") or "").strip().casefold() == "required":
-                capabilities.append("gradient_flow")
-            if str(execution.get("checkpoint_policy") or "").strip().casefold() == "required":
-                capabilities.append("checkpoint_roundtrip")
-            device_policy = str(execution.get("device_policy") or "").strip().casefold()
-            if device_policy == "accelerator_required":
-                capabilities.extend(["accelerator_availability", "tensor_device_placement"])
-            elif device_policy == "external_runtime":
-                capabilities.extend(["runtime_availability", "runtime_invocation"])
-            for capability in dict.fromkeys(capabilities):
-                capability_templates.append(
-                    {
-                        "component_id": str(component.get("id") or ""),
-                        "module": str(component.get("module") or ""),
-                        "callable": str(component.get("callable") or ""),
-                        "capability": capability,
-                        "test": "tests.test_component.ComponentTests.test_capability",
-                        "status": "passed",
-                    }
-                )
-        result_template["capability_tests"] = capability_templates
-    execution_result_note = (
-        """
-6. Because this is scientific architecture schema 1.1 or newer, `foundation_result.json`
-   uses the example above. Populate the empty `execution_contracts` array with one
-   record per component using component_id, module, callable, and the complete
-   execution object from the single per-component contract above. Copy it without
-   weakening it, and replace every capability `test` placeholder with the real
-   delivered test method. Every capability record must retain the component's
-   exact `module` and `callable`, and its test must construct/call that public
-   component while asserting the relevant state transition.
-   A component with `trainable: true` needs evidence of a real parameter update.
-   `gradient_mode: required` needs a gradient/back-propagation test, and
-   `checkpoint_policy: required` needs a save/load round-trip test.
-   `device_policy: accelerator_required` needs tests for accelerator availability
-   and actual tensor placement on that accelerator. Every `test` reference must
-   identify a discoverable `unittest.TestCase` method actually delivered under
-   `tests/test*.py`. `status: passed` is metadata, not proof: the host reruns the
-   complete delivered suite and freezes the Foundation only after a real zero-exit
-   test outcome. Hard training/gradient/checkpoint/device claims are certified only
-   for frameworks in the trusted probe registry; otherwise report
-   `environment_extension_required` instead of copying PyTorch method names or
-   claiming a pass.
-"""
-        if _architecture_requires_execution_contracts(architecture)
-        else """
-6. This is a legacy schema 1.0 architecture. `execution_contracts` and
-   `capability_tests` are encouraged when useful but are not required for compatibility.
-"""
-    )
     environment_policy = (
         environment_request_prompt(case_runtime)
         if case_runtime is not None
@@ -172,7 +96,7 @@ def _foundation_brief(
     )
     return f"""# Role: Foundation Writer
 
-Build the shared scientific foundation for all reproduction tasks. The architecture contract is mandatory and already validated. You own shared source modules and contract tests only; you do not own any figure-specific task, experiment output, report, or runtime result.
+Build the shared scientific foundation for all reproduction tasks. Use the approved architecture and original paper as the implementation brief. Report conflicts to the supervisor; do not silently weaken the task. You own shared source modules and contract tests only; you do not own any figure-specific task, experiment output, report, or runtime result.
 
 ## Implementation ownership
 {scope_instruction}
@@ -219,19 +143,11 @@ not create Foundation work.
 - {environment_policy}
 - Import and use every external `primary_framework` selected by the architecture,
   and declare it in `requirements.txt` or the architecture dependency metadata.
-- When no third-party framework is needed, the architecture must use
-  `primary_framework: standard_library` or `primary_framework: project_local`;
-  an algorithm or component name is not a Python package. Request architecture
-  revision if this convention was not followed.
-- For `device_policy: external_runtime` (for example MATLAB, Julia, or a custom
-  binary), do not add the runtime name as a Python requirement and do not fake a
-  Python import. The architecture must declare runtime-availability and invocation-
-  interface capabilities, each backed by a delivered unittest. The host must
-  resolve the real runtime executable and provide a registered trusted invocation
-  adapter. If either is absent, report `environment_extension_required`. A constant
-  availability function or identity callable is not evidence. The static validator
-  will not launch untrusted external code, but the host will run every delivered
-  unittest before freezing the Foundation.
+- Framework names describe implementation choices, not Python import requirements. A
+  project-local or standard-library implementation does not require another package.
+- If a task genuinely needs an external executable or GPU, use the available host
+  execution interface and report the actual capability result. Do not substitute a
+  constant availability function, fake import, or identity callable for real execution.
 - A NumPy-only, analytic, mock, placeholder, or otherwise non-trainable reference
   is not an implementation of a component that requires training, gradients, or
   checkpoints. Do not replace those requirements with a look-alike interface.
@@ -243,12 +159,11 @@ not create Foundation work.
 1. Read the scoped Foundation context and relevant paper evidence; implement each owned component and exposed binding output. Treat acceptance mappings only as output-routing hints.
 2. Implement the required modules, using package `__init__.py` files where needed.
 3. Add focused `unittest` tests under `tests/` for dimensions, units/normalization, deterministic seeds, component composition, and applicable cross-task interface invariants. Do not test the paper-result verdict.
-4. Run `python -m unittest discover -s tests -v` and fix every failure. Repeat only after relevant source, test, configuration or environment changes; writing the result note alone does not require repeating the suite. The host independently validates the frozen delivery once.
-5. Write `foundation_result.json` only after tests pass:
+4. Run focused tests and record actual results. Explain any failure or unavailable capability, including its effect on the task. Repeat tests only after a relevant change. The host records its guarded test run and exact file identities; the supervisor decides whether the handoff is sufficient.
+5. Write `foundation_result.json` with an honest handoff, including incomplete work:
 ```json
 {pretty_json(result_template)}
 ```
-{execution_result_note}
 
 Do not implement any `tasks/<figure>.py`. Parallel task writers will consume this foundation as a frozen, read-only dependency.
 """
@@ -281,31 +196,6 @@ def _load_cached_foundation(
     }
 
 
-def _load_cached_foundation_failure(
-    *,
-    validation_path: Path,
-    expected_input_hash: str,
-) -> list[dict[str, Any]] | None:
-    """Reuse a failed validation during resume instead of regenerating it."""
-
-    if not validation_path.is_file() or validation_path.is_symlink():
-        return None
-    try:
-        document = json.loads(validation_path.read_text(encoding="utf-8-sig"))
-    except Exception:
-        return None
-    if (
-        not isinstance(document, dict)
-        or document.get("ok") is not False
-        or str(document.get("input_hash") or "") != expected_input_hash
-    ):
-        return None
-    issues = document.get("issues")
-    if not isinstance(issues, list) or not issues:
-        return None
-    normalized = [item for item in issues if isinstance(item, dict)]
-    return normalized or None
-
 
 def _foundation_input_hash(
     analysis_hash: str,
@@ -328,7 +218,5 @@ def _foundation_input_hash(
 
 
 def _required_foundation_modules(architecture: dict[str, Any]) -> set[str]:
-    architecture_modules = foundation_module_paths(architecture)
-    if isinstance(architecture.get("_foundation_scope"), dict) or _architecture_requires_execution_contracts(architecture):
-        return architecture_modules
-    return set(FOUNDATION_CORE_MODULES) | architecture_modules
+    """Only the planned shared modules create work, regardless of schema label."""
+    return foundation_module_paths(architecture)

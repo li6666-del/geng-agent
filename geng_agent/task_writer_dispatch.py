@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from contextvars import copy_context
 from pathlib import Path
 from threading import Lock
 from typing import Any, Callable
@@ -13,7 +11,6 @@ from .case_runtime import CaseRuntime
 from .outputs import write_json
 from .paper_evidence import safe_label
 from .security import redact_text
-from .task_writer_results import _task_writer_runtime_task_passed
 from .task_writer_runner import (
     _review_task_records,
     _run_one_execution_unit_writer,
@@ -22,6 +19,10 @@ from .task_writer_runner import (
 )
 from .task_writer_state import _checkpoint_partial_task_writer_records, _task_writer_record_refresh_pending, _task_writer_record_refresh_reusable
 from .task_writer_units import _execution_unit_sandbox, _execution_unit_work_items
+
+
+def _public_unit(unit):
+    return {"unit_id": str(unit["unit_id"]), "tasks": [task for _index, task, _entry in unit["members"]]}
 
 
 def _dispatch_task_writers(
@@ -62,7 +63,7 @@ def _dispatch_task_writers(
         reusable = all(
             index in existing
             and (
-                _task_writer_runtime_task_passed(existing[index])
+                bool(existing[index].get("writer_completed"))
                 or existing[index].get("scientific_stop_reason") == "foundation_revision_unresolved"
                 or isinstance(existing[index].get("foundation_revision_request"), dict)
             )
@@ -94,27 +95,16 @@ def _dispatch_task_writers(
             )
         else:
             pending_units.append(unit)
-    launched_task_ids = [
-        str(task.get("task_id") or entry.get("task_id") or "")
-        for unit in pending_units
-        for _index, task, entry in unit["members"]
-    ]
     audit: dict[str, Any] = {
-        "policy": "parallel_first",
-        "parallel_attempted": len(pending_units) > 1,
+        "policy": "supervisor_dispatch",
+        "parallel_attempted": False,
         "task_count": len(task_pairs),
         "logical_task_count": len(task_pairs),
         "execution_unit_count": len(units),
         "runtime_capability": "parallel_subagents",
         "codex_sessions_unbounded": True,
         "codex_session_policy": "unbounded_until_exit_or_user_stop",
-        "dispatch_batches": [{
-            "batch_id": "stage5_all_execution_unit_writers",
-            "execution_unit_ids": [str(unit["unit_id"]) for unit in pending_units],
-            "task_ids": launched_task_ids,
-            "launched_before_wait": True,
-            "concurrency_limit": len(pending_units),
-        }] if pending_units else [],
+        "dispatch_batches": [],
         "fallback_reason": None,
         "fallback_evidence_files": [],
         "attempts": [],
@@ -122,179 +112,252 @@ def _dispatch_task_writers(
         "reused_execution_unit_ids": reused_unit_ids,
         "cached_writer_reporter_validation_unit_ids": sorted(cached_review_unit_ids),
         "launch_counts_describe": "scheduled_unit_workflows_not_model_processes",
-        "launched_execution_unit_ids": [str(unit["unit_id"]) for unit in pending_units],
-        "launched_task_ids": launched_task_ids,
+        "launched_execution_unit_ids": [],
+        "launched_task_ids": [],
     }
     audit_path = audit_dir / "writer_dispatch.json"
     write_json(audit_path, audit)
-    futures: dict[Future[Any], dict[str, Any]] = {}
+    from .supervisor import RunSupervisor, current_supervisor
+    from .supervisor_tools import SupervisorTool
+    supervisor = current_supervisor() or RunSupervisor(audit_dir.parent, audit_dir,
+        {"tasks": [task for task, _entry in task_pairs], "run_repro": run_repro,
+         "objective": "并行安排独立实验单元，保留原始审查与有效运行收据。"})
+    units_by_name = {"writer:" + str(unit["unit_id"]): unit for unit in pending_units}
+    finished_names: set[str] = set()
+    errors: dict[str, str] = {}
+
+    def run_unit(unit, decision):
+        task_ids = [str(task.get("task_id") or entry.get("task_id")) for _, task, entry in unit["members"]]
+        supervisor.tools.event("writer_assignment", "writers", unit_id=unit["unit_id"], task_ids=task_ids,
+                               decision=decision)
+        members = unit["members"]
+        if len(members) == 1:
+            index, task, manifest_entry = members[0]
+            existing_record = existing.get(index)
+            return _resume_or_run_writer(
+                writer_runner=_run_one_task_writer,
+                cached_members=members if str(unit["unit_id"]) in cached_review_unit_ids else [],
+                cached_records=existing,
+                index=index,
+                execution_unit_id=str(unit["unit_id"]),
+                reuse_existing=bool(existing_record),
+                runtime_refresh_required=bool(
+                    isinstance(existing_record, dict)
+                    and _task_writer_record_refresh_pending(existing_record)
+                ),
+                task=task,
+                manifest_entry=manifest_entry,
+                facts=facts,
+                experiment_index=experiment_index,
+                paper=paper,
+                paper_path=paper_path,
+                paper_context_json=paper_context_json,
+                paper_images=paper_images,
+                paper_thesis=paper_thesis,
+                foundation=foundation,
+                analysis_snapshot_hash=(snapshot_hashes or {}).get(str(unit["unit_id"]), analysis_snapshot_hash),
+                analysis_artifacts=analysis_artifacts,
+                task_root=task_root,
+                audit_dir=audit_dir,
+                run_repro=run_repro,
+                review_feedback=feedback_by_id.get(
+                    str(task.get("task_id") or manifest_entry.get("task_id") or "")
+                ),
+                task_review_callback=task_review_callback,
+                case_runtime=case_runtime,
+            )
+        else:
+            reuse_existing_unit = all(
+                index in existing for index, _task, _entry in members
+            )
+            return _resume_or_run_writer(
+                writer_runner=_run_one_execution_unit_writer,
+                cached_members=members if str(unit["unit_id"]) in cached_review_unit_ids else [],
+                cached_records=existing,
+                unit=unit,
+                reuse_existing=reuse_existing_unit,
+                runtime_refresh_required=any(
+                    _task_writer_record_refresh_pending(existing[index])
+                    for index, _task, _entry in members
+                    if index in existing
+                ),
+                facts=facts,
+                experiment_index=experiment_index,
+                paper=paper,
+                paper_path=paper_path,
+                paper_context_json=paper_context_json,
+                paper_images=paper_images,
+                paper_thesis=paper_thesis,
+                foundation=foundation,
+                analysis_snapshot_hash=(snapshot_hashes or {}).get(str(unit["unit_id"]), analysis_snapshot_hash),
+                analysis_artifacts=analysis_artifacts,
+                task_root=task_root,
+                audit_dir=audit_dir,
+                run_repro=run_repro,
+                review_feedback=feedback_by_id,
+                task_review_callback=task_review_callback,
+                case_runtime=case_runtime,
+            )
+
+    def reduce_unit(name, result=None, error=None):
+        unit = units_by_name[name]
+        members = unit["members"]
+        try:
+            if error is not None:
+                raise error
+            unit_records = result if isinstance(result, list) else [result]
+            member_index_by_task_id = {
+                str(task.get("task_id") or entry.get("task_id") or ""): index
+                for index, task, entry in members
+            }
+            for record in unit_records:
+                if not isinstance(record, dict):
+                    continue
+                record_index = record.get("index")
+                if not isinstance(record_index, int):
+                    record_index = member_index_by_task_id.get(
+                        str(record.get("task_id") or "")
+                    )
+                if not isinstance(record_index, int) and len(members) == 1:
+                    record_index = members[0][0]
+                if isinstance(record_index, int):
+                    record["index"] = record_index
+                    record.setdefault("execution_unit_id", str(unit["unit_id"]))
+                    by_index[record_index] = record
+            missing_members = [
+                (index, task, entry)
+                for index, task, entry in members
+                if index not in by_index
+            ]
+            if missing_members:
+                missing_ids = [
+                    str(task.get("task_id") or entry.get("task_id") or index)
+                    for index, task, entry in missing_members
+                ]
+                raise RuntimeError(
+                    "execution-unit Writer returned no delivery for logical tasks: "
+                    + ", ".join(missing_ids)
+                )
+            if snapshot_finalizer is not None:
+                snapshot_finalizer(unit, [by_index[index] for index, _task, _entry in members])
+        except Exception as exc:
+            for index, task, manifest_entry in members:
+                if index in by_index:
+                    by_index[index].setdefault("coordination_observations", []).append(
+                        redact_text(f"Execution-unit handoff incomplete: {type(exc).__name__}: {exc}"))
+                    continue
+                failed_task_id = str(
+                    task.get("task_id")
+                    or manifest_entry.get("task_id")
+                    or f"task_{index}"
+                )
+                sandbox = (
+                    task_root / f"{index:02d}_{safe_label(failed_task_id)}"
+                    if len(members) == 1
+                    else _execution_unit_sandbox(task_root, str(unit["unit_id"]))
+                )
+                by_index[index] = _failed_task_record(
+                    index=index,
+                    task_id=failed_task_id,
+                    module=str(manifest_entry.get("module") or ""),
+                    output_subdir=str(
+                        manifest_entry.get("output_subdir") or failed_task_id
+                    ),
+                    sandbox=sandbox,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                by_index[index]["execution_unit_id"] = str(unit["unit_id"])
+        audit["attempts"].append(
+            {
+                "execution_unit_id": str(unit["unit_id"]),
+                "task_ids": [
+                    str(task.get("task_id") or entry.get("task_id") or "")
+                    for _index, task, entry in members
+                ],
+                "writer_error_kinds": [
+                    by_index[index].get("writer_error_kind")
+                    for index, _task, _entry in members
+                    if index in by_index
+                ],
+                "writer_completed": all(
+                    bool(by_index[index].get("writer_completed"))
+                    for index, _task, _entry in members
+                    if index in by_index
+                ),
+            }
+        )
+        write_json(audit_path, audit)
+        _checkpoint_partial_task_writer_records(
+            audit_dir=audit_dir,
+            dispatch_audit=audit,
+            records_by_index=by_index,
+        )
+
+    def received(name, result):
+        reduce_unit(name, result=result)
+        finished_names.add(name)
+        errors.pop(name, None)
+
+    def dispatched(names, decision):
+        unit_ids = [str(units_by_name[name]["unit_id"]) for name in names]
+        task_ids = [str(task.get("task_id") or entry.get("task_id"))
+                    for name in names for _, task, entry in units_by_name[name]["members"]]
+        active_before = any("writer:" + unit_id not in finished_names and "writer:" + unit_id not in errors
+                            for unit_id in audit["launched_execution_unit_ids"])
+        audit["parallel_attempted"] = audit["parallel_attempted"] or len(names) > 1 or active_before
+        audit["launched_execution_unit_ids"].extend(unit_ids)
+        audit["launched_task_ids"].extend(task_ids)
+        audit["dispatch_batches"].append({"batch_id": len(audit["dispatch_batches"]) + 1,
+            "execution_unit_ids": unit_ids, "task_ids": task_ids, "launched_before_wait": True,
+            "concurrency_limit": len(unit_ids), "decision_id": decision.get("decision_id")})
+        write_json(audit_path, audit)
+
+    def failed(name, error):
+        errors[name] = redact_text(f"{type(error).__name__}: {error}")
+        reduce_unit(name, error=error)
+
+    def offer():
+        result = []
+        for name, unit in units_by_name.items():
+            if name in finished_names:
+                continue
+            call = lambda decision, unit=unit: run_unit(unit, decision)
+            result.append(SupervisorTool(name,
+                "独立执行单元的 Writer 与就绪 Reporter；strong 依赖保留在同一单元，其他单元可同时启动。",
+                call, inputs={"unit": _public_unit(unit), "previous_failure": errors.get(name),
+                    "snapshot_hash": (snapshot_hashes or {}).get(str(unit["unit_id"]), analysis_snapshot_hash),
+                    "cached_writer_needs_reporter": str(unit["unit_id"]) in cached_review_unit_ids},
+                resume=call, resources=("writer-unit:" + str(unit["unit_id"]),)))
+        return result
+
+    def routine_route(snapshot: dict) -> dict | None:
+        if errors:
+            return None
+        ready = list(snapshot["ready"])
+        if ready:
+            return {"action": "start", "next_nodes": ready, "status": "routine",
+                    "diagnosis": "Independent execution units are ready."}
+        if not snapshot["active"]:
+            return {"action": "finish", "status": "routine",
+                    "diagnosis": "All dispatched execution units have returned."}
+        return None
+
     if pending_units:
-        with ThreadPoolExecutor(max_workers=len(pending_units)) as executor:
-            for unit in pending_units:
-                members = unit["members"]
-                if len(members) == 1:
-                    index, task, manifest_entry = members[0]
-                    existing_record = existing.get(index)
-                    future = executor.submit(
-                        copy_context().run,
-                        _resume_or_run_writer,
-                        writer_runner=_run_one_task_writer,
-                        cached_members=members if str(unit["unit_id"]) in cached_review_unit_ids else [],
-                        cached_records=existing,
-                        index=index,
-                        execution_unit_id=str(unit["unit_id"]),
-                        reuse_existing=bool(existing_record),
-                        runtime_refresh_required=bool(
-                            isinstance(existing_record, dict)
-                            and _task_writer_record_refresh_pending(existing_record)
-                        ),
-                        task=task,
-                        manifest_entry=manifest_entry,
-                        facts=facts,
-                        experiment_index=experiment_index,
-                        paper=paper,
-                        paper_path=paper_path,
-                        paper_context_json=paper_context_json,
-                        paper_images=paper_images,
-                        paper_thesis=paper_thesis,
-                        foundation=foundation,
-                        analysis_snapshot_hash=(snapshot_hashes or {}).get(str(unit["unit_id"]), analysis_snapshot_hash),
-                        analysis_artifacts=analysis_artifacts,
-                        task_root=task_root,
-                        audit_dir=audit_dir,
-                        run_repro=run_repro,
-                        review_feedback=feedback_by_id.get(
-                            str(task.get("task_id") or manifest_entry.get("task_id") or "")
-                        ),
-                        task_review_callback=task_review_callback,
-                        case_runtime=case_runtime,
-                    )
-                else:
-                    reuse_existing_unit = all(
-                        index in existing for index, _task, _entry in members
-                    )
-                    future = executor.submit(
-                        copy_context().run,
-                        _resume_or_run_writer,
-                        writer_runner=_run_one_execution_unit_writer,
-                        cached_members=members if str(unit["unit_id"]) in cached_review_unit_ids else [],
-                        cached_records=existing,
-                        unit=unit,
-                        reuse_existing=reuse_existing_unit,
-                        runtime_refresh_required=any(
-                            _task_writer_record_refresh_pending(existing[index])
-                            for index, _task, _entry in members
-                            if index in existing
-                        ),
-                        facts=facts,
-                        experiment_index=experiment_index,
-                        paper=paper,
-                        paper_path=paper_path,
-                        paper_context_json=paper_context_json,
-                        paper_images=paper_images,
-                        paper_thesis=paper_thesis,
-                        foundation=foundation,
-                        analysis_snapshot_hash=(snapshot_hashes or {}).get(str(unit["unit_id"]), analysis_snapshot_hash),
-                        analysis_artifacts=analysis_artifacts,
-                        task_root=task_root,
-                        audit_dir=audit_dir,
-                        run_repro=run_repro,
-                        review_feedback=feedback_by_id,
-                        task_review_callback=task_review_callback,
-                        case_runtime=case_runtime,
-                    )
-                futures[future] = unit
-            for future in as_completed(futures):
-                unit = futures[future]
-                members = unit["members"]
-                try:
-                    result = future.result()
-                    unit_records = result if isinstance(result, list) else [result]
-                    member_index_by_task_id = {
-                        str(task.get("task_id") or entry.get("task_id") or ""): index
-                        for index, task, entry in members
-                    }
-                    for record in unit_records:
-                        if not isinstance(record, dict):
-                            continue
-                        record_index = record.get("index")
-                        if not isinstance(record_index, int):
-                            record_index = member_index_by_task_id.get(
-                                str(record.get("task_id") or "")
-                            )
-                        if not isinstance(record_index, int) and len(members) == 1:
-                            record_index = members[0][0]
-                        if isinstance(record_index, int):
-                            record["index"] = record_index
-                            record.setdefault("execution_unit_id", str(unit["unit_id"]))
-                            by_index[record_index] = record
-                    missing_members = [
-                        (index, task, entry)
-                        for index, task, entry in members
-                        if index not in by_index
-                    ]
-                    if missing_members:
-                        missing_ids = [
-                            str(task.get("task_id") or entry.get("task_id") or index)
-                            for index, task, entry in missing_members
-                        ]
-                        raise RuntimeError(
-                            "execution-unit Writer returned no delivery for logical tasks: "
-                            + ", ".join(missing_ids)
-                        )
-                    if snapshot_finalizer is not None:
-                        snapshot_finalizer(unit, [by_index[index] for index, _task, _entry in members])
-                except Exception as exc:
-                    for index, task, manifest_entry in members:
-                        failed_task_id = str(
-                            task.get("task_id")
-                            or manifest_entry.get("task_id")
-                            or f"task_{index}"
-                        )
-                        sandbox = (
-                            task_root / f"{index:02d}_{safe_label(failed_task_id)}"
-                            if len(members) == 1
-                            else _execution_unit_sandbox(task_root, str(unit["unit_id"]))
-                        )
-                        by_index[index] = _failed_task_record(
-                            index=index,
-                            task_id=failed_task_id,
-                            module=str(manifest_entry.get("module") or ""),
-                            output_subdir=str(
-                                manifest_entry.get("output_subdir") or failed_task_id
-                            ),
-                            sandbox=sandbox,
-                            error=f"{type(exc).__name__}: {exc}",
-                        )
-                        by_index[index]["execution_unit_id"] = str(unit["unit_id"])
-                audit["attempts"].append(
-                    {
-                        "execution_unit_id": str(unit["unit_id"]),
-                        "task_ids": [
-                            str(task.get("task_id") or entry.get("task_id") or "")
-                            for _index, task, entry in members
-                        ],
-                        "writer_error_kinds": [
-                            by_index[index].get("writer_error_kind")
-                            for index, _task, _entry in members
-                            if index in by_index
-                        ],
-                        "writer_completed": all(
-                            bool(by_index[index].get("writer_completed"))
-                            for index, _task, _entry in members
-                            if index in by_index
-                        ),
-                    }
-                )
-                write_json(audit_path, audit)
-                _checkpoint_partial_task_writer_records(
-                    audit_dir=audit_dir,
-                    dispatch_audit=audit,
-                    records_by_index=by_index,
-                )
+        decision = supervisor.tools.run("writers", offer,
+            state=lambda: {"completed": sorted(finished_names), "failures": errors,
+                           "pending": sorted(set(units_by_name) - finished_names),
+                           "scientific_conclusions_owned_by": "independent_reporters"},
+            on_result=received, on_error=failed, on_dispatch=dispatched,
+            routine_selector=routine_route)
+        audit["supervisor_decision"] = decision
+        for name, unit in units_by_name.items():
+            if name not in finished_names and any(index not in by_index for index, *_ in unit["members"]):
+                reduce_unit(name, error=RuntimeError("主持人暂缓该单元：" + str(decision.get("diagnosis", "未派发"))))
+    audit["completed_execution_unit_count"] = len(finished_names) + len(reused_unit_ids)
     records = [by_index[index] for index in range(1, len(task_pairs) + 1)]
-    audit["completed_task_count"] = len(records)
-    audit["completed_execution_unit_count"] = len(units)
+    audit["recorded_task_count"] = len(records)
+    audit["completed_task_count"] = sum(len(units_by_name[name]["members"]) for name in finished_names)
+    audit["completed_task_count"] += sum(len(unit["members"]) for unit in units if str(unit["unit_id"]) in reused_unit_ids)
     write_json(audit_path, audit)
     return records, audit
 
@@ -329,7 +392,9 @@ def _resume_or_run_writer(*, writer_runner, cached_members, cached_records, **kw
             for record, (action, feedback) in zip(records, reviews)
             if action == "writer_revision" and isinstance(feedback, dict)
         }
-        if not revisions:
+        # A shared revision must reach the host before any private continuation
+        # recreates this compound sandbox or invalidates a prepared diagnosis.
+        if not revisions or any(record.get("foundation_revision_request") for record in records):
             return records[0] if len(cached_members) == 1 else records
         kwargs["task_review_callback"] = _reporter_callback_with_replay(
             callback, {str(record["task_id"]): record.get("task_reporter") for record in records},

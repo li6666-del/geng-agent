@@ -8,9 +8,6 @@ from tempfile import TemporaryDirectory
 from geng_agent.pipeline import (
     ReviewPipeline,
     _build_run_cost,
-    _result_alignment_level,
-    build_risk_dimensions,
-    detect_nondeterminism_findings,
 )
 
 
@@ -23,37 +20,6 @@ class _UsageClient:
 
     def complete(self, prompt: str, *, system=None, response_format=None) -> str:  # pragma: no cover - unused
         return "{}"
-
-
-class DetectNondeterminismTests(unittest.TestCase):
-    def _project(self, tmp: str, run_experiment: str) -> Path:
-        proj = Path(tmp)
-        (proj / "src").mkdir(exist_ok=True)
-        (proj / "run_experiment.py").write_text(run_experiment, encoding="utf-8")
-        return proj
-
-    def test_randomness_without_seed_is_flagged(self) -> None:
-        with TemporaryDirectory() as tmp:
-            proj = self._project(tmp, "import numpy as np\nx = np.random.normal(size=10)\n")
-            findings = detect_nondeterminism_findings(proj)
-            self.assertEqual(len(findings), 1)
-            self.assertEqual(findings[0]["type"], "nondeterministic_randomness")
-            self.assertIn("run_experiment.py", findings[0]["files"])
-
-    def test_default_rng_with_seed_is_not_flagged(self) -> None:
-        with TemporaryDirectory() as tmp:
-            proj = self._project(tmp, "import numpy as np\nrng = np.random.default_rng(42)\nx = rng.normal(size=10)\n")
-            self.assertEqual(detect_nondeterminism_findings(proj), [])
-
-    def test_random_seed_call_is_not_flagged(self) -> None:
-        with TemporaryDirectory() as tmp:
-            proj = self._project(tmp, "import random\nrandom.seed(0)\nv = random.random()\n")
-            self.assertEqual(detect_nondeterminism_findings(proj), [])
-
-    def test_no_randomness_is_not_flagged(self) -> None:
-        with TemporaryDirectory() as tmp:
-            proj = self._project(tmp, "x = 1 + 1\nprint(x)\n")
-            self.assertEqual(detect_nondeterminism_findings(proj), [])
 
 
 class BuildRunCostTests(unittest.TestCase):
@@ -81,65 +47,6 @@ class BuildRunCostTests(unittest.TestCase):
         cost = _build_run_cost([], total_wall_s=0.0, by_model={})
         self.assertEqual(cost["totals"]["total_tokens"], 0)
         self.assertEqual(cost["by_stage"], [])
-
-
-class RiskDimensionTests(unittest.TestCase):
-    def test_result_alignment_level_tracks_runtime_and_review(self) -> None:
-        self.assertEqual(_result_alignment_level(True, True, True, True, []), "low")
-        self.assertEqual(_result_alignment_level(True, False, True, True, []), "high")
-
-    def test_clean_run_keeps_low_dimensions(self) -> None:
-        dims = build_risk_dimensions(
-            missing=[],
-            assumptions=[],
-            validation={"required_files_present": True, "python_compiles": True},
-            runtime_result={"enabled": True, "passed": True},
-            scientific_check={},
-            tasks={},
-            result_review_result={"enabled": True, "passed": True},
-        )
-        self.assertEqual(dims["implementation_fidelity"]["level"], "low")
-        self.assertEqual(dims["result_alignment"]["level"], "low")
-        self.assertEqual(dims["security_isolation"]["level"], "low")
-
-    def test_dependency_warnings_are_visible_but_not_high_risk(self) -> None:
-        dims = build_risk_dimensions(
-            missing=[],
-            assumptions=[],
-            validation={"required_files_present": True, "python_compiles": True},
-            runtime_result={
-                "enabled": True,
-                "passed": True,
-                "requirements_warnings": [{"message": "missing declaration"}],
-            },
-            scientific_check={},
-            tasks={},
-            result_review_result={"enabled": True, "passed": True},
-        )
-
-        self.assertEqual(dims["runtime_reliability"]["level"], "low")
-        self.assertEqual(dims["security_isolation"]["level"], "low")
-        self.assertEqual(dims["dependency_portability"]["level"], "medium")
-        self.assertIn("requirements_warnings=1", dims["dependency_portability"]["evidence"])
-
-    def test_inconclusive_terminal_result_is_reportable_not_an_incomplete_review(self) -> None:
-        dims = build_risk_dimensions(
-            missing=[{"name": "undisclosed setting"}],
-            assumptions=[],
-            validation={"required_files_present": True, "python_compiles": True},
-            runtime_result={"enabled": True, "passed": True},
-            scientific_check={},
-            tasks={"repro_tasks": [{"task_id": "task_1"}]},
-            result_review_result={
-                "enabled": True,
-                "passed": False,
-                "all_terminal": True,
-                "tasks": [{"task_id": "task_1", "outcome": "inconclusive_missing_information"}],
-            },
-        )
-
-        self.assertEqual(dims["result_alignment"]["level"], "medium")
-        self.assertEqual(dims["information_completeness"]["level"], "high")
 
 
 class UsageRollupTests(unittest.TestCase):

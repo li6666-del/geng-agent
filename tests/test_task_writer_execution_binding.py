@@ -10,10 +10,10 @@ from geng_agent.agentic_task_writers import (
     _load_task_execution_binding,
     _merge_task_writer_deliveries,
     _run_one_task_writer,
-    _task_execution_binding_issues,
     _write_minimal_shared_project_files,
 )
 from geng_agent.outputs import write_json
+from geng_agent.task_writer_execution_binding import _task_execution_binding_from_architecture
 
 
 def _architecture(version: str = '1.1') -> dict:
@@ -65,6 +65,24 @@ def _write_binding(sandbox: Path, version: str = '1.1') -> None:
     root = sandbox / 'paper_evidence' / 'analysis_artifacts'
     root.mkdir(parents=True, exist_ok=True)
     write_json(root / 'scientific_architecture.json', _architecture(version))
+
+
+def test_unversioned_address_aliases_keep_task_ownership_and_original_document():
+    architecture = _architecture()
+    architecture.pop('schema_version')
+    component = architecture['components'][0]
+    component['component_id'] = component.pop('id')
+    first = architecture['bindings'][0]
+    first['component_ids'] = first.pop('components')
+    architecture['bindings'].append({**first, 'task_id': 'fig_2', 'experiment_id': 'exp_2'})
+    original = json.dumps(architecture, ensure_ascii=False)
+    binding = _task_execution_binding_from_architecture(architecture, 'fig_1')
+    assert binding['configuration_issues'] == []
+    assert binding['experiment_ids'] == ['exp_1']
+    assert binding['components'][0]['component_id'] == 'shared_model'
+    assert binding['components'][0]['ownership'] == 'foundation'
+    assert binding['components'][0]['execution'] == component['execution']
+    assert json.dumps(architecture, ensure_ascii=False) == original
 
 
 def _result(
@@ -131,441 +149,18 @@ class TaskWriterExecutionBindingTests(unittest.TestCase):
         self.assertIn('Follow each bound component execution.primary_framework', prompt)
         self.assertNotIn('prefer a real Torch CUDA implementation', prompt)
 
-    def test_v10_keeps_legacy_prompt_and_has_no_binding_gate(self) -> None:
-        with TemporaryDirectory() as temp:
-            sandbox = Path(temp)
-            _write_binding(sandbox, version='1.0')
-            (sandbox / 'tasks').mkdir()
-            (sandbox / 'tasks' / 'fig_1.py').write_text(
-                'import torch.nn as nn\nclass Mirror(nn.Module):\n    pass\n',
-                encoding='utf-8',
-            )
-            binding = _load_task_execution_binding(sandbox, 'fig_1')
-            issues = _task_execution_binding_issues(
-                sandbox=sandbox,
-                task_id='fig_1',
-                result_doc={},
-            )
 
-        self.assertIsNone(binding)
-        self.assertEqual(issues, [])
-        legacy_prompt = _brief(binding)
-        self.assertIn('prefer a real Torch CUDA implementation', legacy_prompt)
-        usage_key = json.dumps('component_usage') + ':'
-        self.assertNotIn(usage_key, legacy_prompt.split('## Required final files', 1)[1])
 
-    def test_composition_entrypoint_reaches_bound_component_through_relative_import(self) -> None:
-        with TemporaryDirectory() as temp:
-            sandbox = Path(temp)
-            _write_binding(sandbox)
-            (sandbox / 'tasks').mkdir()
-            (sandbox / 'tasks' / 'fig_1.py').write_text(
-                'from src.system import System\n\ndef run():\n    return System().run()\n\nif __name__ == "__main__":\n    run()\n',
-                encoding='utf-8',
-            )
-            (sandbox / 'src' / 'models').mkdir(parents=True)
-            (sandbox / 'src' / 'system.py').write_text(
-                'from .models.shared import SharedModel\nclass System:\n    def run(self):\n        return SharedModel()\n',
-                encoding='utf-8',
-            )
-            (sandbox / 'src' / 'models' / 'shared.py').write_text(
-                'class SharedModel:\n    pass\n',
-                encoding='utf-8',
-            )
 
-            issues = _task_execution_binding_issues(
-                sandbox=sandbox,
-                task_id='fig_1',
-                result_doc=_result(),
-            )
 
-        self.assertEqual(issues, [])
 
-    def test_task_private_framework_head_may_compose_with_shared_trainable_component(self) -> None:
-        with TemporaryDirectory() as temp:
-            sandbox = Path(temp)
-            _write_binding(sandbox)
-            (sandbox / 'tasks').mkdir()
-            (sandbox / 'tasks' / 'fig_1.py').write_text(
-                'from src.models.shared import SharedModel\n'
-                'from src import _backend\n'
-                'torch = _backend.torch()\n'
-                'nn = torch.nn\n'
-                'class Mirror(nn.Module):\n    pass\n'
-                'def run():\n'
-                '    return SharedModel(), Mirror()\n'
-                'if __name__ == "__main__":\n'
-                '    run()\n',
-                encoding='utf-8',
-            )
-            (sandbox / 'src' / 'models').mkdir(parents=True)
-            (sandbox / 'src' / 'models' / 'shared.py').write_text(
-                'class SharedModel:\n    pass\n',
-                encoding='utf-8',
-            )
 
-            issues = _task_execution_binding_issues(
-                sandbox=sandbox,
-                task_id='fig_1',
-                result_doc=_result(),
-            )
 
-        self.assertEqual(issues, [])
 
-    def test_orphan_task_helper_import_does_not_satisfy_shared_component_reachability(self) -> None:
-        with TemporaryDirectory() as temp:
-            sandbox = Path(temp)
-            _write_binding(sandbox)
-            (sandbox / 'tasks').mkdir()
-            (sandbox / 'tasks' / 'fig_1.py').write_text(
-                'def run():\n    return 1\n',
-                encoding='utf-8',
-            )
-            (sandbox / 'tasks' / 'orphan.py').write_text(
-                'from src.models.shared import SharedModel\n',
-                encoding='utf-8',
-            )
-            (sandbox / 'src' / 'models').mkdir(parents=True)
-            (sandbox / 'src' / 'models' / 'shared.py').write_text(
-                'class SharedModel:\n    pass\n',
-                encoding='utf-8',
-            )
 
-            issues = _task_execution_binding_issues(
-                sandbox=sandbox,
-                task_id='fig_1',
-                result_doc=_result(),
-            )
 
-        self.assertTrue(
-            any(
-                'expected module src.models.shared is not reachable' in issue
-                for issue in issues
-            )
-        )
 
-    def test_manifest_entry_reaches_helper_and_foundation_composition(self) -> None:
-        with TemporaryDirectory() as temp:
-            sandbox = Path(temp)
-            _write_binding(sandbox)
-            (sandbox / 'tasks').mkdir()
-            write_json(
-                sandbox / 'tasks_manifest.json',
-                {
-                    'version': 1,
-                    'tasks': [
-                        {
-                            'task_id': 'fig_1',
-                            'module': 'assigned',
-                            'script': 'tasks/assigned.py',
-                        }
-                    ],
-                },
-            )
-            (sandbox / 'tasks' / 'assigned.py').write_text(
-                'from tasks.helper import build\n\ndef run():\n    return build()\n\nif __name__ == "__main__":\n    run()\n',
-                encoding='utf-8',
-            )
-            (sandbox / 'tasks' / 'helper.py').write_text(
-                'from src.system import System\n\ndef build():\n    return System().run()\n',
-                encoding='utf-8',
-            )
-            (sandbox / 'tasks' / 'fig_1.py').write_text(
-                'raise RuntimeError("manifest entry must win over fallback")\n',
-                encoding='utf-8',
-            )
-            (sandbox / 'src' / 'models').mkdir(parents=True)
-            (sandbox / 'src' / 'system.py').write_text(
-                'from .models.shared import SharedModel\n'
-                'class System:\n'
-                '    def run(self):\n'
-                '        return SharedModel()\n',
-                encoding='utf-8',
-            )
-            (sandbox / 'src' / 'models' / 'shared.py').write_text(
-                'class SharedModel:\n    pass\n',
-                encoding='utf-8',
-            )
 
-            issues = _task_execution_binding_issues(
-                sandbox=sandbox,
-                task_id='fig_1',
-                result_doc=_result(evidence_files=['tasks/helper.py:3']),
-            )
-
-        self.assertEqual(issues, [])
-
-    def test_component_usage_evidence_must_exist_and_be_in_task_import_closure(self) -> None:
-        with TemporaryDirectory() as temp:
-            sandbox = Path(temp)
-            _write_binding(sandbox)
-            (sandbox / 'tasks').mkdir()
-            (sandbox / 'tasks' / 'fig_1.py').write_text(
-                'from src.models.shared import SharedModel\n',
-                encoding='utf-8',
-            )
-            (sandbox / 'tasks' / 'orphan.py').write_text(
-                'VALUE = 1\n',
-                encoding='utf-8',
-            )
-            (sandbox / 'src' / 'models').mkdir(parents=True)
-            (sandbox / 'src' / 'models' / 'shared.py').write_text(
-                'class SharedModel:\n    pass\n',
-                encoding='utf-8',
-            )
-
-            missing_issues = _task_execution_binding_issues(
-                sandbox=sandbox,
-                task_id='fig_1',
-                result_doc=_result(evidence_files=['tasks/missing.py:1']),
-            )
-            orphan_issues = _task_execution_binding_issues(
-                sandbox=sandbox,
-                task_id='fig_1',
-                result_doc=_result(evidence_files=['tasks/orphan.py:1']),
-            )
-
-        self.assertTrue(any('must exist inside the sandbox' in issue for issue in missing_issues))
-        self.assertTrue(any('not in the assigned task import closure' in issue for issue in orphan_issues))
-
-    def test_import_only_does_not_prove_declared_callable_participation(self) -> None:
-        with TemporaryDirectory() as temp:
-            sandbox = Path(temp)
-            _write_binding(sandbox)
-            (sandbox / 'tasks').mkdir()
-            (sandbox / 'tasks' / 'fig_1.py').write_text(
-                'from src.models.shared import SharedModel\n'
-                'DECLARED_MODEL = SharedModel\n'
-                'def main():\n'
-                '    return 1\n'
-                'if __name__ == "__main__":\n'
-                '    main()\n',
-                encoding='utf-8',
-            )
-            (sandbox / 'src' / 'models').mkdir(parents=True)
-            (sandbox / 'src' / 'models' / 'shared.py').write_text(
-                'class SharedModel:\n    pass\n',
-                encoding='utf-8',
-            )
-
-            issues = _task_execution_binding_issues(
-                sandbox=sandbox,
-                task_id='fig_1',
-                result_doc=_result(),
-            )
-
-        self.assertTrue(
-            any(
-                'declared callable src.models.shared.SharedModel is imported but not called'
-                in issue
-                for issue in issues
-            )
-        )
-
-    def test_dead_entry_helper_call_does_not_prove_scientific_participation(self) -> None:
-        with TemporaryDirectory() as temp:
-            sandbox = Path(temp)
-            _write_binding(sandbox)
-            (sandbox / 'tasks').mkdir()
-            (sandbox / 'tasks' / 'fig_1.py').write_text(
-                'from src.models.shared import SharedModel\n'
-                'def fake():\n'
-                '    return SharedModel()\n'
-                'def main():\n'
-                '    return 1\n'
-                'if __name__ == "__main__":\n'
-                '    main()\n',
-                encoding='utf-8',
-            )
-            (sandbox / 'src' / 'models').mkdir(parents=True)
-            (sandbox / 'src' / 'models' / 'shared.py').write_text(
-                'class SharedModel:\n    pass\n',
-                encoding='utf-8',
-            )
-
-            issues = _task_execution_binding_issues(
-                sandbox=sandbox,
-                task_id='fig_1',
-                result_doc=_result(),
-            )
-
-        self.assertTrue(
-            any(
-                'declared callable src.models.shared.SharedModel is imported but not called'
-                in issue
-                for issue in issues
-            )
-        )
-
-    def test_import_and_assignment_alias_call_declared_callable(self) -> None:
-        with TemporaryDirectory() as temp:
-            sandbox = Path(temp)
-            _write_binding(sandbox)
-            (sandbox / 'tasks').mkdir()
-            (sandbox / 'tasks' / 'fig_1.py').write_text(
-                'from src.models.shared import SharedModel as ModelFactory\n'
-                'def run():\n'
-                '    factory = ModelFactory\n'
-                '    return factory()\n'
-                'if __name__ == "__main__":\n'
-                '    run()\n',
-                encoding='utf-8',
-            )
-            (sandbox / 'src' / 'models').mkdir(parents=True)
-            (sandbox / 'src' / 'models' / 'shared.py').write_text(
-                'class SharedModel:\n    pass\n',
-                encoding='utf-8',
-            )
-
-            issues = _task_execution_binding_issues(
-                sandbox=sandbox,
-                task_id='fig_1',
-                result_doc=_result(),
-            )
-
-        self.assertEqual(issues, [])
-
-    def test_shared_instance_fixture_call_is_accepted(self) -> None:
-        with TemporaryDirectory() as temp:
-            sandbox = Path(temp)
-            _write_binding(sandbox)
-            (sandbox / 'tasks').mkdir()
-            (sandbox / 'tasks' / 'fig_1.py').write_text(
-                'from src.models.shared import SharedModel\n'
-                'MODEL_FIXTURE = SharedModel()\n'
-                'def run(model=MODEL_FIXTURE):\n'
-                '    return model(None)\n'
-                'if __name__ == "__main__":\n'
-                '    run()\n',
-                encoding='utf-8',
-            )
-            (sandbox / 'src' / 'models').mkdir(parents=True)
-            (sandbox / 'src' / 'models' / 'shared.py').write_text(
-                'class SharedModel:\n'
-                '    def __call__(self, value):\n'
-                '        return value\n',
-                encoding='utf-8',
-            )
-
-            issues = _task_execution_binding_issues(
-                sandbox=sandbox,
-                task_id='fig_1',
-                result_doc=_result(),
-            )
-
-        self.assertEqual(issues, [])
-
-    def test_unknown_framework_uses_import_and_evidence_gate_without_model_guessing(self) -> None:
-        with TemporaryDirectory() as temp:
-            sandbox = Path(temp)
-            architecture = _architecture()
-            architecture['components'][0]['execution']['primary_framework'] = 'custom_engine'
-            root = sandbox / 'paper_evidence' / 'analysis_artifacts'
-            root.mkdir(parents=True)
-            write_json(root / 'scientific_architecture.json', architecture)
-            (sandbox / 'tasks').mkdir()
-            (sandbox / 'tasks' / 'fig_1.py').write_text(
-                'from src.models.shared import SharedModel\n'
-                'import torch.nn as nn\n'
-                'class Adapter(nn.Module):\n    pass\n'
-                'def run():\n'
-                '    return SharedModel(), Adapter()\n'
-                'if __name__ == "__main__":\n'
-                '    run()\n',
-                encoding='utf-8',
-            )
-            (sandbox / 'src' / 'models').mkdir(parents=True)
-            (sandbox / 'src' / 'models' / 'shared.py').write_text(
-                'class SharedModel:\n    pass\n',
-                encoding='utf-8',
-            )
-
-            issues = _task_execution_binding_issues(
-                sandbox=sandbox,
-                task_id='fig_1',
-                result_doc=_result(),
-            )
-
-        self.assertEqual(issues, [])
-
-    def test_collection_reports_shared_component_advisory_without_blocking(self) -> None:
-        with TemporaryDirectory() as temp:
-            sandbox = Path(temp)
-            _write_binding(sandbox)
-            (sandbox / 'tasks').mkdir()
-            (sandbox / 'tasks' / 'fig_1.py').write_text('def run():\n    return 1\n', encoding='utf-8')
-            write_json(sandbox / 'task_agent_result.json', _result(usage='reference_only'))
-
-            record = _collect_task_writer_delivery(
-                index=1,
-                task={'task_id': 'fig_1'},
-                manifest_entry={'task_id': 'fig_1', 'module': 'fig_1', 'output_subdir': 'fig_1'},
-                sandbox=sandbox,
-                writer_status={'ok': True},
-            )
-
-        self.assertTrue(record['writer_completed'])
-        self.assertIsNone(record['writer_error_kind'])
-        self.assertFalse(record['delivery_blockers'])
-        self.assertTrue(
-            any(item.startswith('shared_component_advisory:') for item in record['delivery_warnings'])
-        )
-
-    def test_binding_advisory_does_not_reopen_writer(self) -> None:
-        with TemporaryDirectory() as temp:
-            root = Path(temp)
-            ready = {
-                'task_id': 'fig_1',
-                'writer_completed': True,
-                'task_writer_status': 'ready_for_review',
-                'writer_error_kind': None,
-                'delivery_blockers': [],
-                'delivery_warnings': [
-                    'shared_component_advisory: shared_model is reference_only'
-                ],
-            }
-            with patch(
-                'geng_agent.task_writer_runner._prepare_task_writer_sandbox'
-            ), patch(
-                'geng_agent.task_writer_runner._build_task_writer_brief',
-                return_value='base',
-            ), patch(
-                'geng_agent.task_writer_runner._run_task_writer_codex_session',
-                return_value={'ok': True},
-            ) as run_session, patch(
-                'geng_agent.task_writer_runner._restore_trusted_files'
-            ), patch(
-                'geng_agent.task_writer_runner._collect_task_writer_delivery',
-                return_value=ready,
-            ), patch(
-                'geng_agent.task_writer_runner._archive_nonterminal_writer_delivery'
-            ) as archive:
-                result = _run_one_task_writer(
-                    index=1,
-                    reuse_existing=False,
-                    task={'task_id': 'fig_1'},
-                    manifest_entry={
-                        'task_id': 'fig_1',
-                        'module': 'fig_1',
-                        'output_subdir': 'fig_1',
-                    },
-                    facts={},
-                    experiment_index={},
-                    paper={},
-                    paper_path=root / 'paper.pdf',
-                    paper_context_json='',
-                    paper_images=[],
-                    paper_thesis=None,
-                    analysis_snapshot_hash='snapshot',
-                    analysis_artifacts={},
-                    task_root=root / 'sandboxes',
-                    audit_dir=root,
-                    run_repro=True,
-                )
-
-        self.assertEqual(run_session.call_count, 1)
-        self.assertEqual(archive.call_count, 0)
-        self.assertEqual(result['task_writer_status'], 'ready_for_review')
 
     def test_foundation_scaffold_removes_legacy_numpy_and_communication_stubs(self) -> None:
         with TemporaryDirectory() as temp:

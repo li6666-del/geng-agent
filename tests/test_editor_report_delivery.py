@@ -99,18 +99,19 @@ def test_changed_reporter_image_is_not_republished(tmp_path):
 def test_existing_editor_prompt_assigns_concise_comparison_and_detailed_reproduction():
     brief = _build_report_editor_brief(task_count=2)
     assert '# Role: final report editor' in brief
-    for requirement in ('核心事实与假设', '本地结果与原文结果对比', '仍存在的差距', '下一步人工核查建议',
-                        '不能只取列表第一张', '不复制逐任务大表', '未知保持未知'):
+    for requirement in ('核心事实与假设', '本地结果与原文结果对比', '差距与限制（按需）', '下一步人工核查建议（按需）',
+                        '不能只取列表第一张', '不复制逐任务大表', '未知保持未知',
+                        '省略整节', '不写“暂无建议”', '差距与建议仅在适用时出现'):
         assert requirement in brief
 
 
 def test_editor_presentation_keeps_decisions_and_evidence_while_improving_readability():
     brief = _build_report_editor_brief(task_count=3)
     for requirement in (
-        '任务、复现目标、结论、关键差距',
+        '任务、复现目标、结论、结果要点',
         '原文结果、本地结果、对任务结论的影响',
         '上下排列', '附录 原文图像证据',
-        '只有结构简单、比例接近', '不能用去重省掉不同分支',
+        '默认用双列 Markdown 图片表', '本地在左、原文在右', '不能用去重省掉不同分支',
         '不能让舍入改变原有结论', '不准改变状态',
         '不会替你四舍五入或改写测量', '不从文件名猜测',
         '项目入口与运行方法', '不得把它们改写为本任务验收失败',

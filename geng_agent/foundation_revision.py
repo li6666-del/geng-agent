@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 from .foundation_scope import affected_foundation_consumers, derive_foundation_scope
+from .architecture_protocol import architecture_runtime_view
 from .foundation_snapshot import file_sha256, path_is_foundation_link
 
 
@@ -17,7 +19,8 @@ FOUNDATION_REVISION_FILENAME = "foundation_revision_request.json"
 class FoundationRevisionRequired(RuntimeError):
     """A Writer/Reporter requests host-owned repair after active Writers finish."""
 
-    def __init__(self, request: dict[str, Any] | list[dict[str, Any]]) -> None:
+    def __init__(self, request: dict[str, Any] | list[dict[str, Any]], *, partial_result: dict | None = None) -> None:
+        self.partial_result = partial_result
         self.requests = request if isinstance(request, list) else [request]
         self.request = self.requests[0]
         self.affected_component_ids = tuple(sorted({key for item in self.requests for key in item.get("component_ids", [])}))
@@ -67,6 +70,7 @@ def validate_foundation_revision_request(
 
     if not isinstance(request, dict):
         raise ValueError("Foundation revision request must be an object")
+    architecture = architecture_runtime_view(architecture)
     raw_ids = request.get("component_ids", request.get("affected_components"))
     component_ids = sorted({str(value) for value in raw_ids}) if isinstance(raw_ids, list) else []
     scope = derive_foundation_scope(architecture, execution_plan)
@@ -83,11 +87,13 @@ def validate_foundation_revision_request(
         if str(component.get("module")) in modules
     })
     causal_change = str(request.get("causal_change") or "").strip()
-    if not causal_change:
-        raise ValueError("Foundation revision requires a concrete paper-grounded causal change")
     raw_evidence = request.get("paper_evidence_files")
-    if not isinstance(raw_evidence, list) or not raw_evidence:
-        raise ValueError("Foundation revision requires existing paper evidence")
+    observations = list(request.get("observations") or [])
+    if not causal_change:
+        observations.append("The request has no separate causal_change field; inspect the owner's original explanation.")
+    if not isinstance(raw_evidence, list):
+        observations.append("The request has no paper_evidence_files list; evidence remains for coordinator review.")
+        raw_evidence = []
     if path_is_foundation_link(evidence_root):
         raise ValueError("Foundation revision evidence root must not be a link")
     root = evidence_root.resolve(strict=True)
@@ -105,14 +111,17 @@ def validate_foundation_revision_request(
             candidate /= part
             if path_is_foundation_link(candidate):
                 raise ValueError("Foundation revision evidence must not follow filesystem links")
+        if not candidate.is_file():
+            observations.append(f"Declared Foundation evidence is unavailable: {relative}")
+            continue
         resolved = candidate.resolve(strict=True)
         resolved.relative_to(root)
-        if not resolved.is_file():
-            raise ValueError("Foundation revision evidence is not a regular file")
         evidence.append({"path": relative, "sha256": file_sha256(resolved)})
     affected = affected_foundation_consumers(architecture, component_ids, execution_plan)
     result = {
         "component_ids": component_ids,
+        "original_request": deepcopy(request.get("original_request") or request),
+        "observations": list(dict.fromkeys(observations)),
         "module_paths": sorted(modules),
         "paper_evidence_files": sorted({item["path"] for item in evidence}),
         "paper_evidence": sorted(evidence, key=lambda item: item["path"]),
@@ -121,8 +130,28 @@ def validate_foundation_revision_request(
         "affected_task_ids": affected["task_ids"],
         "affected_execution_unit_ids": affected["execution_unit_ids"],
     }
-    encoded = json.dumps(result, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    # Preserve the submitted explanation for review, while keeping operational
+    # recovery instructions out of the identity used by pending consumers.
+    identity = {**result, "original_request": {
+        key: value for key, value in result["original_request"].items()
+        if key != "moderator_recovery"
+    }}
+    encoded = json.dumps(identity, ensure_ascii=False, sort_keys=True).encode("utf-8")
     result["request_id"] = hashlib.sha256(encoded).hexdigest()
+    recovery = request.get("moderator_recovery")
+    if recovery is not None:
+        if not isinstance(recovery, dict) or not all(
+            isinstance(recovery.get(key), str) and recovery[key].strip()
+            for key in ("instructions", "decision_id")
+        ):
+            raise ValueError("Foundation recovery requires concrete instructions and a moderator decision ID")
+        # Operational recovery instructions enter the Foundation prompt and
+        # generation input hash, but do not replace the scientific request ID
+        # which pending consumers use to recognize an applied correction.
+        result["moderator_recovery"] = {
+            key: str(recovery.get(key) or "")
+            for key in ("instructions", "decision_id", "expected_change", "failure_evidence")
+        }
     return result
 
 
