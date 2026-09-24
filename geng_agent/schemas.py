@@ -128,7 +128,21 @@ def validate_manifest_business_rules(
             issues.append(ValidationIssue(f"{base}.path", "duplicate path"))
         seen_paths.add(normalized)
 
-    expected = required_files if required_files is not None else REQUIRED_REPRO_FILES
+    meta = data.get("_meta") if isinstance(data.get("_meta"), dict) else {}
+    if meta.get("package_layout") == "task_directories" and required_files is None:
+        packaged = meta.get("packaged_only_files")
+        for item in packaged if isinstance(packaged, list) else []:
+            if isinstance(item, dict) and isinstance(item.get("path"), str):
+                normalized = _normalize_manifest_path(item["path"], "$.files.path", issues)
+                if normalized is not None:
+                    seen_paths.add(normalized)
+        packages = meta.get("task_packages")
+        expected = {
+            f"{package['directory']}/run_experiment.py"
+            for package in packages if isinstance(package, dict) and isinstance(package.get("directory"), str)
+        } if isinstance(packages, list) and packages else set(REQUIRED_REPRO_FILES)
+    else:
+        expected = required_files if required_files is not None else REQUIRED_REPRO_FILES
     missing = sorted(expected - seen_paths)
     for path in missing:
         issues.append(ValidationIssue("$.files", f"missing required file: {path}"))

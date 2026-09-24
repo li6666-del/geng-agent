@@ -7,8 +7,7 @@ from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
 
-from .agentic_analysis import CODEX_ANALYSIS_BACKEND
-from .json_utils import parse_json_object
+from .agentic_analysis import CODEX_ANALYSIS_BACKEND, parse_owner_handoff
 from .outputs import write_json, write_text
 from .pipeline_helpers import (
     _is_non_retryable_llm_error,
@@ -17,7 +16,7 @@ from .pipeline_helpers import (
 )
 from .prompt_identity import analysis_contract_identity, scientific_cache_value
 from .runtime_status import _load_valid_stage_cache, build_stage_cache_metadata
-from .schemas import ValidationIssue, format_issues, validate_stage
+from .schemas import ValidationIssue
 from .scientific_materiality import SCIENTIFIC_POLICY_ID
 from .stage_cleanup import _clear_stage_outputs
 
@@ -34,8 +33,6 @@ def load_or_create_stage_json(
     schema_stage: str,
     max_attempts: int,
     resume: bool,
-    pre_validation: Callable[[dict[str, Any]], list[ValidationIssue]] | None = None,
-    extra_validation: Callable[[dict[str, Any]], list[ValidationIssue]] | None = None,
     request_timeout: float | None = None,
     fallback_factory: Callable[[Exception], dict[str, Any] | None] | None = None,
     candidate_normalizer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
@@ -88,8 +85,7 @@ def load_or_create_stage_json(
 
     write_text(audit_dir / f"{stage_label}.md", prompt)
     common = dict(prompt=prompt, stage_label=stage_label, schema_stage=schema_stage,
-        audit_dir=audit_dir, max_attempts=1, pre_validation=pre_validation,
-        extra_validation=extra_validation, candidate_normalizer=bind_cache, images=images)
+        audit_dir=audit_dir, max_attempts=1, candidate_normalizer=bind_cache, images=images)
     if backend == CODEX_ANALYSIS_BACKEND:
         parsed = codex_stage_runner(output_dir=output_dir, **common)
     elif backend == "llm":
@@ -163,7 +159,6 @@ def complete_maybe_multimodal(
 def call_validated_json(
     pipeline: Any, prompt: str, stage_label: str, schema_stage: str,
     audit_dir: Path, max_attempts: int,
-    pre_validation: Callable | None = None, extra_validation: Callable | None = None,
     request_timeout: float | None = None, candidate_normalizer: Callable | None = None,
     repair_preservation_validator: Callable | None = None,
     truncation_recovery: Callable | None = None,
@@ -201,7 +196,7 @@ def call_validated_json(
         write_text(snapshot / "raw.txt", raw)
         write_text(audit_dir / f"raw_{stage_label}_attempt_1.txt", raw)
         write_text(audit_dir / f"raw_{stage_label}.txt", raw)
-        parsed = parse_json_object(raw)
+        parsed, parse_issue = parse_owner_handoff(raw, schema_stage)
     except PipelineCancelled:
         raise
     except Exception as exc:
@@ -211,18 +206,11 @@ def call_validated_json(
     if candidate_normalizer is not None:
         parsed = candidate_normalizer(parsed)
     write_json(snapshot / "handoff.json", parsed)
-    issues = validate_stage(schema_stage, parsed)
-    observations = []
-    for observer in (pre_validation, extra_validation):
-        if observer is not None:
-            observations.extend(item.as_dict() for item in observer(parsed))
-    write_json(audit_dir / f"validation_{stage_label}_attempt_1.json", {
-        "ok": not issues, "protocol_errors": [item.as_dict() for item in issues],
-        "observations": observations, "decision_owner": "supervisor", "candidate_snapshot": str(snapshot)})
-    if issues:
-        raise NodeFailure(f"{stage_label} handoff protocol is not executable: {format_issues(issues)}",
-            result={"candidate": parsed, "candidate_snapshot": str(snapshot),
-                    "protocol_errors": [item.as_dict() for item in issues]})
+    observations = ([{"kind": "json_unreadable", "message": parse_issue}]
+                    if parse_issue else [])
+    write_json(audit_dir / f"handoff_{stage_label}_attempt_1.json", {
+        "handoff_recorded": True, "content_validation_performed": False,
+        "observations": observations, "decision_owner": "next_stage", "candidate_snapshot": str(snapshot)})
     meta = dict(parsed.get("_meta", {})) if isinstance(parsed.get("_meta"), dict) else {}
     meta.update({"evidence_visibility": delivered_visibility, "host_observations": observations})
     parsed["_meta"] = meta

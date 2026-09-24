@@ -64,7 +64,7 @@ class RuntimeStatusCacheTests(unittest.TestCase):
         )
 
         self.assertEqual(base["format_version"], "scientific_inputs_and_contract_v3")
-        self.assertEqual(len(base["schema_sha256"]), 64)
+        self.assertIsNone(base["schema_sha256"])
         self.assertNotEqual(base["fingerprint"], prompt_changed["fingerprint"])
         self.assertNotEqual(base["fingerprint"], policy_changed["fingerprint"])
         self.assertNotEqual(base["fingerprint"], inputs_changed["fingerprint"])

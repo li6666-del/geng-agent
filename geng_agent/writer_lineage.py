@@ -34,7 +34,8 @@ def writer_policy_content_hashes() -> dict[str, str]:
 
     root = Path(__file__).parent
     policies = {name: text_identity((root / name).read_text(encoding="utf-8")) for name in (
-        "task_writer_prompts.py", "task_writer_inputs.py", "task_writer_execution_binding.py",
+        "task_writer_prompts.py", "task_writer_inputs.py", "writer_environment.py",
+        "dependency_policy.py", "task_writer_execution_binding.py",
         "task_writer_contracts.py", "task_writer_support.py", "writer_recovery.py",
         "scientific_materiality.py", "execution_receipts.py", "execution_client.py", "execution_sandbox.py",
         "writer_lineage.py",

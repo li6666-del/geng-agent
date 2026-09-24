@@ -185,6 +185,7 @@ def apply_verified_result(
     runtime.update(verification_mode="preserved_reporter_decisions",
         scientific_all_terminal=verification_result.get("all_terminal", False),
         scientific_all_successful=verification_result.get("all_successful", False),
+        all_full_runs_observed=verification_result.get("all_full_runs_observed", False),
         scientific_outcome_counts=verification_result.get("outcome_counts", {}))
     write_json(output_dir / "runtime_result.json", runtime)
     write_json(audit_dir / "03c_task_writers_records.json", {"verification_result": verification_result, "tasks": task_records})

@@ -170,7 +170,7 @@ def execution_inputs(root):
     audit = output / "audit"
     audit.mkdir(parents=True)
     context = SimpleNamespace(output_dir=output, audit_dir=audit,
-        options=SimpleNamespace(resume=True, run_repro=True, run_timeout=30),
+        options=SimpleNamespace(resume=True, run_repro=True),
         progress_tracker=SimpleNamespace(reporter=None), begin=Mock(), mark=Mock())
     analysis = SimpleNamespace(paper={}, paper_path=root / "paper.md", facts={},
         tasks={"repro_tasks": [{"task_id": "t", "goal": "BER at two points"}]},
@@ -179,6 +179,23 @@ def execution_inputs(root):
         repro_project_dir=output / "repro_project", paper_context="synthetic")
     runtime = SimpleNamespace(environment_hash="env", python_executable=Path("python.exe"))
     return context, analysis, runtime
+
+
+def require_shared_foundation(analysis):
+    from geng_agent.execution_plan import compile_execution_plan
+
+    analysis.tasks["repro_tasks"].append({"task_id": "s", "goal": "compare shared normalization"})
+    analysis.tasks["execution_relationships"] = [{
+        "relationship_id": "shared_normalization", "kind": "shared_definition",
+        "strength": "weak", "task_ids": ["t", "s"],
+        "producer_task_id": None, "consumer_task_ids": [], "artifact_ids": [],
+    }]
+    analysis.execution_plan = compile_execution_plan(analysis.tasks)
+    analysis.scientific_architecture = {
+        "components": [{"id": "normalizer", "module": "src/normalizer.py"}],
+        "bindings": [{"task_id": task_id, "components": ["normalizer"]}
+                     for task_id in ("t", "s")],
+    }
 
 
 def test_execution_handoff_keeps_actual_packaging_observations(monkeypatch, tmp_path):
@@ -200,6 +217,7 @@ def test_execution_handoff_keeps_actual_packaging_observations(monkeypatch, tmp_
 
 def test_initial_foundation_hard_failure_is_repaired_by_original_owner(monkeypatch, tmp_path):
     context, analysis, runtime = execution_inputs(tmp_path)
+    require_shared_foundation(analysis)
     foundation = Mock(side_effect=[RuntimeError("invalid import"), {"snapshot_hash": "verified", "manifest": {}}])
     monkeypatch.setattr("geng_agent.case_runtime.ensure_case_runtime", Mock(return_value=runtime))
     monkeypatch.setattr("geng_agent.agentic_foundation.run_codex_foundation_writer_workflow", foundation)
@@ -260,6 +278,7 @@ def test_resumed_execution_rehydrates_foundation_environment_request(monkeypatch
 
 def test_foundation_block_preserves_files_and_does_not_start_dependent_writers(monkeypatch, tmp_path):
     context, analysis, runtime = execution_inputs(tmp_path)
+    require_shared_foundation(analysis)
     preserved = context.audit_dir / "failed-source.py"
     preserved.write_text("raise ImportError('missing')", encoding="utf-8")
     monkeypatch.setattr("geng_agent.case_runtime.ensure_case_runtime", Mock(return_value=runtime))
@@ -298,7 +317,8 @@ def test_reporter_failure_is_recorded_without_forcing_a_repair(monkeypatch, tmp_
     assert result[0]["error"] == "incomplete JSON"
 
 
-def test_packaging_block_retains_current_run_scientific_results_for_partial_delivery(monkeypatch, tmp_path):
+@pytest.mark.parametrize("action", ["block", "continue"])
+def test_packaging_failure_retains_science_and_can_continue_to_reports(monkeypatch, tmp_path, action):
     from geng_agent import agentic_task_writers as writers
     from geng_agent.outputs import write_json
     from tests.test_agentic_task_writers import _pair, _delivery
@@ -312,6 +332,9 @@ def test_packaging_block_retains_current_run_scientific_results_for_partial_deli
     write_json(output / "engineering_facts.json", {"engineering_facts": []})
     write_json(output / "repro_tasks.json", tasks)
     write_json(output / "experiment_index.json", {"experiments": []})
+    previous_project = output / "repro_project"
+    previous_project.mkdir()
+    (previous_project / "README.md").write_text("previous package", encoding="utf-8")
     record = _delivery("task_1", audit / "03c_task_writer_sandboxes" / "01_task_1")
     record.update(index=1, writer_session_count=1,
                   task_verification={"task_id": "task_1", "outcome": "not_reproduced", "host_action": "complete"})
@@ -322,9 +345,9 @@ def test_packaging_block_retains_current_run_scientific_results_for_partial_deli
         return [record], {}
     dispatch = Mock(side_effect=dispatched)
     monkeypatch.setattr(writers, "_dispatch_task_writers", dispatch)
-    monkeypatch.setattr(writers, "_merge_task_writer_deliveries", Mock(side_effect=OSError("copy failed")))
+    monkeypatch.setattr(writers, "_package_task_directories", Mock(side_effect=OSError("copy failed")))
     coordinator, calls = supervisor(output, lambda node, kwargs:
-        {"action": "block", "diagnosis": "Cannot assemble the project on the current volume"}
+        {"action": action, "diagnosis": "Cannot assemble the project on the current volume"}
         if node == "packaging" else None)
     with supervisor_scope(coordinator):
         result = writers.run_codex_task_writer_workflow(
@@ -338,6 +361,11 @@ def test_packaging_block_retains_current_run_scientific_results_for_partial_deli
     assert result["task_records"][0]["task_verification"]["outcome"] == "not_reproduced"
     assert csv.read_text(encoding="utf-8") == "snr,ber\n0,0.12\n"
     assert result["runtime_result"]["delivery_status"] == "partial"
+    assert (previous_project / "README.md").read_text(encoding="utf-8") == "previous package"
     assert result["runtime_result"]["engineering_failures"][0]["node_id"] == "packaging"
     assert result["manifest"]["files"] == []
     assert calls[-1][1]["trigger"] == "node_failed"
+    assert "continue" in calls[-1][1]["actions"]
+    if action == "continue":
+        assert next(node for node in coordinator.snapshot()["nodes"]
+                    if node["node_id"] == "packaging")["status"] == "published"

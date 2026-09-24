@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
@@ -33,6 +34,8 @@ from geng_agent.case_runtime import (
     requirements_from_scientific_architecture,
     requirements_missing_from_lock,
 )
+from geng_agent.case_runtime_requests import architecture_for_execution_tasks
+from geng_agent.case_runtime_locking import _runtime_file_guard
 
 
 def _architecture(
@@ -105,6 +108,25 @@ def _ready_host_resolution(
 
 
 class CaseRuntimeRequestTests(unittest.TestCase):
+    def test_environment_only_provisions_active_task_component_closure(self) -> None:
+        architecture = {
+            "components": [
+                {"component_id": "model", "depends_on": ["signal"],
+                 "execution": {"primary_framework": "numpy"}},
+                {"id": "signal", "execution": {"primary_framework": "scipy"}},
+                {"id": "unused_gpu", "execution": {
+                    "primary_framework": "torch", "device_policy": "cuda"}},
+            ],
+            "bindings": [{"task_id": "task_a", "component_ids": ["model"]}],
+        }
+
+        active = architecture_for_execution_tasks(architecture, ["task_a"])
+        requests = requirements_from_scientific_architecture(active)
+
+        self.assertEqual({item["id"] for item in active["components"]}, {"model", "signal"})
+        self.assertNotIn("torch", {item.requirement for item in requests})
+        self.assertEqual(len(architecture["components"]), 3)
+
     def test_unknown_architecture_package_is_requested_without_static_whitelist(self) -> None:
         architecture = _architecture(framework="novel-research-framework")
 
@@ -333,6 +355,40 @@ class CaseRuntimeRequestTests(unittest.TestCase):
 
 
 class CaseRuntimeHostSharedTests(unittest.TestCase):
+    def test_shared_execution_leases_overlap_but_exclude_package_mutation(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            lock = Path(temp_dir) / "shared-python.lock"
+            release_readers = threading.Event()
+            readers_entered = [threading.Event(), threading.Event()]
+            writer_started = threading.Event()
+            writer_entered = threading.Event()
+
+            def reader(index: int) -> None:
+                with _runtime_file_guard(lock, shared=True):
+                    readers_entered[index].set()
+                    release_readers.wait(5)
+
+            def writer() -> None:
+                writer_started.set()
+                with _runtime_file_guard(lock):
+                    writer_entered.set()
+
+            threads = [threading.Thread(target=reader, args=(index,)) for index in range(2)]
+            threads.append(threading.Thread(target=writer))
+            try:
+                for thread in threads[:2]:
+                    thread.start()
+                self.assertTrue(all(event.wait(5) for event in readers_entered))
+                threads[2].start()
+                self.assertTrue(writer_started.wait(5))
+                self.assertFalse(writer_entered.wait(0.15))
+            finally:
+                release_readers.set()
+                for thread in threads:
+                    if thread.ident is not None:
+                        thread.join(5)
+            self.assertTrue(writer_entered.is_set())
+
     def test_default_runtime_uses_host_prefix_without_creating_case_venv(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -400,7 +456,7 @@ class CaseRuntimeHostSharedTests(unittest.TestCase):
             self.assertTrue(runtime.request_path.is_file())
             self.assertTrue(runtime.report_path.is_file())
 
-    def test_host_failure_never_retires_shared_prefix(self) -> None:
+    def test_unrelated_pip_conflict_is_recorded_without_retiring_shared_prefix(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             output = root / "case"
@@ -431,21 +487,22 @@ class CaseRuntimeHostSharedTests(unittest.TestCase):
             ), patch(
                 "geng_agent.case_runtime.resolve_case_environment",
                 return_value=resolution,
-            ), patch("geng_agent.case_runtime._retire_case_venv") as retire:
-                with self.assertRaises(EnvironmentResolutionError) as caught:
-                    ensure_case_runtime(
-                        output_dir=output,
-                        audit_dir=audit,
-                        scientific_architecture=_architecture(framework="packaging"),
-                        base_interpreter=launcher,
-                        resume=False,
-                        run_argv=failed_pip_check,
-                    )
+            ), patch("geng_agent.case_runtime._probe_runtime_capabilities", return_value=[]), patch(
+                "geng_agent.case_runtime._retire_case_venv") as retire:
+                runtime = ensure_case_runtime(
+                    output_dir=output,
+                    audit_dir=audit,
+                    scientific_architecture=_architecture(framework="packaging"),
+                    base_interpreter=launcher,
+                    resume=False,
+                    run_argv=failed_pip_check,
+                )
 
-            self.assertEqual(caught.exception.category, "abi_conflict")
             self.assertTrue(launcher.is_file())
             self.assertEqual(sentinel.read_text(encoding="utf-8"), "shared host state")
-            self.assertFalse((output / "03a_environment.lock.json").exists())
+            self.assertTrue(runtime.lock_path.is_file())
+            self.assertFalse(runtime.report["pip_check"]["ok"])
+            self.assertTrue(runtime.report["ready"])
             retire.assert_not_called()
 
     def test_shared_lock_target_is_stable_for_same_real_host_interpreter(self) -> None:

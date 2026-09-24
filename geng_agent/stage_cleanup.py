@@ -250,6 +250,7 @@ def _clear_stage_outputs(
         "automation_provenance.json",
     ]
     report_outputs = [
+        "report_layout.py",
         "review.md",
         "review.docx",
         "reproduction_report.md",

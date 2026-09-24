@@ -26,7 +26,7 @@ def choose_tools(context):
         chosen = ["deliver_partial"]
     else:
         resources = set()
-        order = {name: index for index, name in enumerate(("environment", "foundation", "writers", "retain_foundation", "omit_foundation", "deliver_partial"))}
+        order = {name: index for index, name in enumerate(("environment", "foundation", "writers", "retain_foundation", "deliver_partial"))}
         for tool in sorted(context.get("tools", []), key=lambda tool: order.get(tool["name"], 10)):
             name = tool["name"]
             if name not in ready or name in failed or name in {"revise_plan", "revise_understanding"}:

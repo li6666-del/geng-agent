@@ -11,7 +11,6 @@ import unittest
 from geng_agent.agentic_analysis import run_codex_json_stage
 from geng_agent.llm import LLMImage
 from geng_agent.pipeline_helpers import _aggregate_validation_issues
-from geng_agent.schemas import ValidationIssue
 from geng_agent.tasks_normalize import finalize_repro_tasks
 
 
@@ -39,9 +38,10 @@ def test_complete_owner_candidate_is_returned_without_scientific_repair(tmp_path
     worker = Mock(return_value={"ok": True, "last_message_path": str(message)})
     monkeypatch.setattr("geng_agent.agentic_analysis.run_codex_subprocess", worker)
     parsed = run_codex_json_stage(prompt="scientific task", stage_label="tasks", schema_stage="repro_tasks",
-        output_dir=tmp_path, audit_dir=tmp_path / "audit", max_attempts=8,
-        extra_validation=lambda _: [ValidationIssue("$.goal", "same science expressed differently")])
+        output_dir=tmp_path, audit_dir=tmp_path / "audit", max_attempts=8)
     assert parsed["repro_tasks"] == candidate["repro_tasks"]
-    assert parsed["_meta"]["host_observations"]
+    assert parsed["_meta"]["host_observations"] == []
+    audit = json.loads((tmp_path / "audit" / "handoff_tasks_attempt_1.json").read_text(encoding="utf-8"))
+    assert audit["content_validation_performed"] is False
     assert worker.call_count == 1
     assert "Trusted structural schema" not in worker.call_args.kwargs["prompt"]

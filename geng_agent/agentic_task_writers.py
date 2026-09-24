@@ -40,9 +40,7 @@ from .task_writer_support import (
     _manifest_from_project,
     _manifest_disk_paths,
     _missing_required_analysis_artifacts,
-    _prepare_project_workspace,
     _prune_unexpected_files,
-    _restore_trusted_files,
     _write_paper_evidence_bundle,
 )
 from .codex_runner import run_codex_subprocess
@@ -51,7 +49,6 @@ from .case_runtime import (
     EnvironmentRequestRequired,
     environment_request_prompt,
     read_environment_request,
-    requirements_missing_from_lock,
 )
 from .case_environment import EnvironmentPolicyError, RequirementRequest
 from .execution_plan import compile_execution_plan
@@ -61,7 +58,6 @@ from .config import get_config_value
 from .supervisor import StageBlocked, REPLAY_REQUIRED, supervised_call
 from .io_runtime import BACKEND_RUNTIME_API_DOC, IO_RUNTIME_API_DOC, inject_io_runtime
 from .json_utils import pretty_json
-from .manifest_utils import expected_generated_paths
 from .outputs import inspect_output_artifacts, validate_repro_project, write_json, write_text
 from .paper_evidence import facts_for_task, paper_context_for_task, safe_label, thesis_ordering_anchor_for_task
 from .project_portability import build_source_inventory, validate_repro_project_portability
@@ -98,6 +94,7 @@ from .task_writer_packaging import (
     _format_requirements,
     _freeze_repro_project_package,
     _merge_task_writer_deliveries,
+    _package_task_directories,
     _portable_environment_lock,
     _read_requirement_names,
     _remove_packaged_path,
@@ -151,7 +148,6 @@ from .task_writer_state import (
     _record_source_config_fingerprint,
     _rerun_evidence_fingerprint,
     _sandbox_analysis_handoff_hash,
-    _task_environment_requests,
     _task_writer_record_refresh_pending,
     _task_writer_record_refresh_reusable,
     _task_writer_resume_layouts,
@@ -357,7 +353,6 @@ def run_codex_task_writer_workflow(
     audit_dir: Path,
     repro_project_dir: Path,
     run_repro: bool,
-    run_timeout: float = 120.0,
     resume: bool = True,
     review_feedback: dict[str, dict[str, Any]] | None = None,
     force_task_ids: set[str] | None = None,
@@ -375,7 +370,6 @@ def run_codex_task_writer_workflow(
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     audit_dir.mkdir(parents=True, exist_ok=True)
-    del run_timeout
 
     execution_plan = (
         execution_plan
@@ -481,7 +475,6 @@ def run_codex_task_writer_workflow(
                     "task_writer_reviews": [_compact_task_writer_review(record) for record in records]},
                 "status": {"stop_class": "pending_foundation_revision", "validation": validation}})
 
-    expected_paths = expected_generated_paths([item["script"] for item in manifest_entries])
     review_feedback = dict(review_feedback or {})
     force_task_ids = {str(item) for item in (force_task_ids or set()) if str(item)}
 
@@ -662,7 +655,8 @@ def run_codex_task_writer_workflow(
         output_dir,
         "manifest",
         preserve_audit=bool(resume),
-        preserve_paths={"report_assets"} if preserve_cached_report_assets or resume_records else None,
+        preserve_paths=({"repro_project", "report_assets"}
+                        if preserve_cached_report_assets or resume_records else {"repro_project"}),
     )
 
     task_root = audit_dir / "03c_task_writer_sandboxes"
@@ -716,8 +710,10 @@ def run_codex_task_writer_workflow(
 
     handoff_pending_foundation_revisions(task_records, dispatch_audit)
 
-    pending_requests = _task_environment_requests(task_records)
-    if pending_requests:
+    shared_runtime_refresh = any(
+        record.get("writer_error_kind") == "environment_refresh" for record in task_records
+    )
+    if shared_runtime_refresh:
         write_json(
             audit_dir / "03c_task_writers_records.json",
             {"dispatch_policy": dispatch_audit, "tasks": task_records},
@@ -730,8 +726,8 @@ def run_codex_task_writer_workflow(
         )
         pending_runtime["delivery_status"] = "partial"
         raise EnvironmentRequestRequired(
-            pending_requests,
-            source="task_writers",
+            [],
+            source="shared_runtime_refresh",
             partial_result={
                 "manifest": {"_meta": {"mode": "task_writers", "packaging_completed": False},
                              "files": [], "tasks": task_manifest.get("tasks", [])},
@@ -744,48 +740,38 @@ def run_codex_task_writer_workflow(
             },
         )
 
-    initial_expected_paths = set(expected_paths)
     def assemble_project():
-        _prepare_project_workspace(repro_project_dir, task_manifest)
-        expected_paths = _merge_task_writer_deliveries(
+        packaged_paths, packaged_manifest, portability = _package_task_directories(
             repro_project_dir=repro_project_dir,
-            task_manifest=task_manifest,
-            expected_paths=set(initial_expected_paths),
-            task_records=task_records,
-            foundation=foundation,
-            execution_plan=execution_plan,
-            case_runtime=case_runtime,
-            require_lineage=run_repro,
-        )
-        _restore_trusted_files(repro_project_dir, task_manifest)
-        final_task_manifest = task_manifest
-        write_json(repro_project_dir / "tasks_manifest.json", final_task_manifest)
-        validation = {"python_compiles": None, "host_validation_skipped": True,
-                      "observations": []}
-        requirement_warnings, requirement_issues, security_issues = [], [], []
-        manifest, portability = _freeze_repro_project_package(
-            repro_project_dir=repro_project_dir,
-            output_dir=output_dir,
-            audit_path=audit_dir / "03c_project_portability.json",
-            task_manifest=final_task_manifest,
-            expected_paths=expected_paths,
-            analysis_snapshot_hash=analysis_snapshot_hash,
+            output_dir=output_dir, audit_dir=audit_dir,
+            task_manifest=task_manifest, task_records=task_records,
+            execution_plan=execution_plan, foundation=foundation,
+            case_runtime=case_runtime, analysis_snapshot_hash=analysis_snapshot_hash,
             foundation_snapshot_hash=foundation_snapshot_hash,
-            environment_hash=environment_hash,
-            run_smoke=bool(run_repro),
-            python_executable=(
-                case_runtime.python_executable if case_runtime is not None else None
-            ),
-            contextual_findings=validation["observations"],
+            environment_hash=environment_hash, require_lineage=run_repro,
         )
         validation = _final_package_file_validation(
-            repro_project_dir=repro_project_dir, expected_paths=expected_paths,
-            validation=validation,
+            repro_project_dir=repro_project_dir, expected_paths=packaged_paths,
+            validation={"python_compiles": None, "host_validation_skipped": True,
+                        "packaging_completed": True, "portable": bool(portability.get("portable")),
+                        "observations": []},
         )
-        validation["portable"] = bool(portability.get("portable"))
-        validation["relocated_smoke"] = portability.get("smoke", {})
+        return packaged_paths, packaged_manifest, portability, validation, [], [], []
 
-        return expected_paths, manifest, portability, validation, requirement_warnings, requirement_issues, security_issues
+    def continue_after_packaging_failure(decision, error):
+        failure = {"node_id": "packaging", "decision": decision,
+                   "error": f"{type(error).__name__}: {error}",
+                   "package_layout_attempted": "task_directories"}
+        write_json(audit_dir / "03c_packaging_blocked.json", failure)
+        return (set(),
+                {"_meta": {"mode": "task_writers", "packaging_completed": False,
+                           "delivery_blocked": failure}, "files": [],
+                 "tasks": task_manifest.get("tasks", [])},
+                {"portable": False, "delivery_blocked": failure},
+                {"required_files_present": False, "python_compiles": None,
+                 "host_validation_skipped": True, "packaging_completed": False,
+                 "portable": False, "delivery_blocked": failure},
+                [], [], [])
 
     delivery_blocked = None
     try:
@@ -798,11 +784,17 @@ def run_codex_task_writer_workflow(
                         ("task_id", "writer_completed", "task_verification", "execution_summary", "coordination_status", "coordination_observations")}
                         for record in task_records],
                     "instruction": "Assemble only existing verified artifacts. Retain failed or unreproduced tasks; do not rerun scientific experiments to repair delivery."},
-            evidence_roots={"project": repro_project_dir, "writers": audit_dir / "03c_task_writer_sandboxes"},
+            evidence_roots={"project": repro_project_dir,
+                            "writers": audit_dir / "03c_task_writer_sandboxes",
+                            "package_stages": audit_dir / "pkg_stages",
+                            "package_audits": audit_dir / "pkg_task_manifests"},
             summarize=lambda value: {"manifest": value[1], "portability": value[2], "validation": value[3]},
+            degrade=continue_after_packaging_failure,
             reconcile=lambda _state: REPLAY_REQUIRED,
             passthrough=(EnvironmentRequestRequired, FoundationRevisionRequired),
         )
+        if isinstance(portability.get("delivery_blocked"), dict):
+            delivery_blocked = portability["delivery_blocked"]
     except StageBlocked as exc:
         # Keep current-run verified scientific results available to the editor.
         # A broken assembled tree must never masquerade as a portable delivery.

@@ -320,6 +320,7 @@ class RunSupervisor:
     def run_node(self, node_id: str, operation: Callable[[], Any], *, inputs: dict | None = None,
                  evidence_roots: dict[str, Path] | None = None, summarize: Callable[[Any], Any] | None = None,
                  repair: Callable[[dict], None] | None = None,
+                 degrade: Callable[[dict, BaseException], Any] | None = None,
                  reconcile: Callable[[dict], Any] | None = None,
                  passthrough: tuple[type[BaseException], ...] = ()) -> Any:
         # A caller may fill in an output workspace after operation() completes;
@@ -408,11 +409,30 @@ class RunSupervisor:
                            "repair_operations": sorted(self._repair_handlers),
                            "repair_tools": self._repair_specs}
                 actions = ["retry"] if repair else []
+                if degrade is not None:
+                    actions.append("continue")
                 if self._repair_handlers:
                     actions.append("repair_artifacts")
                 actions.append("block")
                 decision = self._request(node_id, trigger="node_failed",
                                          context=context, roots=roots, actions=tuple(actions), routine=False)
+                if decision.get("action") == "continue" and degrade is not None:
+                    try:
+                        partial = degrade(decision, error)
+                        self._results[node_id] = partial
+                        partial_summary = _compact(summarize(partial) if summarize else partial)
+                        self._save(node_id, status="published", summary=partial_summary,
+                                   decision=_compact(decision), degraded=True,
+                                   operation_completed=False)
+                        self._emit("supervisor.node_handoff", node_id,
+                                   "节点无法完成，主持人保留已有成果并继续交接")
+                        return partial
+                    except PipelineCancelled:
+                        self._save(node_id, status="interrupted")
+                        raise
+                    except Exception as exc:
+                        self._block(node_id, {"action": "block",
+                            "diagnosis": f"部分交接失败：{redact_text(str(exc))[:2000]}"}, exc)
                 if decision.get("action") not in {"retry", "repair_artifacts"}:
                     self._block(node_id, decision, error)
                 # A normal check may discover a repair, but repeated rejections

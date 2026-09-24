@@ -3,7 +3,6 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from geng_agent.consolidated_analysis import load_paper_understanding
-from geng_agent.supervisor import NodeFailure
 import unittest
 
 from geng_agent.pipeline import ReviewPipeline
@@ -159,14 +158,14 @@ class PaperThesisStageTests(unittest.TestCase):
             self.assertEqual(persisted["paper_thesis"]["central_claim"], GOOD_THESIS["central_claim"])
             self.assertEqual(len(client.calls), 1)
 
-    def test_unreadable_understanding_retains_raw_error_for_owner_recovery(self) -> None:
+    def test_unreadable_understanding_is_preserved_for_next_stage(self) -> None:
         client = _ThesisFake("this is not json at all")
         with TemporaryDirectory() as directory:
             out = Path(directory)
-            with self.assertRaises(NodeFailure):
-                self._run_stage(out, client)
+            result = self._run_stage(out, client)
             self.assertEqual(len(client.calls), 1)
-            self.assertFalse((out / "paper_understanding.json").exists())
+            self.assertEqual(result["facts"]["_raw_handoff_text"], client.raw)
+            self.assertTrue((out / "paper_understanding.json").exists())
             candidates = list((out / "audit/api_prompt_inputs").glob("*/raw.txt"))
             self.assertEqual(len(candidates), 1)
             self.assertEqual(candidates[0].read_text(encoding="utf-8"), client.raw)

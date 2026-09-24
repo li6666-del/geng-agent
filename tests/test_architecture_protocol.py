@@ -69,21 +69,37 @@ def test_addresses_are_added_without_mutating_or_rewriting_owner_document():
     ("components", "id", "component_id", None, "a"),
     ("components", "id", "component_id", 1, True),
 ])
-def test_conflicting_explicit_addresses_are_rejected_with_location(collection, canonical, alias, left, right):
+def test_conflicting_owner_addresses_are_preserved_without_host_rejection(collection, canonical, alias, left, right):
     source = {collection: [{"note": "preserved"}, {canonical: left, alias: right}]}
     before = deepcopy(source)
-    with pytest.raises(ArchitectureAddressError) as error:
-        architecture_runtime_view(source)
-    assert error.value.path == f"$.{collection}[1].{canonical}"
-    assert canonical in str(error.value) and alias in str(error.value)
+    view = architecture_runtime_view(source)
+    expected = right if (collection, canonical, alias) == ("bindings", "outputs", "output_quantity_ids") else left
+    assert view[collection][1][canonical] == expected
+    assert view[collection][1][alias] == right
     assert source == before
 
 
-def test_two_group_aliases_cannot_silently_choose_different_ids():
-    with pytest.raises(ArchitectureAddressError, match="group_id and consistency_group_id"):
-        architecture_runtime_view({"consistency_groups": [{"group_id": "one", "consistency_group_id": "two"}]})
+def test_two_group_aliases_preserve_both_owner_addresses():
+    conflicting = architecture_runtime_view({"consistency_groups": [{"group_id": "one", "consistency_group_id": "two"}]})
+    assert conflicting["consistency_groups"][0] == {
+        "id": "one", "group_id": "one", "consistency_group_id": "two"}
     view = architecture_runtime_view({"consistency_groups": [{"group_id": "same", "consistency_group_id": "same"}]})
     assert view["consistency_groups"][0] == {"id": "same", "group_id": "same", "consistency_group_id": "same"}
+
+
+def test_artifact_outputs_are_not_confused_with_declared_quantity_outputs():
+    source = {
+        "quantities": [{"quantity_id": "q_result"}],
+        "bindings": [{"task_id": "task", "outputs": ["ART_RESULT"],
+                      "output_quantity_ids": ["q_result"]}],
+    }
+    view = architecture_runtime_view(source)
+    assert view["bindings"][0]["outputs"] == ["q_result"]
+    assert source["bindings"][0]["outputs"] == ["ART_RESULT"]
+    assert architecture_runtime_view(view) == view
+    other = architecture_runtime_view({"quantities": [{"id": "q_other"}],
+                                       "bindings": source["bindings"]})
+    assert other["bindings"][0]["outputs"] == ["q_result"]
 
 
 def test_runtime_view_is_idempotent_and_accepts_equal_duplicate_addresses():

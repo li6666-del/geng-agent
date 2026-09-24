@@ -1,4 +1,4 @@
-"""Expose explicit architecture addresses without rewriting scientific content."""
+"""Expose architecture addresses for runtime use without approving their meaning."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import Any
 
 
 class ArchitectureAddressError(ValueError):
-    """Two explicitly supplied addresses disagree at a known protocol path."""
+    """An architecture value cannot be addressed as a document."""
 
     def __init__(self, path: str, message: str):
         self.path = path
@@ -49,12 +49,10 @@ def architecture_runtime_view(
             if not supplied:
                 continue
             first = supplied[0]
-            for other in supplied[1:]:
-                if type(item[first]) is not type(item[other]) or item[first] != item[other]:
-                    raise ArchitectureAddressError(
-                        f"$.{collection}[{index}].{canonical}",
-                        f"conflicting explicit addresses: {first} and {other}",
-                    )
+            # output_quantity_ids names the runtime scientific quantities;
+            # outputs may name deliverable artifacts. Keep both owner fields.
+            if collection == "bindings" and canonical == "outputs" and "output_quantity_ids" in item:
+                item[canonical] = deepcopy(item["output_quantity_ids"])
             if canonical not in item:
                 item[canonical] = deepcopy(item[first])
     return result

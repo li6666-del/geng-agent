@@ -12,7 +12,6 @@ from .codex_runner import run_codex_subprocess
 from .json_utils import parse_json_object
 from .llm import LLMImage
 from .outputs import write_json, write_text
-from .schemas import ValidationIssue, format_issues, validate_stage
 
 
 CODEX_ANALYSIS_BACKEND = "codex"
@@ -28,27 +27,45 @@ def _read_analysis_documents(workspace: Path, documents: dict[str, str]) -> str:
     for key, name in documents.items():
         path = workspace / name
         if not path.exists():
-            continue  # Missing required pieces enter the existing structure repair.
+            observations.append({"document": name, "path": str(path), "observation": "Document missing"})
+            if key in {"facts", "tasks"}:
+                values[key] = {"_handoff_issue": "document_missing", "path": str(path)}
+            continue
         if path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction()) or not path.is_file():
             raise ValueError(f"Analysis document is not a regular owned file: {name}")
         if path.stat().st_size > 4_000_000:
             raise ValueError(f"Analysis document is too large: {name}")
+        raw_document = path.read_text(encoding="utf-8-sig")
         try:
-            values[key] = json.loads(path.read_text(encoding="utf-8-sig"))
-        except (OSError, ValueError) as exc:
-            if key in {"facts", "tasks"}:
-                raise ValueError(f"Cannot read {name}: {exc}") from exc
+            body = json.loads(raw_document)
+            # The file name already supplies this envelope. Accept a worker
+            # that repeated it without requiring another model invocation.
+            values[key] = body[key] if isinstance(body, dict) and set(body) == {key} else body
+        except ValueError as exc:
+            values[key] = {"_raw_handoff_text": raw_document, "_handoff_issue": "json_unreadable"}
             observations.append({"document": name, "path": str(path),
-                                 "observation": f"Optional document could not be decoded: {exc}"})
+                                 "observation": f"JSON could not be decoded: {exc}"})
     if observations:
         values["_meta"] = {"document_observations": observations}
     return json.dumps(values, ensure_ascii=False)
 
 
+def parse_owner_handoff(raw: str, schema_stage: str) -> tuple[dict[str, Any], str | None]:
+    """Carry undecodable owner text forward without inventing scientific data."""
+    try:
+        return parse_json_object(raw), None
+    except ValueError as exc:
+        body: dict[str, Any] = {"_raw_handoff_text": raw, "_handoff_issue": "json_unreadable"}
+        if schema_stage == "paper_understanding":
+            return {"facts": body}, str(exc)
+        if schema_stage == "experiment_plan":
+            return {"tasks": body}, str(exc)
+        return body, str(exc)
+
+
 def run_codex_json_stage(
     *, prompt: str, stage_label: str, schema_stage: str, output_dir: Path,
     audit_dir: Path, max_attempts: int,
-    pre_validation: Callable | None = None, extra_validation: Callable | None = None,
     candidate_normalizer: Callable | None = None,
     repair_preservation_validator: Callable | None = None,
     truncation_recovery: Callable | None = None,
@@ -83,7 +100,7 @@ def run_codex_json_stage(
         write_text(snapshot / "raw.txt", raw)
         write_text(audit_dir / f"raw_{stage_label}_attempt_1.txt", raw)
         write_text(audit_dir / f"raw_{stage_label}.txt", raw)
-        parsed = parse_json_object(raw)
+        parsed, parse_issue = parse_owner_handoff(raw, schema_stage)
     except PipelineCancelled:
         raise
     except Exception as exc:
@@ -94,19 +111,12 @@ def run_codex_json_stage(
     if candidate_normalizer is not None:
         parsed = candidate_normalizer(parsed)
     write_json(snapshot / "handoff.json", parsed)
-    issues = validate_stage(schema_stage, parsed)
-    observations = []
-    for observer in (pre_validation, extra_validation):
-        if observer is not None:
-            observations.extend(item.as_dict() for item in observer(parsed))
-    write_json(audit_dir / f"validation_{stage_label}_attempt_1.json", {
-        "ok": not issues, "protocol_errors": [item.as_dict() for item in issues],
-        "observations": observations, "decision_owner": "supervisor",
+    observations = ([{"kind": "json_unreadable", "message": parse_issue}]
+                    if parse_issue else [])
+    write_json(audit_dir / f"handoff_{stage_label}_attempt_1.json", {
+        "handoff_recorded": True, "content_validation_performed": False,
+        "observations": observations, "decision_owner": "next_stage",
         "candidate_snapshot": str(snapshot)})
-    if issues:
-        raise NodeFailure(f"{stage_label} handoff protocol is not executable: {format_issues(issues)}",
-            result={"candidate": parsed, "candidate_snapshot": str(snapshot),
-                    "protocol_errors": [item.as_dict() for item in issues]})
     meta = dict(parsed.get("_meta", {})) if isinstance(parsed.get("_meta"), dict) else {}
     meta.update({"analysis_backend": CODEX_ANALYSIS_BACKEND, "analysis_stage_label": stage_label,
                  "analysis_attempt": 1, "host_observations": observations})
@@ -131,9 +141,9 @@ def _build_analysis_brief(
     )
     output_rule = "Return one JSON object. Preserve the scientific content and identify unresolved information explicitly."
     if schema_stage in ANALYSIS_DOCUMENTS:
-        output_rule = ("Write separate UTF-8 JSON files in this isolated workspace, each containing the corresponding top-level schema field: "
+        output_rule = ("Write separate UTF-8 JSON files in this isolated workspace, each containing the document body without repeating its field name: "
             + ", ".join(f"{key} -> {name}" for key, name in ANALYSIS_DOCUMENTS[schema_stage].items())
-            + ". Do not repeat the full documents in the last message. The facts/tasks document is required for host dispatch; optional narrative documents may be omitted. "
+            + ". Do not repeat the full documents in the last message. Pass any unresolved content through in the documents; do not rewrite it merely to satisfy host formatting. "
             "The final message may be a short completion notice. On repair, inspect the existing files and modify only the affected parts, preserving other evidence. "
             "Do not modify the original paper, case files or anything outside this workspace. A nullable document is the JSON literal null.")
     return f"""

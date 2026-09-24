@@ -7,7 +7,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .case_runtime import CaseRuntime, environment_request_prompt
+from .case_runtime import CaseRuntime
+from .writer_environment import writer_environment_prompt, writer_python_path
 from .io_runtime import BACKEND_RUNTIME_API_DOC, IO_RUNTIME_API_DOC
 from .outputs import write_json, write_text
 from .security import dependency_policy_prompt_text
@@ -112,10 +113,14 @@ def write_writer_input(*, sandbox: Path, members: list[tuple[int, dict, dict]],
     write_json(sandbox / WRITER_INPUT_PATH, packet)
     # Preserve full chunks, including late definitions and cross-page conditions.
     write_json(root / "paper_chunks.json", {"chunks": paper.get("chunks", [])})
-    runtime_policy = environment_request_prompt(case_runtime) if case_runtime else "Never install packages from inside the Writer."
+    runtime_policy = (
+        writer_environment_prompt(writer_python_path(sandbox, case_runtime))
+        if case_runtime else "Use the selected Python interpreter for task execution."
+    )
     dependency_policy = dependency_policy_prompt_text(
         runtime_policy=case_runtime.manifest if case_runtime else None,
-        runtime_lock=case_runtime.lock if case_runtime else None)
+        runtime_lock=case_runtime.lock if case_runtime else None,
+        writer_install_allowed=case_runtime is not None)
     write_text(root / "runtime_reference.md", "\n\n".join([
         "# Runtime reference (read applicable interfaces before using them)",
         IO_RUNTIME_API_DOC, BACKEND_RUNTIME_API_DOC, dependency_policy, runtime_policy]))

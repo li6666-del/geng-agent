@@ -32,7 +32,7 @@ from .report_language import CHINESE_REPORT_RULES
 
 
 TASK_VERIFICATION_FILE = "task_verification_result.json"
-TASK_REPORTER_PROMPT_VERSION = "isolated_task_reporter_v15_task_goal_scope"
+TASK_REPORTER_PROMPT_VERSION = "isolated_task_reporter_v16_optional_dispatch"
 REPORTER_CONVERGENCE_POLICY = """## Convergence and materiality
 - Enforce paper-explicit scientific facts. Accept reasonable, disclosed choices where the paper is silent.
 - `host_execution.unobserved_artifacts` lists files added or changed after the observed run. They may illustrate the report, but cannot alone establish scientific support; inspect the observed measurements and implementation.
@@ -253,12 +253,11 @@ Designer criteria and numeric anchors are provisional. If a criterion is not a p
 
 Write the scientific decision once: `decision_reason` explains the verdict, and the per-claim observations and numeric comparisons carry its evidence. Do not additionally write `comparison_summary`, `report_explanation`, or a Markdown report. The final Editor writes reader-facing prose. Refer to a claim/target ID rather than repeating its whole observation in differences or feedback; include additional differences and unresolved limitations without dropping them. Keep verified facts and their original evidence. Missing legacy prose fields never justify another experiment or review.
 
-Write `{TASK_VERIFICATION_FILE}` as one JSON object with the exact assigned `task_id` and a dispatchable `host_action` (`complete` or `rerun_writer`). These are the transport protocol. Scientific reasoning may use whichever concise structure clearly expresses the evidence; missing optional fields, alternate wording or Designer IDs are not reasons to reject a handoff.
+Write `{TASK_VERIFICATION_FILE}` as one JSON object. The host already knows the assigned task from dispatch; `task_id` is useful for navigation but a missing or mistaken echo does not change ownership. Set `host_action` to `rerun_writer` only when you explicitly request another Writer run. Otherwise omit it or use `complete`; the note proceeds to reporting. Scientific reasoning may use whichever concise structure clearly expresses the evidence; missing optional fields, alternate wording or Designer IDs are not reasons to reject a handoff. The host records actual execution separately. If its full-run evidence is missing or failed, address that limitation in your scientific conclusion rather than asserting an observed run that did not occur.
 A small example (adapt evidence fields to the actual task):
 ```json
 {{
   "task_id": "{task_id}",
-  "host_action": "complete",
   "outcome": "not_reproduced",
   "decision_reason": "中文说明任务结论、依据和不确定性",
   "core_conclusions": [],

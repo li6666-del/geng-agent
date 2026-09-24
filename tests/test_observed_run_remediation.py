@@ -61,26 +61,28 @@ class ReporterDecisionTests(unittest.TestCase):
         result = normalize_task_verification({}, "bpsk", run_valid_hint=True)
         self.assertEqual(result["engineering_status"], "handoff_failed")
         self.assertIsNone(result["outcome"])
-        self.assertIsNone(result["host_action"])
+        self.assertEqual(result["host_action"], "complete")
         self.assertTrue(task_verification_issues(result, "bpsk"))
         legacy = normalize_task_verification({**decision(), "schema_version": "2.0"}, "bpsk", run_valid_hint=True)
         self.assertEqual(legacy["outcome"], "reproduced")
         self.assertFalse(task_verification_issues(legacy, "bpsk"))
 
-    def test_engineering_failure_preserves_but_does_not_certify_reporter_decision(self):
+    def test_execution_observation_is_separate_from_reporter_conclusion(self):
         for hint in (False, None):
             result = normalize_task_verification(decision(), "bpsk", run_valid_hint=hint)
             self.assertEqual(result["outcome"], "reproduced")
-            self.assertFalse(verification_scientifically_successful(result))
+            self.assertTrue(verification_scientifically_successful(result))
+            self.assertIs(result["host_run_valid"], hint)
 
-    def test_malformed_optional_fields_are_preserved_and_only_action_blocks(self):
+    def test_malformed_optional_fields_are_preserved_without_action_gate(self):
         cases = [decision(outcome={}), decision(host_action=[]), decision(run_valid="yes")]
         for raw in cases:
             with self.subTest(raw=raw):
                 result = normalize_task_verification(raw, "bpsk", run_valid_hint=True)
                 self.assertEqual(result["outcome"], raw["outcome"])
-                self.assertEqual(result["host_action"], raw["host_action"])
-                self.assertEqual(bool(task_verification_issues(result, "bpsk")), raw["host_action"] == [])
+                self.assertEqual(result["reporter_action"], raw["host_action"])
+                self.assertEqual(result["host_action"], "complete")
+                self.assertFalse(task_verification_issues(result, "bpsk"))
 
     def test_host_stop_cannot_turn_reporter_pending_action_into_verified_success(self):
         verification = normalize_task_verification(decision(), "bpsk", run_valid_hint=True)

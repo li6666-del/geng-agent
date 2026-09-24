@@ -368,7 +368,7 @@ def _run_minimal_full_pipeline(
         patch.dict("os.environ", {"GENG_REPORT_MODE": report_mode}),
         patch.object(
             pipeline,
-            "_generate_docx_reports",
+            "_inspect_editor_word_reports",
             return_value={"enabled": False, "ok": True},
         ),
         patch("geng_agent.pipeline.build_automation_provenance", return_value={}),
@@ -382,24 +382,29 @@ def _run_minimal_full_pipeline(
     return result, output_dir
 
 class PipelineTests(unittest.TestCase):
-    def test_foundation_cancel_does_not_fall_back_or_start_task_writers(self) -> None:
+    def test_required_foundation_cancel_does_not_start_task_writers(self) -> None:
         from geng_agent.progress import PipelineCancelled
 
-        for task_count in (1, 2):
-            with self.subTest(task_count=task_count), TemporaryDirectory() as temp_dir:
-                root = Path(temp_dir)
-                writer = Mock()
-                foundation = Mock(side_effect=PipelineCancelled("user stopped the run"))
-                with self.assertRaisesRegex(PipelineCancelled, "user stopped"):
-                    _run_to_task_writer_boundary(
-                        root, resume=False,
-                        environment_mock=Mock(return_value=case_runtime_fixture(root / "case", "0" * 64)),
-                        foundation_mock=foundation, task_writer_mock=writer,
-                        tasks_document=task_doc(*(task(f"t{i}", f"Claim {i}") for i in range(task_count))),
-                    )
-                foundation.assert_called_once()
-                writer.assert_not_called()
-                self.assertFalse((root / "case/audit/03b_foundation_fallback.json").exists())
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            writer = Mock()
+            foundation = Mock(side_effect=PipelineCancelled("user stopped the run"))
+            tasks_document = task_doc(task("t0", "Claim 0"), task("t1", "Claim 1"))
+            tasks_document["execution_relationships"] = [{
+                "relationship_id": "shared_science", "kind": "shared_definition",
+                "strength": "weak", "task_ids": ["t0", "t1"],
+                "producer_task_id": None, "consumer_task_ids": [], "artifact_ids": [],
+            }]
+            with self.assertRaisesRegex(PipelineCancelled, "user stopped"):
+                _run_to_task_writer_boundary(
+                    root, resume=False,
+                    environment_mock=Mock(return_value=case_runtime_fixture(root / "case", "0" * 64)),
+                    foundation_mock=foundation, task_writer_mock=writer,
+                    tasks_document=tasks_document,
+                )
+            foundation.assert_called_once()
+            writer.assert_not_called()
+            self.assertFalse((root / "case/audit/03b_foundation_fallback.json").exists())
 
     def test_preliminary_task_cache_survives_snapshot_publication(self) -> None:
         expected_cache = {
@@ -717,7 +722,7 @@ class PipelineTests(unittest.TestCase):
                 risk_report["reproducibility_verdict"],
                 result.reproducibility_verdict,
             )
-    def test_foundation_failure_falls_back_to_task_writers_for_all_architecture_versions(self) -> None:
+    def test_optional_foundation_is_skipped_for_all_architecture_versions(self) -> None:
         class WriterReached(BaseException):
             pass
 
@@ -817,14 +822,8 @@ class PipelineTests(unittest.TestCase):
                             paper_path, output_dir, resume=resume, analysis_only=False
                         )
                     task_writer.assert_called_once()
-                foundation_writer.assert_called_once()
-                fallback = json.loads(
-                    (output_dir / "audit" / "03b_foundation_fallback.json").read_text(
-                        encoding="utf-8"
-                    )
-                )
-                self.assertEqual(fallback["decision"], "supervisor_omitted_optional_foundation")
-                self.assertEqual(fallback["moderation"]["action"], "start")
+                foundation_writer.assert_not_called()
+                self.assertFalse((output_dir / "audit" / "03b_foundation_fallback.json").exists())
 
         exercise(
             schema_version="1.1",
@@ -894,7 +893,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(plan["logical_task_count"], 2)
             self.assertEqual(plan["execution_unit_count"], 1)
 
-    def test_optional_foundation_environment_failure_falls_back(self) -> None:
+    def test_optional_foundation_environment_failure_is_never_entered(self) -> None:
         class WriterReached(BaseException):
             pass
 
@@ -920,16 +919,10 @@ class PipelineTests(unittest.TestCase):
                     task_writer_mock=task_writer,
                 )
 
-            fallback = json.loads(
-                (output_dir / "audit" / "03b_foundation_fallback.json").read_text(
-                    encoding="utf-8"
-                )
-            )
+            self.assertFalse((output_dir / "audit" / "03b_foundation_fallback.json").exists())
 
-        foundation.assert_called_once()
+        foundation.assert_not_called()
         task_writer.assert_called_once()
-        self.assertEqual(fallback["decision"], "supervisor_omitted_optional_foundation")
-        self.assertEqual(fallback["moderation"]["action"], "start")
 
     def test_material_weak_foundation_environment_failure_still_stops(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -1016,7 +1009,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(audit["node_id"], "environment")
         self.assertEqual(audit["category"], "trusted_source_unavailable")
 
-    def test_environment_extension_resumes_writers_without_rebuilding_foundation(self) -> None:
+    def test_environment_extension_resumes_writers_without_building_optional_foundation(self) -> None:
         class WriterReached(BaseException):
             pass
 
@@ -1054,12 +1047,8 @@ class PipelineTests(unittest.TestCase):
                 )
             )
 
-        self.assertEqual([call.kwargs["resume"] for call in foundation.call_args_list], [True])
+        foundation.assert_not_called()
         self.assertEqual([call.kwargs["resume"] for call in task_writer.call_args_list], [True, True])
-        self.assertEqual(
-            [call.kwargs["case_runtime"] for call in foundation.call_args_list],
-            [runtime_0],
-        )
         self.assertEqual(
             [call.kwargs["case_runtime"] for call in task_writer.call_args_list],
             [runtime_0, runtime_1],
@@ -1072,16 +1061,53 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(extension["latest_source"], "task_writers")
         self.assertEqual(extension["environment_lock_hash"], "1" * 64)
 
+    def test_shared_runtime_change_refreshes_and_resumes_writers_automatically(self) -> None:
+        class WriterReached(BaseException):
+            pass
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output_dir = root / "case"
+            environment = Mock(side_effect=[
+                case_runtime_fixture(output_dir, "0" * 64),
+                case_runtime_fixture(output_dir, "1" * 64),
+            ])
+            foundation = Mock()
+            writer = Mock(side_effect=[
+                EnvironmentRequestRequired([], source="shared_runtime_refresh"),
+                WriterReached("writer resumed"),
+            ])
+            with self.assertRaises(WriterReached):
+                _run_to_task_writer_boundary(
+                    root, resume=True, environment_mock=environment,
+                    foundation_mock=foundation, task_writer_mock=writer,
+                )
+            extension = json.loads((output_dir / "audit" / "03a_environment_extensions.json").read_text(
+                encoding="utf-8"))
+
+        foundation.assert_not_called()
+        self.assertEqual(environment.call_count, 2)
+        self.assertEqual(writer.call_count, 2)
+        self.assertEqual(environment.call_args_list[1].kwargs["extra_requirements"], [])
+        self.assertEqual(writer.call_args_list[1].kwargs["case_runtime"].environment_hash, "1" * 64)
+        self.assertEqual(extension["latest_source"], "shared_runtime_refresh")
+
     def test_analysis_agent_width_is_not_a_pipeline_option(self) -> None:
         self.assertNotIn("analysis_agent_width", inspect.signature(ReviewPipeline.run).parameters)
 
-    def test_report_renderer_creates_all_three_word_reports(self) -> None:
+    def test_report_delivery_inspects_editor_authored_word_reports(self) -> None:
         with TemporaryDirectory() as temp_dir:
+            from docx import Document
             root = Path(temp_dir)
             for name in ("review.md", "reproduction_report.md", "result_review.md"):
                 (root / name).write_text("## task_1\n\n报告正文。\n", encoding="utf-8")
+            for name in ("review.docx", "reproduction_report.docx", "result_review.docx"):
+                document = Document()
+                document.add_paragraph("智能体编排的报告正文")
+                document.save(root / name)
+            before = (root / "result_review.docx").read_bytes()
 
-            result = ReviewPipeline()._generate_docx_reports(
+            result = ReviewPipeline()._inspect_editor_word_reports(
                 output_dir=root,
                 result_review_result={"passed": True},
             )
@@ -1091,6 +1117,7 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue(result["result_review_docx"]["passed"])
             for name in ("review.docx", "reproduction_report.docx", "result_review.docx"):
                 self.assertTrue((root / name).exists())
+            self.assertEqual((root / "result_review.docx").read_bytes(), before)
 
     def test_pipeline_runs_one_converged_backfill_round_and_refreshes_tasks(self) -> None:
         with TemporaryDirectory() as temp_dir:

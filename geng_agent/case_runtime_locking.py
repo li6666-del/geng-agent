@@ -254,6 +254,14 @@ def _host_shared_runtime_guard(host_python: Path) -> Iterator[None]:
 
 
 @contextmanager
+def _host_shared_runtime_read_guard(host_python: Path) -> Iterator[None]:
+    """Allow concurrent experiments while excluding package mutations."""
+
+    with _runtime_file_guard(_host_shared_runtime_lock_target(host_python), shared=True):
+        yield
+
+
+@contextmanager
 def _case_runtime_guard(venv_dir: Path) -> Iterator[None]:
     """Serialize venv, pip, report, probe, and final lock work for one case."""
 
@@ -262,8 +270,8 @@ def _case_runtime_guard(venv_dir: Path) -> Iterator[None]:
 
 
 @contextmanager
-def _runtime_file_guard(lock_path: Path) -> Iterator[None]:
-    """Hold one host-owned cross-process runtime lock file."""
+def _runtime_file_guard(lock_path: Path, *, shared: bool = False) -> Iterator[None]:
+    """Hold a cross-process runtime lock, shared for readers only."""
 
     parent = lock_path.parent
     if os.name != "nt" and _host_uid() == 0:
@@ -297,23 +305,46 @@ def _runtime_file_guard(lock_path: Path) -> Iterator[None]:
                 "case runtime lock metadata is not host-owned",
             )
         if os.name == "nt":
+            import ctypes
             import msvcrt
+            from ctypes import wintypes
+
+            class Overlapped(ctypes.Structure):
+                _fields_ = [
+                    ("Internal", ctypes.c_size_t), ("InternalHigh", ctypes.c_size_t),
+                    ("Offset", wintypes.DWORD), ("OffsetHigh", wintypes.DWORD),
+                    ("hEvent", wintypes.HANDLE),
+                ]
 
             if info.st_size == 0:
                 handle.write(b"\0")
                 handle.flush()
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            overlapped = Overlapped()
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.LockFileEx.argtypes = [
+                wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD,
+                wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(Overlapped),
+            ]
+            kernel32.LockFileEx.restype = wintypes.BOOL
+            kernel32.UnlockFileEx.argtypes = [
+                wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD,
+                wintypes.DWORD, ctypes.POINTER(Overlapped),
+            ]
+            kernel32.UnlockFileEx.restype = wintypes.BOOL
+            file_handle = msvcrt.get_osfhandle(handle.fileno())
+            flags = 0 if shared else 0x00000002  # LOCKFILE_EXCLUSIVE_LOCK
+            if not kernel32.LockFileEx(file_handle, flags, 0, 1, 0, ctypes.byref(overlapped)):
+                raise OSError(ctypes.get_last_error(), "host runtime lock could not be acquired")
         else:
             import fcntl
 
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
         try:
             yield
         finally:
             if os.name == "nt":
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                if not kernel32.UnlockFileEx(file_handle, 0, 1, 0, ctypes.byref(overlapped)):
+                    raise OSError(ctypes.get_last_error(), "host runtime lock could not be released")
             else:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
     finally:

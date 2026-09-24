@@ -82,12 +82,3 @@ def test_coordination_stop_keeps_original_reporter_request(tmp_path):
     assert verification == before
     assert record["task_verification"] == before
     assert record["coordination_status"] == "stopped"
-
-
-def test_invalid_request_is_local_and_does_not_erase_valid_sibling_delivery():
-    blocked = {"task_id": "blocked", "writer_error_kind": "environment_request_invalid"}
-    sibling = {"task_id": "done", "writer_completed": True, "host_execution": {"passed": True}}
-    original = deepcopy(sibling)
-    assert state._task_environment_requests([blocked, sibling]) == ()
-    assert blocked["coordination_status"] == "needs_review"
-    assert sibling == original

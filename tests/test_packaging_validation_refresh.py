@@ -190,27 +190,19 @@ class FinalPackageValidationTests(unittest.TestCase):
                 inputs, record = _writer_inputs(Path(temp))
                 inputs["resume"] = False
 
-                def merge(**kwargs):
+                def package(**kwargs):
                     project = kwargs["repro_project_dir"]
                     project.mkdir(parents=True, exist_ok=True)
-                    (project / "run_experiment.py").write_text("pass\n", encoding="utf-8")
-                    return {"run_experiment.py", "source_inventory.json"}
-
-                def freeze(**kwargs):
-                    project = kwargs["repro_project_dir"]
-                    self.assertFalse((project / "source_inventory.json").exists())
-                    self.assertEqual(kwargs["contextual_findings"], [])
                     if create_required:
                         (project / "source_inventory.json").write_text('{"files": []}', encoding="utf-8")
-                    return {"files": [{"path": "run_experiment.py"}]}, {"portable": True, "smoke": {"ran": False}}
+                    return ({"source_inventory.json"},
+                            {"files": [{"path": "source_inventory.json"}]},
+                            {"portable": True, "smoke": {"ran": False}})
 
                 with patch("geng_agent.agentic_task_writers._load_cached_task_writer_workflow", return_value=None), \
                      patch("geng_agent.agentic_task_writers._clear_stage_outputs"), \
                      patch("geng_agent.agentic_task_writers._dispatch_task_writers", return_value=([record], {})), \
-                     patch("geng_agent.agentic_task_writers._prepare_project_workspace"), \
-                     patch("geng_agent.agentic_task_writers._restore_trusted_files"), \
-                     patch("geng_agent.agentic_task_writers._merge_task_writer_deliveries", side_effect=merge), \
-                     patch("geng_agent.agentic_task_writers._freeze_repro_project_package", side_effect=freeze):
+                     patch("geng_agent.agentic_task_writers._package_task_directories", side_effect=package):
                     result = run_codex_task_writer_workflow(**inputs)
                 validation = result["runtime_result"]["validation"]
                 self.assertEqual(validation["required_files_present"], create_required)
@@ -227,8 +219,13 @@ class FinalPackageValidationTests(unittest.TestCase):
             write_json(portability_path, portability)
 
             def fake_editor(**kwargs):
+                import runpy
+                from tests.test_agentic_report_editor import _FAKE_LAYOUT
                 for name in ("reproduction_report.md", "result_review.md"):
                     (kwargs["work_dir"] / name).write_text("# 测试报告\n\n结论保留不变。\n", encoding="utf-8")
+                script = kwargs["work_dir"] / "report_layout.py"
+                script.write_text(_FAKE_LAYOUT, encoding="utf-8")
+                runpy.run_path(str(script))
                 return {"ok": True}
 
             with patch("geng_agent.agentic_report_editor.run_codex_subprocess", side_effect=fake_editor) as model:

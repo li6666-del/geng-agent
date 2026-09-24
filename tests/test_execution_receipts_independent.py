@@ -26,6 +26,27 @@ class ExecutionReceiptIndependentTests(unittest.TestCase):
             "config_smoke": "config_smoke.json"}]}), encoding="utf-8")
         return project, ExecutionBroker(project, root / "audit", Path(sys.executable))
 
+    def test_changed_shared_python_is_refreshed_before_touching_old_outputs(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project, _unused = self._project(root, "def main(config):\n    return None\n")
+            old = project / "outputs" / "sample"
+            old.mkdir(parents=True)
+            sentinel = old / "result.csv"
+            sentinel.write_text("preserve me", encoding="utf-8")
+            broker = ExecutionBroker(
+                project, root / "audit", Path(sys.executable),
+                expected_installed_distributions=[{"distribution": "numpy", "version": "1"}],
+            )
+            changed = {"ok": True, "sha256": "changed", "inventory": {
+                "packages": [["numpy", "2"]]}, "duration_s": 0.01}
+            with patch("geng_agent.execution_receipts.probe_execution_environment", return_value=changed):
+                with self.assertRaisesRegex(RuntimeError, "shared_runtime_changed"):
+                    broker.execute({"task_id": "sample", "mode": "full"})
+            self.assertTrue(broker.environment_refresh_required)
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve me")
+            self.assertFalse((old / "execution_receipt.json").exists())
+
     def test_zero_exit_without_new_artifacts_cannot_certify_old_csv(self):
         with TemporaryDirectory() as temporary:
             project, broker = self._project(Path(temporary), "def main(config):\n    return None\n")

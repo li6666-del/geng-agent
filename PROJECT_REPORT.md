@@ -58,7 +58,7 @@ OpenAI-compatible LLM 只保留为前两阶段显式兼容路径；第三阶段�
 
 4. **任务定稿与论文主张**
    - 初始事实与回补事实语义合并为最终 `engineering_facts.json`，未解析请求保留为显式缺失信息。
-   - Python 仅硬验收 JSON 和基本结构；来源、事实引用、证据类型、缺失 resolution、assumption 与 sensitivity_check 均写入 `analysis_warnings.json`，不阻断 Writer。
+   - Python 保存分析智能体的原始交付并传递给下游，不按 JSON 字段形状、事实条数或科学表述预先否决。解析失败时保留原文和错误；实际消费者无法执行时由主持人决定修复归属。
    - 无条件生成 `paper_thesis.json`，记录中心结论、作用机制、方法排序、适用区间和 caveat。
    - `experiment_index.py` 生成 v2 实验索引，只记录实体、参数、baseline、验收标准和证据缺口，不预测运行结果。
    - 新案例由 Architecture Agent 生成 `scientific_architecture.json`，跨文档校验 task/experiment/component/quantity 引用以及共享作用域。
@@ -67,7 +67,7 @@ OpenAI-compatible LLM 只保留为前两阶段显式兼容路径；第三阶段�
 5. **任务级自治复现**
    - `agentic_task_writers.py` 为每个任务创建独立 sandbox。
    - v2 sandbox 先安装完全相同的 Foundation snapshot；其哈希参与 writer cache key，Foundation 改变时旧任务结果自动失效。
-   - 最终项目从 canonical Foundation 与任务依赖闭包组装，并重新执行必需文件、编译和本地导入门禁。
+   - 最终项目按逻辑任务分别交付；每个任务目录包含其执行单元所用完整源码、配置、结果与证据，有 Foundation 时也包含共享快照。强依赖任务的目录注明共同执行关系；根目录只作索引。
    - 每个 sandbox 都包含原始论文、全论文页面图和前两轮最终定稿产物；全论文页面图直接发送给 writer，不再筛选任务页，任务相关事实摘要只作为文本导航。
    - 有几个复现任务就同时启动几个 writer，不按本机资源缩减并发。
    - writer 在独立 sandbox 内自主修改代码、配置、README 和 requirements，自行探测并选择 CPU/GPU。
@@ -88,7 +88,7 @@ OpenAI-compatible LLM 只保留为前两阶段显式兼容路径；第三阶段�
    - 一个任务对应一个隔离 task reporter；它只读取本任务的 writer 产物、任务证据和完整论文。
    - task reporter 直接生成任务级 `accepted/revise` 裁决；明确事实被实质违反或核心观点未获支持，且存在论文证据支撑的可执行修改时才返回对应 writer。合理、公开的论文空白假设可有条件通过，裁图或证据问题只重跑对应 reporter。
    - task reporter 为本任务定位并裁切准确的论文原图/子图；writer 不再生成 `paper_target_figure.json`。
-   - 所有任务通过后，独立 Final Report Editor 只组织语言和排版，生成三份 Markdown；确定性 Word 渲染层只负责转为 DOCX。
+   - 独立 Final Report Editor 撰写两份详细 Markdown，并自行编写、运行 `report_layout.py` 生成对应 Word；宿主只检查和交付，简短导航可选。
    - `review.md/docx`：主审查报告。
    - `reproduction_report.md/docx`：逐任务关键参数、运行配置和假设。
    - `result_review.md/docx`：本地图与论文裁切图对比、结论、差异和原因，不包含 writer 自迭代附录。
@@ -116,7 +116,7 @@ OpenAI-compatible LLM 只保留为前两阶段显式兼容路径；第三阶段�
 | `security.py` | 依赖 allowlist、静态扫描、环境隔离和脱敏 |
 | `schema_models.py` / `schemas.py` | 当前结构化阶段的 Pydantic 接口定义 |
 | `risk_report.py` / `verdict.py` | 风险维度与最终复现结论 |
-| `docx_writer.py` / `review_markdown.py` | 人工可读 Markdown/Word 报告 |
+| `agentic_report_editor.py` / `report_editor_word.py` | 编辑智能体生成 Markdown/Word，宿主只检查 Word 包 |
 | `web/` | 本地上传、后台运行、Codex 健康检查和阶段进度 |
 
 已删除的旧编排与语义中间层不再参与当前流程。证据链现在直接使用原论文、全文分块、最终分析产物和图候选索引；缓存仅依据文件内容哈希失效。
@@ -157,10 +157,13 @@ case_xxx/
     04_reporter_*
     04_reporter_workspace/
   repro_project/
-    requirements.txt
-    configs/
-    tasks/
-    outputs/
+    package_index.json
+    task_packages/
+      t01_<任务ID>/
+        requirements.txt
+        configs/
+        src/
+        outputs/
 ```
 
 ## 6. 运行边界

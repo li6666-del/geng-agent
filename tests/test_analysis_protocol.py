@@ -66,7 +66,40 @@ def test_codex_optional_prose_file_does_not_discard_valid_facts(tmp_path, monkey
     assert list((tmp_path / "audit/analysis_candidates/understand").glob("*/candidate.json"))
 
 
-def test_invalid_json_has_one_owner_call_and_never_uses_fallback(tmp_path):
+def test_repeated_document_envelope_is_unwrapped_without_reasking_owner(tmp_path, monkeypatch):
+    facts = {"engineering_facts": [{"id": "F1", "value": -2}]}
+    worker = Mock()
+
+    def generate(**kwargs):
+        (kwargs["work_dir"] / "facts.json").write_text(
+            json.dumps({"facts": facts}), encoding="utf-8")
+        return {"ok": True}
+
+    worker.side_effect = generate
+    monkeypatch.setattr("geng_agent.agentic_analysis.run_codex_subprocess", worker)
+    result = run_codex_json_stage(prompt="paper", stage_label="understand",
+        schema_stage="paper_understanding", output_dir=tmp_path,
+        audit_dir=tmp_path / "audit", max_attempts=1)
+    assert result["facts"] == facts
+    assert worker.call_count == 1
+
+
+def test_analysis_cache_reuses_owner_content_without_schema_approval(tmp_path):
+    from geng_agent.runtime_status import _load_valid_stage_cache
+
+    cache = tmp_path / "plan.json"
+    audit = tmp_path / "audit"
+    audit.mkdir()
+    owner_content = {"tasks": {"repro_tasks": [{"target": "all paper conditions"}]},
+                     "_meta": {"cache": {"fingerprint": "same-input"}}}
+    cache.write_text(json.dumps(owner_content), encoding="utf-8")
+    result = _load_valid_stage_cache(path=cache, audit_dir=audit, stage_label="plan",
+        schema_stage="experiment_plan", expected_cache_metadata={"fingerprint": "same-input"})
+    assert result == owner_content
+    assert not (audit / "resume_invalid_plan.json").exists()
+
+
+def test_invalid_json_is_forwarded_once_without_host_repair(tmp_path):
     class Client:
         def __init__(self):
             self.calls = 0
@@ -76,42 +109,38 @@ def test_invalid_json_has_one_owner_call_and_never_uses_fallback(tmp_path):
     client = Client()
     fallback = Mock(return_value={"facts": {"engineering_facts": [{"invented": True}]}})
     pipeline = ReviewPipeline(client=client)
-    with pytest.raises(NodeFailure):
-        pipeline._load_or_create_analysis_stage_json(output_path=tmp_path / "understanding.json",
-            output_dir=tmp_path, audit_dir=tmp_path / "audit", prompt="paper", stage_label="understand",
-            cleanup_stage="facts", schema_stage="paper_understanding", max_attempts=5, resume=False,
-            fallback_factory=fallback)
+    result = pipeline._load_or_create_analysis_stage_json(output_path=tmp_path / "understanding.json",
+        output_dir=tmp_path, audit_dir=tmp_path / "audit", prompt="paper", stage_label="understand",
+        cleanup_stage="facts", schema_stage="paper_understanding", max_attempts=5, resume=False,
+        fallback_factory=fallback)
     assert client.calls == 1
     fallback.assert_not_called()
-    assert not (tmp_path / "understanding.json").exists()
+    assert result["facts"]["_raw_handoff_text"] == '{"facts": {"engineering_facts": ['
+    assert (tmp_path / "understanding.json").exists()
     assert list((tmp_path / "audit/api_prompt_inputs").glob("*/raw.txt"))
 
 
-def test_mechanical_failure_returns_to_same_planner_with_raw_candidate_preserved(tmp_path, monkeypatch):
+def test_unaddressed_plan_is_preserved_for_next_stage_without_retry(tmp_path, monkeypatch):
     from geng_agent import supervisor
     original = {"tasks": {"repro_tasks": [{"target": "all three SNR points", "conditions": [0, 3, 6]}]}}
-    fixed = deepcopy(original)
-    fixed["tasks"]["repro_tasks"][0]["task_id"] = "ber"
     prompts = []
     class Client:
         def complete(self, prompt, **_kwargs):
             prompts.append(prompt)
-            return json.dumps(original if len(prompts) == 1 else fixed)
+            return json.dumps(original)
     owner = ReviewPipeline(client=Client())
     scope = RunSupervisor(tmp_path, tmp_path / "audit", {"goal": "all three SNR points"})
-    decisions = Mock(side_effect=[{"action": "retry", "diagnosis": "task lacks address", "instructions": "Add task_id; keep 0,3,6"},
-                                  {"action": "approve", "diagnosis": "address fixed, scope retained"}])
+    decisions = Mock(side_effect=AssertionError("host must not ask for content approval"))
     monkeypatch.setattr(scope, "_request", decisions)
     with supervisor_scope(scope):
         result = supervised_analysis_stage(owner, SimpleNamespace(output_dir=tmp_path), node_id="experiment_planning",
             output_path=tmp_path / "plan.json", output_dir=tmp_path, audit_dir=tmp_path / "audit",
             prompt="Keep all paper conditions", stage_label="plan", schema_stage="experiment_plan",
             cleanup_stage="tasks", max_attempts=5, resume=False, cache_inputs={"paper": "same"})
-    assert len(prompts) == 2
-    assert "Add task_id; keep 0,3,6" in prompts[1]
-    assert result["tasks"] == fixed["tasks"]
+    assert len(prompts) == 1
+    assert result["tasks"] == original["tasks"]
     candidates = [json.loads(path.read_text(encoding="utf-8")) for path in (tmp_path / "audit/api_prompt_inputs").glob("*/candidate.json")]
-    assert original in candidates and fixed in candidates
+    assert candidates == [original]
 
 
 def _waiting_tasks():

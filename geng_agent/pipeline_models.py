@@ -29,7 +29,6 @@ class PipelineResult:
 class PipelineRunOptions:
     max_pages: int | None
     run_repro: bool
-    run_timeout: float
     mineru_timeout: float
     json_repair_attempts: int
     tasks_timeout: float

@@ -14,7 +14,6 @@ from .runtime_status import (
     _sha256_file,
     build_stage_cache_metadata,
 )
-from .schemas import format_issues, validate_stage
 from .scientific_materiality import SCIENTIFIC_POLICY_ID
 from .stage_cleanup import _clear_stage_outputs
 
@@ -84,11 +83,6 @@ def load_or_create_experiment_index(
         paper,
         figure_index,
     )
-    issues = validate_stage("experiment_index", experiment_index)
-    if issues:
-        raise RuntimeError(
-            f"{stage_label} failed local validation: {format_issues(issues)}"
-        )
     meta = (
         dict(experiment_index.get("_meta", {}))
         if isinstance(experiment_index.get("_meta"), dict)

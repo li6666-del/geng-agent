@@ -37,7 +37,9 @@ def _pending_environment_from_audit(audit_dir: Path):
                 continue
             source = str(value.get("source") or ("foundation_writer" if path.name != _PENDING_ENVIRONMENT_PATH else ""))
             raw_requests = value.get("requests")
-            if not source or not isinstance(raw_requests, list) or not raw_requests:
+            if not source or not isinstance(raw_requests, list):
+                continue
+            if not raw_requests and source != "shared_runtime_refresh":
                 continue
             requests = [RequirementRequest(**item) for item in raw_requests if isinstance(item, dict)]
             if len(requests) != len(raw_requests):
@@ -200,7 +202,9 @@ def run_execution_flow(
     # operations have the necessary objects; the supervisor selects every action.
     case_runtime = None
     foundation = None
-    foundation_ready = scientific_architecture is None
+    foundation_required = (scientific_architecture is not None
+                           and _shared_foundation_is_material(execution_plan, scientific_architecture))
+    foundation_ready = not foundation_required
     environment_requests = []
     # Rehydrating this host-owned request prevents a resumed flow from merely
     # re-verifying the baseline interpreter after a Foundation/Writer delivery
@@ -225,7 +229,10 @@ def run_execution_flow(
         context.begin("environment")
         requests = environment_requests + (list(pending_environment.requests) if pending_environment else [])
         result = ensure_case_runtime(output_dir=output_dir, audit_dir=audit_dir,
-            scientific_architecture=scientific_architecture, extra_requirements=requests,
+            scientific_architecture=scientific_architecture,
+            execution_task_ids=[str(task.get("task_id")) for task in tasks.get("repro_tasks", [])
+                                if isinstance(task, dict) and task.get("task_id")],
+            extra_requirements=requests,
             resume=options.resume or attempts.get("environment", 0) > 1)
         context.mark("environment")
         return result
@@ -261,7 +268,7 @@ def run_execution_flow(
             paper=paper, paper_path=paper_path, paper_context_json=analysis.paper_context,
             paper_images=paper_images, paper_thesis=paper_thesis, output_dir=output_dir,
             audit_dir=audit_dir, repro_project_dir=repro_project_dir,
-            run_repro=options.run_repro, run_timeout=options.run_timeout,
+            run_repro=options.run_repro,
             resume=options.resume or attempts.get("writers", 0) > 1,
             task_review_callback=_review_one_task, foundation=foundation, case_runtime=case_runtime,
             force_task_ids=forced_task_ids, review_feedback={},
@@ -308,9 +315,6 @@ def run_execution_flow(
                 add("foundation", "创建或修订共享实现。失败后的修复原因与做法由本次指令指定。",
                     build_foundation, {"revision": pending_revision,
                                        "environment_hash": case_runtime.environment_hash})
-                if pending_revision is None and not _shared_foundation_is_material(execution_plan, scientific_architecture):
-                    add("omit_foundation", "现有执行契约无必需共享实现；决定由隔离 Writer 完成各任务。",
-                        lambda decision: decision)
             if foundation_ready and pending_revision is None:
                 add("writers", "启动/恢复独立 Writer 与 Reporter，按有效收据复用成果；不会为了组装重复 full。",
                     run_writers, {"foundation_hash": (foundation or {}).get("snapshot_hash"),
@@ -328,9 +332,14 @@ def run_execution_flow(
         failures.pop(name, None)
         if name == "environment":
             if pending_environment is not None:
+                refresh_only = pending_environment.source == "shared_runtime_refresh"
                 environment_extension_count += 1
                 environment_requests.extend(pending_environment.requests)
-                failures.pop("writers" if pending_environment.source == "task_writers" else "foundation", None)
+                failures.pop("writers" if pending_environment.source in {"task_writers", "shared_runtime_refresh"} else "foundation", None)
+                if refresh_only:
+                    # The partial Writer records remain on disk; the next
+                    # dispatch resumes them against the refreshed runtime.
+                    agentic_result = None
                 write_json(audit_dir / "03a_environment_extensions.json", {
                     "extension_count": environment_extension_count,
                     "latest_source": pending_environment.source,
@@ -368,10 +377,6 @@ def run_execution_flow(
                 failures.pop("environment", None)
             failures.pop("foundation", None)
             failures.pop("writers", None)
-        elif name == "omit_foundation":
-            foundation_ready = True
-            write_json(audit_dir / "03b_foundation_fallback.json", {
-                "decision": "supervisor_omitted_optional_foundation", "moderation": value})
         elif name == "writers":
             agentic_result, complete = value, True
         elif name == "deliver_partial":
@@ -407,6 +412,10 @@ def run_execution_flow(
     def routine_route(snapshot: dict) -> dict | None:
         # The normal prerequisite chain is mechanical. A failed capability,
         # dependency request, or shared revision still needs moderator routing.
+        if pending_environment is not None and pending_environment.source == "shared_runtime_refresh":
+            if "environment" in snapshot["ready"]:
+                return {"action": "start", "next_nodes": ["environment"], "status": "routine",
+                        "diagnosis": "Shared Python changed; refresh the case environment before resuming Writers."}
         if failures or pending_revision is not None:
             return None
         ready = set(snapshot["ready"])

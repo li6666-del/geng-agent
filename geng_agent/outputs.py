@@ -184,6 +184,27 @@ def validate_repro_project(root: Path) -> dict[str, Any]:
 
 def _declared_required_project_files(root: Path) -> set[str]:
     required = set(REQUIRED_REPRO_FILES)
+    reproducibility_path = root / "reproducibility_manifest.json"
+    if reproducibility_path.is_file() and not reproducibility_path.is_symlink():
+        try:
+            delivery = json.loads(reproducibility_path.read_text(encoding="utf-8-sig"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            delivery = {}
+        if isinstance(delivery, dict) and delivery.get("layout") == "task_directories":
+            required = {"tasks_manifest.json", "package_index.json"}
+            packages = delivery.get("task_packages")
+            for package in packages if isinstance(packages, list) else []:
+                if not isinstance(package, dict):
+                    continue
+                directory = str(package.get("directory") or "")
+                for name in ("run_experiment.py", "config.json", "config_smoke.json"):
+                    relative = f"{directory}/{name}"
+                    try:
+                        path = resolve_inside(root, relative)
+                    except ValueError:
+                        required.add(relative)
+                    else:
+                        required.add(path.relative_to(root.resolve()).as_posix())
     manifest_path = root / "tasks_manifest.json"
     if not manifest_path.is_file() or manifest_path.is_symlink():
         return required

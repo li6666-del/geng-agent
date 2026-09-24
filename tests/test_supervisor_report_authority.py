@@ -30,13 +30,45 @@ def test_host_keeps_raw_science_and_unstructured_causal_guidance():
     assert result["host_observations"]
 
 
-@pytest.mark.parametrize("raw", [None, [], {"task_id": "wrong", "host_action": "complete"},
-    {"task_id": "t"}, {"task_id": "t", "host_action": "looks good"}, {"task_id": "t", "host_action": {"next": "run"}}])
-def test_undispatchable_report_never_defaults_to_complete(raw):
+@pytest.mark.parametrize("raw", [None, [], {}])
+def test_absent_reporter_note_remains_a_handoff_failure(raw):
     result = normalize_task_verification(raw, "t")
     assert partition_task_verification_issues(result, "t")[0]
-    if isinstance(raw, dict):
-        assert result["host_action"] == raw.get("host_action")
+
+
+@pytest.mark.parametrize("raw", [{"task_id": "wrong", "host_action": "complete"},
+    {"task_id": "t"}, {"task_id": "t", "host_action": "looks good"},
+    {"task_id": "t", "host_action": {"next": "run"}}])
+def test_reporter_echo_and_non_rerun_action_do_not_block_handoff(raw):
+    result = normalize_task_verification(raw, "t")
+    assert partition_task_verification_issues(result, "t")[0] == []
+    assert result["task_id"] == result["assigned_task_id"] == "t"
+    assert result["reported_task_id"] == raw.get("task_id")
+    assert result["reporter_action"] == raw.get("host_action")
+    assert result["host_action"] == "complete"
+
+
+def test_wrong_task_echo_does_not_suppress_explicit_rerun():
+    note = normalize_task_verification(
+        {"task_id": "wrong", "host_action": "rerun_writer", "outcome": "not_reproduced"},
+        "assigned",
+    )
+    assert note["task_id"] == "assigned"
+    assert note["reported_task_id"] == "wrong"
+    assert note["host_action"] == "rerun_writer"
+    assert partition_task_verification_issues(note, "assigned")[0] == []
+
+
+def test_positive_reporter_conclusion_and_full_run_observation_are_separate():
+    note = normalize_task_verification(
+        {"outcome": "reproduced", "decision_reason": "Reporter evidence supports the claim"},
+        "assigned", run_valid_hint=False,
+    )
+    summary = aggregate_task_verifications([note])
+    assert note["engineering_status"] == "execution_failed"
+    assert summary["all_successful"] is True
+    assert summary["all_full_runs_observed"] is False
+    assert summary["tasks"][0]["outcome"] == "reproduced"
 
 
 def test_arbitrary_scientific_expression_and_missing_schema_are_observations():
@@ -127,8 +159,13 @@ def test_two_reports_without_navigation_are_delivered_and_cacheable(tmp_path, mo
     output = tmp_path / "case"
     output.mkdir()
     def owner(**kwargs):
+        import runpy
+        from tests.test_agentic_report_editor import _FAKE_LAYOUT
         for name in ("reproduction_report.md", "result_review.md"):
             (kwargs["work_dir"] / name).write_text("# 智能体生成的正文\n保留实际限制。", encoding="utf-8")
+        script = kwargs["work_dir"] / "report_layout.py"
+        script.write_text(_FAKE_LAYOUT, encoding="utf-8")
+        runpy.run_path(str(script))
         return {"ok": True, "role": "report_editor"}
     model = Mock(side_effect=owner)
     monkeypatch.setattr(editor, "run_codex_subprocess", model)
@@ -137,22 +174,22 @@ def test_two_reports_without_navigation_are_delivered_and_cacheable(tmp_path, mo
         output_dir=output, audit_dir=output / "audit", resume=False)
     result = editor.run_codex_report_editor_workflow(**arguments)
     assert result["ok"] and not (output / "review.md").exists()
-    assert result["host_observations"] == ["review.md"]
+    assert result["host_observations"] == ["review.md", "review.docx"]
     assert _report_outputs_fingerprint(output)
     cached = editor.run_codex_report_editor_workflow(**{**arguments, "resume": True})
     assert cached["cached"] and model.call_count == 1
 
 
 def test_navigation_docx_absence_does_not_fail_two_main_reports(tmp_path, monkeypatch):
-    from geng_agent import docx_writer
-    from geng_agent.pipeline_report_delivery import generate_docx_reports
+    from docx import Document
+    from geng_agent.pipeline_report_delivery import inspect_editor_word_reports
     for name in ("reproduction_report.md", "result_review.md"):
         (tmp_path / name).write_text("# Report", encoding="utf-8")
-    def convert(path, **kwargs):
-        path.write_bytes(b"converted")
-        return path
-    monkeypatch.setattr(docx_writer, "write_markdown_report_docx", convert)
-    result = generate_docx_reports(output_dir=tmp_path, result_review_result={"passed": True})
+    for name in ("reproduction_report.docx", "result_review.docx"):
+        document = Document()
+        document.add_paragraph("智能体生成的正文")
+        document.save(tmp_path / name)
+    result = inspect_editor_word_reports(output_dir=tmp_path, result_review_result={"passed": True})
     assert result["review_docx"]["passed"] is None
     assert result["reproduction_report_docx"]["passed"]
     assert result["result_review_docx"]["passed"]

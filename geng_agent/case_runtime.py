@@ -97,6 +97,7 @@ from .case_runtime_probe import (
     _trusted_runtime_roots,
 )
 from .case_runtime_requests import (
+    architecture_for_execution_tasks,
     _persisted_host_requests,
     environment_request_prompt,
     read_environment_request,
@@ -112,6 +113,7 @@ def ensure_case_runtime(
     output_dir: Path,
     audit_dir: Path,
     scientific_architecture: Mapping[str, Any] | None,
+    execution_task_ids: Sequence[str] | None = None,
     extra_requirements: Sequence[RequirementRequest | str | Mapping[str, Any]] = (),
     base_interpreter: str | Path | None = None,
     resume: bool = True,
@@ -131,12 +133,18 @@ def ensure_case_runtime(
     resolved_audit = audit_dir.resolve()
     runtime_dir = resolved_audit / CASE_RUNTIME_DIRNAME
     runtime_dir.mkdir(parents=True, exist_ok=True)
-    host_python = Path(base_interpreter or sys.executable).absolute()
+    from .config import get_config_value
+
+    shared_python = get_config_value("GENG_SHARED_SCIENCE_PYTHON") if base_interpreter is None else None
+    host_python = Path(base_interpreter or shared_python or sys.executable).absolute()
+    required_architecture = architecture_for_execution_tasks(
+        scientific_architecture, execution_task_ids,
+    )
     with _host_shared_runtime_guard(host_python):
         return _ensure_case_runtime_locked(
             output_dir=resolved_output,
             audit_dir=resolved_audit,
-            scientific_architecture=scientific_architecture,
+            scientific_architecture=required_architecture,
             extra_requirements=extra_requirements,
             base_interpreter=host_python,
             resume=resume,
@@ -249,24 +257,18 @@ def _ensure_case_runtime_locked(
             cwd=None,
             timeout=180.0,
         )
-    except Exception:
-        _cleanup_failed_host_shared_runtime(output_dir=output_dir)
-        raise
-    report["pip_check"] = {
-        "returncode": pip_check.returncode,
-        "stdout": pip_check.stdout[-8000:],
-        "stderr": pip_check.stderr[-8000:],
-    }
-    if pip_check.returncode != 0:
-        report["ready"] = False
-        report["status"] = "abi_conflict"
-        write_json(resolution.paths.report, report)
-        _cleanup_failed_host_shared_runtime(output_dir=output_dir)
-        raise EnvironmentResolutionError(
-            "abi_conflict",
-            "pip check found an incompatible host-shared dependency set",
-            report=report,
-        )
+    except Exception as exc:
+        report["pip_check"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    else:
+        report["pip_check"] = {
+            "ok": pip_check.returncode == 0,
+            "returncode": pip_check.returncode,
+            "stdout": pip_check.stdout[-8000:],
+            "stderr": pip_check.stderr[-8000:],
+        }
+    # A global pip check can report conflicts in packages no active task uses.
+    # Record it for the Writer and Reporter; executable capability probes and
+    # actual task runs determine whether this case can proceed.
 
     try:
         capabilities = _probe_runtime_capabilities(

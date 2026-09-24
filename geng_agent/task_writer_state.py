@@ -9,7 +9,6 @@ import shutil
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable
 
-from .case_environment import EnvironmentPolicyError, RequirementRequest
 from .foundation_snapshot import path_is_foundation_link
 from .outputs import write_json
 from .paper_evidence import safe_label
@@ -645,43 +644,6 @@ def _complete_execution_unit_runtime_refresh(
         record["environment_refresh_required"] = True
         record["environment_refresh_completed"] = bool(fresh_delivery_usable)
     return bool(fresh_delivery_usable)
-
-def _task_environment_requests(
-    records: list[dict[str, Any]],
-) -> tuple[RequirementRequest, ...]:
-    requests: list[RequirementRequest] = []
-    for record in records:
-        # This task already has an explicit terminal coordination decision.
-        # Retain its diagnostic record, but do not install its dependencies or
-        # let its invalid request abort independently completed sibling tasks.
-        if record.get("supervisor_blocked"):
-            continue
-        if record.get("writer_error_kind") == "environment_request_invalid":
-            status = record.get("writer_status")
-            reason = status.get("blocked_reason") if isinstance(status, dict) else None
-            record.setdefault("coordination_observations", []).append(
-                str(reason or "task writer produced an invalid environment request"))
-            record["coordination_status"] = "needs_review"
-            continue
-        raw_requests = record.get("environment_requests")
-        for item in raw_requests if isinstance(raw_requests, list) else []:
-            if (not isinstance(item, dict) or not isinstance(item.get("requirement"), str)
-                    or not item["requirement"].strip()
-                    or (item.get("import_names") is not None and not isinstance(item["import_names"], (list, tuple)))):
-                record.setdefault("coordination_observations", []).append("task writer environment request is malformed")
-                record["coordination_status"] = "needs_review"
-                continue
-            requests.append(
-                RequirementRequest(
-                    requirement=str(item.get("requirement") or ""),
-                    import_names=tuple(str(name) for name in item.get("import_names") or ()),
-                    requested_by=str(item.get("requested_by") or record.get("task_id") or "task_writer"),
-                    reason=str(item.get("reason") or "") or None,
-                    capability=str(item.get("capability") or "") or None,
-                    import_names_explicit=bool(item.get("import_names_explicit")),
-                )
-            )
-    return tuple(requests)
 
 def _rerun_evidence_fingerprint(evidence: Any, progress: str = "") -> str:
     """Return an order-stable scientific rerun identity for loop detection."""

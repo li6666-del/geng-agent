@@ -191,7 +191,7 @@ class ReporterObservationTests(unittest.TestCase):
                         checked, "experiment_a", task=_task(), run_valid_hint=True
                     )
                     self.assertTrue(warnings)
-                    self.assertEqual(result["engineering_status"], "handoff_failed")
+                    self.assertEqual(result["engineering_status"], "verified")
                     self.assertFalse(verification_scientifically_successful(result))
 
     def test_missing_claim_local_evidence_cannot_certify_success(self) -> None:
@@ -210,9 +210,9 @@ class ReporterObservationTests(unittest.TestCase):
             }
             checked, warnings = normalize_reporter_observation_evidence(raw, workspace)
             result = normalize_task_verification(checked, "experiment_a", task=_task(), run_valid_hint=True)
-            self.assertEqual(result["engineering_status"], "handoff_failed")
+            self.assertEqual(result["engineering_status"], "verified")
             self.assertFalse(verification_scientifically_successful(result))
-            self.assertIsNone(result["host_action"])
+            self.assertEqual(result["host_action"], "complete")
             self.assertTrue(any("missing.csv" in warning for warning in warnings))
             self.assertEqual(raw["core_conclusions"][0]["status"], "supported")
 
@@ -289,7 +289,7 @@ class ReporterObservationTests(unittest.TestCase):
                 result = normalize_task_verification(
                     {"core_conclusions": [item]}, "experiment_a", task=_task(), run_valid_hint=True
                 )
-                self.assertEqual(result["engineering_status"], "handoff_failed")
+                self.assertEqual(result["engineering_status"], "verified")
                 self.assertFalse(verification_scientifically_successful(result))
                 self.assertEqual(result["core_conclusions"][0], item)
                 self.assertNotIn("evidence_files", result)
@@ -303,7 +303,7 @@ class ReporterObservationTests(unittest.TestCase):
                 result = normalize_task_verification(
                     {"core_conclusions": items}, "experiment_a", task=_task(), run_valid_hint=True
                 )
-                self.assertEqual(result["engineering_status"], "handoff_failed")
+                self.assertEqual(result["engineering_status"], "verified")
                 self.assertEqual(result["core_conclusions"], items)
                 self.assertIn("low SNR", str(result["core_conclusions"]))
                 self.assertIn("high SNR", str(result["core_conclusions"]))

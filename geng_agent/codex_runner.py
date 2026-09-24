@@ -563,6 +563,8 @@ def run_codex_subprocess(
     image_paths: list[Path] | None = None,
     extra_env: dict[str, str] | None = None,
     path_prepend: list[Path | str] | None = None,
+    workspace_network_access: bool = False,
+    workspace_writable_roots: list[Path] | None = None,
 ) -> dict[str, Any]:
     raw_cmd = command_override or get_config_value("GENG_CODEX_CMD") or "codex"
     model_config = resolve_model_config(role, getter=get_config_value)
@@ -681,6 +683,11 @@ def run_codex_subprocess(
         "--model",
         model,
     ]
+    if workspace_network_access and sandbox == "workspace-write":
+        command.extend(["--config", "sandbox_workspace_write.network_access=true"])
+    if workspace_writable_roots and sandbox == "workspace-write":
+        command.extend(["--config", "sandbox_workspace_write.writable_roots=" +
+                        json.dumps([str(path.resolve()) for path in workspace_writable_roots])])
     command.extend(model_cli_options(model_config, env))
     if output_schema is not None:
         command.extend(["--output-schema", str(output_schema)])

@@ -6,7 +6,7 @@ import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from geng_agent.foundation_snapshot import foundation_snapshot_hash
 from geng_agent.outputs import write_json
@@ -101,7 +101,38 @@ def _write_frozen_test_project(root: Path) -> tuple[Path, Path, Path]:
 
 
 class AutonomousTaskWriterTests(unittest.TestCase):
-    def test_environment_request_wins_even_when_codex_session_reports_failure(self) -> None:
+    def test_writer_routes_changed_shared_python_to_environment_refresh(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            sandbox = root / "sandbox"
+            audit_dir = root / "audit"
+            sandbox.mkdir()
+            audit_dir.mkdir()
+            runtime = type("Runtime", (), {
+                "python_executable": Path(sys.executable),
+                "venv_dir": Path(sys.executable).parent.parent,
+                "environment_hash": "before",
+                "lock": {"installed_distributions": [
+                    {"distribution": "numpy", "version": "1"}]},
+            })()
+            broker = MagicMock()
+            broker.__enter__.return_value = broker
+            broker.session_id = "session"
+            broker.environment_refresh_required = True
+            with patch("geng_agent.task_writer_runner.ExecutionBroker", return_value=broker) as broker_factory, patch(
+                "geng_agent.task_writer_runner.run_codex_subprocess",
+                return_value={"ok": False, "error": "shared_runtime_changed"},
+            ):
+                status = _run_task_writer_codex_session(
+                    label="changed_runtime", prompt="continue task", sandbox=sandbox,
+                    audit_dir=audit_dir, case_runtime=runtime,
+                )
+
+        self.assertEqual(status["error_kind"], "environment_refresh")
+        self.assertEqual(broker_factory.call_args.kwargs["expected_installed_distributions"],
+                         runtime.lock["installed_distributions"])
+
+    def test_legacy_environment_request_does_not_override_writer_failure(self) -> None:
         with TemporaryDirectory() as temp:
             root = Path(temp)
             sandbox = root / "sandbox"
@@ -127,9 +158,9 @@ class AutonomousTaskWriterTests(unittest.TestCase):
                     audit_dir=audit_dir,
                 )
 
-        self.assertEqual(status["error_kind"], "environment_request")
-        self.assertEqual(status["environment_requests"][0]["requirement"], "scipy>=1.11")
-        self.assertNotIn("codex session ended", status["blocked_reason"])
+        self.assertFalse(status["ok"])
+        self.assertIn("codex session ended", status["error"])
+        self.assertNotEqual(status.get("error_kind"), "environment_request")
 
     @unittest.skipIf(os.name == "nt", "symlink creation is not reliably available on Windows")
     def test_writer_requirements_symlink_is_rejected_without_leaking_target(self) -> None:
@@ -1095,7 +1126,7 @@ class AutonomousTaskWriterTests(unittest.TestCase):
                 output,
                 "manifest",
                 preserve_audit=True,
-                preserve_paths={"report_assets"},
+                preserve_paths={"repro_project", "report_assets"},
             )
 
     def test_one_writer_reruns_once_for_complete_causal_request(self) -> None:

@@ -11,8 +11,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .agentic_foundation import _assert_foundation_sandbox_layout_safe, foundation_violations, restore_foundation_snapshot
-from .case_environment import EnvironmentPolicyError
-from .case_runtime import CaseRuntime, read_environment_request, requirements_missing_from_lock
+from .case_runtime import CaseRuntime
 from .codex_runner import run_codex_subprocess
 from .execution_receipts import ExecutionBroker, trusted_input_snapshot, find_host_execution
 from .foundation_revision import read_foundation_revision_request
@@ -43,7 +42,8 @@ from .task_writer_state import (
 from .task_writer_support import PAPER_EVIDENCE_DIR, _restore_trusted_files
 from .task_writer_units import _execution_unit_sandbox, _public_execution_unit
 from .verification_result import rerun_evidence_path_issues, task_verification_issues
-from .writer_recovery import localize_writer_feedback, writer_recovery_context, archive_satisfied_environment_request
+from .writer_recovery import localize_writer_feedback, writer_recovery_context
+from .writer_environment import ensure_writer_environment, snapshot_writer_environment
 from .task_recovery import recovery_state_id, recover_writer_stall, resolve_revision_owner
 from .supervisor import NodeFailure, StageBlocked, REPLAY_REQUIRED, current_supervisor, supervised_call
 
@@ -288,7 +288,7 @@ def _supervise_writer_delivery(*, node_id, produce, archive, tasks, sandbox, ana
         recheck_on_retry = False
         handoff_failed = False
         status, records = latest
-        routed = status.get("error_kind") in {"environment_request", "foundation_revision"}
+        routed = status.get("error_kind") in {"environment_request", "environment_refresh", "foundation_revision"}
         if current_supervisor() is not None and not routed and not any(
             record.get("writer_completed") for record in records
         ):
@@ -571,6 +571,7 @@ def _run_one_execution_unit_writer(
                 )
             if writer_status.get("error_kind") in {
                 "environment_request",
+                "environment_refresh",
                 "environment_request_invalid",
                 "sandbox_inspection_failed",
                 "foundation_revision",
@@ -655,7 +656,7 @@ def _run_one_execution_unit_writer(
         reconcile_first = False
         if any(record.get("supervisor_blocked") for record in records):
             return records
-        if writer_status.get("error_kind") in {"environment_request", "environment_request_invalid", "foundation_revision", "sandbox_inspection_failed"}:
+        if writer_status.get("error_kind") in {"environment_request", "environment_refresh", "environment_request_invalid", "foundation_revision", "sandbox_inspection_failed"}:
             return records
 
         requested_feedback: dict[str, dict[str, Any]] = {}
@@ -931,6 +932,7 @@ def _run_one_task_writer(
 
             if writer_status.get("error_kind") in {
                 "environment_request",
+                "environment_refresh",
                 "environment_request_invalid",
                 "sandbox_inspection_failed",
                 "foundation_revision",
@@ -988,7 +990,7 @@ def _run_one_task_writer(
         reconcile_first = False
         record = delivery_records[0]
         if record.get("supervisor_blocked") or writer_status.get("error_kind") in {
-            "environment_request", "environment_request_invalid", "foundation_revision", "sandbox_inspection_failed",
+            "environment_request", "environment_refresh", "environment_request_invalid", "foundation_revision", "sandbox_inspection_failed",
         }:
             return record
         recovered_feedback = None
@@ -1183,18 +1185,10 @@ def _run_task_writer_codex_session(
     request_source: str = "task_writer",
     require_execution_receipt: bool = True,
 ) -> dict[str, Any]:
-    if case_runtime is not None:
-        try:
-            resolved_request = archive_satisfied_environment_request(sandbox, case_runtime)
-        except (ValueError, OSError, EnvironmentPolicyError) as exc:
-            return {"ok": False, "error_kind": "environment_request_invalid",
-                    "blocked_reason": f"Could not safely restore dependency request state: {exc}"}
-        if resolved_request:
-            prompt += (f"\nThe host verified and archived the previous dependency request at `{resolved_request}`. "
-                       "Continue the preserved implementation with the updated environment; do not request the same installed dependencies again.\n")
     write_text(audit_dir / f"{label}_brief.md", prompt)
     selected_python = (
-        case_runtime.python_executable if case_runtime is not None else Path(sys.executable).absolute()
+        ensure_writer_environment(sandbox, case_runtime)
+        if case_runtime is not None else Path(sys.executable).absolute()
     )
     python_dir = selected_python.parent
     runtime_env = {
@@ -1203,10 +1197,14 @@ def _run_task_writer_codex_session(
         "PYTHONDONTWRITEBYTECODE": "1",
     }
     if case_runtime is not None:
-        runtime_env["VIRTUAL_ENV"] = str(case_runtime.venv_dir)
+        runtime_env["VIRTUAL_ENV"] = str(selected_python.parent.parent)
     evidence_before = trusted_input_snapshot(sandbox, (PAPER_EVIDENCE_DIR,))
     with ExecutionBroker(sandbox, audit_dir, selected_python,
                          environment_hash=case_runtime.environment_hash if case_runtime else "",
+                         shared_runtime_python=(case_runtime.python_executable if case_runtime else None),
+                         expected_installed_distributions=(
+                             case_runtime.lock.get("installed_distributions")
+                             if case_runtime and "installed_distributions" in case_runtime.lock else None),
                          allow_full=require_execution_receipt) as broker:
         runtime_env["GENG_EXECUTION_BROKER"] = broker.session_id
         prompt += ("\n\nHost-observed execution: invoke the selected Python using your shell's syntax and use the task's actual config path. "
@@ -1225,7 +1223,17 @@ def _run_task_writer_codex_session(
             command_override=get_config_value("GENG_CODEX_TASK_WRITER_CMD"),
             image_paths=unique_image_paths(sorted(path.resolve() for path in (sandbox / PAPER_EVIDENCE_DIR / "full_paper_pages").glob("paper_page_*.png") if path.is_file())),
             extra_env=runtime_env, path_prepend=[python_dir],
+            workspace_network_access=case_runtime is not None,
+            workspace_writable_roots=[selected_python.parent.parent] if case_runtime else None,
         )
+    if case_runtime is not None:
+        try:
+            snapshot_writer_environment(sandbox, case_runtime)
+        except (OSError, ValueError) as exc:
+            status["writer_environment_snapshot_error"] = f"{type(exc).__name__}: {exc}"
+    if broker.environment_refresh_required is True:
+        return {**status, "ok": False, "error_kind": "environment_refresh",
+                "blocked_reason": "Shared Python changed after case preparation; the host will refresh the environment before continuing."}
     return _inspect_task_writer_completion(status=status, sandbox=sandbox, audit_dir=audit_dir,
         case_runtime=case_runtime, request_source=request_source,
         require_execution_receipt=require_execution_receipt, evidence_before=evidence_before)
@@ -1265,65 +1273,6 @@ def _inspect_task_writer_completion(*, status, sandbox, audit_dir, case_runtime,
             status = {**status, "ok": False, "error_kind": "evidence_modified",
                       "blocked_reason": "Original paper evidence changed during Writer execution",
                       "paper_evidence_changed_files": changed}
-    try:
-        requests = read_environment_request(sandbox=sandbox, source=request_source)
-    except EnvironmentPolicyError as exc:
-        return {
-            **status,
-            "ok": False,
-            "error_kind": "environment_request_invalid",
-            "blocked_reason": "task writer produced an invalid dependency request",
-        }
-    if requests:
-        return {
-            **status,
-            "ok": False,
-            "error_kind": "environment_request",
-            "blocked_reason": "task writer requested a host-managed case dependency",
-            "environment_requests": [
-                {
-                    "requirement": item.requirement,
-                    "import_names": list(item.import_names),
-                    "requested_by": item.requested_by,
-                    "reason": item.reason,
-                    "capability": item.capability,
-                    "import_names_explicit": item.import_names_explicit,
-                }
-                for item in requests
-            ],
-        }
-    if case_runtime is not None:
-        try:
-            requests = requirements_missing_from_lock(
-                sandbox / "requirements.txt",
-                case_runtime.lock,
-                source=f"{request_source}:requirements.txt",
-            )
-        except EnvironmentPolicyError as exc:
-            return {
-                **status,
-                "ok": False,
-                "error_kind": "environment_request_invalid",
-                "blocked_reason": "task writer requirements are invalid or unsafe",
-            }
-        if requests:
-            return {
-                **status,
-                "ok": False,
-                "error_kind": "environment_request",
-                "blocked_reason": "task writer declared a dependency absent from the active case lock",
-                "environment_requests": [
-                    {
-                        "requirement": item.requirement,
-                        "import_names": list(item.import_names),
-                        "requested_by": item.requested_by,
-                        "reason": item.reason,
-                        "capability": item.capability,
-                        "import_names_explicit": item.import_names_explicit,
-                    }
-                    for item in requests
-                ],
-            }
     architecture_path = sandbox / PAPER_EVIDENCE_DIR / "analysis_artifacts" / "scientific_architecture.json"
     if (sandbox / "foundation_revision_request.json").is_file() and architecture_path.is_file():
         plan_path = architecture_path.with_name("execution_plan.json")

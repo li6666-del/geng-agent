@@ -63,7 +63,6 @@ def _add_common_review_args(parser: argparse.ArgumentParser) -> None:
     run_group.add_argument("--no-run-repro", dest="run_repro", action="store_false", help="不自动运行生成代码；这是默认行为。")
     parser.set_defaults(run_repro=False)
     parser.add_argument("--no-analysis-fallback", action="store_true", help="禁用前两阶段本地确定性兜底；默认启用以提高端到端稳定性。")
-    parser.add_argument("--run-timeout", type=float, default=120.0, help="单次复现运行超时时间，单位秒。")
     parser.add_argument(
         "--mineru-timeout",
         type=float,
@@ -121,7 +120,6 @@ def main(argv: list[str] | None = None) -> int:
             output_dir=output_dir,
             max_pages=args.max_pages,
             run_repro=args.run_repro,
-            run_timeout=args.run_timeout,
             mineru_timeout=args.mineru_timeout,
             json_repair_attempts=args.json_repair_attempts,
             tasks_timeout=args.tasks_timeout,

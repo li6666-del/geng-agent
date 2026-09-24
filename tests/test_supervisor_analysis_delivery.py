@@ -300,7 +300,7 @@ def test_packaging_failure_does_not_prevent_report_editor(tmp_path, monkeypatch,
         (tmp_path / f"{name}.md").write_text("# Current report", encoding="utf-8")
         (tmp_path / f"{name}.docx").write_bytes(b"old Word file")
     word_result = {f"{name}_docx": {"passed": False} for name in ("review", "result_review", "reproduction_report")} if word_failed else {}
-    result = run_report_flow(SimpleNamespace(_generate_docx_reports=Mock(return_value=word_result)), context, analysis, execution,
+    result = run_report_flow(SimpleNamespace(_inspect_editor_word_reports=Mock(return_value=word_result)), context, analysis, execution,
         provenance_builder=lambda **k: {})
     assert package.call_count == 1
     editor.assert_called_once()
@@ -324,15 +324,15 @@ def test_packaging_failure_does_not_prevent_report_editor(tmp_path, monkeypatch,
         assert result.review_docx_path is result.result_review_docx_path is result.reproduction_report_docx_path is None
 
 
-def test_word_conversion_failure_preserves_markdown(tmp_path, monkeypatch):
-    from geng_agent.pipeline_report_delivery import generate_docx_reports
-    from geng_agent import docx_writer
+def test_missing_editor_word_files_preserve_markdown(tmp_path):
+    from geng_agent.pipeline_report_delivery import inspect_editor_word_reports
 
     for name in ("review.md", "result_review.md", "reproduction_report.md"):
         (tmp_path / name).write_text("# 已完成的报告\n原始结论保留。", encoding="utf-8")
-    monkeypatch.setattr(docx_writer, "write_markdown_report_docx", Mock(side_effect=OSError("Word unavailable")))
-    result = generate_docx_reports(output_dir=tmp_path, result_review_result={"passed": True})
-    assert all(item["passed"] is False for item in result.values())
+    result = inspect_editor_word_reports(output_dir=tmp_path, result_review_result={"passed": True})
+    assert result["review_docx"]["passed"] is None
+    assert result["result_review_docx"]["passed"] is False
+    assert result["reproduction_report_docx"]["passed"] is False
     assert all((tmp_path / name).exists() for name in ("review.md", "result_review.md", "reproduction_report.md"))
 
 

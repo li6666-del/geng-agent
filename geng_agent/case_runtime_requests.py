@@ -25,6 +25,39 @@ from .case_runtime_contracts import (
 )
 from .case_runtime_probe import _read_regular_file_nofollow
 from .security import import_names_for_requirement
+from .foundation_scope import derive_foundation_scope
+from .architecture_protocol import architecture_runtime_view
+
+
+def architecture_for_execution_tasks(
+    architecture: Mapping[str, Any] | None,
+    task_ids: Sequence[str] | None,
+) -> Mapping[str, Any] | None:
+    """Defer unbound architecture suggestions until a Writer needs them.
+
+    Bindings and component dependencies are addresses, not a judgement about
+    whether a scientific choice is correct. Standalone runtime callers retain
+    their existing all-component behavior when no task list is supplied.
+    """
+    if not isinstance(architecture, Mapping) or task_ids is None:
+        return architecture
+    active_tasks = {str(task_id) for task_id in task_ids}
+    addressed = architecture_runtime_view(dict(architecture))
+    scope = derive_foundation_scope(addressed)
+    active_components = {
+        component_id
+        for task_id, component_ids in scope["task_component_ids"].items()
+        if task_id in active_tasks
+        for component_id in component_ids
+    }
+    components = addressed.get("components")
+    return {
+        **addressed,
+        "components": [
+            component for component in components
+            if isinstance(component, Mapping) and str(component.get("id")) in active_components
+        ] if isinstance(components, list) else [],
+    }
 
 
 def requirements_from_scientific_architecture(

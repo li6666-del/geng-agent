@@ -171,6 +171,10 @@ class TaskWriterAssemblyTests(unittest.TestCase):
             self.assertTrue((project / "tasks" / "_figure_6_helper.py").is_file())
             self.assertIn("tasks/lookup.json", expected)
             self.assertEqual((project / "tasks" / "lookup.json").read_text(encoding="utf-8"), '{"scale": 1}\n')
+            self.assertEqual((project / "task_requirements" / "figure_6.txt").read_text(encoding="utf-8"), "numpy\n")
+            manifest = json.loads((project / "reproducibility_manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["requirements_by_execution_unit"]["figure_6"],
+                             "task_requirements/figure_6.txt")
 
     def test_missing_local_import_is_reported_as_advisory(self) -> None:
         with TemporaryDirectory() as temp_dir:

@@ -87,7 +87,7 @@ class CliDefaultsTests(unittest.TestCase):
         self.assertNotIn("--codex-reporter-timeout", help_text)
         self.assertIn("--timeout", help_text)
         self.assertIn("--tasks-timeout", help_text)
-        self.assertIn("--run-timeout", help_text)
+        self.assertNotIn("--run-timeout", help_text)
         self.assertIn("--mineru-timeout", help_text)
         self.assertNotIn("--no-result-review", help_text)
         self.assertNotIn("--codex-agent-stall-rounds", help_text)

@@ -73,7 +73,7 @@ def cached_case(tmp_path, monkeypatch):
     def forbidden(*_args, **_kwargs):
         pytest.fail("Pending Foundation repair must be handed off before clearing, dispatching or packaging.")
 
-    for function in ("_clear_stage_outputs", "_dispatch_task_writers", "_prepare_project_workspace"):
+    for function in ("_clear_stage_outputs", "_dispatch_task_writers", "_package_task_directories"):
         monkeypatch.setattr(workflow, function, forbidden)
 
     def run(callback):

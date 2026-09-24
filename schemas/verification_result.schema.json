@@ -433,6 +433,11 @@
       "title": "All Successful",
       "type": "boolean"
     },
+    "all_full_runs_observed": {
+      "default": false,
+      "title": "All Full Runs Observed",
+      "type": "boolean"
+    },
     "outcome_counts": {
       "additionalProperties": {
         "type": "integer"

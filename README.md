@@ -17,6 +17,7 @@ Case 工作流只接受 `workflow_version: "2"`。已有阶段产物但缺少有
 - 解析 PDF/TXT/Markdown 论文，保留全文分块、页面图像和带 caption/page/bbox 的图候选索引，供 Codex 直接查证。
 - 论文理解一次读取原文，同时产出工程事实和核心主张；分别保存 `engineering_facts_initial.json`、`paper_thesis.json`，组合缓存为 `paper_understanding.json`。
 - 实验规划同时生成任务、验收导航和科学架构。主张在初次规划前已可用；无缺口路径包含理解、规划两次主要分析调用。正常节点交接不再调用主持人批准。
+- 分析智能体的原始交付直接进入下一阶段；宿主不按事实条数、措辞、方法排序、趋势或数值差距预审，也不以分析 JSON 的字段形状否决交接。无法解析的原文和错误一并保留，只有实际消费者无法执行时才交由主持人安排修复。
 - 只有规划者明确选中的关键缺口才进入定向回补；理解角色按请求查证，规划者随后共同修订任务与架构。保留搜索台账、旧稿及信息不足，不再另调主张提炼、最终定稿或架构 Agent。
 - `scientific_acceptance` 是有来源、稳定 ID 的审查导航；独立 Reporter 以原论文、实际实现与执行证据判断科研结论，程序不按文字相似度或统一倍率阈值重判。
 - 联合计划保存为 `experiment_plan.json`，同时发布供下游使用的 `repro_tasks.json` 和可选 `scientific_architecture.json`。私有独立任务可以不单列架构；跨执行单元共享科学定义必须具备相应契约。
@@ -27,7 +28,7 @@ Case 工作流只接受 `workflow_version: "2"`。已有阶段产物但缺少有
 - 每个 Writer 围绕论文明确事实和任务目标实现，只在论文未披露或确有歧义处作显式假设。Reporter 提出有证据和预期效果的修订，主持人决定是否交回 Writer；Python 不按固定理由标签或字段模板判断修订是否值得执行。
 - 宿主按数据依赖推进正常阶段和独立 Writer 批次，记录交付、实际执行与异常；只有下一步无法执行或修复归属不明时才唤醒主持人。科学结论由独立 Reporter 判断，主持人安排异常修复。
 - 每个 Writer 交付后立即启动对应的独立 Codex task reporter，核对论文与本地产物。Reporter 给出 `reproduced`、`reproduced_with_assumptions`、`inconclusive_missing_information` 或 `not_reproduced`；后两者是可报告终态。协调停止时仍保留未接受意见及停止原因，交由已有的报告编辑智能体说明。
-- 主要交付为本地复现报告 `reproduction_report.md/docx` 和论文对比报告 `result_review.md/docx`；`review.md/docx` 是可选导航。两份正文由编辑智能体生成，Word 转换由宿主执行；导航缺失不阻碍正文交付。
+- 主要交付为本地复现报告 `reproduction_report.md/docx` 和论文对比报告 `result_review.md/docx`；`review.md/docx` 是可选导航。两份正文与 Word 版式由编辑智能体完成，宿主检查文件并保存交付；导航缺失不阻碍正文交付。
 - 提供极简 Web UI，可上传 PDF 或填写 PDF 链接并实时查看阶段进度。
 
 ## 工作流
@@ -56,7 +57,7 @@ Case 工作流只接受 `workflow_version: "2"`。已有阶段产物但缺少有
 
 ## 科学结果与执行证据
 
-最终任务稿按任务完整规格发布，可以撤销旧参数、假设和关系；此前稿件仍保存在 audit。独立 Reporter 保留任务清单之外的新反证，成功判断必须有实际本地证据。原始输出、源码与论文输入在审查前后核对完整性，最终报告附宿主生成的任务终态。
+最终任务稿按任务完整规格发布，可以撤销旧参数、假设和关系；此前稿件仍保存在 audit。独立 Reporter 保留任务清单之外的新反证，并根据可用的本地证据判断科学结论。宿主另行记录每项 full 运行是否被实际观察到，不以收据缺失改写 Reporter 的原判；两种状态并列交给最终报告说明。原始输出、源码与论文输入在审查前后核对完整性。
 
 Writer 使用生成项目的 `run_task.py --task <ID> --config <配置> --mode full` 提交一次实际执行。宿主记录进程退出状态、可观测源码/配置/输入、运行环境和输出哈希；原生库加载的数据须在配置或 `--input` 中声明，smoke 不得作为 full 证据。每次开始前归档该任务旧输出，避免空运行继承旧 CSV。执行后新增数值产物不算本次运行证据；补画图片可用于排版，但科学判断仍需已观察的测量或源码证据。原始运行记录在 `audit/execution_runs/`，交付中的 `execution_evidence.json` 解释配置改名与文件搬移，不伪称组装后的文件曾重新执行。
 
@@ -64,7 +65,7 @@ Writer 使用生成项目的 `run_task.py --task <ID> --config <配置> --mode f
 
 Foundation 只冻结需要跨执行单元一致的共享组件与依赖。私有科学实现可由所属 Writer 修改；共享缺陷通过有论文证据的 `foundation_revision_request.json` 定点修订。共享训练产物必须有生产者和消费关系。缓存按执行单元的科学规格、相关组件与依赖版本判断；缺包、局部修订和一次无进展重试不再清空整个 case。
 
-交付包附安装文件、已记录的依赖版本、任务配置和执行证据，并保留现有运行环境下的目录搬移检查。交付阶段不新建独立环境、不重新安装依赖或执行独立环境验证。科学未复现保留其真实终态。成本事件按调用保存并跨恢复累计；缺失的历史用量保持未知。
+交付项目统一按任务分目录；每个目录带有该任务实际执行单元所需的源码（包括所用 Foundation）、安装文件、已记录的依赖版本、配置、结果和执行证据。强依赖任务若同属一次执行，各任务目录均保留该单元完整材料并标明共同执行关系。根目录只提供索引，不声称存在一套已执行的统一源码。打包失败时主持人可保留原始 Writer/Reporter 结果，明确标记项目交付不完整后继续生成报告。交付阶段不新建独立环境、不重新安装依赖或执行独立环境验证。科学未复现保留其真实终态。成本事件按调用保存并跨恢复累计；缺失的历史用量保持未知。
 
 ## 安装
 
@@ -81,7 +82,7 @@ python -m pip install -e ".[repro]"
 python -m pip install -e ".[repro,web]"
 ```
 
-`.[repro]` 只是常见通信论文的便利预装资料包，包括 `numpy`、`scipy`、`matplotlib`、`pandas`、`sympy`、`numba`、`torch`、`scikit-learn`、`galois`、`h5py` 等；它不是包准入白名单。每个 case 复用宿主选定的共享 Python：解析器先对全部请求包做真实版本和 import 探测，只从登记的 HTTPS 来源补装未满足的二进制 wheel，并在 case 动态锁中逐项记录 `host_runtime` 或 `trusted_index` 来源。宿主随后执行 `pip check` 和真实科学能力探针；共享运行时的完整变更事务由宿主级互斥锁串行化。
+`.[repro]` 只是常见通信论文的便利预装资料包，包括 `numpy`、`scipy`、`matplotlib`、`pandas`、`sympy`、`numba`、`torch`、`scikit-learn`、`galois`、`h5py` 等；它不是包准入白名单。可用 `GENG_SHARED_SCIENCE_PYTHON` 指定预装这些大库的共享 Python，避免每个 Writer 重复安装。每个 case 先记录共享运行时的实际依赖与能力；每个并发 Writer 再获得自己的可写虚拟环境，通过 `.pth` 读取共享库，需要新增包时直接安装进自己的环境。`GENG_WRITER_ENVS_ROOT` 可指定这些虚拟环境的固定存放目录。Writer 的安装互不排队，也不会改动共享基础环境。科学执行使用对应 Writer 的 Python，并记录运行前后的实际包清单；交付项目保留每个执行单元的 `task_requirements/` 和实际运行收据，不打包临时环境。完整交付且报告通过后才清理 Writer 环境；中断、部分交付仍保留以便续跑，后续重建从私有环境锁恢复 Writer 自装的包。
 
 安装后先自检：
 
@@ -89,7 +90,7 @@ python -m pip install -e ".[repro,web]"
 python -m geng_agent doctor
 ```
 
-`doctor` 会检查 Python 版本、运行本体依赖和常用复现资料包。只有 Python/编排器依赖缺失才阻断；论文特有库由 Case Resolver 在执行前补齐、锁定并验证，不会迫使架构设计师改用更弱实现。
+`doctor` 会检查启动 CLI 的 Python 版本、运行本体依赖和常用复现资料包；若另设 `GENG_SHARED_SCIENCE_PYTHON`，实际复现基础环境还会在 case 准备时探测。只有 Python/编排器依赖缺失才阻断；论文特有库可由 Case Resolver 在执行前准备，或由 Task Writer 在其私有环境自行安装，不会迫使架构设计师改用更弱实现。
 
 ### 可选 MinerU 图定位增强
 
@@ -113,7 +114,7 @@ MinerU 缺失、超时、非零退出或未识别到目标图时，流程不会�
 
 系统会把原始论文文件、全论文页面图以及最终定稿的 `engineering_facts.json`、`repro_tasks.json`、`execution_plan.json`、`experiment_index.json`、v2 的 `scientific_architecture.json`、可选 `paper_thesis.json` 和 `analysis_warnings.json` 复制到每个 writer sandbox。确需共享科学层的 sandbox 安装同一份只读 Foundation snapshot。所有论文页面图直接随 Codex writer 会话发送，不再执行任务页筛选；任务相关事实摘要只用于文本导航，不构成信息边界。
 
-每个 Writer 交付后，专属 Reporter 在独立上下文中对照原文、实际代码和宿主 full 收据，按 v3 协议提交科学结论、直接理由、比较条件与下一步动作。Reporter 判断语义等价、数值可比性、材料性与假设影响；宿主只校验交接身份、结构和证据文件，记录原判并调度，不按文字差异或通用十倍阈值重判。交接不完整由已有 Reporter 修复，修复仍失败则记录 review_incomplete；这不是论文信息不足，也不触发 Writer 重跑。所有任务到达可报告终态后生成三份最终报告。
+每个 Writer 交付后，专属 Reporter 在独立上下文中对照原文、实际代码和宿主 full 收据，按 v3 协议提交科学结论、直接理由、比较条件与下一步动作。Reporter 判断语义等价、数值可比性、材料性与假设影响；任务归属由调度器确定，不要求 Reporter 重复写对任务 ID。只有明确要求 `rerun_writer` 才进入修订调度，其他可读结论直接交给报告阶段。宿主保存原始字段及异常、独立记录运行证据，不按字段措辞或数值阈值改判。只有未交出可读结论才要求修复交接；仍失败则记录 review_incomplete。所有任务到达可报告终态后生成两份详细报告，可选生成导航报告。
 
 对 PDF，系统优先把 MinerU 的整图候选连同 caption、页码和归一化 bbox 交给 task reporter。Reporter 可在候选父图内部标注目标子图，Python 再从原 PDF 确定性裁切；任一边界不确定时使用完整父图。图像不是全局必需产物：图类任务应有可读结果图或等价的 CSV、表格、summary、文本证据，无图任务和信息不足终态可直接用结构化证据成文。
 
@@ -146,7 +147,7 @@ set GENG_CODEX_CMD=codex
 - `reproduction_report.md/docx`：集中保存完整参数及来源、实现与配置、依赖环境、入口命令、运行与迭代摘要、产物和证据索引、交付限制等详细信息。
 - `review.md/docx`：可选的简短导航；缺少它不阻止两份详细报告发布。
 
-程序只整理材料、按 Reporter 记录的哈希恢复图片、检查文件、保存智能体产物和转换 Word 格式；不插入终态正文，不进行语义匹配或替 Editor 判定表达。来源事实与 Writer 自述明确区分，人工核查建议标为未执行的建议。语言修订不改变科学判决，也不构成 Writer 重跑理由。
+Editor 自行编写并运行 `report_layout.py`，生成两份可编辑的 Word 文件；脚本随报告保留。宿主只整理材料、按 Reporter 记录的哈希恢复图片、检查 Word 文件可读性并保存智能体产物；不转换格式、不插入终态正文，也不替 Editor 判定表达。来源事实与 Writer 自述明确区分，人工核查建议标为未执行的建议。语言修订不改变科学判决，也不构成 Writer 重跑理由。
 
 也可以按阶段覆盖：
 
@@ -219,11 +220,10 @@ python -m geng_agent review paper.pdf --out case_analysis --analysis-only
 --analysis-backend codex     前两阶段 backend，默认 codex；llm 为旧兼容路径
 --analysis-only              只生成最终事实、最终任务、论文主张和实验索引
 --mineru-timeout 1800        MinerU 单篇预解析超时；超时后自动回退页面图定位
---run-timeout 120            单次任务运行超时
 --no-resume                  不复用已有阶段产物，从头运行
 ```
 
-Analysis、Foundation/Task Writer、Task Reporter 和 Report Editor 的 Codex 推理会话均不设项目内运行时长上限。上面的 `--mineru-timeout` 与 `--run-timeout` 约束的是非 Codex 子流程。
+Analysis、Foundation/Task Writer、Task Reporter 和 Report Editor 的 Codex 推理会话，以及 Writer 发起的单次科学任务执行，均不设项目内运行时长上限。`--mineru-timeout` 只约束 MinerU 预解析。
 
 检查已有 case 的阶段状态：
 
@@ -259,6 +259,8 @@ Web UI 支持上传 PDF、管理案例、查看五个当前主流程阶段、接
 
 ```text
 GENG_CASES_ROOT         case 根目录；默认 %USERPROFILE%\Desktop\耿同学agent_cases
+GENG_SHARED_SCIENCE_PYTHON  预装常用科学大库的共享 Python 解释器；未设置时沿用启动宿主的 Python
+GENG_WRITER_ENVS_ROOT   各 Writer 可写虚拟环境的根目录；建议放在案例目录外的固定运行目录
 GENG_DATABASE_URL       SQLAlchemy 数据库地址
 GENG_REDIS_URL          Redis/Celery 地址
 GENG_CELERY_EAGER       1 表示本地进程内执行
@@ -316,19 +318,24 @@ case_001/
     04_reporter_workspace/
   repro_project/
     README.md
-    requirements.txt
+    package_index.json
     execution_plan.json
     artifact_lineage.json
-    environment.lock.json
     reproducibility_manifest.json
     source_inventory.json
     tasks_manifest.json
-    configs/
-    execution_units/
-    src/
-    tasks/
-    tests/
-    outputs/
+    task_packages/
+      t01_<任务ID>/
+        README.md
+        run_experiment.py
+        requirements.txt
+        environment.lock.json
+        configs/
+        src/
+        tasks/
+        outputs/
+      t02_<任务ID>/
+        ...
 ```
 
 其中：
@@ -368,7 +375,7 @@ case_001/
 
 ## 项目定位
 
-耿同学 agent 的目标是提供忠于论文证据并能检验核心观点的复现结果，不是替代人工科研判断。`matched` 只表示Reporter 认可相应科学结论且宿主执行证据有效；`inconclusive_missing_information` 与 `not_reproduced` 则如实保留信息不足或忠实失败的科学结果。任何终态都不表示恢复了作者未公开代码。
+耿同学 agent 的目标是提供忠于论文证据并能检验核心观点的复现结果，不是替代人工科研判断。`scientific_all_successful` 汇总 Reporter 的正面结论，`all_full_runs_observed` 独立说明宿主是否观察到全部 full 运行；二者不一致时报告必须保留差异。`inconclusive_missing_information` 与 `not_reproduced` 如实保留信息不足或忠实失败的科学结果。任何终态都不表示恢复了作者未公开代码。
 
 ### 实际运行问题整改（2026-09-08）
 

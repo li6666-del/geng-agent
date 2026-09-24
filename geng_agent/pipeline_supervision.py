@@ -11,6 +11,7 @@ from .security import redact_text
 from .supervisor import RunSupervisor, StageBlocked, supervisor_scope
 from .supervisor_tools import SupervisorTool
 from .supervisor_repairs import register_delivery_repairs, write_delivery_index
+from .writer_environment import cleanup_completed_writer_environments
 
 
 def _failure(phase: str, exc: Exception) -> dict:
@@ -212,4 +213,13 @@ def run_supervised_pipeline(*, context, supervisor: RunSupervisor,
                    and getattr(execution, "runtime_result", {}).get("delivery_status") not in {"partial", "blocked"}}
     write_json(context.audit_dir / "supervisor" / "outcome.json", outcome)
     write_delivery_index(context.output_dir, outcome)
+    if (status == "complete" and execution is not None and not context.options.analysis_only
+            and isinstance(result, PipelineResult) and result.result_review_passed is True):
+        try:
+            cleanup = cleanup_completed_writer_environments(
+                output_dir=context.output_dir, task_records=execution.task_records,
+            )
+        except Exception as exc:
+            cleanup = {"removed": [], "skipped": [f"{type(exc).__name__}: {exc}"]}
+        write_json(context.audit_dir / "03c_writer_environment_cleanup.json", cleanup)
     return result

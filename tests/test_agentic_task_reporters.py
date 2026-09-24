@@ -262,18 +262,21 @@ class IsolatedTaskReporterTests(unittest.TestCase):
         self.assertIn("CSV, JSON, PDF", prompt)
         self.assertEqual(
             TASK_REPORTER_PROMPT_VERSION,
-            "isolated_task_reporter_v15_task_goal_scope",
+            "isolated_task_reporter_v16_optional_dispatch",
         )
         self.assertNotIn('"report_explanation"', prompt)
         self.assertIn('"decision_reason"', prompt)
         self.assertNotIn('"verdict"', prompt)
         self.assertNotIn('"revision_target"', prompt)
 
-    def test_missing_structure_is_reporter_handoff_failure(self):
+    def test_task_identity_is_bound_by_dispatch_without_changing_reporter_note(self):
         result = normalize_task_verification({"task_id": "wrong_task"}, "task_a", task=_task(), run_valid_hint=True)
         self.assertIsNone(result["outcome"])
-        self.assertEqual(result["engineering_status"], "handoff_failed")
-        self.assertTrue(result["handoff_issues"])
+        self.assertEqual(result["task_id"], "task_a")
+        self.assertEqual(result["reported_task_id"], "wrong_task")
+        self.assertEqual(result["engineering_status"], "verified")
+        self.assertFalse(result["handoff_issues"])
+        self.assertTrue(result["host_observations"])
         self.assertEqual(result["core_conclusions"], [])
         self.assertFalse((not task_verification_issues(result, "task_a") and result.get("host_action") == "rerun_writer"))
 

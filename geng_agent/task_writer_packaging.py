@@ -8,9 +8,11 @@ import json
 import shutil
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
+from uuid import uuid4
 
 from .agentic_foundation import install_foundation_snapshot
 from .case_runtime import CaseRuntime
+from .foundation_snapshot import path_is_foundation_link
 from .outputs import write_json, write_text
 from .paper_evidence import safe_label
 from .project_portability import (
@@ -19,7 +21,13 @@ from .project_portability import (
     validate_repro_project_portability,
 )
 from .task_writer_files import _read_optional_json_object, _task_owned_files, _task_result_file_path
-from .task_writer_support import PAPER_EVIDENCE_DIR, _manifest_from_project, _prune_unexpected_files
+from .task_writer_support import (
+    PAPER_EVIDENCE_DIR,
+    _manifest_from_project,
+    _prepare_project_workspace,
+    _prune_unexpected_files,
+    _restore_trusted_files,
+)
 
 
 def _freeze_repro_project_package(
@@ -35,6 +43,7 @@ def _freeze_repro_project_package(
     run_smoke: bool,
     python_executable: Path | None = None,
     contextual_findings: list[dict[str, Any]] | None = None,
+    package_layout: str = "shared_source",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Freeze the final tree only after its last package mutation.
 
@@ -43,8 +52,11 @@ def _freeze_repro_project_package(
     portability audit and text-compatible project manifest are committed.
     """
 
-    from .delivery_environment import export_installation
-    expected_paths.update(export_installation(repro_project_dir, python_executable=python_executable))
+    if package_layout == "shared_source":
+        from .delivery_environment import export_installation
+        expected_paths.update(export_installation(repro_project_dir, python_executable=python_executable))
+    elif package_layout != "task_directories":
+        raise ValueError(f"unknown package layout: {package_layout}")
     source_inventory = build_source_inventory(repro_project_dir)
     write_json(repro_project_dir / "source_inventory.json", source_inventory)
     portability = validate_repro_project_portability(
@@ -73,13 +85,29 @@ def _freeze_repro_project_package(
     lineage = _read_optional_json_object(repro_project_dir / "artifact_lineage.json")
     portability.setdefault("observations", []).extend(lineage.get("observations") or [])
     write_json(audit_path, portability)
+    manifest_paths = (expected_paths if package_layout == "shared_source" else
+                      {path for path in expected_paths if not path.startswith("task_packages/")})
     manifest = _manifest_from_project(
         repro_project_dir=repro_project_dir,
-        expected_paths=expected_paths,
+        expected_paths=manifest_paths,
         task_manifest=task_manifest,
         round_no=1,
     )
+    if package_layout == "task_directories":
+        # The aggregate manifest describes an index. Task files are delivered
+        # and inventoried on disk, but their source text does not belong in a
+        # second, synthetic project manifest with a single root entrypoint.
+        inventoried = {item["path"]: item for item in source_inventory["files"]}
+        for relative in sorted(expected_paths - manifest_paths):
+            item = inventoried.get(relative)
+            if item is None:
+                raise FileNotFoundError(f"task package file missing from inventory: {relative}")
+            manifest["_meta"]["packaged_only_files"].append({
+                "path": relative, "bytes": item["size"], "sha256": item["sha256"],
+                "represented_by": "source_inventory.json",
+            })
     manifest["_meta"]["mode"] = "task_writers"
+    manifest["_meta"]["package_layout"] = package_layout
     manifest["_meta"]["analysis_snapshot_hash"] = analysis_snapshot_hash
     manifest["_meta"]["foundation_snapshot_hash"] = foundation_snapshot_hash or None
     manifest["_meta"]["environment_lock_hash"] = environment_hash or None
@@ -89,6 +117,189 @@ def _freeze_repro_project_package(
     )
     write_json(output_dir / "repro_project_manifest.json", manifest)
     return manifest, portability
+
+
+def _package_task_directories(
+    *,
+    repro_project_dir: Path,
+    output_dir: Path,
+    audit_dir: Path,
+    task_manifest: dict[str, Any],
+    task_records: list[dict[str, Any]],
+    execution_plan: dict[str, Any],
+    foundation: dict[str, Any] | None,
+    case_runtime: CaseRuntime | None,
+    analysis_snapshot_hash: str,
+    foundation_snapshot_hash: str,
+    environment_hash: str,
+    require_lineage: bool,
+) -> tuple[set[str], dict[str, Any], dict[str, Any]]:
+    """Deliver one runnable folder per task, retaining its whole execution unit.
+
+    A strong relationship can put several tasks in one Writer sandbox. Each
+    task's folder then contains that full executed unit, including shared
+    checkpoints and companion tasks; the index records that the folders refer
+    to the same run. The aggregate root never claims to be a unified program.
+    Build it beside the current project so a failed attempt preserves the old
+    tree and every Writer sandbox for supervisor recovery.
+    """
+    case_root = output_dir.resolve()
+    for path in (repro_project_dir, audit_dir):
+        try:
+            path.resolve().relative_to(case_root)
+        except ValueError as exc:
+            raise ValueError("package destinations must stay inside the case") from exc
+    if path_is_foundation_link(repro_project_dir) or path_is_foundation_link(audit_dir):
+        raise ValueError("linked package destination")
+
+    stage = audit_dir / "pkg_stages" / uuid4().hex[:8]
+    stage.mkdir(parents=True)
+    tasks_root = stage / "task_packages"
+    tasks_root.mkdir()
+    task_entries: list[dict[str, Any]] = []
+    task_to_directory: dict[str, str] = {}
+    aggregate_evidence: list[dict[str, Any]] = []
+    planned_units = execution_plan.get("execution_units")
+    if not isinstance(planned_units, list) or not planned_units:
+        raise ValueError("task delivery requires execution units")
+    manifest_entries = [item for item in task_manifest.get("tasks", []) if isinstance(item, dict)]
+    task_order = {str(item.get("task_id")): index
+                  for index, item in enumerate(manifest_entries, start=1)}
+    for unit in planned_units:
+        if not isinstance(unit, dict):
+            raise ValueError("execution unit must be an object")
+        unit_id = str(unit.get("unit_id") or "")
+        task_ids = [str(value) for value in unit.get("task_ids", []) if str(value)]
+        records = [record for record in task_records if record.get("execution_unit_id") == unit_id]
+        entries = [item for item in manifest_entries if str(item.get("task_id")) in task_ids]
+        recorded_tasks = {str(record.get("task_id")) for record in records}
+        if (not unit_id or not task_ids or len(entries) != len(task_ids)
+                or not set(task_ids).issubset(recorded_tasks)):
+            raise ValueError(f"execution unit has no complete package handoff: {unit_id}")
+        if not any(Path(str(record.get("sandbox") or "")).is_dir() for record in records):
+            raise ValueError(f"execution unit sandbox unavailable: {unit_id}")
+        unit_manifest = {**task_manifest, "tasks": entries, "execution_units": [unit]}
+        unit_plan = {**execution_plan, "execution_units": [unit],
+                     "task_to_execution_unit": {task_id: unit_id for task_id in task_ids},
+                     "weak_consistency_groups": []}
+        for task_id in task_ids:
+            index = task_order[task_id]
+            relative_root = f"task_packages/t{index:02d}_{safe_label(task_id)}"
+            task_root = stage / relative_root
+            _prepare_project_workspace(task_root, unit_manifest)
+            task_expected = _merge_task_writer_deliveries(
+                repro_project_dir=task_root, task_manifest=unit_manifest,
+                expected_paths=set(), task_records=records, foundation=foundation,
+                execution_plan=unit_plan, case_runtime=case_runtime,
+                require_lineage=require_lineage,
+            )
+            _restore_trusted_files(task_root, unit_manifest)
+            write_json(task_root / "tasks_manifest.json", unit_manifest)
+            task_audit = audit_dir / "pkg_task_manifests" / f"t{index:02d}"
+            task_audit.mkdir(parents=True, exist_ok=True)
+            task_frozen, task_portability = _freeze_repro_project_package(
+                repro_project_dir=task_root, output_dir=task_audit,
+                audit_path=task_audit / "portability.json", task_manifest=unit_manifest,
+                expected_paths=task_expected,
+                analysis_snapshot_hash=analysis_snapshot_hash,
+                foundation_snapshot_hash=foundation_snapshot_hash,
+                environment_hash=environment_hash, run_smoke=False,
+                python_executable=case_runtime.python_executable if case_runtime else None,
+            )
+            if not task_portability.get("portable"):
+                raise RuntimeError(f"task package is incomplete: {task_id}")
+            task_entries.append({
+                "task_id": task_id, "execution_unit_id": unit_id,
+                "unit_task_ids": task_ids, "directory": relative_root,
+                "full_command": ["python", "run_experiment.py", "config.json"],
+                "smoke_command": ["python", "run_experiment.py", "config_smoke.json"],
+                "requirements": f"{relative_root}/requirements.txt",
+                "environment_lock": f"{relative_root}/environment.lock.json" if case_runtime else None,
+                "installation": f"{relative_root}/installation.json",
+                "source_inventory": f"{relative_root}/source_inventory.json",
+                "execution_evidence": f"{relative_root}/execution_evidence.json",
+                "source_inventory_sha256": task_frozen.get("_meta", {}).get("source_inventory_sha256"),
+            })
+            task_to_directory[task_id] = relative_root
+            task_evidence = _read_optional_json_object(task_root / "execution_evidence.json")
+            for evidence in task_evidence.get("tasks", []):
+                if not isinstance(evidence, dict) or evidence.get("task_id") != task_id:
+                    continue
+                files = [{**item, "packaged_path": f"{relative_root}/{item['packaged_path']}"}
+                         if isinstance(item, dict) and item.get("packaged_path") else item
+                         for item in evidence.get("files", [])]
+                aggregate_evidence.append({**evidence, "execution_unit_id": unit_id,
+                    "receipt": f"{relative_root}/{evidence['receipt']}", "files": files})
+
+    delivered_tasks = []
+    for entry in manifest_entries:
+        task_id = str(entry.get("task_id") or "")
+        prefix = task_to_directory[task_id]
+        delivered_tasks.append({**entry, "task_directory": prefix,
+            "script": f"{prefix}/{entry['script']}",
+            "config_full": f"{prefix}/{entry['config_full']}",
+            "config_smoke": f"{prefix}/{entry['config_smoke']}",
+            "output_directory": f"{prefix}/outputs/{entry['output_subdir']}"})
+    write_json(stage / "tasks_manifest.json", {**task_manifest, "tasks": delivered_tasks})
+    write_json(stage / "execution_plan.json", execution_plan)
+    write_json(stage / "package_index.json", {"schema_version": "1.0",
+        "layout": "task_directories", "foundation_snapshot_hash": foundation_snapshot_hash or None,
+        "tasks": task_entries})
+    write_json(stage / "artifact_lineage.json", {"schema_version": "1.0",
+        "layout": "task_directories",
+        "task_lineages": [{"task_id": item["task_id"],
+            "path": f"{item['directory']}/artifact_lineage.json"} for item in task_entries]})
+    write_json(stage / "execution_evidence.json", {"schema_version": 1,
+        "meaning": "Original host observations; each mapping points into the executed unit's delivered project.",
+        "tasks": aggregate_evidence})
+    write_json(stage / "reproducibility_manifest.json", {"schema_version": "1.0",
+        "layout": "task_directories", "tasks_manifest": "tasks_manifest.json",
+        "execution_plan": "execution_plan.json", "artifact_lineage": "artifact_lineage.json",
+        "source_inventory": "source_inventory.json", "execution_evidence": "execution_evidence.json",
+        "task_packages": task_entries})
+    readme = ["# 复现项目：按任务交付", "",
+              "每个任务目录保留其 Writer 执行单元使用的代码、配置、结果与运行证据。",
+              "有 Foundation 时，共享源码也复制到每个任务目录。",
+              "强依赖任务可能共用一次执行；各任务目录会包含该执行单元的完整材料。", "",
+              "| 任务 | 执行单元 | 目录 |", "| --- | --- | --- |"]
+    for item in task_entries:
+        readme.append(f"| {item['task_id']} | {item['execution_unit_id']} | `{item['directory']}` |")
+    readme += ["", "进入相应任务目录，先按其 `README.md` 安装依赖，然后运行：", "",
+               "```sh", "python run_experiment.py config_smoke.json",
+               "python run_experiment.py config.json", "```", "",
+               "各任务的环境清单、执行收据和源码哈希分别位于其目录中；科研结论见案例报告。", ""]
+    write_text(stage / "README.md", "\n".join(readme))
+    expected = {path.relative_to(stage).as_posix() for path in stage.rglob("*") if path.is_file()}
+    expected.add("source_inventory.json")
+    root_audit = audit_dir / "pkg_aggregate"
+    root_audit.mkdir(parents=True, exist_ok=True)
+    frozen, portability = _freeze_repro_project_package(
+        repro_project_dir=stage, output_dir=root_audit,
+        audit_path=audit_dir / "03c_project_portability.json",
+        task_manifest={**task_manifest, "tasks": delivered_tasks},
+        expected_paths=expected, analysis_snapshot_hash=analysis_snapshot_hash,
+        foundation_snapshot_hash=foundation_snapshot_hash, environment_hash=environment_hash,
+        run_smoke=False, package_layout="task_directories",
+    )
+    frozen["_meta"]["task_packages"] = task_entries
+    previous = None
+    if repro_project_dir.exists():
+        previous = audit_dir / "pkg_previous" / uuid4().hex[:8]
+        previous.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(repro_project_dir), str(previous))
+    try:
+        shutil.move(str(stage), str(repro_project_dir))
+    except Exception:
+        if previous is not None and not repro_project_dir.exists():
+            shutil.move(str(previous), str(repro_project_dir))
+        raise
+    write_json(output_dir / "repro_project_manifest.json", frozen)
+    write_json(audit_dir / "03c_task_package_delivery.json", {
+        "layout": "task_directories", "tasks": task_entries,
+        "source_inventory_sha256": frozen.get("_meta", {}).get("source_inventory_sha256"),
+        "previous_project": str(previous) if previous is not None else None,
+    })
+    return expected, frozen, portability
 
 def _expected_paths_from_project_manifest(manifest: dict[str, Any]) -> set[str]:
     paths: set[str] = set()
@@ -111,7 +322,7 @@ def _remove_packaged_path(path: Path) -> None:
 def _clear_previous_packaged_runtime_files(repro_project_dir: Path) -> None:
     """Do not certify stale outputs or repair scratch from an earlier assembly."""
 
-    for name in ("outputs", "repair_logs"):
+    for name in ("outputs", "repair_logs", "task_requirements"):
         path = repro_project_dir / name
         if path.exists() or path.is_symlink():
             _remove_packaged_path(path)
@@ -165,6 +376,8 @@ def _merge_task_writer_deliveries(
         combined_requirements.clear()
     copied_task_files: dict[str, tuple[str, str]] = {}
     processed_sandboxes: set[str] = set()
+    unit_requirements: dict[str, str] = {}
+    unit_environment_locks: dict[str, str] = {}
     for record in task_records:
         raw_sandbox = str(record.get("sandbox") or "").strip()
         if not raw_sandbox:
@@ -196,6 +409,27 @@ def _merge_task_writer_deliveries(
             req_path = sandbox / "requirements.txt"
             if req_path.exists():
                 combined_requirements.extend(_read_requirement_names(req_path))
+                unit_id = safe_label(str(record.get("execution_unit_id") or record.get("task_id") or sandbox.name))
+                relative_requirements = f"task_requirements/{unit_id}.txt"
+                target_requirements = repro_project_dir / relative_requirements
+                target_requirements.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(req_path, target_requirements)
+                unit_requirements[unit_id] = relative_requirements
+                expected_paths.add(relative_requirements)
+            env_lock_path = sandbox / "writer_environment.lock.json"
+            if env_lock_path.is_file():
+                unit_id = safe_label(str(record.get("execution_unit_id") or record.get("task_id") or sandbox.name))
+                relative_env_lock = f"task_requirements/{unit_id}.lock.json"
+                target_env_lock = repro_project_dir / relative_env_lock
+                target_env_lock.parent.mkdir(parents=True, exist_ok=True)
+                local_lock = _read_optional_json_object(env_lock_path)
+                write_json(target_env_lock, {
+                    "schema_version": 1,
+                    "shared_environment_hash": local_lock.get("shared_environment_hash"),
+                    "local_distributions": local_lock.get("local_distributions", []),
+                })
+                unit_environment_locks[unit_id] = relative_env_lock
+                expected_paths.add(relative_env_lock)
             unit_result = sandbox / "execution_unit_result.json"
             if unit_result.is_file():
                 unit_id = str(record.get("execution_unit_id") or sandbox.name)
@@ -257,6 +491,8 @@ def _merge_task_writer_deliveries(
             "environment_lock": (
                 "environment.lock.json" if case_runtime is not None else None
             ),
+            "requirements_by_execution_unit": unit_requirements,
+            "environment_lock_by_execution_unit": unit_environment_locks,
             "source_inventory": "source_inventory.json",
             "execution_evidence": "execution_evidence.json",
             "smoke_command": ["python", "run_experiment.py", "config_smoke.json"],
@@ -375,6 +611,7 @@ def _writer_package_files(sandbox: Path) -> list[Path]:
         "repro_project_manifest.json",
         "reproducibility_manifest.json",
         "requirements.txt",
+        "writer_environment.lock.json",
         "run_experiment.py",
         "source_inventory.json",
         "task_agent_result.json",

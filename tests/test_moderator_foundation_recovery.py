@@ -10,12 +10,13 @@ from geng_agent.case_environment import RequirementRequest
 from geng_agent.case_runtime import EnvironmentRequestRequired, EnvironmentResolutionError
 from geng_agent.foundation_revision import FoundationRevisionRequired, validate_foundation_revision_request
 from geng_agent.supervisor import supervisor_scope
-from tests.test_execution_supervision import execution_inputs, supervisor
+from tests.test_execution_supervision import execution_inputs, require_shared_foundation, supervisor
 from tests.supervisor_decisions import choose_tools
 
 
 def setup_case(tmp_path, monkeypatch, foundation, writer, choose, environment=None):
     context, analysis, runtime = execution_inputs(tmp_path)
+    require_shared_foundation(analysis)
     monkeypatch.setattr("geng_agent.case_runtime.ensure_case_runtime", environment or Mock(return_value=runtime))
     monkeypatch.setattr("geng_agent.agentic_foundation.run_codex_foundation_writer_workflow", foundation)
     monkeypatch.setattr("geng_agent.agentic_task_writers.run_codex_task_writer_workflow", writer)

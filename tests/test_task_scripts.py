@@ -78,8 +78,8 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(first["module"], "reproduce_fig_7")
         self.assertEqual(first["script"], "tasks/reproduce_fig_7.py")
         self.assertEqual(first["output_subdir"], io_slug("reproduce_fig_7"))
-        self.assertIn("timeout_smoke_s", first)
-        self.assertEqual(first["timeout_full_s"], 2000)
+        self.assertNotIn("timeout_smoke_s", first)
+        self.assertNotIn("timeout_full_s", first)
 
     def test_duplicate_task_ids_get_unique_modules(self) -> None:
         manifest = build_tasks_manifest({"repro_tasks": [{"task_id": "Fig 4"}, {"task_id": "fig_4"}]})

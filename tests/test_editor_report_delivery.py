@@ -1,12 +1,13 @@
 import hashlib
 import json
+import runpy
 from pathlib import Path
 from unittest.mock import patch
 from zipfile import ZipFile
 
 from geng_agent.agentic_report_editor import run_codex_report_editor_workflow, _build_report_editor_brief
-from geng_agent.pipeline_report_delivery import generate_docx_reports
-from tests.test_agentic_report_editor import _workflow_inputs, PNG_B64
+from geng_agent.pipeline_report_delivery import inspect_editor_word_reports
+from tests.test_agentic_report_editor import _workflow_inputs, _FAKE_LAYOUT, PNG_B64
 import base64
 
 
@@ -52,6 +53,17 @@ def test_resume_restores_verified_images_and_keeps_editor_text(tmp_path):
         assert len(kwargs['image_paths']) == 1
         for name, text in report_texts.items():
             (editor_root / name).write_text(text, encoding='utf-8')
+        layout = editor_root / 'report_layout.py'
+        layout.write_text(_FAKE_LAYOUT + """
+from docx.shared import Inches
+comparison = root / 'result_review.docx'
+document = Document(comparison)
+pair = document.add_table(rows=1, cols=2)
+pair.cell(0, 0).paragraphs[0].add_run().add_picture(str(root / 'report_assets/task_1/local_result.png'), width=Inches(2.5))
+pair.cell(0, 1).paragraphs[0].add_run().add_picture(str(root / 'report_assets/task_1/paper_target.png'), width=Inches(2.5))
+document.save(comparison)
+""", encoding='utf-8')
+        runpy.run_path(str(layout))
         return {'ok': True, 'role': 'report_editor'}
 
     with patch('geng_agent.agentic_report_editor.run_codex_subprocess', side_effect=editor) as call:
@@ -70,8 +82,11 @@ def test_resume_restores_verified_images_and_keeps_editor_text(tmp_path):
             assert (output / name).read_text(encoding='utf-8') == text
         assert run_codex_report_editor_workflow(**inputs)['cached']
         assert call.call_count == 2
-    word = generate_docx_reports(output_dir=output, result_review_result={'passed': True})
+    authored_word = (output / 'result_review.docx').read_bytes()
+    word = inspect_editor_word_reports(output_dir=output, result_review_result={'passed': True})
     assert word['result_review_docx']['passed']
+    assert (output / 'result_review.docx').read_bytes() == authored_word
+    assert (output / 'report_layout.py').is_file()
     with ZipFile(output / 'result_review.docx') as doc:
         xml = doc.read('word/document.xml').decode('utf-8')
         assert '人工核查建议' in xml and '−3.25 dB' in xml
@@ -111,9 +126,10 @@ def test_editor_presentation_keeps_decisions_and_evidence_while_improving_readab
         '任务、复现目标、结论、结果要点',
         '原文结果、本地结果、对任务结论的影响',
         '上下排列', '附录 原文图像证据',
-        '默认用双列 Markdown 图片表', '本地在左、原文在右', '不能用去重省掉不同分支',
+        'Markdown 默认用双列图片表', '本地在左、原文在右',
+        'python-docx` 两列表格', '不能用去重省掉不同分支',
         '不能让舍入改变原有结论', '不准改变状态',
-        '不会替你四舍五入或改写测量', '不从文件名猜测',
+        '排版脚本不得自行四舍五入或改写测量', '不从文件名猜测',
         '项目入口与运行方法', '不得把它们改写为本任务验收失败',
     ):
         assert requirement in brief

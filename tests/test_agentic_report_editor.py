@@ -1,6 +1,8 @@
 import base64
+from copy import deepcopy
 import json
 import os
+import runpy
 import sys
 import textwrap
 import unittest
@@ -15,6 +17,30 @@ from geng_agent.agentic_report_editor import (
 
 
 PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+
+_FAKE_LAYOUT = """from pathlib import Path
+from docx import Document
+
+root = Path(__file__).resolve().parent
+sources = {
+    'review': ('review.md', '主报告.md'),
+    'reproduction_report': ('reproduction_report.md', '本地复现报告.md'),
+    'result_review': ('result_review.md', '论文对比报告.md'),
+}
+for stem, names in sources.items():
+    source = next((root / name for name in names if (root / name).is_file()), None)
+    if source is None:
+        continue
+    document = Document()
+    document.add_paragraph(source.read_text(encoding='utf-8', errors='replace'))
+    document.save(root / f'{stem}.docx')
+"""
+
+
+def _fake_word_tail() -> str:
+    return ("import runpy\n"
+            f"(root / 'report_layout.py').write_text({_FAKE_LAYOUT!r}, encoding='utf-8')\n"
+            "runpy.run_path(str(root / 'report_layout.py'))\n")
 
 
 def _fake_editor(root: Path) -> str:
@@ -32,7 +58,7 @@ def _fake_editor(root: Path) -> str:
         (root / "review.md").write_text("# 主审查报告\\n" + "\\n".join(ids), encoding="utf-8")
         (root / "reproduction_report.md").write_text("\\n".join(f"## {item}" for item in ids), encoding="utf-8")
         (root / "result_review.md").write_text("\\n".join(f"## {item}" for item in ids), encoding="utf-8")
-    """), encoding="utf-8")
+    """) + _fake_word_tail(), encoding="utf-8")
     return f'"{sys.executable}" "{script}"'
 
 
@@ -44,7 +70,10 @@ def _editor_command(root: Path, name: str, body: str) -> str:
         "    print('--ephemeral')\n"
         "    raise SystemExit(0)\n"
         "from pathlib import Path\nroot = Path.cwd()\n"
-        + textwrap.dedent(body),
+        "try:\n"
+        + textwrap.indent(textwrap.dedent(body).strip() + "\n", "    ")
+        + "finally:\n"
+        + textwrap.indent(_fake_word_tail(), "    "),
         encoding="utf-8",
     )
     return f'"{sys.executable}" "{script}"'
@@ -89,6 +118,90 @@ def _run_with_command(command: str, **kwargs) -> dict:
 
 
 class FinalReportEditorTests(unittest.TestCase):
+    def test_complete_planning_sources_reach_editor_and_invalidate_cache(self) -> None:
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / "case"
+            inputs = _workflow_inputs(output)
+            inputs["facts"] = {"engineering_facts": [{
+                "type": "simulation_parameter", "name": "noise variance",
+                "value": {"sigma2": 0.5},
+                "source": {"page": 4, "chunk_id": "p4_c2", "quote": "sigma squared = 0.5"},
+            }], "missing_information": [{"name": "seed", "why_needed": "variance"}]}
+            inputs["tasks"]["repro_tasks"][0].update({
+                "required_facts": [{"type": "simulation_parameter", "name": "noise variance"}],
+                "assumptions": [{"name": "seed", "default_value": 7,
+                                 "reason": "paper omits it", "risk": "medium"}],
+                "parameter_matrix": [{"name": "SNR", "value": [0, 5, 10], "status": "evidenced"}],
+                "scientific_acceptance": {"core_conclusions": [{"claim_id": "c1", "statement": "BER falls"}]},
+            })
+            inputs["paper_thesis"] = {"central_claims": [{"claim_id": "c1", "statement": "BER falls"}]}
+            command = _fake_editor(root)
+
+            first = _run_with_command(command, **inputs)
+            self.assertTrue(first["ok"], first)
+            workspace = Path(first["workspace"])
+            index = json.loads((workspace / "inputs" / "report_editor_input.json").read_text(encoding="utf-8"))
+            self.assertEqual(index["planning_sources"], {
+                "engineering_facts": "inputs/engineering_facts.json",
+                "repro_tasks": "inputs/repro_tasks.json",
+                "paper_thesis": "inputs/paper_thesis.json",
+            })
+            for name, expected in (("engineering_facts", inputs["facts"]),
+                                   ("repro_tasks", inputs["tasks"]),
+                                   ("paper_thesis", inputs["paper_thesis"])):
+                actual = json.loads((workspace / "inputs" / f"{name}.json").read_text(encoding="utf-8"))
+                self.assertEqual(actual, expected)
+            brief = (output / "audit" / "04b_report_editor_brief.md").read_text(encoding="utf-8")
+            self.assertIn("计划引用但未核实", brief)
+            self.assertTrue(_run_with_command(command, **{**inputs, "resume": True})["cached"])
+
+            changed = deepcopy(inputs)
+            changed["facts"]["engineering_facts"][0]["value"]["sigma2"] = 0.75
+            refreshed = _run_with_command(command, **{**changed, "resume": True})
+            self.assertFalse(refreshed["cached"])
+            self.assertNotEqual(refreshed["input_hash"], first["input_hash"])
+
+            changed["tasks"]["repro_tasks"][0]["assumptions"][0]["default_value"] = 11
+            assumption_refresh = _run_with_command(command, **{**changed, "resume": True})
+            self.assertFalse(assumption_refresh["cached"])
+            self.assertNotEqual(assumption_refresh["input_hash"], refreshed["input_hash"])
+
+    def test_missing_word_is_repaired_by_same_editor_without_rewriting_valid_report(self) -> None:
+        with TemporaryDirectory() as temp:
+            output = Path(temp) / "case"
+            inputs = _workflow_inputs(output)
+
+            def incomplete(**kwargs):
+                workspace = kwargs["work_dir"]
+                (workspace / "reproduction_report.md").write_text("# 本地复现\n原始材料", encoding="utf-8")
+                (workspace / "result_review.md").write_text("# 对比报告\n原始结论", encoding="utf-8")
+                script = workspace / "report_layout.py"
+                script.write_text(_FAKE_LAYOUT, encoding="utf-8")
+                runpy.run_path(str(script))
+                (workspace / "reproduction_report.docx").unlink()
+                return {"ok": True, "role": "report_editor"}
+
+            with patch("geng_agent.agentic_report_editor.run_codex_subprocess", side_effect=incomplete):
+                first = run_codex_report_editor_workflow(**inputs)
+            self.assertFalse(first["ok"])
+            self.assertEqual(first["missing_outputs"], ["reproduction_report.docx"])
+            original_word = (output / "result_review.docx").read_bytes()
+
+            def repair(**kwargs):
+                workspace = kwargs["work_dir"]
+                self.assertEqual((workspace / "result_review.docx").read_bytes(), original_word)
+                script = workspace / "report_layout.py"
+                script.write_text(_FAKE_LAYOUT, encoding="utf-8")
+                runpy.run_path(str(script))
+                return {"ok": True, "role": "report_editor"}
+
+            with patch("geng_agent.agentic_report_editor.run_codex_subprocess", side_effect=repair):
+                second = run_codex_report_editor_workflow(**inputs, attempt_no=2, repair_context=first)
+            self.assertTrue(second["ok"], second)
+            self.assertEqual((output / "result_review.docx").read_bytes(), original_word)
+            self.assertTrue((output / "reproduction_report.docx").is_file())
+
     def test_editor_receives_terminal_packets_and_writes_reports(self) -> None:
         with TemporaryDirectory() as temp:
             root = Path(temp)
@@ -170,7 +283,7 @@ class FinalReportEditorTests(unittest.TestCase):
             self.assertIn("不是科研成功次数", brief)
             self.assertEqual(
                 REPORT_EDITOR_PROMPT_VERSION,
-                "final_report_editor_v15_conditional_comparison",
+                "final_report_editor_v19_complete_planning_sources",
             )
 
     def test_human_readable_task_headings_do_not_require_machine_task_ids(self) -> None:
@@ -296,7 +409,7 @@ class FinalReportEditorTests(unittest.TestCase):
             first = _run_with_command(command, **inputs)
             self.assertFalse(first["ok"])
             self.assertTrue(first["retryable"])
-            self.assertEqual(first["missing_outputs"], ["reproduction_report.md"])
+            self.assertEqual(first["missing_outputs"], ["reproduction_report.md", "reproduction_report.docx"])
             self.assertEqual(first["fallback_files"], [])
             self.assertFalse((output / "reproduction_report.md").exists())
             repair = _editor_command(root, "repair.py", """

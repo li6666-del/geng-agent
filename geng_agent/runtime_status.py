@@ -11,6 +11,7 @@ inspect produced outputs, and assess partial success of a failed run."""
 from .outputs import write_json
 from .pipeline_helpers import _read_json_file
 from .schemas import ValidationIssue, validate_stage
+from .analysis_protocol import ANALYSIS_STAGES
 
 
 STAGE_CACHE_FORMAT_VERSION = "scientific_inputs_and_contract_v3"
@@ -36,12 +37,13 @@ def build_stage_cache_metadata(
     prompt: str,
     policy_version: str,
     inputs: Any,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Build an explicit content-addressed resume key without adding a stage gate."""
     from .schema_models import model_for_stage
     from .prompt_identity import scientific_cache_value, text_identity
 
-    schema_hash = _canonical_sha256(model_for_stage(schema_stage).model_json_schema())
+    schema_hash = (None if schema_stage in ANALYSIS_STAGES
+                   else _canonical_sha256(model_for_stage(schema_stage).model_json_schema()))
     identity = {
         "format_version": STAGE_CACHE_FORMAT_VERSION,
         "stage_label": stage_label,
@@ -125,11 +127,11 @@ def _load_valid_stage_cache(
             )
             return None
 
-    # required_files: per-task manifests have a different required set (no run_experiment.py,
-    # plus tasks/*.py) — without this override a cached per-task manifest always fails the
-    # default-set validation and the whole codegen silently re-runs on resume.
-    issues = validate_stage(schema_stage, cached, required_files=required_files)
-    if extra_validation is not None:
+    # Analysis owner content remains the owner's evidence on resume. Reuse is
+    # keyed by its inputs and prompt; the host does not re-judge its contents.
+    issues = [] if schema_stage in ANALYSIS_STAGES else validate_stage(
+        schema_stage, cached, required_files=required_files)
+    if extra_validation is not None and schema_stage not in ANALYSIS_STAGES:
         issues.extend(extra_validation(cached))
     if issues:
         write_json(

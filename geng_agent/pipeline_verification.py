@@ -8,6 +8,7 @@ def build_terminal_review_summary(verification_result: dict[str, Any]) -> dict[s
     summary = {"enabled": True, "passed": bool(verification_result.get("all_terminal")),
                "all_terminal": bool(verification_result.get("all_terminal")),
                "scientific_all_successful": bool(verification_result.get("all_successful")),
+               "all_full_runs_observed": bool(verification_result.get("all_full_runs_observed")),
                "outcome_counts": counts, "verification_result": verification_result,
                "mode": "preserved_reporter_decisions"}
     return {"all_successful": bool(verification_result.get("all_successful")),

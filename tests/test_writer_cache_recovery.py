@@ -74,8 +74,6 @@ def test_inspection_failure_preserves_original_path_and_exception(monkeypatch, t
     inaccessible = tmp_path / "src"
     error = PermissionError(errno.EACCES, "directory ACL denies access", str(inaccessible))
     monkeypatch.setattr(runner, "_assert_foundation_sandbox_layout_safe", Mock(side_effect=error))
-    read_request = Mock(side_effect=AssertionError("must not read files after inspection failure"))
-    monkeypatch.setattr(runner, "read_environment_request", read_request)
     result = runner._run_task_writer_codex_session(label="offline", prompt="fixture", sandbox=tmp_path,
                                                    audit_dir=tmp_path / "audit")
     assert result["error_kind"] == "sandbox_inspection_failed"
@@ -83,7 +81,6 @@ def test_inspection_failure_preserves_original_path_and_exception(monkeypatch, t
     assert result["inspection_error"]["path"] == str(inaccessible)
     assert result["inspection_error"]["errno"] == errno.EACCES
     assert "PermissionError" in result["blocked_reason"]
-    read_request.assert_not_called()
 
 
 def coordinate(root, callback):
@@ -173,34 +170,7 @@ def test_verified_mechanical_recovery_does_not_reopen_writer(tmp_path, monkeypat
 def test_mechanical_reconcile_keeps_layout_hard_boundary(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "_assert_foundation_sandbox_layout_safe",
                         Mock(side_effect=RuntimeError("link or reparse point at src")))
-    read_request = Mock(side_effect=AssertionError("unsafe files must not be read"))
-    monkeypatch.setattr(runner, "read_environment_request", read_request)
     result = runner._inspect_task_writer_completion(status={"ok": True}, sandbox=tmp_path,
         audit_dir=tmp_path / "audit", case_runtime=None, request_source="t", require_execution_receipt=True)
     assert result["error_kind"] == "sandbox_inspection_failed"
     assert "link or reparse point" in result["blocked_reason"]
-    read_request.assert_not_called()
-
-
-def test_blocked_task_cannot_abort_or_install_but_valid_sibling_request_survives():
-    from copy import deepcopy
-    from geng_agent.task_writer_state import _task_environment_requests
-    records = [
-        {"task_id": "blocked", "supervisor_blocked": {"action": "block"},
-         "writer_error_kind": "environment_request_invalid", "environment_requests": ["malformed"]},
-        {"task_id": "sibling", "environment_requests": [{"requirement": "numpy", "reason": "needed"}]},
-    ]
-    before = deepcopy(records)
-    requests = _task_environment_requests(records)
-    assert len(requests) == 1
-    assert requests[0].requirement == "numpy"
-    assert requests[0].requested_by == "sibling"
-    assert records == before
-
-
-def test_unhandled_invalid_environment_request_is_local_observation():
-    from geng_agent.task_writer_state import _task_environment_requests
-    record = {"writer_error_kind": "environment_request_invalid"}
-    assert _task_environment_requests([record]) == ()
-    assert record["coordination_status"] == "needs_review"
-    assert record["coordination_observations"]

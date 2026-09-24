@@ -625,6 +625,7 @@ class VerificationResultDocument(StrictModel):
     schema_version: Literal["3.0"] = "3.0"
     all_terminal: bool = False
     all_successful: bool = False
+    all_full_runs_observed: bool = False
     outcome_counts: dict[str, int] = Field(default_factory=dict)
     tasks: list[TaskVerificationResult] = Field(default_factory=list)
 

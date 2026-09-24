@@ -44,18 +44,18 @@ def _observed_runtime_distributions(
 
     _graph, names, versions = runtime_distribution_metadata(_runtime_prefix(python_executable))
     aliases = {"sklearn": "scikit-learn", "yaml": "pyyaml", "pil": "pillow", "pytorch": "torch"}
+    executed_versions = {canonicalize_name(str(item[0])): str(item[1])
+                         for item in (inventory or {}).get("packages", [])
+                         if isinstance(item, (list, tuple)) and len(item) == 2}
     consumed: set[str] = set()
     for imported in roots:
         name = str(imported).split(".")[0]
         consumed.update(names.get(name, set()))
         canonical = canonicalize_name(name)
         canonical = aliases.get(canonical, canonical)
-        if canonical in versions:
+        if canonical in executed_versions:
             consumed.add(canonical)
-    executed_versions = {canonicalize_name(str(item[0])): str(item[1])
-                         for item in (inventory or {}).get("packages", [])
-                         if isinstance(item, (list, tuple)) and len(item) == 2}
-    return {name: executed_versions.get(name, versions[name]) for name in sorted(consumed)}
+    return {name: executed_versions.get(name, versions.get(name, "")) for name in sorted(consumed)}
 
 
 def probe_execution_environment(python: Path) -> dict[str, Any]:
@@ -75,6 +75,23 @@ def probe_execution_environment(python: Path) -> dict[str, Any]:
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         return {"ok": False, "sha256": None, "error": f"{type(exc).__name__}: {exc}",
                 "duration_s": round(time.monotonic() - started, 4)}
+
+
+def _installed_distribution_versions(items: Any) -> dict[str, str]:
+    """Compare runtime inventories without judging any package's scientific use."""
+    from packaging.utils import canonicalize_name
+
+    versions: dict[str, str] = {}
+    for item in items if isinstance(items, list) else []:
+        if isinstance(item, dict):
+            name, version = item.get("distribution"), item.get("version")
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            name, version = item
+        else:
+            continue
+        if str(name or "").strip():
+            versions[canonicalize_name(str(name))] = str(version or "")
+    return versions
 
 
 def _inside(root: Path, relative: str) -> Path:
@@ -185,9 +202,14 @@ def validate_receipt(root: Path, receipt: dict[str, Any], *, task_id: str) -> di
 class ExecutionBroker:
     """One serial scientific execution queue per isolated Writer workspace."""
 
-    def __init__(self, root: Path, audit_dir: Path, python: Path, *, environment_hash: str = "", allow_full: bool = True):
+    def __init__(self, root: Path, audit_dir: Path, python: Path, *, environment_hash: str = "", allow_full: bool = True,
+                 expected_installed_distributions: list[dict[str, str]] | None = None,
+                 shared_runtime_python: Path | None = None):
         self.root, self.audit_dir, self.python = root.resolve(), audit_dir.resolve(), python
         self.environment_hash = environment_hash
+        self.shared_runtime_python = shared_runtime_python or python
+        self.expected_installed_distributions = expected_installed_distributions
+        self.environment_refresh_required = False
         self.allow_full = allow_full
         self.session_id = uuid.uuid4().hex
         self.queue = self.root / ".geng_execution" / self.session_id
@@ -414,6 +436,14 @@ class ExecutionBroker:
             _io_path(temporary).unlink(missing_ok=True)
 
     def execute(self, request: dict[str, Any]) -> dict[str, Any]:
+        from .case_runtime_locking import _host_shared_runtime_read_guard
+
+        # Installation takes the exclusive side of this same host-wide lock.
+        # Separate Writer sandboxes can still execute full runs concurrently.
+        with _host_shared_runtime_read_guard(self.shared_runtime_python):
+            return self._execute_with_runtime_lease(request)
+
+    def _execute_with_runtime_lease(self, request: dict[str, Any]) -> dict[str, Any]:
         if not self.allow_full and str(request.get("mode") or "full") == "full":
             raise ValueError("full execution is disabled for this preparation session; smoke remains available")
         from .codex_runner import _FOUNDATION_UNITTEST_GUARD, _foundation_unittest_guard_config
@@ -431,6 +461,22 @@ class ExecutionBroker:
             or str(config_doc.get("run_profile") or config_doc.get("profile") or "").lower() == "smoke"
         ):
             raise ValueError("a smoke configuration cannot establish a full execution")
+        environment_before = probe_execution_environment(self.python)
+        if not environment_before.get("ok"):
+            raise RuntimeError("Selected execution environment could not be inventoried")
+        if self.expected_installed_distributions is not None:
+            expected = _installed_distribution_versions(self.expected_installed_distributions)
+            # A Writer may install or override packages in its own venv. Only
+            # changes to the shared base invalidate the case-level inventory.
+            shared_observation = (
+                probe_execution_environment(self.shared_runtime_python)
+                if self.shared_runtime_python != self.python else environment_before
+            )
+            observed = _installed_distribution_versions(
+                shared_observation.get("inventory", {}).get("packages"))
+            if observed != expected:
+                self.environment_refresh_required = True
+                raise RuntimeError("shared_runtime_changed: refresh the case environment before execution")
         module = str(entry["module"])
         if not module.isidentifier():
             raise ValueError("invalid task module")
@@ -473,11 +519,13 @@ class ExecutionBroker:
             if os.environ.get(key):
                 env[key] = os.environ[key]
         guard_config = _foundation_unittest_guard_config(work_dir=self.root, start_dir="tasks",
-            python_executable=self.python, write_roots=(output, assets, runtime_home))
+            python_executable=self.python,
+            trusted_runtime_roots=(
+                _runtime_prefix(self.python), _runtime_prefix(self.shared_runtime_python),
+                Path(sys.base_prefix),
+            ),
+            write_roots=(output, assets, runtime_home))
         guard_config.update(task_module=module, task_config=config_rel, task_output_prefix=f"outputs/{output_rel}/")
-        environment_before = probe_execution_environment(self.python)
-        if not environment_before.get("ok"):
-            raise RuntimeError("Selected execution environment could not be inventoried")
         prefix, separator, _tail = _FOUNDATION_UNITTEST_GUARD.partition("\nimport unittest\n")
         if not separator:
             raise RuntimeError("scientific process guard is unavailable")

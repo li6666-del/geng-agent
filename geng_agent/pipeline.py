@@ -25,7 +25,7 @@ from .pipeline_json_stage import (
 from .pipeline_models import PipelineResult, PipelineRunOptions
 from .pipeline_supervision import run_supervised_pipeline
 from .supervisor import RunSupervisor
-from .pipeline_report_delivery import generate_docx_reports
+from .pipeline_report_delivery import inspect_editor_word_reports
 from .pipeline_report_flow import run_report_flow
 from .pipeline_scientific_stages import (
     load_or_create_experiment_index as _load_or_create_experiment_index_impl,
@@ -147,7 +147,6 @@ class ReviewPipeline:
         output_dir: Path,
         max_pages: int | None = None,
         run_repro: bool = False,
-        run_timeout: float = 120.0,
         mineru_timeout: float = 1800.0,
         json_repair_attempts: int = 1,
         tasks_timeout: float = 300.0,
@@ -188,7 +187,6 @@ class ReviewPipeline:
                 output_dir=output_dir,
                 max_pages=max_pages,
                 run_repro=run_repro,
-                run_timeout=run_timeout,
                 mineru_timeout=mineru_timeout,
                 json_repair_attempts=json_repair_attempts,
                 tasks_timeout=tasks_timeout,
@@ -205,7 +203,6 @@ class ReviewPipeline:
         output_dir: Path,
         max_pages: int | None = None,
         run_repro: bool = False,
-        run_timeout: float = 120.0,
         mineru_timeout: float = 1800.0,
         json_repair_attempts: int = 1,
         tasks_timeout: float = 300.0,
@@ -241,7 +238,6 @@ class ReviewPipeline:
             options=PipelineRunOptions(
                 max_pages=max_pages,
                 run_repro=run_repro,
-                run_timeout=run_timeout,
                 mineru_timeout=mineru_timeout,
                 json_repair_attempts=json_repair_attempts,
                 tasks_timeout=tasks_timeout,
@@ -317,8 +313,6 @@ class ReviewPipeline:
         schema_stage: str,
         max_attempts: int,
         resume: bool,
-        pre_validation: Callable[[dict[str, Any]], list[ValidationIssue]] | None = None,
-        extra_validation: Callable[[dict[str, Any]], list[ValidationIssue]] | None = None,
         request_timeout: float | None = None,
         fallback_factory: Callable[[Exception], dict[str, Any] | None] | None = None,
         candidate_normalizer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
@@ -341,8 +335,6 @@ class ReviewPipeline:
             schema_stage=schema_stage,
             max_attempts=max_attempts,
             resume=resume,
-            pre_validation=pre_validation,
-            extra_validation=extra_validation,
             request_timeout=request_timeout,
             fallback_factory=fallback_factory,
             candidate_normalizer=candidate_normalizer,
@@ -368,8 +360,6 @@ class ReviewPipeline:
         schema_stage: str,
         max_attempts: int,
         resume: bool,
-        candidate_extra_validation: Callable[[dict[str, Any]], list[ValidationIssue]] | None = None,
-        final_extra_validation: Callable[[dict[str, Any]], list[ValidationIssue]] | None = None,
         request_timeout: float | None = None,
         fallback_factory: Callable[[Exception], dict[str, Any] | None] | None = None,
         candidate_normalizer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
@@ -391,8 +381,6 @@ class ReviewPipeline:
             schema_stage=schema_stage,
             max_attempts=max_attempts,
             resume=resume,
-            pre_validation=candidate_extra_validation,
-            extra_validation=final_extra_validation,
             request_timeout=request_timeout,
             fallback_factory=fallback_factory,
             candidate_normalizer=candidate_normalizer,
@@ -450,8 +438,6 @@ class ReviewPipeline:
         schema_stage: str,
         audit_dir: Path,
         max_attempts: int,
-        pre_validation: Callable[[dict[str, Any]], list[ValidationIssue]] | None = None,
-        extra_validation: Callable[[dict[str, Any]], list[ValidationIssue]] | None = None,
         request_timeout: float | None = None,
         candidate_normalizer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         repair_preservation_validator: Callable[[dict[str, Any], dict[str, Any]], list[ValidationIssue]] | None = None,
@@ -466,8 +452,6 @@ class ReviewPipeline:
             schema_stage=schema_stage,
             audit_dir=audit_dir,
             max_attempts=max_attempts,
-            pre_validation=pre_validation,
-            extra_validation=extra_validation,
             request_timeout=request_timeout,
             candidate_normalizer=candidate_normalizer,
             repair_preservation_validator=repair_preservation_validator,
@@ -476,13 +460,13 @@ class ReviewPipeline:
             client=client,
         )
 
-    def _generate_docx_reports(
+    def _inspect_editor_word_reports(
         self,
         *,
         output_dir: Path,
         result_review_result: dict[str, Any],
     ) -> dict[str, Any]:
-        return generate_docx_reports(
+        return inspect_editor_word_reports(
             output_dir=output_dir,
             result_review_result=result_review_result,
         )

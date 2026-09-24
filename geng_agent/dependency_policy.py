@@ -450,6 +450,7 @@ def dependency_policy_prompt_text(
     *,
     runtime_policy: RuntimeDocument = None,
     runtime_lock: RuntimeDocument = None,
+    writer_install_allowed: bool = False,
 ) -> str:
     available = []
     unavailable = []
@@ -474,22 +475,33 @@ def dependency_policy_prompt_text(
     lines = [
         "依赖与 import 规则：",
         "1. Python 标准库和本项目本地模块不需要写入 requirements.txt。",
-        "2. 按论文的真实科学需求选择第三方库；下面的 known profiles 只是名称/导入提示，不是包白名单。未知包应提交 environment request，绝不能因此换成更弱的标准库或 NumPy 近似。",
+        ("2. 按论文的真实科学需求选择第三方库；下面的 known profiles 只是名称/导入提示，不是包白名单。缺库可安装到当前 Writer 私有环境，绝不能因此换成更弱的标准库或 NumPy 近似。"
+         if writer_install_allowed else
+         "2. 按论文的真实科学需求选择第三方库；下面的 known profiles 只是名称/导入提示，不是包白名单。未知包应提交 environment request，绝不能因此换成更弱的标准库或 NumPy 近似。"),
         "3. 只要 Python 代码里出现第三方 import，就必须在 requirements.txt 里写对应包名，一行一个包名。",
-        "4. requirements.txt 可写包名和普通 PEP 508 版本约束；禁止 URL、VCS、本地路径、自定义 index 和安装参数。安装只能由宿主 resolver 从可信来源执行。",
-        "5. 不要用 broad try/except 包住第三方 import 来静默降级；缺库时生成 environment request，等待 case lock 证明已安装并通过 import probe。",
+        ("4. requirements.txt 记录实际用到的包名和版本约束；用选定的私有 Python 安装，不能改动共享基础环境。"
+         if writer_install_allowed else
+         "4. requirements.txt 可写包名和普通 PEP 508 版本约束；禁止 URL、VCS、本地路径、自定义 index 和安装参数。安装只能由宿主 resolver 从可信来源执行。"),
+        ("5. 不要用 broad try/except 包住第三方 import 来静默降级；缺库时在私有环境安装并重新执行。"
+         if writer_install_allowed else
+         "5. 不要用 broad try/except 包住第三方 import 来静默降级；缺库时生成 environment request，等待 case lock 证明已安装并通过 import probe。"),
         "6. 标准通信原语优先调用成熟库，但不得用标准实现替换论文真正的自定义算法。",
         "当前 case lock 已验证可用（未提供 lock 时仅为宿主兼容探测）：",
     ]
     lines.extend(f"- {item}" for item in available or ["（无）"])
     if unavailable:
-        lines.append("尚未由当前 case lock 验证；应请求 resolver，不得静默降级：")
+        lines.append("尚未由当前 case lock 验证；可在 Writer 私有环境安装，不得静默降级：" if writer_install_allowed else
+                     "尚未由当前 case lock 验证；应请求 resolver，不得静默降级：")
         lines.extend(f"- {item}" for item in unavailable)
     lines.append(
-        "Architecture execution contract precedence: if scientific_architecture/1.1 "
-        "requires a framework that is unresolved or unavailable, request the case "
-        "environment and report an explicit capability gap. Never silently replace it with a "
-        "standard-library placeholder or a scientifically weaker approximation."
+        ("Architecture execution contract precedence: if a required framework is absent, "
+         "install it into this Writer's private environment and report a real capability gap "
+         "only if it remains unavailable. Never silently replace it with a weaker approximation."
+         if writer_install_allowed else
+         "Architecture execution contract precedence: if scientific_architecture/1.1 "
+         "requires a framework that is unresolved or unavailable, request the case "
+         "environment and report an explicit capability gap. Never silently replace it with a "
+         "standard-library placeholder or a scientifically weaker approximation.")
     )
     return "\n".join(lines)
 

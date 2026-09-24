@@ -76,6 +76,7 @@ def run_report_flow(
     runtime_result.update({
         "scientific_all_terminal": verification_result.get("all_terminal"),
         "scientific_all_successful": verification_result.get("all_successful"),
+        "all_full_runs_observed": verification_result.get("all_full_runs_observed"),
         "scientific_outcome_counts": verification_result.get("outcome_counts", {}),
     })
     write_json(output_dir / "runtime_result.json", runtime_result)
@@ -171,6 +172,7 @@ def run_report_flow(
         "verification_rounds": verification_round,
         "all_terminal": bool(verification_result.get("all_terminal")),
         "all_successful": bool(verification_result.get("all_successful")),
+        "all_full_runs_observed": bool(verification_result.get("all_full_runs_observed")),
         "outcome_counts": verification_result.get("outcome_counts", {}),
     }
     risk_report["report_editor"] = {
@@ -187,23 +189,23 @@ def run_report_flow(
     context.begin("reports")
     docx_generation: dict[str, Any] = {}
 
-    def deliver_word_reports() -> dict[str, Any]:
+    def inspect_word_reports() -> dict[str, Any]:
         nonlocal docx_generation
-        docx_generation = pipeline._generate_docx_reports(
+        docx_generation = pipeline._inspect_editor_word_reports(
             output_dir=output_dir, result_review_result=result_review_result,
         )
         if result_review_result.get("passed") and any(
             isinstance(item, dict) and item.get("passed") is False
             for key, item in docx_generation.items() if key != "review_docx"
         ):
-            raise ReportOperationError({"error": "Word conversion failed; original Markdown reports are preserved",
+            raise ReportOperationError({"error": "Editor-authored Word delivery is incomplete; original Markdown reports are preserved",
                                         "docx_generation": docx_generation})
         return docx_generation
 
     if result_review_result.get("passed"):
         try:
             docx_generation = supervised_call(
-                "report_delivery", deliver_word_reports,
+                "report_delivery", inspect_word_reports,
                 inputs={"owner": "host_delivery", "reports": ["review.md", "result_review.md", "reproduction_report.md"]},
                 evidence_roots={name.replace(".", "_"): output_dir / name for name in
                                 ("review.md", "result_review.md", "reproduction_report.md",
@@ -217,7 +219,7 @@ def run_report_flow(
             docx_generation["delivery_error"] = {"passed": False, "error": f"{type(exc).__name__}: {exc}",
                                                   "markdown_preserved": True}
     else:
-        docx_generation = pipeline._generate_docx_reports(
+        docx_generation = pipeline._inspect_editor_word_reports(
             output_dir=output_dir, result_review_result=result_review_result,
         )
     risk_report["docx_generation"] = docx_generation

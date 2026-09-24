@@ -150,17 +150,25 @@ def rerun_evidence_path_issues(
 def normalize_task_verification(result: Any, expected_task_id: str, *,
         task: dict[str, Any] | None = None, run_valid_hint: bool | None = None,
         evidence_workspace: Path | None = None) -> dict[str, Any]:
-    """Attach host observations without rewriting the independent scientific note."""
+    """Bind the note to its dispatched task without judging its conclusion."""
     raw = result if isinstance(result, dict) else {}
     protocol_issues = []
     if not isinstance(result, dict):
         protocol_issues.append("Reporter note is not a JSON object")
-    if raw.get("task_id") != expected_task_id:
-        protocol_issues.append("Reporter task_id does not match the assigned task")
-    action = raw.get("host_action")
-    if not isinstance(action, str) or action not in {"complete", "rerun_writer"}:
-        protocol_issues.append("Reporter action cannot be dispatched; clarify complete or rerun_writer")
+    elif not any(not str(key).startswith("_") for key in raw):
+        protocol_issues.append("Reporter note is empty")
+    reported_task_id = raw.get("task_id")
+    reporter_action = raw.get("host_action")
+    # The dispatch already owns task identity. Only an explicit rerun request
+    # changes the next operation; all other notes proceed to reporting.
+    host_action = "rerun_writer" if reporter_action == "rerun_writer" else "complete"
     observations = _string_list(raw.get("_engineering_issues"))
+    if reported_task_id is not None and reported_task_id != expected_task_id:
+        observations.append("Reporter task_id differs from the dispatched task; the original value is retained")
+    if reporter_action is not None and (
+        not isinstance(reporter_action, str) or reporter_action not in {"complete", "rerun_writer"}
+    ):
+        observations.append("Reporter action is not an explicit rerun request; the note proceeds to reporting")
     if not raw.get("outcome"):
         observations.append("Reporter did not supply a separate outcome label; inspect the original note")
     if not raw.get("decision_reason"):
@@ -193,9 +201,10 @@ def normalize_task_verification(result: Any, expected_task_id: str, *,
         else "verified" if run_valid_hint is True else "unverified_execution")
     return {
         **raw,
-        "task_id": raw.get("task_id"), "assigned_task_id": expected_task_id,
+        "task_id": expected_task_id, "assigned_task_id": expected_task_id,
+        "reported_task_id": reported_task_id,
         "outcome": raw.get("outcome"), "decision_authority": "reporter",
-        "reporter_action": action, "host_action": action,
+        "reporter_action": reporter_action, "host_action": host_action,
         "engineering_status": engineering_status, "host_run_valid": run_valid_hint,
         "engineering_issues": [*protocol_issues, *observations], "handoff_issues": protocol_issues,
         "host_observations": observations,
@@ -208,12 +217,12 @@ def normalize_task_verification(result: Any, expected_task_id: str, *,
 
 
 def verification_scientifically_successful(result: dict[str, Any]) -> bool:
-    """Count accepted positive reports only when the actual full evidence is valid."""
+    """Summarize the Reporter's accepted conclusion, separate from run evidence."""
     return (result.get("outcome") in ("reproduced", "reproduced_with_assumptions")
         and result.get("host_action") == "complete"
-        and result.get("engineering_status") == "verified"
-        and result.get("host_run_valid", result.get("run_valid")) is True
-        and result.get("handoff_accepted", True) is True and not result.get("handoff_issues"))
+        and result.get("handoff_accepted", True) is True
+        and result.get("coordination_status") != "stopped"
+        and not result.get("handoff_issues"))
 
 
 def partition_writer_delivery_issues(
@@ -263,15 +272,13 @@ def writer_delivery_issues(
 
 
 def task_verification_issues(result: Any, expected_task_id: str) -> list[str]:
-    """Only object, task identity and dispatchable action are protocol requirements."""
+    """Only an absent or unreadable note prevents a Reporter handoff."""
+    del expected_task_id
     if not isinstance(result, dict):
         return ["task_verification_result.json is not an object"]
-    issues = []
-    if result.get("task_id") != expected_task_id:
-        issues.append(f"task_id must be {expected_task_id}")
-    if result.get("host_action") not in ("complete", "rerun_writer"):
-        issues.append("host_action must be clarified before dispatch")
-    return issues
+    return list(result.get("handoff_issues") or []) if result.get("handoff_issues") else (
+        ["task_verification_result.json is empty"] if not result else []
+    )
 
 
 def partition_task_verification_issues(result: Any, expected_task_id: str) -> tuple[list[str], list[str]]:
@@ -295,7 +302,8 @@ def aggregate_task_verifications(task_results: list[dict[str, Any]]) -> dict[str
         for item in tasks)
     return {"schema_version": "3.0", "tasks": tasks, "outcome_counts": counts,
             "all_terminal": all_terminal,
-            "all_successful": bool(tasks) and all(verification_scientifically_successful(item) for item in tasks)}
+            "all_successful": bool(tasks) and all(verification_scientifically_successful(item) for item in tasks),
+            "all_full_runs_observed": bool(tasks) and all(item.get("host_run_valid") is True for item in tasks)}
 
 
 def feedback_from_verification(result: dict[str, Any]) -> dict[str, dict[str, Any]]:

@@ -1,6 +1,5 @@
-"""Cancellation is control flow; a sibling's environment gap is partial delivery."""
+"""Cancellation is control flow; a sibling's install failure is partial delivery."""
 from copy import deepcopy
-import json
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -9,7 +8,6 @@ import pytest
 from geng_agent import agentic_task_writers as writers
 from geng_agent import pipeline_execution_flow as flow
 from geng_agent import task_writer_runner as runner
-from geng_agent.case_runtime import EnvironmentResolutionError
 from geng_agent.outputs import write_json
 from geng_agent.progress import PipelineCancelled
 from geng_agent.supervisor import supervisor_scope
@@ -48,7 +46,7 @@ def test_writer_recovery_cancellation_is_not_a_stop_decision(monkeypatch, tmp_pa
     assert callback.call_count == (1 if location == "clarification" else 0)
 
 
-def test_environment_extension_block_preserves_current_dispatch_sibling(monkeypatch, tmp_path):
+def test_writer_install_failure_preserves_current_dispatch_sibling(monkeypatch, tmp_path):
     context, analysis, _runtime = execution_inputs(tmp_path)
     context.options.resume = False
     analysis.tasks = {"repro_tasks": [_pair(name)[0] for name in ("done", "needs_dependency")]}
@@ -61,8 +59,9 @@ def test_environment_extension_block_preserves_current_dispatch_sibling(monkeypa
     done.update(task_verification=note, task_reporter={"ok": True, "task_verification": note}, index=1)
     csv = Path(done["sandbox"]) / "outputs/result.csv"
     pending = {"task_id": "needs_dependency", "writer_completed": False,
-               "host_execution": {"passed": False}, "environment_requests": [
-                   {"requirement": "missing-scientific-package", "requested_by": "needs_dependency"}]}
+               "host_execution": {"passed": False},
+               "writer_error_kind": "dependency_install_failed",
+               "blocked_reason": "Writer could not install a required package"}
     records = [done, pending]
     def dispatch_current(**_kwargs):
         csv.parent.mkdir(parents=True)
@@ -70,14 +69,13 @@ def test_environment_extension_block_preserves_current_dispatch_sibling(monkeypa
         return records, {}
     dispatch = Mock(side_effect=dispatch_current)
     monkeypatch.setattr(writers, "_dispatch_task_writers", dispatch)
-    monkeypatch.setattr(writers, "_prepare_project_workspace", Mock(side_effect=AssertionError("No complete package exists")))
+    monkeypatch.setattr(writers, "_package_task_directories", Mock(side_effect=OSError("Incomplete unit cannot be packaged")))
     monkeypatch.setattr("geng_agent.agentic_foundation.run_codex_foundation_writer_workflow", Mock(return_value=None))
-    ensure = Mock(side_effect=[case_runtime_fixture(context.output_dir, "original-environment"),
-                              EnvironmentResolutionError("unavailable", "Required package is unavailable")])
+    ensure = Mock(return_value=case_runtime_fixture(context.output_dir, "original-environment"))
     monkeypatch.setattr("geng_agent.case_runtime.ensure_case_runtime", ensure)
     # A stale on-disk record must not replace this invocation's actual result.
     write_json(context.audit_dir / "03c_task_writers_records.json", {"tasks": [{"task_id": "obsolete", "host_execution": {"passed": True}}]})
-    coordinator, calls = supervisor(context.output_dir, lambda node, _kwargs:
+    coordinator, _calls = supervisor(context.output_dir, lambda node, _kwargs:
         {"action": "block", "diagnosis": "The necessary dependency is unavailable"}
         if node.startswith("environment:extension:") else None)
     with supervisor_scope(coordinator):
@@ -89,12 +87,8 @@ def test_environment_extension_block_preserves_current_dispatch_sibling(monkeypa
     assert result.runtime_result["tasks_total"] == 2
     assert result.runtime_result["delivery_status"] == "partial"
     assert result.runtime_result["partial_success"]["valid_task_ids"] == ["done"]
-    assert any(item["node_id"] == "environment:extension" for item in result.runtime_result["engineering_failures"])
+    assert not any(item.get("node_id") == "environment:extension"
+                   for item in result.runtime_result["engineering_failures"])
     assert result.manifest["files"] == []
-    assert result.validation["packaging_completed"] is False
     assert csv.read_text(encoding="utf-8") == "snr,ber\n0,0.12\n"
-    assert dispatch.call_count == 1 and ensure.call_count == 2
-    blocked = json.loads((context.audit_dir / "03a_environment_blocked.json").read_text(encoding="utf-8"))
-    assert blocked["pipeline_can_continue"] is True
-    assert blocked["preserved_task_ids"] == ["done", "needs_dependency"]
-    assert calls[-1][1]["trigger"] == "tool_dispatch"
+    assert dispatch.call_count == 1 and ensure.call_count == 1

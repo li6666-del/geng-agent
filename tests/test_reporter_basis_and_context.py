@@ -132,7 +132,7 @@ def test_reporter_structure_recovery_sees_old_note_and_canonical_inputs(tmp_path
         else:
             recovery = json.loads((workspace / "inputs/reporter_repair.json").read_text(encoding="utf-8"))
             assert recovery["kind"] == "structure_recovery"
-            assert any("task_id" in issue or "host_action" in issue for issue in recovery["issues"])
+            assert any("empty" in issue or "unreadable" in issue for issue in recovery["issues"])
             assert (workspace / "inputs/previous_reporter_note.txt").read_text(encoding="utf-8") == '{"core_conclusions": ['
             (workspace / "task_verification_result.json").write_text(json.dumps(_supported_raw()), encoding="utf-8")
         return {"ok": True, "role": "task_reporter"}
@@ -211,13 +211,21 @@ def test_reporter_cache_uses_actual_prompt_model_and_page_content(tmp_path, monk
     assert context._task_reporter_input_hash(**kwargs) != before
 
 
-def test_editor_cache_ignores_removed_writer_and_risk_prose_but_tracks_facts(tmp_path):
+def test_editor_cache_tracks_complete_planning_sources_and_reporter_facts(tmp_path):
     from geng_agent.agentic_report_editor import _editor_input_hash
     args = dict(output_dir=tmp_path, paper={"title": "Paper"}, paper_thesis={}, runtime_result={}, risk_report={}, task_packets=[])
     before = _editor_input_hash(**args)
     args["risk_report"] = {"reproducibility_verdict": "stale verdict"}
-    args["paper_thesis"] = {"unused": "long narrative"}
     assert _editor_input_hash(**args) == before
+    args["paper_thesis"] = {"central_claims": [{"statement": "BER falls"}]}
+    assert _editor_input_hash(**args) != before
+    args["paper_thesis"] = {}
+    args["facts"] = {"engineering_facts": [{"name": "noise variance", "value": 0.5}]}
+    assert _editor_input_hash(**args) != before
+    args["facts"] = {}
+    args["tasks"] = {"repro_tasks": [{"task_id": "task_a", "assumptions": [{"name": "seed", "default_value": 7}]}]}
+    assert _editor_input_hash(**args) != before
+    args["tasks"] = {}
     args["task_packets"] = [{"task_id": "task_a", "verification": {"verified_facts": [{"text": "3 verified layers"}]}}]
     assert _editor_input_hash(**args) != before
 

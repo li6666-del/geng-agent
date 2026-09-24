@@ -27,13 +27,15 @@ class StageCleanupV2Tests(unittest.TestCase):
             repro_manifest = _write(root / "repro_project_manifest.json")
             runtime = _write(root / "runtime_result.json")
             project_file = _write(root / "repro_project" / "src" / "channel.py")
+            report_layout = _write(root / "report_layout.py", "# stale report layout")
 
             _clear_stage_outputs(root, "manifest")
 
             self.assertTrue(foundation_source.exists())
             self.assertTrue(foundation_validation.exists())
             self.assertTrue(foundation_manifest.exists())
-            for stale in (task_source, task_status, reporter, editor, repro_manifest, runtime, project_file):
+            for stale in (task_source, task_status, reporter, editor, repro_manifest, runtime, project_file,
+                          report_layout):
                 self.assertFalse(stale.exists(), stale)
 
     def test_architecture_cleanup_still_removes_foundation_and_all_downstream_audit(self) -> None:

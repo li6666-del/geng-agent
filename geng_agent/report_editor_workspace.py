@@ -8,9 +8,16 @@ import re
 import shutil
 from typing import Any
 
+from .report_editor_word import (
+    REPORT_LAYOUT_SCRIPT, REPORT_WORD_FILES, REQUIRED_REPORT_WORD_FILES,
+    inspect_word_file, report_file_limit,
+)
+
 
 REPORT_MARKDOWN_FILES = ("review.md", "reproduction_report.md", "result_review.md")
 REQUIRED_REPORT_MARKDOWN_FILES = ("reproduction_report.md", "result_review.md")
+REPORT_OUTPUT_FILES = (*REPORT_MARKDOWN_FILES, *REPORT_WORD_FILES, REPORT_LAYOUT_SCRIPT)
+REQUIRED_REPORT_OUTPUT_FILES = (*REQUIRED_REPORT_MARKDOWN_FILES, *REQUIRED_REPORT_WORD_FILES, REPORT_LAYOUT_SCRIPT)
 REPORT_ASSETS_DIR = "report_assets"
 REPORT_FILE_ALIASES = {
     "review.md": ("main_report.md", "final_review.md", "主报告.md", "审查报告.md"),
@@ -23,8 +30,10 @@ def _repair_targets(context: dict[str, Any] | None) -> list[str]:
     if not isinstance(context, dict):
         return []
     values = context.get("missing_outputs") if isinstance(context.get("missing_outputs"), list) else []
-    targets = [name for name in REPORT_MARKDOWN_FILES if name in values]
-    return targets or list(REQUIRED_REPORT_MARKDOWN_FILES)
+    targets = [name for name in REPORT_OUTPUT_FILES if name in values]
+    if any(name.endswith(".docx") for name in targets) and REPORT_LAYOUT_SCRIPT not in targets:
+        targets.append(REPORT_LAYOUT_SCRIPT)
+    return targets or list(REQUIRED_REPORT_OUTPUT_FILES)
 
 
 def _repair_issues(context: dict[str, Any] | None) -> list[str]:
@@ -51,11 +60,11 @@ def _seed_repair_drafts(
         return [], {}
     preserved: list[str] = []
     snapshots: dict[str, bytes] = {}
-    for name in REPORT_MARKDOWN_FILES:
+    for name in REPORT_OUTPUT_FILES:
         if name in repair_targets:
             continue
         source = prior_workspace / name
-        if not _nonempty_file(source, max_bytes=max_bytes):
+        if not _nonempty_file(source, max_bytes=report_file_limit(name, markdown_max_bytes=max_bytes)):
             continue
         payload = source.read_bytes()
         (workspace / name).write_bytes(payload)
@@ -74,7 +83,8 @@ def _restore_protected_reports(
     for name, payload in protected_reports.items():
         path = workspace / name
         try:
-            current = path.read_bytes() if _nonempty_file(path, max_bytes=max_bytes) else None
+            current = path.read_bytes() if _nonempty_file(
+                path, max_bytes=report_file_limit(name, markdown_max_bytes=max_bytes)) else None
         except OSError:
             current = None
         if current == payload:
@@ -161,7 +171,7 @@ def _recover_unsafe_report_outputs(
     actions: list[str] = []
     failures: list[str] = []
     quarantine_root = workspace / "discarded_report_outputs"
-    for name in REPORT_MARKDOWN_FILES:
+    for name in REPORT_OUTPUT_FILES:
         path = workspace / name
         unsafe_reason = ""
         try:
@@ -171,8 +181,10 @@ def _recover_unsafe_report_outputs(
                 unsafe_reason = "non-file output"
             elif path.is_file():
                 size = path.stat().st_size
-                if size > max_bytes:
+                if size > report_file_limit(name, markdown_max_bytes=max_bytes):
                     unsafe_reason = f"resource limit exceeded ({size} bytes)"
+                elif name.endswith(".docx"):
+                    unsafe_reason = inspect_word_file(path) or ""
                 else:
                     with path.open("rb") as handle:
                         handle.read(1)
@@ -203,26 +215,30 @@ def _inspect_report_editor_outputs(
     missing: list[str] = []
     hard_issues: list[str] = []
     observations: list[str] = []
-    for name in REPORT_MARKDOWN_FILES:
-        issues = hard_issues if name in REQUIRED_REPORT_MARKDOWN_FILES else observations
+    for name in REPORT_OUTPUT_FILES:
+        issues = hard_issues if name in REQUIRED_REPORT_OUTPUT_FILES else observations
         path = workspace / name
         try:
             if path.is_symlink():
                 issues.append(f"{name} must not be a symbolic link")
             elif not path.exists():
-                (missing if name in REQUIRED_REPORT_MARKDOWN_FILES else observations).append(name)
+                (missing if name in REQUIRED_REPORT_OUTPUT_FILES else observations).append(name)
             elif not path.is_file():
                 issues.append(f"{name} must be a regular file")
-            elif path.stat().st_size > max_bytes:
+            elif path.stat().st_size > report_file_limit(name, markdown_max_bytes=max_bytes):
                 issues.append(f"{name} exceeds the report resource limit")
+            elif name.endswith(".docx"):
+                issue = inspect_word_file(path)
+                if issue:
+                    issues.append(f"{name} {issue}")
             elif not path.read_text(encoding="utf-8").strip():
-                (missing if name in REQUIRED_REPORT_MARKDOWN_FILES else observations).append(name)
+                (missing if name in REQUIRED_REPORT_OUTPUT_FILES else observations).append(name)
         except (OSError, UnicodeError) as exc:
             issues.append(f"{name} could not be read safely: {type(exc).__name__}")
     return {"missing": missing, "hard_issues": hard_issues, "observations": observations}
 
 def _clear_editor_outputs(output_dir: Path) -> None:
-    for name in (*REPORT_MARKDOWN_FILES, "review.docx", "reproduction_report.docx", "result_review.docx", "report_editor_error.json"):
+    for name in (*REPORT_OUTPUT_FILES, "report_editor_error.json"):
         path = output_dir / name
         if path.is_file() or path.is_symlink():
             path.unlink(missing_ok=True)
@@ -235,10 +251,11 @@ def _report_outputs_fingerprint(
     *,
     max_bytes: int = REPORT_MARKDOWN_MAX_BYTES,
 ) -> str | None:
-    if not all(_nonempty_file(output_dir / name, max_bytes=max_bytes) for name in REQUIRED_REPORT_MARKDOWN_FILES):
+    if not all(_nonempty_file(output_dir / name, max_bytes=report_file_limit(name, markdown_max_bytes=max_bytes))
+               for name in REQUIRED_REPORT_OUTPUT_FILES):
         return None
-    paths = [output_dir / name for name in REPORT_MARKDOWN_FILES
-             if _nonempty_file(output_dir / name, max_bytes=max_bytes)]
+    paths = [output_dir / name for name in REPORT_OUTPUT_FILES
+             if _nonempty_file(output_dir / name, max_bytes=report_file_limit(name, markdown_max_bytes=max_bytes))]
     digest = hashlib.sha256()
     try:
         for path in paths:

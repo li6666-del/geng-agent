@@ -80,15 +80,13 @@ def analysis_contract_identity(*, stage_label: str, schema_stage: str,
     from .agentic_analysis import _build_analysis_brief
     from .pipeline import SYSTEM_MESSAGE
     from . import pipeline_helpers
-    from .analysis_protocol import analysis_protocol_issues
 
     repairs = {}
     if backend != "codex":
         repairs["build_text_only_evidence_prompt"] = text_identity(inspect.getsource(pipeline_helpers.build_text_only_evidence_prompt))
-    return {"version": "analysis-contract-v2-supervisor-owned", "stage": stage_label,
+    return {"version": "analysis-contract-v3-pass-through", "stage": stage_label,
             "prompt_sha256": text_identity(prompt),
             "system_sha256": text_identity(SYSTEM_MESSAGE) if backend != "codex" else None,
             "wrapper_sha256": text_identity(inspect.getsource(_build_analysis_brief)) if backend == "codex" else None,
             "repair_sha256": repairs,
-            "protocol_sha256": text_identity(inspect.getsource(analysis_protocol_issues)),
             "model": model_identity("analysis", backend=backend, client=client)}

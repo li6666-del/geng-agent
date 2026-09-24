@@ -5,10 +5,7 @@ from typing import Any, Callable
 
 from .outputs import write_json
 from .progress import PipelineCancelled
-
-
-def _docx_error(stage: str, exc: Exception) -> dict[str, str]:
-    return {"stage": stage, "error": f"{type(exc).__name__}: {exc}"}
+from .report_editor_word import inspect_word_file
 
 
 def _write_docx_error(output_dir: Path, errors: list[dict[str, str]]) -> None:
@@ -135,101 +132,38 @@ def run_supervised_report_editor(
     return result, invocation_count
 
 
-def generate_docx_reports(
+def inspect_editor_word_reports(
     *,
     output_dir: Path,
     result_review_result: dict[str, Any],
 ) -> dict[str, Any]:
-    """Convert the two reports and optional navigation without writing prose."""
+    """Inspect Editor-authored Word files; never generate or rewrite them."""
+
+    specs = ("review", "reproduction_report", "result_review")
+    result: dict[str, Any] = {}
+    if not result_review_result.get("passed"):
+        reason = str(result_review_result.get("reason") or "Report Editor did not complete")
+        return {f"{stem}_docx": {"passed": None, "path": None, "reason": reason}
+                for stem in specs}
 
     errors: list[dict[str, str]] = []
-    specs = (
-        (
-            "review",
-            "耿同学agent 论文工程复现审查报告",
-            "通信论文工程复现的总体结论、风险与证据摘要",
-        ),
-        (
-            "reproduction_report",
-            "本地复现报告",
-            "各复现任务实际采用的参数、假设、配置与运行产物",
-        ),
-        (
-            "result_review",
-            "论文复现结果对比报告",
-            "本地复现结果与论文原图的逐任务证据对比",
-        ),
-    )
-    result: dict[str, Any] = {
-        f"{stem}_docx": {
-            "passed": None,
-            "path": None,
-            "reason": "Codex reporter did not complete",
-        }
-        for stem, _, _ in specs
-    }
-
-    try:
-        from .docx_writer import write_markdown_report_docx
-    except PipelineCancelled:
-        raise
-    except Exception as exc:
-        error = _docx_error("import_docx_writer", exc)
-        errors.append(error)
-        for key in result:
-            result[key] = {
-                "passed": False,
-                "path": None,
-                "error": error["error"],
-            }
-        _write_docx_error(output_dir, errors)
-        return result
-
-    if not result_review_result.get("passed"):
-        reason = str(
-            result_review_result.get("reason") or "Codex reporter did not complete"
-        )
-        for key in result:
-            result[key]["reason"] = reason
-        return result
-
-    for stem, title, subtitle in specs:
+    for stem in specs:
+        name = f"{stem}.docx"
+        path = output_dir / name
         key = f"{stem}_docx"
-        markdown_path = output_dir / f"{stem}.md"
-        docx_path = output_dir / f"{stem}.docx"
-        if not markdown_path.exists():
-            result[key] = {
-                "passed": None if stem == "review" else False,
-                "path": None,
-                "reason": f"{markdown_path.name} was not generated",
-            }
+        if stem == "review" and not path.exists():
+            result[key] = {"passed": None, "path": None, "reason": "optional navigation not generated"}
             continue
-        try:
-            generated = write_markdown_report_docx(
-                docx_path,
-                markdown_text=markdown_path.read_text(
-                    encoding="utf-8", errors="replace"
-                ),
-                title=title,
-                subtitle=subtitle,
-                base_dir=output_dir,
-            )
-            result[key] = {"passed": True, "path": str(generated)}
-        except PipelineCancelled:
-            raise
-        except Exception as exc:
-            error = _docx_error(docx_path.name, exc)
+        issue = inspect_word_file(path)
+        if issue:
+            error = {"stage": name, "error": issue}
             errors.append(error)
-            result[key] = {
-                "passed": False,
-                "path": None,
-                "error": error["error"],
-            }
+            result[key] = {"passed": False, "path": None, "error": issue}
+        else:
+            result[key] = {"passed": True, "path": str(path), "authored_by": "report_editor"}
 
     if errors:
         _write_docx_error(output_dir, errors)
     else:
-        error_path = output_dir / "docx_generation_error.json"
-        if error_path.exists():
-            error_path.unlink()
+        (output_dir / "docx_generation_error.json").unlink(missing_ok=True)
     return result

@@ -44,6 +44,16 @@ if 'isolated scientific task reporter' in prompt:
 elif 'final report editor' in prompt:
     for name in ('review.md','reproduction_report.md','result_review.md'):
         (root/name).write_text('# Explanation\nThe evidence is supplied separately.\n')
+    layout="""from pathlib import Path
+from docx import Document
+root=Path(__file__).resolve().parent
+for stem in ('review','reproduction_report','result_review'):
+    document=Document()
+    document.add_paragraph((root/f'{stem}.md').read_text(encoding='utf-8'))
+    document.save(root/f'{stem}.docx')
+"""
+    (root/'report_layout.py').write_text(layout, encoding='utf-8')
+    subprocess.run([sys.executable,str(root/'report_layout.py')],cwd=root,check=True)
 else:
     (root/'tasks/sample.py').write_text("import csv,json,math\nfrom pathlib import Path\ndef main(config):\n    settings=json.loads(Path(config).read_text())\n    out=Path('outputs/sample')\n    out.mkdir(parents=True,exist_ok=True)\n    with (out/'results.csv').open('w',newline='') as f:\n        w=csv.writer(f);w.writerow(['snr','capacity'])\n        for snr in settings.get('snrs',[1,3]): w.writerow([snr,math.log2(1+snr)])\n")
     completed=subprocess.run([sys.executable,str(root/'run_task.py'),'--task','sample','--mode','full'],cwd=root)

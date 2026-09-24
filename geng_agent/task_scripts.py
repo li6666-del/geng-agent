@@ -27,10 +27,6 @@ from typing import Any
 from .io_runtime import io_slug
 
 
-DEFAULT_SMOKE_TIMEOUT_S = 60
-DEFAULT_FULL_TIMEOUT_S = 2000
-
-
 def task_module_name(task_id: object, used: set[str] | None = None) -> str:
     """A valid, unique Python module name for a task id (for ``tasks/<module>.py``)."""
     slug = re.sub(r"[^0-9A-Za-z_]+", "_", str(task_id or "")).strip("_").lower()
@@ -51,8 +47,6 @@ def task_module_name(task_id: object, used: set[str] | None = None) -> str:
 def build_tasks_manifest(
     tasks_doc: Any,
     *,
-    smoke_timeout_s: int = DEFAULT_SMOKE_TIMEOUT_S,
-    full_timeout_s: int = DEFAULT_FULL_TIMEOUT_S,
     execution_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Derive the per-task run manifest from a repro_tasks document.
@@ -94,8 +88,6 @@ def build_tasks_manifest(
                 "module": module,
                 "script": f"tasks/{module}.py",
                 "output_subdir": output_subdir,
-                "timeout_smoke_s": smoke_timeout_s,
-                "timeout_full_s": full_timeout_s,
             }
         unit_id = str(task_to_unit.get(task_id) or "").strip()
         if unit_id:

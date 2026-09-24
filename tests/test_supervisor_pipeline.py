@@ -67,6 +67,35 @@ def test_scientific_failure_is_reportable_and_does_not_request_host_retry(tmp_pa
     assert not any(packet.get("failures") for _, packet in calls)
 
 
+def test_packaging_partial_handoff_still_reaches_reports(tmp_path, monkeypatch):
+    context, supervisor, _ = case(tmp_path, monkeypatch)
+    execution = SimpleNamespace(
+        runtime_result={"passed": True, "delivery_status": "partial",
+                        "validation": {"packaging_completed": False}},
+        task_records=[{"task_id": "t1", "writer_completed": True}],
+        validation={"required_files_present": False})
+    calls = {"execute": 0, "report": 0}
+
+    def execute(_analysis):
+        calls["execute"] += 1
+        return execution
+
+    def report(_analysis, handed_off):
+        calls["report"] += 1
+        assert handed_off is execution
+        return PipelineResult(
+            output_dir=tmp_path, review_path=tmp_path / "review.md",
+            repro_project_dir=tmp_path / "repro_project",
+            risk_report_path=tmp_path / "risk_report.json",
+            result_review_passed=True, delivery_status="partial")
+
+    delivered = run_supervised_pipeline(
+        context=context, supervisor=supervisor, analyze=lambda: object(),
+        execute=execute, report=report, finish_analysis=lambda _: None)
+    assert calls == {"execute": 1, "report": 1}
+    assert delivered.delivery_status == "partial"
+
+
 @pytest.mark.parametrize("failure", [StageBlocked("parse", {"diagnosis": "unreadable"}), RuntimeError("host conversion failed")])
 def test_analysis_failure_finishes_with_explicit_blocked_state(tmp_path, monkeypatch, failure):
     context, supervisor, _ = case(tmp_path, monkeypatch)
