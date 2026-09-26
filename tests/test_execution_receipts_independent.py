@@ -26,7 +26,7 @@ class ExecutionReceiptIndependentTests(unittest.TestCase):
             "config_smoke": "config_smoke.json"}]}), encoding="utf-8")
         return project, ExecutionBroker(project, root / "audit", Path(sys.executable))
 
-    def test_changed_shared_python_is_refreshed_before_touching_old_outputs(self):
+    def test_changed_shared_python_is_observed_without_rejecting_execution(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             project, _unused = self._project(root, "def main(config):\n    return None\n")
@@ -41,11 +41,12 @@ class ExecutionReceiptIndependentTests(unittest.TestCase):
             changed = {"ok": True, "sha256": "changed", "inventory": {
                 "packages": [["numpy", "2"]]}, "duration_s": 0.01}
             with patch("geng_agent.execution_receipts.probe_execution_environment", return_value=changed):
-                with self.assertRaisesRegex(RuntimeError, "shared_runtime_changed"):
-                    broker.execute({"task_id": "sample", "mode": "full"})
-            self.assertTrue(broker.environment_refresh_required)
-            self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve me")
-            self.assertFalse((old / "execution_receipt.json").exists())
+                receipt = broker.execute({"task_id": "sample", "mode": "full"})
+            self.assertEqual(receipt["returncode"], 0)
+            self.assertEqual(receipt["environment_observation"]["before"], changed)
+            previous = broker.audit_dir / "execution_runs" / receipt["run_id"] / "previous_outputs/result.csv"
+            self.assertEqual(previous.read_text(encoding="utf-8"), "preserve me")
+            self.assertTrue((old / "execution_receipt.json").is_file())
 
     def test_zero_exit_without_new_artifacts_cannot_certify_old_csv(self):
         with TemporaryDirectory() as temporary:
@@ -66,14 +67,13 @@ class ExecutionReceiptIndependentTests(unittest.TestCase):
             self.assertTrue(validate_receipt(project, second, task_id="sample")["passed"], second)
             self.assertNotEqual(first["run_id"], second["run_id"])
 
-    def test_smoke_configuration_cannot_claim_full_evidence(self):
+    def test_smoke_configuration_is_forwarded_for_agent_interpretation(self):
         with TemporaryDirectory() as temporary:
             project, broker = self._project(Path(temporary), "from pathlib import Path\ndef main(config):\n    Path('outputs/sample/result.csv').write_text('smoke only')\n")
-            try:
-                receipt = broker.execute({"task_id": "sample", "mode": "full", "config": "config_smoke.json"})
-            except ValueError:
-                return
-            self.assertFalse(validate_receipt(project, receipt, task_id="sample")["passed"])
+            receipt = broker.execute({"task_id": "sample", "mode": "full", "config": "config_smoke.json"})
+            self.assertEqual(receipt["returncode"], 0)
+            self.assertEqual(receipt["mode"], "full")
+            self.assertEqual(receipt["config_observation"], {"run_profile": "smoke", "smoke": True})
 
     def test_nonzero_main_return_is_not_a_successful_process(self):
         with TemporaryDirectory() as temporary:
@@ -139,7 +139,8 @@ class ExecutionReceiptIndependentTests(unittest.TestCase):
                     while not (project / "outputs/sample/started.json").exists() and time.monotonic() < deadline:
                         time.sleep(0.05)
                     self.assertTrue((project / "outputs/sample/started.json").exists(), "science child did not start")
-                    raise RuntimeError("cancel current execution")
+                    from geng_agent.progress import PipelineCancelled
+                    raise PipelineCancelled("cancel current execution")
             self.assertFalse((project / "outputs/sample/finished.csv").exists())
             self.assertEqual(len(broker.receipts), 1)
             self.assertTrue(broker.receipts[0]["cancelled"])

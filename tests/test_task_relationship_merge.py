@@ -74,41 +74,6 @@ def _document(*, ready: bool, relationships: list[dict]) -> dict:
 
 
 class TaskRelationshipMergeTests(unittest.TestCase):
-    def test_semantic_merge_refreshes_relationship_by_id_independent_of_task_dedup(self) -> None:
-        base = _document(
-            ready=False,
-            relationships=[_relationship("shared_model", rationale="old rationale")],
-        )
-        addition = _document(
-            ready=True,
-            relationships=[
-                _relationship(
-                    "shared_model",
-                    strength="strong",
-                    rationale="the exact state must be shared",
-                ),
-                _relationship(
-                    "unknown_task_reference",
-                    task_ids=["task_2", "not_compiled_yet"],
-                ),
-                _relationship("invalid_singleton", task_ids=["task_1"]),
-            ],
-        )
-
-        merged, _delta = semantic_merge_repro_tasks(base, addition)
-
-        self.assertEqual(len(merged["repro_tasks"]), 2)
-        self.assertEqual(
-            [item["relationship_id"] for item in merged["execution_relationships"]],
-            ["shared_model", "unknown_task_reference"],
-        )
-        self.assertEqual(merged["execution_relationships"][0]["strength"], "strong")
-        self.assertEqual(
-            merged["execution_relationships"][1]["task_ids"],
-            ["task_2", "not_compiled_yet"],
-        )
-        self.assertTrue(merged["backfill_handoff"]["ready_for_writer"])
-        self.assertNotIn("backfill_handoff", merged.get("_meta", {}))
 
     def test_reconciliation_keeps_the_complete_new_graph_and_does_not_mutate_old_evidence(self) -> None:
         preliminary = _document(

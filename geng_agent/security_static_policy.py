@@ -41,13 +41,6 @@ ORDINARY_REFLECTION_BUILTINS = frozenset(
         "vars",
     }
 )
-FOUNDATION_STATIC_SECURITY_ADVISORY_CATEGORIES = frozenset(
-    {
-        "environment_access",
-        "importlib_usage",
-        "ordinary_reflection",
-    }
-)
 FORBIDDEN_DUNDER_ATTRS = {
     "__getattribute__",
     "__subclasses__",

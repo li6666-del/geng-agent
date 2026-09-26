@@ -248,10 +248,6 @@ def _run_to_task_writer_boundary(
         ),
         patch("geng_agent.case_runtime.ensure_case_runtime", new=environment_mock),
         patch(
-            "geng_agent.agentic_foundation.run_codex_foundation_writer_workflow",
-            new=foundation_mock,
-        ),
-        patch(
             "geng_agent.agentic_task_writers.run_codex_task_writer_workflow",
             new=task_writer_mock,
         ),
@@ -382,29 +378,6 @@ def _run_minimal_full_pipeline(
     return result, output_dir
 
 class PipelineTests(unittest.TestCase):
-    def test_required_foundation_cancel_does_not_start_task_writers(self) -> None:
-        from geng_agent.progress import PipelineCancelled
-
-        with TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            writer = Mock()
-            foundation = Mock(side_effect=PipelineCancelled("user stopped the run"))
-            tasks_document = task_doc(task("t0", "Claim 0"), task("t1", "Claim 1"))
-            tasks_document["execution_relationships"] = [{
-                "relationship_id": "shared_science", "kind": "shared_definition",
-                "strength": "weak", "task_ids": ["t0", "t1"],
-                "producer_task_id": None, "consumer_task_ids": [], "artifact_ids": [],
-            }]
-            with self.assertRaisesRegex(PipelineCancelled, "user stopped"):
-                _run_to_task_writer_boundary(
-                    root, resume=False,
-                    environment_mock=Mock(return_value=case_runtime_fixture(root / "case", "0" * 64)),
-                    foundation_mock=foundation, task_writer_mock=writer,
-                    tasks_document=tasks_document,
-                )
-            foundation.assert_called_once()
-            writer.assert_not_called()
-            self.assertFalse((root / "case/audit/03b_foundation_fallback.json").exists())
 
     def test_preliminary_task_cache_survives_snapshot_publication(self) -> None:
         expected_cache = {
@@ -722,119 +695,6 @@ class PipelineTests(unittest.TestCase):
                 risk_report["reproducibility_verdict"],
                 result.reproducibility_verdict,
             )
-    def test_optional_foundation_is_skipped_for_all_architecture_versions(self) -> None:
-        class WriterReached(BaseException):
-            pass
-
-        def exercise(*, schema_version: str, architecture_contract: str, resume: bool) -> None:
-            with TemporaryDirectory() as temp_dir:
-                root = Path(temp_dir)
-                paper_path = root / "paper.md"
-                paper_path.write_text(
-                    "# Results\nFig. 4 reports bit error rate versus SNR.",
-                    encoding="utf-8",
-                )
-                output_dir = root / "case"
-                if resume:
-                    output_dir.mkdir()
-                    write_json(
-                        output_dir / "workflow.json",
-                        {
-                            "workflow_version": "2",
-                            "architecture_contract": architecture_contract,
-                        },
-                    )
-
-                initial = fact_doc(
-                    fact("figure_claim", "Fig. 4"),
-                    fact("metric", "bit_error_rate"),
-                )
-                preliminary = task_doc(task("reproduce_fig_4", "Fig. 4"))
-                preliminary["backfill_handoff"] = {
-                    "ready_for_writer": True,
-                    "blocking_request_ids": [],
-                    "reason": "fixture has no missing facts",
-                }
-
-                def fake_analysis_stage(**kwargs):
-                    architecture = architecture_doc(output_dir, preliminary)
-                    architecture["schema_version"] = schema_version
-                    document = (understanding_doc(initial) if kwargs["stage_label"] == "01_understand_paper"
-                                else {"tasks": preliminary, "scientific_architecture": architecture})
-                    document = json.loads(json.dumps(document))
-                    write_json(kwargs["output_path"], document)
-                    return document
-
-
-                def fake_experiment_index(**kwargs):
-                    document = {
-                        "experiments": [
-                            {
-                                "task_id": "reproduce_fig_4",
-                                "experiment_id": "exp_reproduce_fig_4",
-                            }
-                        ]
-                    }
-                    write_json(kwargs["output_dir"] / "experiment_index.json", document)
-                    return document
-
-
-                pipeline = ReviewPipeline()
-                mineru_result = {
-                    "ok": True,
-                    "cached": False,
-                    "fallback_used": False,
-                    "duration_s": 0.0,
-                    "figure_count": 0,
-                    "figure_index": {"figures": [], "unmatched_visuals": []},
-                }
-                with (
-                    patch.object(pipeline, "_render_paper_images", return_value=[]),
-                    patch(
-                        "geng_agent.pipeline.run_mineru_layout_stage",
-                        return_value=mineru_result,
-                    ),
-                    patch.object(
-                        pipeline,
-                        "_load_or_create_analysis_stage_json",
-                        side_effect=fake_analysis_stage,
-                    ),
-                    patch.object(
-                        pipeline,
-                        "_load_or_create_experiment_index",
-                        side_effect=fake_experiment_index,
-                    ),
-                    patch(
-                        "geng_agent.case_runtime.ensure_case_runtime",
-                        return_value=case_runtime_fixture(output_dir, "0" * 64),
-                    ),
-                    patch(
-                        "geng_agent.agentic_foundation.run_codex_foundation_writer_workflow",
-                        side_effect=ValueError("foundation boom"),
-                    ) as foundation_writer,
-                    patch(
-                        "geng_agent.agentic_task_writers.run_codex_task_writer_workflow",
-                        side_effect=WriterReached("task writer reached"),
-                    ) as task_writer,
-                ):
-                    with self.assertRaises(WriterReached):
-                        pipeline.run(
-                            paper_path, output_dir, resume=resume, analysis_only=False
-                        )
-                    task_writer.assert_called_once()
-                foundation_writer.assert_not_called()
-                self.assertFalse((output_dir / "audit" / "03b_foundation_fallback.json").exists())
-
-        exercise(
-            schema_version="1.1",
-            architecture_contract="scientific_architecture/1.1",
-            resume=False,
-        )
-        exercise(
-            schema_version="1.0",
-            architecture_contract="scientific_architecture/1.0",
-            resume=True,
-        )
 
     def test_planner_revision_is_preserved_without_host_merging_old_tasks(self) -> None:
         from types import SimpleNamespace
@@ -891,7 +751,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(final_tasks["repro_tasks"][0]["figure_or_claim"], "Claim A refined")
             self.assertEqual(base_tasks["repro_tasks"][0]["figure_or_claim"], "Claim A")
             self.assertEqual(plan["logical_task_count"], 2)
-            self.assertEqual(plan["execution_unit_count"], 1)
+            self.assertEqual(plan["execution_unit_count"], 2)
 
     def test_optional_foundation_environment_failure_is_never_entered(self) -> None:
         class WriterReached(BaseException):
@@ -924,54 +784,6 @@ class PipelineTests(unittest.TestCase):
         foundation.assert_not_called()
         task_writer.assert_called_once()
 
-    def test_material_weak_foundation_environment_failure_still_stops(self) -> None:
-        with TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            output_dir = root / "case"
-            tasks = task_doc(
-                task("task_a", "Claim A"),
-                task("task_b", "Claim B"),
-            )
-            tasks["execution_relationships"] = [
-                {
-                    "relationship_id": "shared_definition_ab",
-                    "kind": "shared_definition",
-                    "strength": "weak",
-                    "task_ids": ["task_a", "task_b"],
-                    "producer_task_id": None,
-                    "consumer_task_ids": [],
-                    "artifact_ids": ["shared_channel_definition"],
-                }
-            ]
-            foundation = Mock(
-                side_effect=EnvironmentResolutionError(
-                    "material_foundation_dependency",
-                    "material Foundation dependency unavailable",
-                )
-            )
-            task_writer = Mock()
-
-            with self.assertRaises(StageBlocked):
-                _run_to_task_writer_boundary(
-                    root,
-                    resume=False,
-                    environment_mock=Mock(
-                        return_value=case_runtime_fixture(output_dir, "0" * 64)
-                    ),
-                    foundation_mock=foundation,
-                    task_writer_mock=task_writer,
-                    tasks_document=tasks,
-                )
-
-            audit = json.loads(
-                (output_dir / "audit" / "execution_tool_failures.json").read_text(
-                    encoding="utf-8"
-                )
-            )
-
-        foundation.assert_called_once()
-        task_writer.assert_not_called()
-        self.assertIn("material Foundation dependency unavailable", audit["foundation"]["error"])
 
     def test_initial_case_environment_failure_stops_before_writers(self) -> None:
         with TemporaryDirectory() as temp_dir:

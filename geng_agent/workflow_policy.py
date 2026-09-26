@@ -21,7 +21,6 @@ _WORKFLOW_STAGE_SENTINELS = (
     "scientific_architecture.json",
     "03a_environment_request.json",
     "03a_environment.lock.json",
-    "foundation_manifest.json",
     "repro_project_manifest.json",
     "repro_project",
     "runtime_result.json",
@@ -35,42 +34,8 @@ class UnsupportedWorkflowVersionError(RuntimeError):
     """The case belongs to a workflow generation this code no longer runs."""
 
 
-def _execution_plan_requires_shared_science(plan: Any) -> bool:
-    """Return whether separate Writers must share one frozen Foundation.
-
-    Strong relationships are already protected by co-locating their logical
-    tasks in one Writer/sandbox/run. Only weak relationships cross Writer
-    boundaries and therefore make the shared scientific layer material.
-    """
-
-    if not isinstance(plan, dict):
-        return False
-    groups = plan.get("weak_consistency_groups")
-    return any(
-        isinstance(group, dict)
-        and len(
-            set(
-                map(
-                    str,
-                    group.get("execution_unit_ids")
-                    if isinstance(group.get("execution_unit_ids"), list)
-                    else [],
-                )
-            )
-        )
-        > 1
-        for group in (groups if isinstance(groups, list) else [])
-    )
 
 
-def _shared_foundation_is_material(plan: Any, architecture: Any) -> bool:
-    """Return whether continuing without Foundation would split shared science."""
-
-    del architecture
-    # Task Designer relationships are authoritative. Architecture may suggest
-    # additional reuse, but that advisory reuse must not manufacture a new
-    # pipeline-stopping gate.
-    return _execution_plan_requires_shared_science(plan)
 
 
 def _ensure_v2_workflow(output_dir: Path) -> None:
@@ -108,9 +73,8 @@ def _ensure_v2_workflow(output_dir: Path) -> None:
         {
             "workflow_version": CURRENT_WORKFLOW_VERSION,
             "architecture_contract": "scientific_architecture/advisory-1.1",
-            "task_execution_contract": "task-execution-relationships/2.0",
-            "execution_plan_contract": "execution-plan/1.0",
-            "foundation_contract": "foundation/1",
+            "task_execution_contract": "planner-owned-tasks/3.0",
+            "execution_plan_contract": "execution-plan/2.0",
             "environment_contract": "case-environment/1",
             "scientific_policy_id": SCIENTIFIC_POLICY_ID,
         },

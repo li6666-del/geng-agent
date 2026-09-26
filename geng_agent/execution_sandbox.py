@@ -1,8 +1,8 @@
 """Launch scientific processes inside Codex's OS sandbox without calling a model.
 
-This preserves native write isolation. Broad OS read access remains compatible
-with the existing Windows backend; the Python guard still restricts reads and
-network operations. It is not a claim of native-code read isolation.
+This preserves native write isolation to the task project and disables network
+access during science. File observation does not veto the scientific program.
+The existing Windows backend does not provide native-code read isolation.
 """
 from __future__ import annotations
 
@@ -65,8 +65,8 @@ def scientific_sandbox_launch(command: Sequence[str], *, work_dir: Path,
     roots = []
     for item in write_roots:
         path = item.resolve(strict=True)
-        if path == root or not path.is_relative_to(root) or item.is_symlink():
-            raise ValueError("Scientific write roots must be specific directories inside the task workspace")
+        if not path.is_relative_to(root) or item.is_symlink():
+            raise ValueError("Scientific write roots must stay within the task workspace")
         roots.append(str(path))
     if not roots or not command:
         raise ValueError("Scientific execution needs a command and explicit write directories")
@@ -106,5 +106,5 @@ def scientific_sandbox_launch(command: Sequence[str], *, work_dir: Path,
     return {"command": [*args, "--", *child_command], "env": safe_env,
             "policy": {"provider": "codex_sandbox", "model_invocation": False,
                        "native_write_roots": sorted(set(roots)), "native_read_scope": "global_read",
-                       "network_enabled": False, "python_guard_required": True,
+                       "network_enabled": False, "python_guard_required": False,
                        "native_read_isolation": False, "executable": str(executable)}}

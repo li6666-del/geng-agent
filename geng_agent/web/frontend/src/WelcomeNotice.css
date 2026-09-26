@@ -1,0 +1,57 @@
+.header-actions { display: flex; align-items: center; gap: 20px; min-width: 0; }
+.notice-trigger { display: inline-flex; align-items: center; justify-content: center; gap: 7px; border: 1px solid #dce7f5; border-radius: 11px; padding: 7px 11px; color: #4e6e99; background: #f7faff; font-size: 12px; white-space: nowrap; }
+.notice-trigger:hover { color: #2b5ed7; background: #eef4ff; border-color: #bccfeb; }
+.welcome-dialog { width: min(760px, calc(100% - 40px)); max-width: none; max-height: calc(100vh - 56px); max-height: calc(100dvh - 56px); padding: 0; margin: auto; border: 1px solid #dae7f5; border-radius: 26px; background: #fff; color: #344d6b; box-shadow: 0 30px 100px #173d7540; overflow: hidden; }
+.welcome-dialog[open] { display: flex; flex-direction: column; }
+.welcome-dialog::backdrop { background: #203c675c; backdrop-filter: blur(5px); }
+.welcome-header { position: relative; flex-shrink: 0; padding: 27px 34px 23px; background: linear-gradient(120deg, #eef5ff, #f3fbfb); border-bottom: 1px solid #e4edf6; }
+.welcome-eyebrow { display: flex; align-items: center; gap: 8px; font-size: 10px; letter-spacing: 1.2px; color: #627fa3; margin-bottom: 10px; }
+.welcome-eyebrow svg { color: #4c80c8; }
+.welcome-header h2 { padding-right: 28px; font-size: 25px; line-height: 1.6; font-weight: 700; color: #263f62; }
+.welcome-header h2:focus { outline: none; }
+.welcome-close { position: absolute; top: 18px; right: 18px; color: #6a84a5; background: #ffffffad; border: 1px solid #dce7f5; border-radius: 50%; height: 31px; width: 31px; padding: 0; display: grid; place-items: center; }
+.welcome-close:hover { background: #eaf2fd; color: #2b5ed7; }
+.welcome-body { padding: 25px 34px 27px; min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: #c7d8ec transparent; font-size: 14px; line-height: 1.95; }
+.welcome-body strong { color: #304f78; font-weight: 600; }
+.welcome-section { margin-top: 23px; }
+.welcome-section:first-child { margin-top: 0; }
+.welcome-section h3 { color: #315477; font-size: 14px; font-weight: 700; margin-bottom: 10px; }
+.welcome-agents { list-style: none; padding: 0; margin: 0; counter-reset: agent; }
+.welcome-agents li { position: relative; counter-increment: agent; padding: 0 0 12px 35px; }
+.welcome-agents li:last-child { padding-bottom: 0; }
+.welcome-agents li p { display: inline; }
+.welcome-agents li p::before { content: "："; }
+.welcome-agents li::before { content: counter(agent, decimal-leading-zero); position: absolute; top: 3px; left: 0; width: 24px; height: 24px; line-height: 24px; text-align: center; color: #5e83b6; background: #eef4fc; border: 1px solid #e0eafa; border-radius: 8px; font-size: 10px; }
+.welcome-reminder { padding: 17px 19px; border: 1px solid #e3eaf2; border-left: 3px solid #83a5d8; border-radius: 13px; background: #f7faff; }
+.welcome-reminder p + p { margin-top: 9px; }
+.welcome-contact { border-top: 1px dashed #dce6f1; padding-top: 20px; }
+.welcome-contact h3 { display: flex; align-items: center; gap: 7px; }
+.welcome-contact p + p { margin-top: 10px; }
+.welcome-contact a { display: inline-flex; align-items: center; gap: 7px; color: #2b5ed7; text-decoration: underline; text-decoration-color: #b3c8ee; text-underline-offset: 4px; overflow-wrap: anywhere; }
+.welcome-contact a svg { flex-shrink: 0; }
+.welcome-footer { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 18px 34px; background: #fcfdff; border-top: 1px solid #e6edf5; flex-shrink: 0; }
+.welcome-footer p { color: #788ca4; font-size: 11px; line-height: 1.8; }
+.welcome-footer .button { flex-shrink: 0; }
+@media (max-width: 800px) {
+  .header-actions { gap: 10px; }
+  .header-actions .header-note { display: none; }
+  .header-actions .account-email { max-width: 105px; }
+}
+@media (max-width: 520px) {
+  .header-inner { gap: 10px; }
+  .header-actions { gap: 4px; }
+  .notice-trigger { padding: 6px 8px; font-size: 10px; gap: 5px; }
+  .notice-trigger svg { width: 13px; }
+  .logout-button > span { display: none; }
+  .account .logout-button { padding: 8px 3px; }
+  .welcome-dialog { width: calc(100% - 24px); max-height: calc(100vh - 24px); max-height: calc(100dvh - 24px); border-radius: 20px; }
+  .welcome-header { padding: 20px 21px 16px; }
+  .welcome-header h2 { font-size: 20px; }
+  .welcome-eyebrow { font-size: 9px; margin-bottom: 8px; letter-spacing: .6px; }
+  .welcome-close { right: 12px; top: 12px; height: 28px; width: 28px; }
+  .welcome-body { padding: 20px 21px; font-size: 13px; }
+  .welcome-section { margin-top: 20px; }
+  .welcome-reminder { padding: 13px; }
+  .welcome-footer { align-items: stretch; flex-direction: column; gap: 10px; padding: 14px 21px; }
+  .welcome-footer p { font-size: 10px; }
+}

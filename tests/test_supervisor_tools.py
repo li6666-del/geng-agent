@@ -110,17 +110,27 @@ def test_unknown_interrupted_side_effect_is_not_replayed_even_after_input_change
         supervisor.tools.call("test", tool, {})
     tool.inputs = {"new_version": 2}
     tool.invoke = lambda _: pytest.fail("must reconcile before another side effect")
-    with pytest.raises(StageBlocked, match="对账"):
+    from geng_agent.supervisor import NodeFailure
+    with pytest.raises(NodeFailure, match="中断"):
         supervisor.tools.call("test", tool, {})
 
 
-def test_resource_conflict_never_partially_launches_batch(tmp_path, monkeypatch):
+def test_resource_conflict_is_split_into_sequential_batches(tmp_path, monkeypatch):
     supervisor, _ = controller(tmp_path, monkeypatch, batch_or_finish)
-    tools = [SupervisorTool(name, name, lambda _: pytest.fail("conflicting batch launched"),
+    results, active, peak = {}, [], []
+    def work(name):
+        active.append(name)
+        peak.append(len(active))
+        time.sleep(.01)
+        active.remove(name)
+        return name
+    tools = [SupervisorTool(name, name, lambda _, name=name: work(name),
                             resources=("shared-checkpoint",)) for name in ("a", "b")]
-    with pytest.raises(StageBlocked, match="冲突"):
-        supervisor.tools.run("test", lambda: tools, state=lambda: {}, on_result=lambda *_: None, on_error=lambda *_: None)
-    assert supervisor.tools.status("test", "a") == {}
+    supervisor.tools.run("test", lambda: [t for t in tools if t.name not in results],
+        state=lambda: {}, on_result=lambda name,value:results.update({name:value}),
+        on_error=lambda name,error:pytest.fail(str(error)))
+    assert results == {"a":"a","b":"b"}
+    assert max(peak) == 1
 
 
 def test_heartbeat_wakes_without_restarting_live_tool(tmp_path, monkeypatch):
@@ -251,7 +261,6 @@ def test_project_and_execution_controllers_deliver_negative_result_with_real_mod
         return {"action": "start", "next_node": ready[0]} if ready else {"action": "wait" if packet["active"] else "finish"}
     supervisor, calls = controller(context.output_dir, monkeypatch, choose)
     monkeypatch.setattr("geng_agent.case_runtime.ensure_case_runtime", Mock(return_value=runtime))
-    monkeypatch.setattr("geng_agent.agentic_foundation.run_codex_foundation_writer_workflow", Mock(return_value=None))
     reviewer = Mock(return_value={"ok": True, "task_verification": verdict})
     monkeypatch.setattr("geng_agent.agentic_task_reporters.run_codex_task_reporter_workflow", reviewer)
     def writer(**kwargs):

@@ -15,9 +15,9 @@ from packaging.requirements import Requirement, InvalidRequirement
 from packaging.utils import canonicalize_name
 
 from .case_runtime import CaseRuntime
-from .foundation_scope import derive_foundation_scope
+from .task_components import task_component_ids
 from .architecture_protocol import architecture_runtime_view
-from .foundation_snapshot import file_sha256, path_is_foundation_link, scan_foundation_tree
+from .artifact_paths import file_sha256, path_is_link, scan_tree
 from .task_writer_support import WRITER_HANDOFF_POLICY_VERSION, WRITER_ANALYSIS_SCHEMA_VERSION
 from .task_writer_units import _execution_unit_sandbox, _execution_unit_work_items, _public_execution_unit
 from .paper_evidence import safe_label, thesis_comparisons_for_task
@@ -59,7 +59,7 @@ def _digest(value: Any) -> str:
 
 def _json(path: Path) -> dict[str, Any]:
     try:
-        if path_is_foundation_link(path):
+        if path_is_link(path):
             return {}
         value = json.loads(path.read_text(encoding="utf-8-sig"))
         return value if isinstance(value, dict) else {}
@@ -72,15 +72,15 @@ def _module_name(relative: str) -> str:
 
 
 def _python_sources(root: Path) -> list[Path]:
-    if not root.is_dir() or path_is_foundation_link(root):
+    if not root.is_dir() or path_is_link(root):
         return []
-    return [path for path in scan_foundation_tree(root)[0] if path.suffix == ".py"]
+    return [path for path in scan_tree(root)[0] if path.suffix == ".py"]
 
 
 def _source_closure(root: Path, initial: set[str]) -> tuple[dict[str, str], set[str]]:
     modules: dict[str, str] = {}
     for path in _python_sources(root / "src"):
-        if not path_is_foundation_link(path) and path.is_file():
+        if not path_is_link(path) and path.is_file():
             relative = path.relative_to(root).as_posix()
             modules[_module_name(relative)] = relative
     pending = list(initial)
@@ -92,7 +92,7 @@ def _source_closure(root: Path, initial: set[str]) -> tuple[dict[str, str], set[
             continue
         path = root / relative
         try:
-            if any(path_is_foundation_link(part) for part in [path, *path.parents] if part != root.parent and part.is_relative_to(root)) or not path.is_file():
+            if any(path_is_link(part) for part in [path, *path.parents] if part != root.parent and part.is_relative_to(root)) or not path.is_file():
                 continue
             path.resolve().relative_to(root.resolve())
             hashes[relative] = file_sha256(path)
@@ -234,11 +234,11 @@ def _runtime_projection(
 def _observed_imports_by_task(audit_dir: Path) -> dict[str, set[str]]:
     """Read only host-owned observations; Writer result notes are not evidence."""
     run_root = audit_dir / "execution_runs"
-    if not run_root.is_dir() or path_is_foundation_link(run_root):
+    if not run_root.is_dir() or path_is_link(run_root):
         return {}
     latest: dict[str, tuple[float, set[str]]] = {}
     for directory in sorted(run_root.iterdir()):
-        if not directory.is_dir() or path_is_foundation_link(directory):
+        if not directory.is_dir() or path_is_link(directory):
             continue
         receipt = _json(directory / "execution_receipt.json")
         if receipt.get("observer") != "orchestration_host":
@@ -272,78 +272,10 @@ def _scoped_architecture_metadata(
             "consistency_groups": groups, "invariants": invariants}
 
 
-def foundation_cache_projection(
-    *, architecture: dict[str, Any], facts: dict[str, Any], paper_path: Path,
-    case_runtime: CaseRuntime | None,
-) -> tuple[str, dict[str, Any], str]:
-    """Exclude private task edits and unused package additions from Foundation."""
-    scope = architecture.get("_foundation_scope") or {}
-    components = _objects(architecture.get("components"))
-    component_ids = {str(item.get("id")) for item in components}
-    task_ids = {str(key) for component in component_ids for key in scope.get("component_task_ids", {}).get(component, [])}
-    quantity_ids = {str(key) for item in components for field in ("inputs", "outputs", "parameters") for key in item.get(field, [])}
-    bindings = [{"task_id": item.get("task_id"), "experiment_id": item.get("experiment_id"),
-                 "components": sorted(component_ids.intersection(map(str, item.get("components", [])))),
-                 "overrides": {key: value for key, value in (item.get("overrides") or {}).items() if key in quantity_ids}}
-                for item in _objects(architecture.get("bindings")) if str(item.get("task_id")) in task_ids]
-    metadata = _scoped_architecture_metadata(architecture, components, bindings, task_ids)
-    refs = {(str(ref.get("type")), str(ref.get("name")).casefold())
-            for item in [*components, *metadata["quantities"], *metadata["invariants"]]
-            for ref in _objects((item.get("basis") or {}).get("evidence_facts"))}
-    selected_facts = [item for item in _objects(facts.get("engineering_facts"))
-                      if not refs or (str(item.get("type")), str(item.get("name")).casefold()) in refs]
-    analysis_hash = _digest({"paper_sha256": file_sha256(paper_path) if paper_path.is_file() else None,
-                             "facts": selected_facts, "policy_content_hashes": foundation_policy_content_hashes()})
-    projected = {"schema_version": architecture.get("schema_version"), "components": components,
-                 "bindings": bindings, **metadata,
-                 "scope_policy": scope.get("policy_version")}
-    if architecture.get("_foundation_revision"):
-        projected["_foundation_revision"] = architecture["_foundation_revision"]
-    runtime = foundation_consumed_runtime(architecture=architecture, case_runtime=case_runtime)
-    return analysis_hash, projected, _digest(runtime)
 
 
-def foundation_policy_content_hashes() -> dict[str, str]:
-    """Track Foundation policy without coupling it to task Writer lineage edits.
-
-    This module also fingerprints task Writer policies and execution units. Hash only the
-    Foundation projection and the shared helpers it consumes, so those unrelated
-    policies cannot discard a valid frozen Foundation. Keep the helper list in
-    the fingerprint too: changing this boundary must invalidate the old key.
-    """
-    module_root = Path(__file__).parent
-    policy = {name: text_identity((module_root / name).read_text(encoding="utf-8")) for name in (
-        "foundation_prompt_cache.py", "foundation_scope.py", "foundation_revision.py",
-    )}
-    policy.update({
-        function.__name__: text_identity(inspect.getsource(function))
-        for function in (
-            foundation_policy_content_hashes, foundation_cache_projection,
-            foundation_consumed_runtime, _scoped_architecture_metadata,
-            _objects, _digest, _runtime_dependency_graph,
-            runtime_distribution_metadata, _runtime_projection,
-            _source_closure, _python_sources, _module_name,
-        )
-    })
-    return policy
 
 
-def foundation_consumed_runtime(
-    *, architecture: dict[str, Any], case_runtime: CaseRuntime | None,
-    source_root: Path | None = None,
-) -> dict[str, Any]:
-    libraries: set[str] = set()
-    modules: set[str] = set()
-    for component in _objects(architecture.get("components")):
-        execution = component.get("execution") or {}
-        libraries.add(str(execution.get("primary_framework") or ""))
-        libraries.update(map(str, execution.get("supporting_libraries") or []))
-        modules.add(str(component.get("module") or ""))
-    imports = _source_closure(source_root, modules)[1] if source_root is not None else set()
-    distribution_names: dict[str, set[str]] = {}
-    versions: dict[str, str] = {}
-    graph = _runtime_dependency_graph(case_runtime, import_distributions=distribution_names, installed_versions=versions)
-    return _runtime_projection(case_runtime, libraries, imports, graph, distribution_names, versions)
 
 
 def build_writer_unit_lineage(
@@ -354,7 +286,6 @@ def build_writer_unit_lineage(
     experiment_index: dict[str, Any],
     paper_path: Path,
     analysis_artifacts: dict[str, Path],
-    foundation: dict[str, Any] | None,
     case_runtime: CaseRuntime | None,
     task_root: Path,
     paper_thesis: dict[str, Any] | None = None,
@@ -368,7 +299,7 @@ def build_writer_unit_lineage(
     """
     architecture = architecture_runtime_view(
         _json(analysis_artifacts["scientific_architecture.json"]) if "scientific_architecture.json" in analysis_artifacts else {})
-    scope = derive_foundation_scope(architecture, execution_plan)
+    component_map = task_component_ids(architecture)
     components = {str(item.get("id")): item for item in _objects(architecture.get("components"))}
     paper_hash = file_sha256(paper_path) if paper_path.is_file() else None
     distribution_names: dict[str, set[str]] = {}
@@ -382,7 +313,7 @@ def build_writer_unit_lineage(
     for unit in _execution_unit_work_items(task_pairs, execution_plan):
         task_ids = {str(task.get("task_id") or entry.get("task_id")) for _, task, entry in unit["members"]}
         unit_tasks = [task for _, task, _ in unit["members"]]
-        component_ids = {key for task_id in task_ids for key in scope["task_component_ids"].get(task_id, [])}
+        component_ids = {key for task_id in task_ids for key in component_map.get(task_id, [])}
         unit_components = [components[key] for key in sorted(component_ids) if key in components]
         bindings = [item for item in _objects(architecture.get("bindings")) if str(item.get("task_id")) in task_ids]
         metadata = _scoped_architecture_metadata(architecture, unit_components, bindings, task_ids)
@@ -399,11 +330,7 @@ def build_writer_unit_lineage(
         facts_are_scoped = all(_objects(task.get("required_facts")) for task in unit_tasks)
         unit_facts = [item for item in _objects(facts.get("engineering_facts"))
                       if not facts_are_scoped or (str(item.get("type")), str(item.get("name")).casefold()) in refs]
-        shared_paths = {str(item.get("module")) for item in unit_components if str(item.get("id")) in scope["component_ids"]}
-        shared_hashes: dict[str, str] = {}
         imports: set[str] = set()
-        if foundation is not None:
-            shared_hashes, imports = _source_closure(Path(foundation["snapshot_dir"]), shared_paths)
         for task_id in task_ids:
             imports.update(observed_imports.get(task_id, set()))
         members = unit["members"]
@@ -411,7 +338,7 @@ def build_writer_unit_lineage(
             task_root / f"{members[0][0]:02d}_{safe_label(str(members[0][1].get('task_id') or members[0][2].get('task_id') or 'task'))}"
             if len(members) == 1 else _execution_unit_sandbox(task_root, str(unit["unit_id"]))
         )
-        if sandbox.is_dir() and not path_is_foundation_link(sandbox):
+        if sandbox.is_dir() and not path_is_link(sandbox):
             owned = {path.relative_to(sandbox).as_posix() for path in _python_sources(sandbox / "tasks")}
             _, actual_imports = _source_closure(sandbox, owned)
             imports.update(actual_imports)
@@ -434,7 +361,6 @@ def build_writer_unit_lineage(
             "components": unit_components,
             **metadata,
             "experiments": [item for item in _objects(experiment_index.get("experiments")) if str(item.get("task_id")) in task_ids],
-            "shared_source_hashes": shared_hashes,
             "runtime": _runtime_projection(case_runtime, libraries, imports, graph, distribution_names, versions),
         }
         result[str(unit["unit_id"])] = {"snapshot_hash": _digest(payload), "inputs": payload}

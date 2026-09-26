@@ -19,7 +19,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from .outputs import write_json, _io_path
+from .outputs import _io_path
+from .observations import write_json
 
 
 def file_hash(path: Path) -> str:
@@ -226,31 +227,44 @@ class ExecutionBroker:
         self.completed_pending: dict[str, dict[str, Any]] = {}
         self.process: subprocess.Popen | None = None
         self.cancelled = threading.Event()
+        self.closing = threading.Event()
         self.stopped = threading.Event()
         self.thread = threading.Thread(target=self._serve, daemon=True)
 
     def __enter__(self):
         _io_path(self.queue).mkdir(parents=True, exist_ok=True)
-        self._publish_status()
+        try:
+            self._publish_status()
+        except Exception as exc:
+            from .observations import record_error
+            record_error(self.queue / "status.json", exc)
         self.heartbeat_thread.start()
         self.thread.start()
         return self
 
     def __exit__(self, exc_type, *_args):
-        self.stopped.set()
+        self.closing.set()
         # Never launch a duplicate full after the worker CLI exits. Complete
         # the scientific process already in flight and preserve its result.
-        if exc_type is not None:
+        from .progress import PipelineCancelled
+        if exc_type is not None and issubclass(exc_type, (PipelineCancelled, KeyboardInterrupt)):
             self.cancelled.set()
             self._stop_process()
         try:
-            self.thread.join()
-            self.heartbeat_thread.join(timeout=2)
-        except KeyboardInterrupt:
+            from .supervisor import current_supervisor
+            supervisor = current_supervisor()
+            while self.thread.is_alive():
+                self.thread.join(timeout=.2)
+                if supervisor is not None:
+                    supervisor._check_cancelled()
+        except (PipelineCancelled, KeyboardInterrupt):
             self.cancelled.set()
             self._stop_process()
             self.thread.join(timeout=5)
             raise
+        finally:
+            self.stopped.set()
+            self.heartbeat_thread.join(timeout=2)
 
     def _publish_status(self) -> None:
         _io_path(_inside(self.root, self.queue.relative_to(self.root).as_posix())).mkdir(parents=True, exist_ok=True)
@@ -309,8 +323,10 @@ class ExecutionBroker:
 
     def _serve(self):
         handled: set[str] = set()
-        while not self.stopped.is_set():
+        while not self.closing.is_set():
             for path in self._queue_requests():
+                if self.closing.is_set():
+                    break
                 if path.name in handled:
                     continue
                 handled.add(path.name)
@@ -325,7 +341,7 @@ class ExecutionBroker:
                         # Enumerate only when consuming an actual pending result:
                         # adding an optional module can change execution as well
                         # as modifying an existing source file.
-                        self._request_identity(request)
+                        self._observed_request_identity(request)
                         == completed["request_identity"]
                         and self._observed_identity_is_current(completed["receipt"])
                     ):
@@ -334,8 +350,13 @@ class ExecutionBroker:
                         self._deliver_receipt(task_id, path.name.removesuffix(".request.json"), result_path, completed["receipt"])
                         continue
                     self._set_status(task_id, {"state": "starting", "request_id": path.name.removesuffix(".request.json")})
-                    request_sources = source_hashes(self.root)
-                    request_identity = self._request_identity(request, source_snapshot=request_sources)
+                    try:
+                        request_sources = source_hashes(self.root)
+                        request_identity = self._observed_request_identity(request, source_snapshot=request_sources)
+                    except Exception as exc:
+                        from .observations import record_error
+                        record_error(path, exc)
+                        request_sources, request_identity = {}, None
                     receipt = self.execute(request)
                     self.receipts.append(receipt)
                     # Snapshot already queued requests while the just-completed
@@ -346,7 +367,7 @@ class ExecutionBroker:
                             continue
                         try:
                             queued = json.loads(_io_path(_inside(self.root, pending.relative_to(self.root).as_posix())).read_text(encoding="utf-8"))
-                            if self._request_identity(queued, source_snapshot=self._current_recorded_hashes(request_sources)) == request_identity:
+                            if request_identity is not None and self._observed_request_identity(queued, source_snapshot=self._current_recorded_hashes(request_sources)) == request_identity:
                                 self.completed_pending[pending.name] = {
                                     "request_identity": request_identity,
                                     "receipt": receipt,
@@ -382,7 +403,11 @@ class ExecutionBroker:
             self.task_status[task_id] = current
             if request_id:
                 self.request_status[request_id] = current
-            self._publish_status()
+            try:
+                self._publish_status()
+            except Exception as exc:
+                from .observations import record_error
+                record_error(self.queue / "status.json", exc)
 
     def _current_recorded_hashes(self, recorded: dict[str, Any]) -> dict[str, Any]:
         """Recheck known files without enumerating the project again."""
@@ -413,15 +438,27 @@ class ExecutionBroker:
         config = _inside(self.root, config_name)
         input_names = set(map(str, request.get("inputs", [])))
         if config.is_file():
-            input_names.update(_configuration_file_inputs(self.root, json.loads(config.read_text(encoding="utf-8-sig"))))
+            try:
+                input_names.update(_configuration_file_inputs(self.root, json.loads(config.read_text(encoding="utf-8-sig"))))
+            except (OSError, ValueError, TypeError):
+                pass  # The task's loader, not the request identity, consumes it.
         inputs = sorted({_inside(self.root, path).resolve().relative_to(self.root).as_posix()
                          for path in input_names})
         identity = {"task_id": task_id, "mode": mode,
+            "device": str(request.get("device") or "auto"),
             "config": config.resolve().relative_to(self.root).as_posix(),
             "config_hash": file_hash(config) if config.is_file() else None,
             "inputs": {path: file_hash(_inside(self.root, path)) if _inside(self.root, path).is_file() else None for path in inputs},
             "source_hashes": source_snapshot if source_snapshot is not None else source_hashes(self.root)}
         return hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()
+
+    def _observed_request_identity(self, request, *, source_snapshot=None):
+        try:
+            return self._request_identity(request, source_snapshot=source_snapshot)
+        except Exception as exc:
+            from .observations import record_error
+            record_error(self.queue, exc)
+            return None  # Unknown identity cannot reuse a prior result; execution still proceeds.
 
     def _publish_response(self, path: Path, value: dict[str, Any]) -> None:
         relative = path.relative_to(self.root).as_posix()
@@ -437,64 +474,59 @@ class ExecutionBroker:
 
     def execute(self, request: dict[str, Any]) -> dict[str, Any]:
         from .case_runtime_locking import _host_shared_runtime_read_guard
+        from .gpu_resources import select_compute
+        from .progress import PipelineCancelled
 
-        # Installation takes the exclusive side of this same host-wide lock.
-        # Separate Writer sandboxes can still execute full runs concurrently.
-        with _host_shared_runtime_read_guard(self.shared_runtime_python):
-            return self._execute_with_runtime_lease(request)
-
-    def _execute_with_runtime_lease(self, request: dict[str, Any]) -> dict[str, Any]:
         if not self.allow_full and str(request.get("mode") or "full") == "full":
             raise ValueError("full execution is disabled for this preparation session; smoke remains available")
-        from .codex_runner import _FOUNDATION_UNITTEST_GUARD, _foundation_unittest_guard_config
+        if self.cancelled.is_set():
+            raise PipelineCancelled("execution cancelled before launch")
+        allocation = select_compute(str(request.get("device") or "auto"))
+        # Experiments share this runtime read lock and may use the same GPU
+        # concurrently. Only package installation takes the exclusive lock.
+        with _host_shared_runtime_read_guard(self.shared_runtime_python):
+            if self.cancelled.is_set():
+                raise PipelineCancelled("execution cancelled before launch")
+            return self._execute_with_runtime_lease(request, allocation=allocation)
+
+    def _execute_with_runtime_lease(self, request: dict[str, Any], *, allocation) -> dict[str, Any]:
+        from .scientific_process import DRIVER
         from .security_env import build_safe_env
+
+        observation_errors = []
+        def observe(label, operation, fallback):
+            try:
+                return operation()
+            except Exception as exc:
+                observation_errors.append({"observation": label, "error": f"{type(exc).__name__}: {exc}"})
+                return fallback
+        def observed_hash(path):
+            return observe(str(path), lambda: file_hash(path), None)
 
         task_id = str(request.get("task_id") or "")
         entry = self.entries[task_id]
         config_rel = str(request.get("config") or entry.get("config_smoke" if request.get("mode") == "smoke" else "config_full") or "config.json")
         config = _inside(self.root, config_rel)
-        if not config.is_file() or config.suffix.lower() != ".json":
-            raise ValueError("execution requires an existing project JSON configuration")
-        config_doc = json.loads(config.read_text(encoding="utf-8-sig"))
-        if str(request.get("mode") or "full") == "full" and (
-            config_rel == entry.get("config_smoke") or config_doc.get("smoke") is True
-            or str(config_doc.get("run_profile") or config_doc.get("profile") or "").lower() == "smoke"
-        ):
-            raise ValueError("a smoke configuration cannot establish a full execution")
-        environment_before = probe_execution_environment(self.python)
-        if not environment_before.get("ok"):
-            raise RuntimeError("Selected execution environment could not be inventoried")
-        if self.expected_installed_distributions is not None:
-            expected = _installed_distribution_versions(self.expected_installed_distributions)
-            # A Writer may install or override packages in its own venv. Only
-            # changes to the shared base invalidate the case-level inventory.
-            shared_observation = (
-                probe_execution_environment(self.shared_runtime_python)
-                if self.shared_runtime_python != self.python else environment_before
-            )
-            observed = _installed_distribution_versions(
-                shared_observation.get("inventory", {}).get("packages"))
-            if observed != expected:
-                self.environment_refresh_required = True
-                raise RuntimeError("shared_runtime_changed: refresh the case environment before execution")
+        try:
+            config_doc = json.loads(config.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            config_doc = {}
+        if not isinstance(config_doc, dict):
+            config_doc = {}
+        environment_before = observe("environment_before", lambda: probe_execution_environment(self.python), {})
         module = str(entry["module"])
-        if not module.isidentifier():
-            raise ValueError("invalid task module")
         output_rel = str(entry.get("output_subdir") or task_id)
         output = _inside(self.root, f"outputs/{output_rel}")
         output.mkdir(parents=True, exist_ok=True)
         run_id = uuid.uuid4().hex
         run_dir = self.audit_dir / "execution_runs" / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
-        before = source_hashes(self.root)
-        before[config_rel] = file_hash(config)
+        before = observe("source_before", lambda: source_hashes(self.root), {})
+        before[config_rel] = observed_hash(config)
         input_paths = set(map(str, request.get("inputs", []))) | _configuration_file_inputs(self.root, config_doc)
-        inputs = {p: file_hash(_inside(self.root, p)) for p in input_paths}
-        asset_stats_before = _persistent_asset_stats(self.root)
-        dependency_errors = self._check_producers(inputs, required_mode=str(request.get("mode") or "full"))
-        if dependency_errors:
-            raise ValueError("; ".join(dependency_errors))
-        old_outputs = artifact_hashes(self.root, output_rel)
+        inputs = {p: observe(p, lambda p=p: file_hash(_inside(self.root, p)), None) for p in input_paths}
+        asset_stats_before = observe("assets_before", lambda: _persistent_asset_stats(self.root), {})
+        old_outputs = observe("old_outputs", lambda: artifact_hashes(self.root, output_rel), {})
         if output.exists():
             # A successful no-op must not relabel yesterday's CSV as a new run.
             # Deterministic rewrites are fine because the new directory is empty.
@@ -518,43 +550,38 @@ class ExecutionBroker:
         for key in ("CUDA_VISIBLE_DEVICES", "CUDA_PATH", "CUDA_HOME", "LD_LIBRARY_PATH"):
             if os.environ.get(key):
                 env[key] = os.environ[key]
-        guard_config = _foundation_unittest_guard_config(work_dir=self.root, start_dir="tasks",
-            python_executable=self.python,
-            trusted_runtime_roots=(
-                _runtime_prefix(self.python), _runtime_prefix(self.shared_runtime_python),
-                Path(sys.base_prefix),
-            ),
-            write_roots=(output, assets, runtime_home))
-        guard_config.update(task_module=module, task_config=config_rel, task_output_prefix=f"outputs/{output_rel}/")
-        prefix, separator, _tail = _FOUNDATION_UNITTEST_GUARD.partition("\nimport unittest\n")
-        if not separator:
-            raise RuntimeError("scientific process guard is unavailable")
-        guard = prefix + _TASK_READ_TRACE + "\nimport importlib\n_TRACE_INITIAL_MODULES = set(sys.modules)\ntry:\n    _MODULE = importlib.import_module('tasks.' + _CONFIG['task_module'])\n    _RESULT = _MODULE.main(_CONFIG['task_config'])\nfinally:\n    _TRACE_STREAM.write('GENG_OBSERVED_MODULES ' + json.dumps(sorted({name.split('.')[0] for name in set(sys.modules) - _TRACE_INITIAL_MODULES})) + '\\n')\n    _TRACE_STREAM.flush()\nraise SystemExit(_RESULT if isinstance(_RESULT, int) and not isinstance(_RESULT, bool) else 0)\n"
+        # The child sees its selected GPU, which other tasks may also use. CPU requests cannot
+        # accidentally pick CUDA through a library's automatic device choice.
+        env["CUDA_VISIBLE_DEVICES"] = allocation.cuda_visible_devices
+        guard_config = {"task_module": module, "task_config": config_rel,
+                        "task_output_prefix": f"outputs/{output_rel}/"}
+        guard = DRIVER
         started = time.time()
         write_json(run_dir / "started.json", {"run_id": run_id, "task_id": task_id,
                    "source_hashes": before, "input_hashes": inputs, "started_at": started})
         from .execution_sandbox import scientific_sandbox_launch
         launch = scientific_sandbox_launch([str(self.python), "-I", "-B", "-c", guard, json.dumps(guard_config)],
-            work_dir=self.root, write_roots=(output, assets, runtime_home), env=env)
+            work_dir=self.root, write_roots=(self.root,), env=env)
         with (run_dir / "stdout.log").open("w", encoding="utf-8") as stdout, (run_dir / "stderr.log").open("w", encoding="utf-8") as stderr:
             process = subprocess.Popen(launch["command"], cwd=self.root, env=launch["env"], stdout=stdout, stderr=stderr,
                 start_new_session=os.name != "nt", creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0)
             self.process = process
             self._set_status(task_id, {"state": "running", "run_id": run_id,
                 "pid": process.pid, "pid_kind": "os_sandbox_supervisor",
+                "device_request": allocation.request, "gpu_uuid": allocation.gpu_uuid,
                 "stdout_log": str(run_dir / "stdout.log"), "stderr_log": str(run_dir / "stderr.log"),
                 "started_at": started})
             if self.cancelled.is_set():
                 self._stop_process()
             returncode = process.wait()
             self.process = None
-        environment_after = probe_execution_environment(self.python)
-        environment_stable = bool(environment_after.get("ok")) and environment_before["sha256"] == environment_after.get("sha256")
-        after = source_hashes(self.root)
-        after[config_rel] = file_hash(config)
-        output_hashes = artifact_hashes(self.root, output_rel)
-        asset_stats_after = _persistent_asset_stats(self.root)
-        stderr_text = (run_dir / "stderr.log").read_text(encoding="utf-8", errors="replace")
+        environment_after = observe("environment_after", lambda: probe_execution_environment(self.python), {})
+        environment_stable = bool(environment_after.get("ok")) and environment_before.get("sha256") == environment_after.get("sha256")
+        after = observe("source_after", lambda: source_hashes(self.root), {})
+        after[config_rel] = observed_hash(config)
+        output_hashes = observe("outputs_after", lambda: artifact_hashes(self.root, output_rel), {})
+        asset_stats_after = observe("assets_after", lambda: _persistent_asset_stats(self.root), {})
+        stderr_text = observe("stderr", lambda: (run_dir / "stderr.log").read_text(encoding="utf-8", errors="replace"), "")
         observed_reads: dict[str, str] = {}
         written_paths: set[str] = set()
         observed_import_roots: list[str] = []
@@ -576,24 +603,27 @@ class ExecutionBroker:
                 except (ValueError, KeyError, TypeError):
                     continue
         sources = {p: h for p, h in observed_reads.items() if p in before}
-        sources[config_rel] = before.get(config_rel) or file_hash(config)
+        sources[config_rel] = before.get(config_rel)
         inputs.update({p: h for p, h in observed_reads.items() if p not in sources})
-        dependency_issues = self._check_producers(inputs, required_mode=str(request.get("mode") or "full"))
+        dependency_issues = observe("producer_history", lambda: self._check_producers(inputs,
+            required_mode=str(request.get("mode") or "full"),
+            current_inventory=environment_before.get("inventory")), [])
         # Native scientific serializers (e.g. PyTorch's C++ zip writer) do not
         # emit Python open events. Observe their real filesystem products too.
         written_paths.update(p for p, metadata in asset_stats_after.items() if asset_stats_before.get(p) != metadata)
-        produced = {p: file_hash(_inside(self.root, p)) for p in written_paths if _inside(self.root, p).is_file()}
-        inputs_stable = environment_stable and before == after and all(file_hash(_inside(self.root, p)) == h for p, h in inputs.items())
-        observed_distributions = _observed_runtime_distributions(
-            self.python, observed_import_roots, environment_before.get("inventory"),
-        )
+        produced = {p: observe(p, lambda p=p: file_hash(_inside(self.root, p)), None) for p in written_paths}
+        inputs_stable = environment_stable and before == after and all(observe(p, lambda p=p: file_hash(_inside(self.root, p)), None) == h for p, h in inputs.items()) and not observation_errors
+        observed_distributions = observe("runtime_distributions", lambda: _observed_runtime_distributions(
+            self.python, observed_import_roots, environment_before.get("inventory")), {})
         receipt = {"schema_version": 1, "observer": "orchestration_host", "run_id": run_id,
             "task_id": task_id, "output_subdir": output_rel,
-            "mode": str(request.get("mode") or "full"), "config": config_rel,
+            "mode": str(request.get("mode") or "full"), "config": config_rel, "config_observation": config_doc,
             "python_executable": str(self.python), "environment_hash": self.environment_hash,
+            "compute_resource": {"request": allocation.request, "gpu_uuid": allocation.gpu_uuid,
+                "cuda_visible_devices": allocation.cuda_visible_devices},
             "sandbox_policy": launch["policy"],
             "environment_observation": {"before": environment_before, "after": environment_after,
-                "stable": environment_stable, "probe_duration_s": round(environment_before["duration_s"] + environment_after["duration_s"], 4)},
+                "stable": environment_stable, "probe_duration_s": round(environment_before.get("duration_s", 0) + environment_after.get("duration_s", 0), 4)},
             "started_at": started, "finished_at": time.time(), "returncode": returncode,
             "pid": process.pid, "pid_kind": "os_sandbox_supervisor", "source_hashes": sources,
             "source_snapshot_hashes": before, "input_hashes": inputs,
@@ -602,22 +632,23 @@ class ExecutionBroker:
             "observed_import_roots": observed_import_roots,
             "observed_distributions": observed_distributions,
             "input_observation_scope": "Python file events plus explicit --input and configuration file paths; native loads require one of those declarations",
-            "cancelled": self.cancelled.is_set(),
+            "cancelled": self.cancelled.is_set(), "observation_errors": observation_errors,
             "unchanged_output_paths": sorted(p for p, h in output_hashes.items() if old_outputs.get(p) == h),
             "stderr_tail": "\n".join(line for line in stderr_text.splitlines() if not line.startswith("GENG_OBSERVED_"))[-12000:]}
         write_json(run_dir / "execution_receipt.json", receipt)
         write_json(output / "execution_receipt.json", receipt)
         return receipt
 
-    def _check_producers(self, inputs: dict[str, str], *, required_mode: str = "full") -> list[str]:
-        """An old generated checkpoint cannot silently outlive its training recipe."""
+    def _check_producers(self, inputs: dict[str, str], *, required_mode: str = "full",
+                         current_inventory: dict | None = None) -> list[str]:
+        """Describe recorded origins; this observation never prevents execution."""
         return _producer_chain_issues(self.root, self.audit_dir, inputs,
-                                      required_mode=required_mode, python_executable=self.python)
+            required_mode=required_mode, python_executable=self.python, current_inventory=current_inventory)
 
 
 def _producer_chain_issues(
     root: Path, audit_dir: Path, inputs: dict[str, str], *, required_mode: str = "full",
-    python_executable: Path | None = None,
+    python_executable: Path | None = None, current_inventory: dict | None = None,
 ) -> list[str]:
     """Revalidate only the supplied assets' ancestry, for execution and resume."""
     generated_inputs = {path: digest for path, digest in inputs.items()
@@ -651,6 +682,13 @@ def _producer_chain_issues(
         prefix = _runtime_prefix(selected_python)
         if prefix not in runtime_metadata:
             _graph, _names, versions = runtime_distribution_metadata(prefix)
+            inventory = current_inventory
+            if inventory is None and selected_python.is_file() and not previous.keys() <= versions.keys():
+                # A private venv can import shared packages through .pth files.
+                # Directory-only inventory must not misreport them as removed.
+                inventory = probe_execution_environment(selected_python).get("inventory")
+            if inventory is not None:
+                versions = _installed_distribution_versions(inventory.get("packages"))
             runtime_metadata[prefix] = versions
         versions = runtime_metadata[prefix]
         return all(versions.get(name) == version for name, version in previous.items())
@@ -711,54 +749,3 @@ def find_host_execution(root: Path, audit_dir: Path, task_id: str) -> dict[str, 
         observed["issues"].extend(chain_issues)
         observed["passed"] = not observed["issues"]
     return observed
-
-
-_TASK_READ_TRACE = r'''
-import hashlib
-import importlib.machinery
-# -B prevents new bytecode, but still reads existing __pycache__. Load only
-# project modules from source so the read trace binds the code actually run.
-# Runtime/site-packages retain their bytecode caches (notably large ML stacks).
-_ORIGINAL_SOURCE_GET_CODE = importlib.machinery.SourceFileLoader.get_code
-def _case_source_get_code(loader, fullname):
-    filename = loader.get_filename(fullname)
-    path = _real_path(filename)
-    if path is not None and _inside(path, _WORK_DIR):
-        return loader.source_to_code(loader.get_data(filename), filename)
-    return _ORIGINAL_SOURCE_GET_CODE(loader, fullname)
-importlib.machinery.SourceFileLoader.get_code = _case_source_get_code
-_TRACE_BUSY = False
-_TRACE_READS = set()
-_TRACE_WRITES = set()
-_TRACE_STREAM = sys.stderr
-def _trace_task_reads(event, args):
-    global _TRACE_BUSY
-    if event != 'open' or not args or _TRACE_BUSY:
-        return
-    path = _real_path(args[0])
-    if path is None or not _inside(path, _WORK_DIR):
-        return
-    relative = os.path.relpath(path, _WORK_DIR).replace('\\', '/')
-    if relative.startswith(('.geng_runtime/', '.geng_execution/', _CONFIG['task_output_prefix'])) or '__pycache__' in relative:
-        return
-    if _open_is_write(args[1] if len(args)>1 else None, args[2] if len(args)>2 else None):
-        if relative not in _TRACE_WRITES:
-            _TRACE_STREAM.write('GENG_OBSERVED_WRITE ' + json.dumps({'path': relative}) + '\n')
-            _TRACE_STREAM.flush()
-        _TRACE_WRITES.add(relative)
-        return
-    if relative in _TRACE_READS or relative in _TRACE_WRITES:
-        return
-    _TRACE_BUSY = True
-    try:
-        digest = hashlib.sha256()
-        with open(path, 'rb') as source:
-            for block in iter(lambda: source.read(1024 * 1024), b''):
-                digest.update(block)
-        _TRACE_READS.add(relative)
-        _TRACE_STREAM.write('GENG_OBSERVED_READ ' + json.dumps({'path': relative, 'sha256': digest.hexdigest()}) + '\n')
-        _TRACE_STREAM.flush()
-    finally:
-        _TRACE_BUSY = False
-sys.addaudithook(_trace_task_reads)
-'''

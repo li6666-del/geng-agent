@@ -4,18 +4,7 @@ from unittest.mock import patch
 import os
 import unittest
 
-from geng_agent.security import (
-    FOUNDATION_STATIC_SECURITY_ADVISORY_CATEGORIES,
-    FORBIDDEN_BUILTINS,
-    codex_safe_env,
-    reconcile_runtime_requirements,
-    requirement_name_for_import,
-    split_static_security_issues,
-    split_requirement_issues,
-    static_scan_repro_project,
-    validate_requirements,
-    _runtime_lock_is_trusted,
-)
+from geng_agent.security import FORBIDDEN_BUILTINS, codex_safe_env, reconcile_runtime_requirements, requirement_name_for_import, split_static_security_issues, split_requirement_issues, static_scan_repro_project, validate_requirements, _runtime_lock_is_trusted
 
 
 def scan_source(source: str) -> list[dict[str, str]]:
@@ -347,35 +336,7 @@ class StaticScanDynamicBuiltinTests(unittest.TestCase):
         self.assertEqual(flagged[0]["file"], "run_experiment.py")
         self.assertEqual(flagged[0]["line"], "2")
 
-    def test_environment_findings_are_foundation_advisories_but_strict_by_default(self) -> None:
-        issues = scan_source(
-            "import os\n"
-            "key = 'OPENAI_' + 'API_KEY'\n"
-            "secret = os.getenv('OPENAI_API_KEY')\n"
-            "dynamic = os.environ[key]\n"
-            "bulk = dict(os.environ)\n"
-            "os.environ.update({'MODEL_SIZE': 'small'})\n"
-        )
-
-        strict_blocking, strict_warnings = split_static_security_issues(issues)
-        self.assertEqual(strict_warnings, [])
-        self.assertTrue(strict_blocking)
-        self.assertTrue(all(item["severity"] == "error" for item in strict_blocking))
-
-        foundation_blocking, foundation_warnings = split_static_security_issues(
-            issues,
-            advisory_categories=FOUNDATION_STATIC_SECURITY_ADVISORY_CATEGORIES,
-        )
-        self.assertEqual(foundation_blocking, [])
-        self.assertTrue(foundation_warnings)
-        self.assertTrue(
-            all(
-                item["category"] == "environment_access"
-                and item["severity"] == "warning"
-                for item in foundation_warnings
-            ),
-            foundation_warnings,
-        )
+    pass  # Retired shared-code/compound execution policy.
 
     def test_does_not_flag_dotted_or_legitimate_calls(self) -> None:
         # re.compile is an attribute call, not the bare compile builtin; numerical

@@ -1,82 +1,12 @@
-export type PhaseState = "waiting" | "running" | "partial" | "success" | "failed" | "cancelled";
-
-export interface Job {
-  id: string;
-  case_id: string;
-  status: string;
-  current_phase: string | null;
-  current_step: string | null;
-  cancel_requested: boolean;
-  attempt: number;
-  error: { code: string; message: string } | null;
-  created_at: string;
-  started_at: string | null;
-  finished_at: string | null;
-}
-
-export interface Phase {
-  id: string;
-  index: number;
-  label: string;
-  steps: string[];
-  state: PhaseState;
-  artifact_count: number;
-}
-
-export interface Artifact {
-  id: string;
-  phase: string;
-  path: string;
-  kind: string;
-  mime_type: string;
-  size_bytes: number;
-  sha256: string;
-  content_url: string;
-  download_url: string;
-}
-
-export interface CaseSummary {
+export interface User { id: string; email: string }
+export interface AuthSession { user: User; csrf_token: string }
+export interface SiteConfig { max_pdf_bytes: number; registration_enabled: boolean }
+export interface PaperCase {
   id: string;
   display_name: string;
-  source: string;
   created_at: string;
-  job: Job | null;
-}
-
-export interface CaseDetail extends CaseSummary {
-  phases: Phase[];
-  artifacts: Artifact[];
-  research: ResearchView;
-  recent_events: EventPayload[];
-}
-
-export interface ResearchTask {
-  task_id: string;
-  title: string;
-  target: string | null;
-  outcome: string | null;
-  engineering_status: string | null;
-  decision_reason: string | null;
-  remaining_uncertainties: string[];
-  host_action: string | null;
-}
-
-export interface ResearchView {
-  tasks: ResearchTask[];
-  verification_available: boolean;
-  all_terminal: boolean | null;
-  all_successful: boolean | null;
-  editor_ok: boolean | null;
-  editor_mode: string | null;
-  warnings: string[];
-}
-
-export interface EventPayload {
-  id: number;
-  type: string;
-  phase?: string;
-  step?: string;
-  message?: string;
-  data?: Record<string, unknown>;
-  created_at: string;
+  status: string;
+  message: string;
+  download_url: string | null;
+  can_retry: boolean;
 }

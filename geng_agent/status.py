@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .foundation_snapshot import path_is_foundation_link, validate_foundation_snapshot
+from .artifact_paths import path_is_link
 from .security import _runtime_lock_is_trusted
 
 
@@ -17,7 +17,6 @@ STAGES = [
     ("experiment_index", "experiment_index.json", "experiment_index"),
     ("scientific_architecture", "scientific_architecture.json", "scientific_architecture"),
     ("environment_lock", "03a_environment.lock.json", None),
-    ("foundation_manifest", "foundation_manifest.json", None),
     ("repro_project_manifest", "repro_project_manifest.json", "repro_project_manifest"),
     ("repro_project", "repro_project", None),
     ("runtime", "runtime_result.json", None),
@@ -32,10 +31,10 @@ STAGES = [
 
 # These stages enrich a case or package it for humans, but their absence must
 # not make a scientifically usable case look incomplete. The pipeline already
-# has explicit fallbacks for the architecture/Foundation pair and report DOCX
+# has explicit fallbacks for the architecture and report DOCX
 # rendering.
 OPTIONAL_STAGES = {
-    "paper_thesis", "scientific_architecture", "foundation_manifest",
+    "paper_thesis", "scientific_architecture",
     "review_docx", "reproduction_report_docx", "result_review_docx",
 }
 
@@ -55,7 +54,6 @@ RESUME_LABELS = {
     "experiment_index": "02e_build_experiment_index",
     "scientific_architecture": "02f_design_scientific_architecture",
     "environment_lock": "03a_environment_resolver",
-    "foundation_manifest": "03b_foundation_writer",
     "repro_project_manifest": "03c_task_writer_workflow",
     "repro_project": "03c_task_writer_workflow",
     "runtime": "03c_task_writer_workflow",
@@ -202,28 +200,6 @@ def inspect_stage(output_dir: Path, name: str, rel_path: str, schema_stage: str 
             "ok": ok,
             "path": str(path),
             "reason": "valid" if ok else "environment lock is not ready or trusted",
-        }
-
-    if name == "foundation_manifest":
-        try:
-            if path_is_foundation_link(path):
-                raise ValueError("Foundation manifest must not be a link or reparse point")
-            manifest = read_json(path)
-        except Exception as exc:
-            return {"stage": name, "ok": False, "path": str(path), "reason": f"invalid json: {exc}"}
-        snapshot_dir = output_dir / "audit" / "03b_foundation_snapshot"
-        try:
-            issues = validate_foundation_snapshot(manifest, snapshot_dir)
-        except OSError as exc:
-            issues = [{"path": str(snapshot_dir), "message": f"cannot inspect Foundation snapshot: {exc}"}]
-        ok = not issues
-        return {
-            "stage": name,
-            "ok": ok,
-            "path": str(path),
-            "snapshot_dir": str(snapshot_dir),
-            "reason": "valid" if ok else "invalid foundation snapshot",
-            "issues": issues[:5],
         }
 
     if name == "repro_project":

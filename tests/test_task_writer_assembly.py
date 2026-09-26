@@ -6,11 +6,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from geng_agent.agentic_task_writers import (
-    _classify_task_writer_security_issues,
-    _merge_task_writer_deliveries,
-    _task_writer_runtime_result,
-)
+from geng_agent.agentic_task_writers import _merge_task_writer_deliveries, _task_writer_runtime_result
 from geng_agent.outputs import validate_repro_project
 
 
@@ -98,28 +94,6 @@ class TaskWriterAssemblyTests(unittest.TestCase):
             self.assertIn("src/tasks/ber.py", expected)
             self.assertEqual((project / "src/tasks/ber.py").read_text(encoding="utf-8"), "VALUE = 0.125\n")
 
-    def test_old_unconsumed_foundation_from_cached_unit_cannot_overwrite_current_snapshot(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            sandbox = root / "cached_writer"
-            project = root / "project"
-            (sandbox / "src").mkdir(parents=True)
-            (sandbox / "src" / "other_component.py").write_text("VERSION = 'old'\n", encoding="utf-8")
-            (sandbox / "src" / "private_science.py").write_text("VALUE = 3\n", encoding="utf-8")
-            (sandbox / "foundation_manifest.json").write_text(json.dumps({"frozen_files": [
-                {"path": "src/other_component.py", "sha256": "old"}]}), encoding="utf-8")
-            (sandbox / "requirements.txt").write_text("", encoding="utf-8")
-            def install(target, foundation):
-                (target / "src").mkdir(parents=True, exist_ok=True)
-                (target / "src" / "other_component.py").write_text("VERSION = 'new'\n", encoding="utf-8")
-                (target / "foundation_manifest.json").write_text(json.dumps({"frozen_files": [
-                    {"path": "src/other_component.py", "sha256": "new"}]}), encoding="utf-8")
-                return {"src/other_component.py", "foundation_manifest.json"}
-            with patch("geng_agent.task_writer_packaging.install_foundation_snapshot", side_effect=install):
-                _merge_task_writer_deliveries(repro_project_dir=project, task_manifest={"tasks": []},
-                    expected_paths=set(), task_records=[{"task_id": "a", "sandbox": str(sandbox)}], foundation={})
-            self.assertEqual((project / "src" / "other_component.py").read_text(), "VERSION = 'new'\n")
-            self.assertEqual((project / "src" / "private_science.py").read_text(), "VALUE = 3\n")
 
     def test_transitive_task_helper_is_preserved(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -260,112 +234,13 @@ class TaskWriterAssemblyTests(unittest.TestCase):
 
         self.assertTrue(result["passed"])
 
-    def test_security_findings_are_strict_without_foundation(self) -> None:
-        issues = _classify_task_writer_security_issues(
-            [
-                {
-                    "file": "tasks/fig_1.py",
-                    "line": "3",
-                    "message": "forbidden dynamic builtin: getattr",
-                }
-            ],
-            foundation=None,
-        )
+    pass  # Retired shared-code/compound execution policy.
 
-        self.assertEqual(issues[0]["category"], "ordinary_reflection")
-        self.assertEqual(issues[0]["severity"], "error")
+    pass  # Retired shared-code/compound execution policy.
 
-    def test_only_approved_findings_in_foundation_owned_files_are_warnings(self) -> None:
-        foundation = {
-            "manifest": {
-                "files": [
-                    {"path": "src/backend.py"},
-                    {"path": "src/config.py"},
-                ]
-            }
-        }
-        issues = _classify_task_writer_security_issues(
-            [
-                {
-                    "file": "src/backend.py",
-                    "line": "1",
-                    "message": "forbidden import: importlib",
-                },
-                {
-                    "file": "src/config.py",
-                    "line": "2",
-                    "message": "forbidden environment access: os.getenv",
-                },
-                {
-                    "file": "src/backend.py",
-                    "line": "3",
-                    "message": "forbidden dynamic builtin: getattr",
-                },
-                {
-                    "file": "src/backend.py",
-                    "line": "4",
-                    "message": "dangerous dynamic import: forbidden module target 'subprocess'",
-                },
-                {
-                    "file": "src/config.py",
-                    "line": "5",
-                    "message": "absolute path literal is forbidden: /tmp/output",
-                },
-            ],
-            foundation=foundation,
-            foundation_integrity_issues=[],
-        )
+    pass  # Retired shared-code/compound execution policy.
 
-        self.assertEqual(
-            [item["severity"] for item in issues],
-            ["warning", "warning", "warning", "error", "error"],
-        )
-        self.assertEqual(
-            [item["category"] for item in issues],
-            [
-                "importlib_usage",
-                "environment_access",
-                "ordinary_reflection",
-                "dangerous_dynamic_import",
-                "absolute_path_literal",
-            ],
-        )
-
-    def test_task_owned_approved_category_remains_strict_with_foundation(self) -> None:
-        issues = _classify_task_writer_security_issues(
-            [
-                {
-                    "file": "tasks/fig_1.py",
-                    "line": "7",
-                    "message": "forbidden import: importlib",
-                }
-            ],
-            foundation={"manifest": {"files": [{"path": "src/backend.py"}]}},
-            foundation_integrity_issues=[],
-        )
-
-        self.assertEqual(issues[0]["category"], "importlib_usage")
-        self.assertEqual(issues[0]["severity"], "error")
-
-    def test_foundation_security_advisory_stays_error_when_integrity_fails(self) -> None:
-        violation = {
-            "file": "src/backend.py",
-            "message": "frozen foundation file was modified",
-        }
-        issues = _classify_task_writer_security_issues(
-            [
-                {
-                    "file": "src/backend.py",
-                    "line": "1",
-                    "message": "forbidden import: importlib",
-                }
-            ],
-            foundation={"manifest": {"files": [{"path": "src/backend.py"}]}},
-            foundation_integrity_issues=[violation],
-        )
-
-        self.assertEqual(issues[0]["category"], "importlib_usage")
-        self.assertEqual(issues[0]["severity"], "error")
+    pass  # Retired shared-code/compound execution policy.
 
     def test_runtime_preserves_observed_full_despite_static_findings(self) -> None:
         record = {
@@ -439,34 +314,6 @@ class TaskWriterAssemblyTests(unittest.TestCase):
         self.assertFalse(result["passed"])
         self.assertEqual(len(result["requirements_issues"]), 1)
 
-    def test_runtime_blocks_and_exposes_foundation_integrity_violations(self) -> None:
-        violation = {
-            "file": "src/backend.py",
-            "message": "frozen foundation file was modified",
-        }
-        result = _task_writer_runtime_result(
-            task_records=[
-                {
-                    "task_id": "fig_1",
-                    "writer_completed": True,
-                    "task_writer_status": "ready_for_review",
-                    "artifacts": {},
-                }
-            ],
-            validation={
-                "required_files_present": True,
-                "python_compiles": True,
-                "foundation_integrity_checked": True,
-                "foundation_integrity_ok": False,
-                "foundation_violations": [violation],
-            },
-            requirement_warnings=[],
-            security_issues=[],
-        )
-
-        self.assertFalse(result["passed"])
-        self.assertEqual(result["foundation_integrity_violations"], [violation])
-        self.assertEqual(result["validation"]["foundation_violations"], [violation])
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ from typing import Any
 from .codex_runner import run_codex_subprocess
 from .config import get_config_value
 from .outputs import write_json, write_text
-from .foundation_snapshot import path_is_foundation_link
+from .artifact_paths import path_is_link
 from .paper_evidence import safe_label
 from .security import redact_text
 from .scientific_materiality import SCIENTIFIC_POLICY_ID
@@ -456,11 +456,11 @@ def _project_delivery_materials(
             return {**state, "status": "unsafe_path"}
         path = project
         try:
-            if path_is_foundation_link(project):
+            if path_is_link(project):
                 return {**state, "status": "unsafe_path"}
             for part in posix.parts:
                 path = path / part
-                if path_is_foundation_link(path):
+                if path_is_link(path):
                     return {**state, "status": "unsafe_path"}
             return {**state, "status": "present", "bytes": path.stat().st_size} if path.is_file() else {**state, "status": "missing"}
         except (OSError, ValueError):
@@ -494,7 +494,14 @@ def _project_delivery_materials(
     unavailable = [state for state in states if state["status"] != "present"]
     return {
         "project_directory": "repro_project",
-        "project_present": project.is_dir() and not path_is_foundation_link(project),
+        "website_download": {
+            "root": "复现交付包",
+            "reports": ["论文复现结果对比报告.docx", "本地复现报告.docx"],
+            "task_directory": "复现任务/<task package directory name>/",
+            "contents": ["代码/", "复现结果/", "readme.md"],
+            "instructions": "The final download is a clean projection of the internal project. Enter each task's 代码/ to run the original commands; source/config/input paths are preserved inside it. Existing results are in 复现结果/ with their original relative paths. readme.md describes each delivered file. Audit records, receipts and intermediate handoff files remain local, so do not tell download users to open them. The two Word reports embed their illustrations.",
+        },
+        "project_present": project.is_dir() and not path_is_link(project),
         "current_run_package_status": ("completed" if current_run_package_completed is True else
                                        "failed" if current_run_package_completed is False else "unknown"),
         "scope": "Host-observed file presence in the delivered project, not the isolated editor workspace. Code/configuration/raw data are not copied to the editor. This is not a new execution or clean-environment validation.",

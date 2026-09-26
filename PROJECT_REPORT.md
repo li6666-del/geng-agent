@@ -44,56 +44,30 @@ OpenAI-compatible LLM 只保留为前两阶段显式兼容路径；第三阶段�
    - `documents.py` 读取 PDF/TXT/Markdown。
    - PDF 同时提取文本块并渲染页面 PNG。
 
-2. **工程事实抽取**
-   - 启动一个覆盖文本、公式、页面图像、表格和实验设置的 Codex 事实专家，生成高召回实验地图 `engineering_facts_initial.json`。
-   - 本轮优先覆盖全部数值实验目标和核心模型、指标、算法、baseline，不为边缘事实反复扫描全文。
-   - 视觉近似读数、附录公式、bound 和相互冲突的观察均保留来源、置信度与误差说明；程序只做结构规范化，不按内容类别删除事实。
+2. **论文理解**
+   - 同一分析调用读取原文并生成事实和核心主张，保留事实来源、假设和未解决信息。
+   - 原始交付直接传递；宿主不按事实条数、字段措辞或科学内容拒收。
 
-3. **初步任务与定向回补**
-   - Codex 任务设计专家生成 `repro_tasks_preliminary.json`。
-   - 同一 figure/subfigure、同一指标、可共享仿真的曲线、baseline 和参数点优先合并成一个任务。
-   - 每个任务用 `missing_fact_requests.required_fields` 精确声明会改变代码、配置或验收的缺失证据。
-   - 程序按稳定请求键和字段 ID 合并去重；初步任务专家先输出 `backfill_handoff`，事实专家只处理其中明确选择的 blocker。
-   - 每轮结束后任务专家再次软交接；同一未解字段最多搜索两次，第三轮只容纳新暴露的 blocker，不按“无新增事实”反复空转。
+3. **联合规划与定向补查**
+   - 同一规划者决定最终任务清单和可选科学架构；同时权衡科学依赖、单个 Writer 工作量、独立验收与修订能力和并行收益，在计划说明中简述划分理由。共同实现的小变体可合并，工作量明显不同且可独立完成的目标可拆分；保留全部必要目标、条件和分别的结果，减少无关附加实验。
+   - 只有规划者提出的阻塞缺口进入补查；主持人决定例外恢复，规划者联合修订任务和架构。
+   - 宿主不再编译 strong/weak 分组，不设置 Foundation。组件绑定只提供实现上下文。
 
-4. **任务定稿与论文主张**
-   - 初始事实与回补事实语义合并为最终 `engineering_facts.json`，未解析请求保留为显式缺失信息。
-   - Python 保存分析智能体的原始交付并传递给下游，不按 JSON 字段形状、事实条数或科学表述预先否决。解析失败时保留原文和错误；实际消费者无法执行时由主持人决定修复归属。
-   - 无条件生成 `paper_thesis.json`，记录中心结论、作用机制、方法排序、适用区间和 caveat。
-   - `experiment_index.py` 生成 v2 实验索引，只记录实体、参数、baseline、验收标准和证据缺口，不预测运行结果。
-   - 新案例由 Architecture Agent 生成 `scientific_architecture.json`，跨文档校验 task/experiment/component/quantity 引用以及共享作用域。
-   - Foundation Writer 顺序生成共享 `src/` 和契约测试，验证通过后保存内容寻址快照；并行 task writer 不得修改共享层。
+4. **完整任务实现与文件传递**
+   - 每个最终任务分配一个独立 Writer，拥有完整源码、配置、测试及私有环境；无依赖任务并行。
+   - 确需传递训练检查点或数据时，消费任务用 `depends_on` 声明生产者和文件；上游交付后复制给消费方，缺失情况也交给消费方。
+   - 宿主记录实际运行与异常。日志或收据观测失败不会终止进程，也不替 Reporter 重判结论。用户主动停止仍可终止所拥有的进程树。
 
-5. **任务级自治复现**
-   - `agentic_task_writers.py` 为每个任务创建独立 sandbox。
-   - v2 sandbox 先安装完全相同的 Foundation snapshot；其哈希参与 writer cache key，Foundation 改变时旧任务结果自动失效。
-   - 最终项目按逻辑任务分别交付；每个任务目录包含其执行单元所用完整源码、配置、结果与证据，有 Foundation 时也包含共享快照。强依赖任务的目录注明共同执行关系；根目录只作索引。
-   - 每个 sandbox 都包含原始论文、全论文页面图和前两轮最终定稿产物；全论文页面图直接发送给 writer，不再筛选任务页，任务相关事实摘要只作为文本导航。
-   - 有几个复现任务就同时启动几个 writer，不按本机资源缩减并发。
-   - writer 在独立 sandbox 内自主修改代码、配置、README 和 requirements，自行探测并选择 CPU/GPU。
-   - 开启 `--run-repro` 时，writer 直接运行 smoke/full；主持人不拦截命令、不分配资源也不中途打断。
-   - 抽取事实缺少参数时，writer 继续检索原论文 PDF、caption、公式、表格和附录；仍缺失时才建立显式科学假设。假设可补全未说明的值或实现步骤，但不得覆盖论文明确的数据、模型、公式或核心算法。
-   - writer 首先核验明确事实和任务核心观点，再把剩余问题区分为材料性 blocker、合理的论文空白假设和非材料差异；只有材料性 blocker 才继续修改和 full。
-   - Writer 采用直接循环：full 运行、证据分级、提出具体修改方针、修改并再次 full；不设置固定轮数，也不盲从与论文冲突的 Reporter 建议或为非阻塞差异机械重跑。
-   - 对适合批量矩阵或 Monte Carlo 的重计算，CUDA 可用时优先实现真实 Torch CUDA 路径；backend 标签本身不算 GPU 运行证据。
-   - writer 提交 `ready_for_review` 时必须交付执行摘要、本地图和 CSV/summary；无效交付在同一 sandbox 自动续跑。
-   - Writer 不能授予最终 matched；只有外部 Codex、网络、额度或运行环境错误可以中止候选生成。
+5. **独立审查与主持人恢复**
+   - 每个 Writer 交付后立即启动对应 Reporter，逐实验核对原文、实现、假设和结果，不等待其他独立任务。
+   - 科学结论由 Reporter 给出；主持人决定是否修复、找谁修复或保留当前结果。无宿主固定重试上限、无代码变化指纹批准关卡。
+   - 真实无法派发、工具运行失败或读不到必要输入时请求修复；修复工具本身失败也回到主持人，不由宿主伪造停止决定。
 
-6. **任务级闭环调度**
-   - 每个 writer 完成可靠 full 后立即进入对应 task reporter，不等待其他任务。
-   - 主持人只校验任务覆盖、运行证据路径和基础代码健康，不参与科学裁决。
-   - task reporter 拒绝时只重启失败任务，已通过任务冻结；裁图或证据问题只重跑对应 reporter。
-
-7. **任务级 Codex 审查与报告阶段**
-   - 一个任务对应一个隔离 task reporter；它只读取本任务的 writer 产物、任务证据和完整论文。
-   - task reporter 直接生成任务级 `accepted/revise` 裁决；明确事实被实质违反或核心观点未获支持，且存在论文证据支撑的可执行修改时才返回对应 writer。合理、公开的论文空白假设可有条件通过，裁图或证据问题只重跑对应 reporter。
-   - task reporter 为本任务定位并裁切准确的论文原图/子图；writer 不再生成 `paper_target_figure.json`。
-   - 独立 Final Report Editor 撰写两份详细 Markdown，并自行编写、运行 `report_layout.py` 生成对应 Word；宿主只检查和交付，简短导航可选。
-   - `review.md/docx`：主审查报告。
-   - `reproduction_report.md/docx`：逐任务关键参数、运行配置和假设。
-   - `result_review.md/docx`：本地图与论文裁切图对比、结论、差异和原因，不包含 writer 自迭代附录。
-   - `review.md/docx`：事实、任务、运行覆盖、风险和最终复现结论。
-   - `runtime_result.json`、`risk_report.json`、`generated_files.json`、`run_cost.json`：内部审计与状态。
+6. **按任务交付与两份中文报告**
+   - 各任务完整代码、环境说明、配置、上游输入、运行结果和记录分别打包。打包失败时主持人可安排修复或保留部分交付后继续报告。
+   - 已有编辑智能体生成两份中文 Markdown，并自行编写、执行排版脚本生成 Word；宿主不代写正文。
+   - `reproduction_report.md/docx` 保存详细执行和追溯记录；`result_review.md/docx` 展示任务结论与本地/原文并列结果图，按实际需要介绍差距和人工核查建议。
+   - 本轮变更与恢复边界见 [按任务的智能体工作流](docs/task_owned_architecture.md)。
 
 ## 4. 关键模块
 
@@ -137,7 +111,6 @@ case_xxx/
   repro_tasks.json
   experiment_index.json
   scientific_architecture.json
-  foundation_manifest.json
   repro_project_manifest.json
   runtime_result.json
   report_assets/

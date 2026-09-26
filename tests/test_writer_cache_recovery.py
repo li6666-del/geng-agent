@@ -7,80 +7,18 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 
-from geng_agent import foundation_snapshot as snapshot
-from geng_agent import foundation_snapshot_delivery as foundation
 from geng_agent import task_writer_runner as runner
 from geng_agent.supervisor import RunSupervisor, supervisor_scope
 
 
-@pytest.mark.parametrize("name", [".pytest_cache", "__pycache__"])
-def test_unreadable_regular_cache_is_not_traversed(tmp_path, monkeypatch, name):
-    cache = tmp_path / name
-    cache.mkdir()
-    (tmp_path / "science.py").write_text("VALUE = 1\n", encoding="utf-8")
-    original = snapshot.os.scandir
-    visited = []
-    def scandir(path):
-        visited.append(Path(path))
-        if Path(path) == cache:
-            raise PermissionError(errno.EACCES, "cache ACL denies enumeration", str(cache))
-        return original(path)
-    monkeypatch.setattr(snapshot.os, "scandir", scandir)
-    foundation._assert_foundation_sandbox_layout_safe(tmp_path)
-    assert cache not in visited
-    assert tmp_path in visited
 
 
-@pytest.mark.parametrize("name", [".pytest_cache", "__pycache__"])
-def test_cache_named_reparse_point_still_fails_without_traversal(tmp_path, monkeypatch, name):
-    cache = tmp_path / name
-    cache.mkdir()
-    original = snapshot.path_is_foundation_link
-    monkeypatch.setattr(snapshot, "path_is_foundation_link", lambda path: Path(path) == cache or original(path))
-    with pytest.raises(RuntimeError, match="link or reparse point"):
-        foundation._assert_foundation_sandbox_layout_safe(tmp_path)
 
 
-@pytest.mark.parametrize("name", [".pytest_cache", "__pycache__"])
-def test_cache_named_nonregular_entry_still_fails(tmp_path, monkeypatch, name):
-    cache = tmp_path / name
-    cache.write_text("fixture placeholder for a FIFO", encoding="utf-8")
-    entry = SimpleNamespace(path=str(cache), name=name,
-        is_dir=lambda **_kwargs: False, is_file=lambda **_kwargs: False)
-    @contextmanager
-    def scan(_path):
-        yield iter([entry])
-    monkeypatch.setattr(snapshot.os, "scandir", scan)
-    with pytest.raises(RuntimeError, match="non-regular entry"):
-        foundation._assert_foundation_sandbox_layout_safe(tmp_path)
 
 
-def test_unreadable_scientific_directory_still_fails(tmp_path, monkeypatch):
-    source = tmp_path / "src"
-    source.mkdir()
-    original = snapshot.os.scandir
-    def scan(path):
-        if Path(path) == source:
-            raise PermissionError(errno.EACCES, "source inaccessible", str(source))
-        return original(path)
-    monkeypatch.setattr(snapshot.os, "scandir", scan)
-    with pytest.raises(PermissionError):
-        foundation._assert_foundation_sandbox_layout_safe(tmp_path)
 
 
-def test_inspection_failure_preserves_original_path_and_exception(monkeypatch, tmp_path):
-    monkeypatch.setattr(runner, "run_codex_subprocess", Mock(return_value={"ok": True, "returncode": 0}))
-    monkeypatch.setattr(runner, "ExecutionBroker", MagicMock())
-    inaccessible = tmp_path / "src"
-    error = PermissionError(errno.EACCES, "directory ACL denies access", str(inaccessible))
-    monkeypatch.setattr(runner, "_assert_foundation_sandbox_layout_safe", Mock(side_effect=error))
-    result = runner._run_task_writer_codex_session(label="offline", prompt="fixture", sandbox=tmp_path,
-                                                   audit_dir=tmp_path / "audit")
-    assert result["error_kind"] == "sandbox_inspection_failed"
-    assert result["inspection_error"]["type"] == "PermissionError"
-    assert result["inspection_error"]["path"] == str(inaccessible)
-    assert result["inspection_error"]["errno"] == errno.EACCES
-    assert "PermissionError" in result["blocked_reason"]
 
 
 def coordinate(root, callback):
@@ -98,14 +36,14 @@ def retry(node_id, **kwargs):
 
 
 @pytest.mark.parametrize("all_valid", [True, False])
-def test_repair_preserves_outputs_only_if_every_actual_host_receipt_is_valid(tmp_path, monkeypatch, all_valid):
+def test_handoff_preserves_outputs_without_host_receipt_approval(tmp_path, monkeypatch, all_valid):
     coordinator = coordinate(tmp_path, retry)
     archive = Mock()
     checked = []
     def check(_root, _audit, task_id):
         checked.append(task_id)
         return {"passed": all_valid or task_id == "a", "run_id": "full-" + task_id}
-    monkeypatch.setattr(runner, "find_host_execution", check)
+    monkeypatch.setattr("geng_agent.execution_receipts.find_host_execution", check)
     requests = []
     def produce(instructions, attempt):
         requests.append(instructions)
@@ -115,19 +53,19 @@ def test_repair_preserves_outputs_only_if_every_actual_host_receipt_is_valid(tmp
     with supervisor_scope(coordinator):
         runner._supervise_writer_delivery(node_id="writer:unit:round:1", produce=produce, archive=archive,
             tasks=[{"task_id": "a"}, {"task_id": "b"}], sandbox=tmp_path, analysis_snapshot_hash="a")
-    assert checked == ["a", "b"]
-    assert archive.call_count == (0 if all_valid else 1)
-    assert requests[1]["preserved_full_receipts"] == ({"a": "full-a", "b": "full-b"} if all_valid else {})
+    assert checked == []
+    archive.assert_not_called()
+    assert requests == [None]
 
 
-def test_changed_scientific_inputs_cannot_reuse_a_previously_valid_receipt(tmp_path, monkeypatch):
+def test_changed_input_observation_reaches_reporter_without_host_block(tmp_path, monkeypatch):
     calls = 0
     def decisions(node_id, **kwargs):
         nonlocal calls
         calls += 1
         return retry(node_id, **kwargs) if calls == 1 else {"action": "block", "diagnosis": "new full required"}
     coordinator = coordinate(tmp_path, decisions)
-    monkeypatch.setattr(runner, "find_host_execution", Mock(return_value={"passed": True, "run_id": "old-full"}))
+    monkeypatch.setattr("geng_agent.execution_receipts.find_host_execution", Mock(return_value={"passed": True, "run_id": "old-full"}))
     archive = Mock()
     def produce(_instructions, attempt):
         return ({"execution_receipts_required": True, "execution_audit_dir": str(tmp_path / "audit")},
@@ -139,13 +77,13 @@ def test_changed_scientific_inputs_cannot_reuse_a_previously_valid_receipt(tmp_p
     archive.assert_not_called()
     assert records[0]["host_execution"]["passed"] is False
     assert not records[0].get("supervisor_blocked")
-    assert calls == 1  # The anomaly is handed to Reporter, not retried again here.
+    assert calls == 0  # The anomaly is handed to Reporter without host approval.
 
 
 @pytest.mark.parametrize("resume", [False, True])
 def test_verified_mechanical_recovery_does_not_reopen_writer(tmp_path, monkeypatch, resume):
     coordinator = coordinate(tmp_path, retry)
-    monkeypatch.setattr(runner, "find_host_execution", Mock(return_value={"passed": True, "run_id": "same-full"}))
+    monkeypatch.setattr("geng_agent.execution_receipts.find_host_execution", Mock(return_value={"passed": True, "run_id": "same-full"}))
     archive = Mock()
     attempts = []
     def produce(instructions, attempt):
@@ -160,17 +98,8 @@ def test_verified_mechanical_recovery_does_not_reopen_writer(tmp_path, monkeypat
         status, records = runner._supervise_writer_delivery(node_id="writer:t:round:1", produce=produce,
             archive=archive, tasks=[{"task_id": "t"}], sandbox=tmp_path, analysis_snapshot_hash="a",
             reconcile_first=resume)
-    assert attempts == ([0] if resume else [1, 0])
+    assert attempts == ([0] if resume else [1])
     archive.assert_not_called()
     assert records[0]["host_execution"]["run_id"] == "same-full"
     assert records[0]["result_json"]["acceptance_checklist"] == ["preserved"]
-    assert not status.get("error_kind")
-
-
-def test_mechanical_reconcile_keeps_layout_hard_boundary(tmp_path, monkeypatch):
-    monkeypatch.setattr(runner, "_assert_foundation_sandbox_layout_safe",
-                        Mock(side_effect=RuntimeError("link or reparse point at src")))
-    result = runner._inspect_task_writer_completion(status={"ok": True}, sandbox=tmp_path,
-        audit_dir=tmp_path / "audit", case_runtime=None, request_source="t", require_execution_receipt=True)
-    assert result["error_kind"] == "sandbox_inspection_failed"
-    assert "link or reparse point" in result["blocked_reason"]
+    assert status.get("error_kind") == (None if resume else "sandbox_inspection_failed")

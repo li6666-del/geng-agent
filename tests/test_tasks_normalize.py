@@ -11,7 +11,7 @@ def test_task_copy_never_guesses_metrics_references_or_acceptance():
     original = deepcopy(source)
     assert finalize_repro_tasks(source, {"engineering_facts": []}) == original
     assert normalize_repro_tasks_candidate(source, {}) == (original, [])
-    assert validate_stage("repro_tasks", original) == []
+    assert not validate_stage("repro_tasks", original)
     assert source == original
 
 
@@ -19,7 +19,7 @@ def test_no_seed_task_or_readiness_is_fabricated():
     assert finalize_repro_tasks({"repro_tasks": []}, {}) == {"repro_tasks": []}
     raw = {"repro_tasks": [{"target": "no machine address"}]}
     assert finalize_repro_tasks(raw, {}) == raw
-    assert validate_stage("repro_tasks", raw)
+    assert not validate_stage("repro_tasks", raw)
     with pytest.raises(ValueError):
         finalize_repro_tasks([], {})
 

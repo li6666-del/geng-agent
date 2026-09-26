@@ -17,7 +17,6 @@ from geng_agent.analysis_prompt_context import (
 )
 from geng_agent.llm import LLMImage, OpenAICompatibleClient
 from geng_agent.pipeline import ReviewPipeline
-from tests.test_scientific_architecture import _inputs
 
 
 IMAGE = LLMImage(label="paper_page:1", mime_type="image/png", data_b64="QQ==")

@@ -189,7 +189,7 @@ def _probe_nvidia_devices() -> dict[str, Any]:
 
     This intentionally uses ``nvidia-smi`` instead of importing a deep-learning
     framework. Importability and hardware presence are separate facts; the
-    generated Foundation must still verify that its selected framework can
+    generated Writer must still verify that its selected framework can
     actually use the requested device at runtime.
     """
 
@@ -452,7 +452,7 @@ def architecture_capability_inventory(
     particular, a missing package must never make the designer silently replace
     a trainable/autograd component with a NumPy approximation. The architecture
     should declare the scientifically appropriate execution contract and let the
-    Foundation report an explicit dependency or runtime-capability gap.
+    Writer report an explicit dependency or runtime-capability gap.
     """
 
     current = report or check_environment()
@@ -487,7 +487,7 @@ def architecture_capability_inventory(
         ],
         "interpretation": {
             "package_importable_does_not_prove_device_usable": True,
-            "foundation_must_runtime_verify_selected_backend": True,
+            "writer_must_runtime_verify_selected_backend": True,
             "missing_package_must_not_trigger_silent_scientific_downgrade": True,
         },
     }

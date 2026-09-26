@@ -22,7 +22,7 @@ def test_package_freeze_does_not_run_an_extra_experiment_or_static_judgment(tmp_
     manifest, result = packaging._freeze_repro_project_package(
         repro_project_dir=project, output_dir=tmp_path, audit_path=tmp_path / "audit.json",
         task_manifest={"tasks": []}, expected_paths={"optional_diagnostic.py", "config.json"},
-        analysis_snapshot_hash="a", foundation_snapshot_hash="", environment_hash="e", run_smoke=True,
+        analysis_snapshot_hash="a", environment_hash="e", run_smoke=True,
         contextual_findings=[{"code": "optional_diagnostic_unchecked"}])
     assert result["portable"] is True
     assert result["smoke"]["ran"] is False
@@ -50,7 +50,7 @@ def lineage_fixture(tmp_path, path="execution_units/unit/model.bin"):
     return writer, project
 
 
-def test_lineage_description_conflicts_are_observations_and_not_invented_provenance(tmp_path):
+def test_lineage_preserves_agent_descriptions_without_strong_weak_inference(tmp_path):
     writer, project = lineage_fixture(tmp_path)
     plan = {"execution_units": [{"dependencies": [
         {"artifact_id": "model", "producer_task_id": "train", "consumer_task_id": "evaluate", "strength": "strong"},
@@ -59,8 +59,7 @@ def test_lineage_description_conflicts_are_observations_and_not_invented_provena
     result = packaging._build_artifact_lineage(repro_project_dir=project, execution_plan=plan,
         task_records=[{"task_id": "train", "execution_unit_id": "unit", "sandbox": str(writer)}], require_lineage=True)
     assert result["artifacts"][0]["producer_task_id"] == "different-wording"
-    assert {item["code"] for item in result["observations"]} == {
-        "producer_description_differs", "strong_artifact_description_missing"}
+    assert result["observations"] == []
 
 
 def test_lineage_never_resolves_an_unsafe_path(tmp_path):

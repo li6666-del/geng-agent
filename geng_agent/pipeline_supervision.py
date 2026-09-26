@@ -111,7 +111,7 @@ def run_supervised_pipeline(*, context, supervisor: RunSupervisor,
             else:
                 execution_incomplete = getattr(execution, "runtime_result", {}).get("delivery_status") in {"partial", "blocked"}
                 if "execution" not in completed or execution_incomplete:
-                    add("execution", "调用环境、Foundation、并行 Writer/Reporter 与组装工具；保留已有执行证据。", lambda: execute(analysis))
+                    add("execution", "调用环境、并行 Writer/Reporter 与组装工具；保留已有执行证据。", lambda: execute(analysis))
                 if execution is not None and (result is None or not getattr(result, "result_review_passed", False)):
                     add("reports", "用本次已有证据生成报告，可交付未复现或工程受阻的结果。", lambda: report(analysis, execution))
         return capabilities

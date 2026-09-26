@@ -16,54 +16,30 @@ def _relationship(task_ids, *, strength="weak", kind="shared_definition", **extr
     return {"task_ids": task_ids, "strength": strength, "kind": kind, **extra}
 
 
-def test_shared_deterministic_science_leaves_distinct_goals_independent():
-    task_ids = ["accuracy", "interval_ranking", "tail_limit", "order_sweep"]
-    plan = compile_execution_plan({
-        "repro_tasks": [_task(task_id) for task_id in task_ids],
-        "execution_relationships": [_relationship(task_ids, rationale="Same frozen evaluator and grid")],
-    })
-
-    assert [unit["task_ids"] for unit in plan["execution_units"]] == [[task_id] for task_id in task_ids]
-    assert len(plan["weak_consistency_groups"]) == 1
-    assert len(plan["weak_consistency_groups"][0]["execution_unit_ids"]) == 4
+def test_planner_merge_is_a_real_single_task():
+    task = {**_task("joint"), "experiments": [
+        {"experiment_id":"train", "goal":"train a checkpoint"},
+        {"experiment_id":"ber", "goal":"evaluate the same checkpoint"}]}
+    plan = compile_execution_plan({"repro_tasks":[task]})
+    assert plan["execution_unit_count"] == 1
+    assert plan["execution_units"][0]["task_ids"] == ["joint"]
+    assert len(task["experiments"]) == 2
 
 
-def test_real_state_flow_and_paired_samples_survive_independent_definitions():
-    tasks = ["train", "evaluate_ber", "evaluate_similarity", "paired_a", "paired_b", "analytic_bound"]
-    plan = compile_execution_plan({
-        "repro_tasks": [_task(task_id) for task_id in tasks],
-        "execution_relationships": [
-            _relationship(tasks[:3], strength="strong", kind="checkpoint_flow",
-                          producer_task_id="train", consumer_task_ids=tasks[1:3],
-                          artifact_ids=["selected_checkpoint"]),
-            _relationship(tasks[3:5], strength="strong", kind="shared_random_realization",
-                          artifact_ids=["paired_channel_samples"]),
-            _relationship(["evaluate_ber", "paired_a", "analytic_bound"]),
-        ],
-    })
-
-    assert [unit["task_ids"] for unit in plan["execution_units"]] == [tasks[:3], tasks[3:5], tasks[5:]]
-    dependencies = plan["execution_units"][0]["dependencies"]
-    assert {(item["producer_task_id"], item["consumer_task_id"], item["artifact_id"])
-            for item in dependencies} == {
-        ("train", "evaluate_ber", "selected_checkpoint"),
-        ("train", "evaluate_similarity", "selected_checkpoint"),
-    }
+def test_explicit_file_dependency_remains_separate_task():
+    consumer = {**_task("evaluate"), "depends_on":[{"task_id":"train","artifacts":["model.pt"]}]}
+    plan = compile_execution_plan({"repro_tasks":[_task("train"),consumer]})
+    assert plan["execution_unit_count"] == 2
+    assert plan["execution_units"][1]["depends_on"] == consumer["depends_on"]
 
 
-def test_host_neither_invents_dependencies_nor_downgrades_explicit_strong():
-    task_ids = ["checkpoint_analysis", "checkpoint_ranking"]
-    document = {"repro_tasks": [_task(task_id) for task_id in task_ids]}
+def test_legacy_relationships_do_not_override_final_tasks():
+    document = {"repro_tasks":[_task("a"),_task("b")],
+                "execution_relationships":[_relationship(["a","b"],strength="strong")]}
     assert compile_execution_plan(document)["execution_unit_count"] == 2
-    # Even a questionable explanation is not authorization for host semantic judgment.
-    document["execution_relationships"] = [_relationship(
-        task_ids, strength="strong", kind="same_run_outputs",
-        rationale="Both cite one figure and recompute deterministic values",
-    )]
-    assert compile_execution_plan(document)["execution_unit_count"] == 1
 
 
-def test_actual_combined_planner_receives_independence_and_state_protection(monkeypatch, tmp_path):
+def test_actual_combined_planner_receives_balanced_boundaries_and_state_protection(monkeypatch, tmp_path):
     pipeline = ReviewPipeline()
     captured = {}
 
@@ -82,12 +58,16 @@ def test_actual_combined_planner_receives_independence_and_state_protection(monk
                          paper_images=[], figure_index={}, host_capabilities={})
 
     prompt = captured["prompt"]
-    assert "independent Writer by default" in prompt
-    assert "deterministic recalculation" in prompt
-    assert "Foundation supplies the same implementation" in prompt
-    assert "Uncertainty is not a reason to guess strong" in prompt
-    assert "Preserve every scientifically necessary dependency" in prompt
-    assert "does not reinterpret prose to weaken them" in prompt
-    # These architecture rules are injected by the real combined entry point.
-    assert "Shared deterministic definitions can normally run in independent Writers" in prompt
-    assert "do not drop scientifically necessary state to gain concurrency" in prompt
+    assert "single Writer's workload" in prompt
+    assert "independent review and repair" in prompt
+    assert "brief rationale in Chinese" in prompt
+    assert "Avoid unnecessary supplementary experiments" in prompt
+    assert "producer\nhandoff follows its Writer/Reporter process" in prompt
+    assert "Component reuse or compatible implementations must not silently merge tasks" in prompt
+    assert "ONE task with ONE task_id" not in prompt
+    assert "already merged compatible experiments" not in prompt
+    assert "Preserve every" in prompt
+    assert "original goal, condition, baseline" in prompt
+    assert "Each final task receives one independent Reporter" in prompt
+    assert "consumer task's `depends_on` list" in prompt
+    assert "does not infer mergers" in prompt

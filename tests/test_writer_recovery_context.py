@@ -8,7 +8,6 @@ import pytest
 from types import SimpleNamespace
 from pathlib import Path
 
-from geng_agent import agentic_foundation as foundation
 from geng_agent.execution_receipts import ExecutionBroker, file_hash
 from geng_agent.task_writer_prompts import (_build_task_writer_brief,
     _build_task_writer_continuation_brief, _task_experiment_index)
@@ -16,41 +15,6 @@ from geng_agent.writer_recovery import localize_writer_feedback, writer_recovery
 from geng_agent import execution_client
 
 
-def test_foundation_repair_restores_implementation_and_actual_validation_failure(monkeypatch, tmp_path):
-    audit, output = tmp_path / 'audit', tmp_path / 'output'
-    audit.mkdir(); output.mkdir()
-    delivery = {'trusted_changed': []}
-    validation = {'ok': False, 'issues': [{'file': 'src/model.py', 'message': 'wrong channel normalization'}],
-                  'tests': {'returncode': 1, 'stderr': 'test_unit_power: AssertionError'}}
-    for name, value in {
-        '_collect_writer_analysis_artifacts': {'scientific_architecture.json': tmp_path / 'architecture.json'},
-        '_missing_required_analysis_artifacts': [], '_analysis_snapshot_hash': 'analysis',
-        '_foundation_input_hash': 'input', '_load_cached_foundation': None,
-        'load_foundation_writer_delivery': delivery, '_load_foundation_validation_record': validation,
-        '_required_foundation_modules': {'src/model.py'}, 'persist_foundation_writer_delivery': delivery,
-        '_finalize_foundation_delivery': {'repaired': True}, '_write_paper_evidence_bundle': None,
-    }.items():
-        monkeypatch.setattr(foundation, name, lambda *a, _value=value, **kw: _value)
-    restored = []
-    def restore(*, sandbox, **kw):
-        (sandbox / 'src').mkdir(parents=True, exist_ok=True)
-        (sandbox / 'src/model.py').write_text('existing_model = 123\n', encoding='utf8')
-        (sandbox / 'requirements.txt').write_text('numpy\nmatplotlib\n', encoding='utf8')
-        restored.append(sandbox)
-    monkeypatch.setattr(foundation, 'restore_foundation_writer_delivery', restore)
-    seen = []
-    def worker(*, work_dir, prompt, **kw):
-        assert (work_dir / 'src/model.py').read_text() == 'existing_model = 123\n'
-        assert json.loads((work_dir / 'foundation_validation_feedback.json').read_text()) == validation
-        assert 'wrong channel normalization' in prompt and 'test_unit_power: AssertionError' in prompt
-        seen.append(prompt)
-        return {'ok': True}
-    monkeypatch.setattr(foundation, 'run_codex_subprocess', worker)
-    result = foundation.run_codex_foundation_writer_workflow(facts={}, tasks={}, experiment_index={},
-        scientific_architecture={}, paper={}, paper_path=tmp_path/'paper.pdf', paper_images=[],
-        paper_thesis=None, output_dir=output, audit_dir=audit, resume=True,
-        recovery_instructions={"action": "retry", "instructions": "Repair the normalization and its failing unit-power test."})
-    assert result == {'repaired': True} and len(seen) == 1 and restored
 
 
 def test_feedback_references_reuse_identical_local_files_and_preserve_changed_reviewed_bytes(tmp_path):

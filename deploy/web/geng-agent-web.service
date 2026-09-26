@@ -1,0 +1,26 @@
+[Unit]
+Description=BUPT Geng Agent paper portal
+After=network.target
+
+[Service]
+Type=simple
+User=geng-web
+Group=geng-web
+WorkingDirectory=/opt/geng-agent-web/current
+EnvironmentFile=/etc/geng-agent-web.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+Environment=TMPDIR=/var/lib/geng-agent-web/tmp
+ExecStart=/opt/geng-agent-web/venv/bin/python -m uvicorn geng_agent.web.app:app --host 127.0.0.1 --port 8768 --proxy-headers --forwarded-allow-ips=127.0.0.1
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/geng-agent-web
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

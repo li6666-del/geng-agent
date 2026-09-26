@@ -18,7 +18,7 @@ from .case_environment import (
 CASE_RUNTIME_DIRNAME = "03a_case_environment"
 WRITER_ENVIRONMENT_REQUEST_FILENAME = "environment_request.json"
 HOST_SHARED_RUNTIME_MODE = "host_shared"
-_FOUNDATION_BASELINE_REQUIREMENTS = ("numpy", "matplotlib")
+_PROJECT_BASELINE_REQUIREMENTS = ("numpy", "matplotlib")
 _LOCAL_RUNTIME_NAMES = {
     "builtin",
     "builtins",

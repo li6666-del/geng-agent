@@ -10,9 +10,8 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 from uuid import uuid4
 
-from .agentic_foundation import install_foundation_snapshot
 from .case_runtime import CaseRuntime
-from .foundation_snapshot import path_is_foundation_link
+from .artifact_paths import path_is_link
 from .outputs import write_json, write_text
 from .paper_evidence import safe_label
 from .project_portability import (
@@ -38,7 +37,6 @@ def _freeze_repro_project_package(
     task_manifest: dict[str, Any],
     expected_paths: set[str],
     analysis_snapshot_hash: str,
-    foundation_snapshot_hash: str,
     environment_hash: str,
     run_smoke: bool,
     python_executable: Path | None = None,
@@ -109,7 +107,6 @@ def _freeze_repro_project_package(
     manifest["_meta"]["mode"] = "task_writers"
     manifest["_meta"]["package_layout"] = package_layout
     manifest["_meta"]["analysis_snapshot_hash"] = analysis_snapshot_hash
-    manifest["_meta"]["foundation_snapshot_hash"] = foundation_snapshot_hash or None
     manifest["_meta"]["environment_lock_hash"] = environment_hash or None
     inventory = portability.get("inventory")
     manifest["_meta"]["source_inventory_sha256"] = (
@@ -127,19 +124,16 @@ def _package_task_directories(
     task_manifest: dict[str, Any],
     task_records: list[dict[str, Any]],
     execution_plan: dict[str, Any],
-    foundation: dict[str, Any] | None,
     case_runtime: CaseRuntime | None,
     analysis_snapshot_hash: str,
-    foundation_snapshot_hash: str,
     environment_hash: str,
     require_lineage: bool,
 ) -> tuple[set[str], dict[str, Any], dict[str, Any]]:
-    """Deliver one runnable folder per task, retaining its whole execution unit.
+    """Deliver one runnable folder per final task and its supplied inputs.
 
-    A strong relationship can put several tasks in one Writer sandbox. Each
-    task's folder then contains that full executed unit, including shared
-    checkpoints and companion tasks; the index records that the folders refer
-    to the same run. The aggregate root never claims to be a unified program.
+    Historical multi-task sandboxes retain their original files when packaged;
+    new plans always dispatch one complete task per Writer. The aggregate root
+    never claims to be a unified scientific program.
     Build it beside the current project so a failed attempt preserves the old
     tree and every Writer sandbox for supervisor recovery.
     """
@@ -149,7 +143,7 @@ def _package_task_directories(
             path.resolve().relative_to(case_root)
         except ValueError as exc:
             raise ValueError("package destinations must stay inside the case") from exc
-    if path_is_foundation_link(repro_project_dir) or path_is_foundation_link(audit_dir):
+    if path_is_link(repro_project_dir) or path_is_link(audit_dir):
         raise ValueError("linked package destination")
 
     stage = audit_dir / "pkg_stages" / uuid4().hex[:8]
@@ -181,7 +175,7 @@ def _package_task_directories(
         unit_manifest = {**task_manifest, "tasks": entries, "execution_units": [unit]}
         unit_plan = {**execution_plan, "execution_units": [unit],
                      "task_to_execution_unit": {task_id: unit_id for task_id in task_ids},
-                     "weak_consistency_groups": []}
+                     "task_policy": "planner_final_tasks"}
         for task_id in task_ids:
             index = task_order[task_id]
             relative_root = f"task_packages/t{index:02d}_{safe_label(task_id)}"
@@ -189,7 +183,7 @@ def _package_task_directories(
             _prepare_project_workspace(task_root, unit_manifest)
             task_expected = _merge_task_writer_deliveries(
                 repro_project_dir=task_root, task_manifest=unit_manifest,
-                expected_paths=set(), task_records=records, foundation=foundation,
+                expected_paths=set(), task_records=records,
                 execution_plan=unit_plan, case_runtime=case_runtime,
                 require_lineage=require_lineage,
             )
@@ -202,7 +196,7 @@ def _package_task_directories(
                 audit_path=task_audit / "portability.json", task_manifest=unit_manifest,
                 expected_paths=task_expected,
                 analysis_snapshot_hash=analysis_snapshot_hash,
-                foundation_snapshot_hash=foundation_snapshot_hash,
+
                 environment_hash=environment_hash, run_smoke=False,
                 python_executable=case_runtime.python_executable if case_runtime else None,
             )
@@ -211,6 +205,7 @@ def _package_task_directories(
             task_entries.append({
                 "task_id": task_id, "execution_unit_id": unit_id,
                 "unit_task_ids": task_ids, "directory": relative_root,
+                "output_directory": f"{relative_root}/outputs",
                 "full_command": ["python", "run_experiment.py", "config.json"],
                 "smoke_command": ["python", "run_experiment.py", "config_smoke.json"],
                 "requirements": f"{relative_root}/requirements.txt",
@@ -243,7 +238,7 @@ def _package_task_directories(
     write_json(stage / "tasks_manifest.json", {**task_manifest, "tasks": delivered_tasks})
     write_json(stage / "execution_plan.json", execution_plan)
     write_json(stage / "package_index.json", {"schema_version": "1.0",
-        "layout": "task_directories", "foundation_snapshot_hash": foundation_snapshot_hash or None,
+        "layout": "task_directories",
         "tasks": task_entries})
     write_json(stage / "artifact_lineage.json", {"schema_version": "1.0",
         "layout": "task_directories",
@@ -259,11 +254,13 @@ def _package_task_directories(
         "task_packages": task_entries})
     readme = ["# 复现项目：按任务交付", "",
               "每个任务目录保留其 Writer 执行单元使用的代码、配置、结果与运行证据。",
-              "有 Foundation 时，共享源码也复制到每个任务目录。",
-              "强依赖任务可能共用一次执行；各任务目录会包含该执行单元的完整材料。", "",
-              "| 任务 | 执行单元 | 目录 |", "| --- | --- | --- |"]
+              "每个任务拥有自己的完整实现；合并任务内部包含多个实验及逐项结果。", "",
+              "本次已有的图表、数据和其他结果随对应任务交付，保留原始相对路径。", "",
+              "| 任务 | 执行单元 | 目录 | 本次复现结果 |", "| --- | --- | --- | --- |"]
     for item in task_entries:
-        readme.append(f"| {item['task_id']} | {item['execution_unit_id']} | `{item['directory']}` |")
+        readme.append(f"| {item['task_id']} | {item['execution_unit_id']} | "
+                      f"[{item['directory']}]({item['directory']}/) | "
+                      f"[查看结果]({item['output_directory']}/) |")
     readme += ["", "进入相应任务目录，先按其 `README.md` 安装依赖，然后运行：", "",
                "```sh", "python run_experiment.py config_smoke.json",
                "python run_experiment.py config.json", "```", "",
@@ -278,7 +275,7 @@ def _package_task_directories(
         audit_path=audit_dir / "03c_project_portability.json",
         task_manifest={**task_manifest, "tasks": delivered_tasks},
         expected_paths=expected, analysis_snapshot_hash=analysis_snapshot_hash,
-        foundation_snapshot_hash=foundation_snapshot_hash, environment_hash=environment_hash,
+        environment_hash=environment_hash,
         run_smoke=False, package_layout="task_directories",
     )
     frozen["_meta"]["task_packages"] = task_entries
@@ -340,7 +337,6 @@ def _merge_task_writer_deliveries(
     task_manifest: dict[str, Any],
     expected_paths: set[str],
     task_records: list[dict[str, Any]],
-    foundation: dict[str, Any] | None = None,
     execution_plan: dict[str, Any] | None = None,
     case_runtime: CaseRuntime | None = None,
     require_lineage: bool = False,
@@ -362,18 +358,9 @@ def _merge_task_writer_deliveries(
     if case_runtime is not None:
         expected_paths.add("environment.lock.json")
     write_json(repro_project_dir / "execution_plan.json", execution_plan or {})
-    if foundation is not None:
-        expected_paths.update(install_foundation_snapshot(repro_project_dir, foundation))
-    canonical_frozen = {
-        str(item.get("path") or "").replace("\\", "/")
-        for item in _read_optional_json_object(repro_project_dir / "foundation_manifest.json").get("frozen_files", [])
-        if isinstance(item, dict)
-    }
     configs_dir = repro_project_dir / "configs"
     configs_dir.mkdir(parents=True, exist_ok=True)
     combined_requirements: list[str] = ["numpy", "matplotlib"]
-    if foundation is not None:
-        combined_requirements.clear()
     copied_task_files: dict[str, tuple[str, str]] = {}
     processed_sandboxes: set[str] = set()
     unit_requirements: dict[str, str] = {}
@@ -396,8 +383,6 @@ def _merge_task_writer_deliveries(
                 shutil.copy2(writer_readme, repro_project_dir / note_path)
                 expected_paths.add(note_path)
             for source in [*_task_owned_files(sandbox), *_writer_package_files(sandbox)]:
-                if source.relative_to(sandbox).as_posix() in canonical_frozen:
-                    continue
                 _copy_merged_writer_file(
                     source=source,
                     sandbox=sandbox,
@@ -450,12 +435,9 @@ def _merge_task_writer_deliveries(
                 target = configs_dir / target_name
                 shutil.copy2(source, target)
                 expected_paths.add(f"configs/{target_name}")
-        source_output = sandbox / "outputs" / output_subdir
-        target_output = repro_project_dir / "outputs" / output_subdir
-        if target_output.exists() or target_output.is_symlink():
-            _remove_packaged_path(target_output)
-        if source_output.exists():
-            shutil.copytree(source_output, target_output, ignore=shutil.ignore_patterns("paper_target*"))
+        # The complete outputs/ tree was copied with this sandbox's other files.
+        # Writers may use outputs/ directly or additional subdirectories; the
+        # configured output_subdir is not an exhaustive list of their results.
         result_dir = repro_project_dir / "outputs" / output_subdir
         result_dir.mkdir(parents=True, exist_ok=True)
         for name in ("task_agent_result.json", "task_agent_result.md"):
@@ -529,7 +511,8 @@ def _copy_merged_writer_file(
     relative = source.relative_to(sandbox).as_posix()
     if relative.startswith("tests/"):
         relative = f"execution_units/{safe_label(owner)}/{relative}"
-    if source.suffix.lower() == ".py":
+    normalize_python = source.suffix.lower() == ".py" and not relative.startswith("outputs/")
+    if normalize_python:
         normalized_content = (
             source.read_text(encoding="utf-8-sig")
             .replace("\r\n", "\n")
@@ -542,7 +525,7 @@ def _copy_merged_writer_file(
     previous = copied_files.get(relative)
     target = repro_project_dir / Path(relative)
     if previous is not None and previous[0] != content_hash:
-        if _documentation_only_package(source) and _documentation_only_package(target):
+        if normalize_python and _documentation_only_package(source) and _documentation_only_package(target):
             # A package shared by private submodules can have two descriptions.
             # Keep both descriptions separately; only its package docstring is
             # normalized. Imports, assignments and any executable code still
@@ -562,7 +545,7 @@ def _copy_merged_writer_file(
             "execution-unit package collision for "
             f"{relative}: {previous[1]} and {owner} supplied different content"
         )
-    if source.suffix.lower() == ".py":
+    if normalize_python:
         _copy_python_without_bom(source, target)
     else:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -573,11 +556,6 @@ def _copy_merged_writer_file(
 def _writer_package_files(sandbox: Path) -> list[Path]:
     """Return portable runtime files, including original paper inputs when present."""
 
-    frozen_paths = {
-        str(item.get("path") or "").replace("\\", "/")
-        for item in _read_optional_json_object(sandbox / "foundation_manifest.json").get("frozen_files", [])
-        if isinstance(item, dict)
-    }
     excluded_roots = {
         ".git",
         ".geng_execution",
@@ -587,7 +565,6 @@ def _writer_package_files(sandbox: Path) -> list[Path]:
         ".ruff_cache",
         ".venv",
         "__pycache__",
-        "outputs",
         "repair_logs",
         "venv",
         "writer_progress",
@@ -604,7 +581,6 @@ def _writer_package_files(sandbox: Path) -> list[Path]:
         "execution_unit.json",
         "execution_unit_result.json",
         "execution_plan.json",
-        "foundation_manifest.json",
         "package_manifest.json",
         "project_manifest.json",
         "project_portability_manifest.json",
@@ -643,11 +619,7 @@ def _writer_package_files(sandbox: Path) -> list[Path]:
         if any(part.casefold() in excluded_roots for part in relative_path.parts):
             continue
         relative = relative_path.as_posix()
-        if relative in frozen_paths:
-            continue
         if len(relative_path.parts) == 1 and relative in excluded_root_files:
-            continue
-        if relative.startswith("configs/foundation"):
             continue
         if path.suffix.lower() in {".pyc", ".pyo"}:
             continue
@@ -769,108 +741,22 @@ def _build_artifact_lineage(
                 previous["path"] != item["path"]
                 or previous["sha256"] != item["sha256"]
             ):
-                raise RuntimeError(
-                    f"material artifact {artifact_id!r} has conflicting packaged identities"
-                )
+                observations.append({"code": "multiple_artifact_descriptions", "previous": previous, "current": item})
             entries_by_artifact[artifact_id] = item
 
-    dependencies: dict[tuple[str, str, str], dict[str, Any]] = {}
-    raw_units = execution_plan.get("execution_units")
-    for unit in (raw_units if isinstance(raw_units, list) else []):
-        if not isinstance(unit, dict):
-            continue
-        raw_dependencies = unit.get("dependencies")
-        for dependency in raw_dependencies if isinstance(raw_dependencies, list) else []:
-            if not isinstance(dependency, dict):
-                continue
-            key = (
-                str(dependency.get("artifact_id") or ""),
-                str(dependency.get("producer_task_id") or ""),
-                str(dependency.get("consumer_task_id") or ""),
-            )
-            if all(key):
-                dependencies[key] = dependency
-    strong_requirements: dict[str, dict[str, set[str]]] = {}
-    for unit in (raw_units if isinstance(raw_units, list) else []):
-        if not isinstance(unit, dict):
-            continue
-        relationships = unit.get("relationships")
-        for relationship in relationships if isinstance(relationships, list) else []:
-            if (
-                not isinstance(relationship, dict)
-                or str(relationship.get("strength") or "") != "strong"
-            ):
-                continue
-            producer = str(relationship.get("producer_task_id") or "")
-            consumers = {
-                str(value)
-                for value in relationship.get("consumer_task_ids", [])
-                if str(value)
-            } if isinstance(relationship.get("consumer_task_ids"), list) else set()
-            if not consumers:
-                consumers = {
-                    str(value)
-                    for value in relationship.get("task_ids", [])
-                    if str(value) and str(value) != producer
-                } if isinstance(relationship.get("task_ids"), list) else set()
-            for artifact_id in (
-                relationship.get("artifact_ids")
-                if isinstance(relationship.get("artifact_ids"), list)
-                else []
-            ):
-                key = str(artifact_id)
-                if not key:
-                    continue
-                requirement = strong_requirements.setdefault(
-                    key,
-                    {"producers": set(), "consumers": set()},
-                )
-                if producer:
-                    requirement["producers"].add(producer)
-                requirement["consumers"].update(consumers)
-
-    for (artifact_id, producer, consumer), dependency in dependencies.items():
-        if str(dependency.get("strength") or "") == "strong":
-            requirement = strong_requirements.setdefault(
-                artifact_id,
-                {"producers": set(), "consumers": set()},
-            )
-            requirement["producers"].add(producer)
-            requirement["consumers"].add(consumer)
-
-    for artifact_id, requirement in sorted(strong_requirements.items()):
-        item = entries_by_artifact.get(artifact_id)
-        if item is None:
-            observations.append({"code": "strong_artifact_description_missing", "artifact_id": artifact_id})
-            continue
-        producers = set(requirement["producers"])
-        expected_producer = next(iter(producers)) if len(producers) == 1 else None
-        if len(producers) > 1:
-            observations.append({"code": "multiple_declared_producers", "artifact_id": artifact_id,
-                                 "producers": sorted(producers)})
-        if item.get("producer_task_id") not in {None, expected_producer}:
-            observations.append({"code": "producer_description_differs", "artifact_id": artifact_id,
-                                 "declared": item.get("producer_task_id"), "planned": expected_producer})
-        if item.get("producer_task_id") is None and expected_producer is not None:
-            item["planned_producer_task_id"] = expected_producer
-        consumers = set(item.get("consumer_task_ids") or [])
-        consumers.update(requirement["consumers"])
-        item["consumer_task_ids"] = sorted(consumers)
-
     return {
-        "schema_version": "1.0",
+        "schema_version": "2.0",
         "artifacts": [entries_by_artifact[key] for key in sorted(entries_by_artifact)],
         "observations": observations,
-        "strong_dependency_count": sum(
-            1
-            for dependency in dependencies.values()
-            if str(dependency.get("strength") or "") == "strong"
-        ),
-        "strong_artifact_count": len(strong_requirements),
+        "declared_task_inputs": [
+            {"task_ids": unit.get("task_ids", []), "depends_on": unit.get("depends_on", [])}
+            for unit in execution_plan.get("execution_units", [])
+        ],
     }
 
-def _writer_snapshot_hash(analysis_hash: str, foundation_hash: str) -> str:
-    payload = f"{analysis_hash}::{foundation_hash}".encode("ascii")
+
+def _writer_snapshot_hash(analysis_hash: str, runtime_hash: str) -> str:
+    payload = f"{analysis_hash}::{runtime_hash}".encode("ascii")
     return hashlib.sha256(payload).hexdigest()
 
 def _write_final_shared_project_files(

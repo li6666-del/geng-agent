@@ -7,7 +7,7 @@ from typing import Any
 
 from .task_writer_files import _read_optional_json_object
 from .task_writer_support import PAPER_EVIDENCE_DIR
-from .foundation_scope import derive_foundation_scope
+from .task_components import task_component_ids
 from .architecture_protocol import architecture_runtime_view
 
 
@@ -47,8 +47,7 @@ def _task_execution_binding_from_architecture(
         if isinstance(item, dict) and str(item.get('task_id') or '') == str(task_id)
     ] if isinstance(raw_bindings, list) else []
     binding = bindings[0] if bindings else None
-    scope = derive_foundation_scope(architecture, execution_plan)
-    shared_ids = set(scope['component_ids'])
+    component_map = task_component_ids(architecture)
     configuration_issues: list[str] = []
     bound_components: list[dict[str, Any]] = []
     raw_groups = architecture.get('consistency_groups')
@@ -73,7 +72,7 @@ def _task_execution_binding_from_architecture(
             component_ids.extend(str(value) for value in item['components'])
         component_ids = list(dict.fromkeys([
             *component_ids,
-            *scope['task_component_ids'].get(str(task_id), []),
+            *component_map.get(str(task_id), []),
         ]))
         for raw_component_id in component_ids:
             component_id = str(raw_component_id or '')
@@ -89,7 +88,7 @@ def _task_execution_binding_from_architecture(
                     'module': str(component.get('module') or ''),
                     'callable': str(component.get('callable') or ''),
                     'execution': dict(execution) if isinstance(execution, dict) else {},
-                    'ownership': 'foundation' if component_id in shared_ids else 'execution_unit',
+                    'ownership': 'task',
                 }
             )
     return {

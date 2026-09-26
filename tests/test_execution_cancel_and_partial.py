@@ -33,13 +33,13 @@ def test_writer_recovery_cancellation_is_not_a_stop_decision(monkeypatch, tmp_pa
     cancelled = PipelineCancelled("user stopped")
     recover = Mock(side_effect=cancelled) if location == "moderator" else Mock(
         return_value={"action": "repair_reporter", "decision": {"instructions": "clarify"}})
-    monkeypatch.setattr(runner, "recover_writer_stall", recover)
+    monkeypatch.setattr(runner, "resolve_revision_owner", recover)
     callback = Mock(side_effect=cancelled)
     record = {"task_id": "t", "sandbox": str(tmp_path)}
     with pytest.raises(PipelineCancelled, match="user stopped"):
-        runner._recover_writer_exceptions(
-            work=[(1, {"task_id": "t"}, record, {"task_id": "t", "host_action": "rerun_writer"})],
-            trigger="writer_stall", writer_budget_available=True, callback=callback, session_round=1)
+        runner._prepare_reporter_review(
+            {"ok":True, "task_verification":{"task_id":"t","host_action":"rerun_writer"}},
+            callback, 1, {"task_id":"t"}, record, 1)
     assert "moderator_error" not in record
     assert "coordination_status" not in record
     assert "scientific_stop_reason" not in record
@@ -70,7 +70,6 @@ def test_writer_install_failure_preserves_current_dispatch_sibling(monkeypatch, 
     dispatch = Mock(side_effect=dispatch_current)
     monkeypatch.setattr(writers, "_dispatch_task_writers", dispatch)
     monkeypatch.setattr(writers, "_package_task_directories", Mock(side_effect=OSError("Incomplete unit cannot be packaged")))
-    monkeypatch.setattr("geng_agent.agentic_foundation.run_codex_foundation_writer_workflow", Mock(return_value=None))
     ensure = Mock(return_value=case_runtime_fixture(context.output_dir, "original-environment"))
     monkeypatch.setattr("geng_agent.case_runtime.ensure_case_runtime", ensure)
     # A stale on-disk record must not replace this invocation's actual result.

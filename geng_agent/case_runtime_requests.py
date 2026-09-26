@@ -17,7 +17,7 @@ from .case_environment import (
 from .case_runtime_contracts import (
     CaseRuntime,
     WRITER_ENVIRONMENT_REQUEST_FILENAME,
-    _FOUNDATION_BASELINE_REQUIREMENTS,
+    _PROJECT_BASELINE_REQUIREMENTS,
     _coerce_normalized_request,
     _dedupe_requests,
     _normalized_request,
@@ -25,7 +25,7 @@ from .case_runtime_contracts import (
 )
 from .case_runtime_probe import _read_regular_file_nofollow
 from .security import import_names_for_requirement
-from .foundation_scope import derive_foundation_scope
+from .task_components import task_component_ids
 from .architecture_protocol import architecture_runtime_view
 
 
@@ -43,10 +43,10 @@ def architecture_for_execution_tasks(
         return architecture
     active_tasks = {str(task_id) for task_id in task_ids}
     addressed = architecture_runtime_view(dict(architecture))
-    scope = derive_foundation_scope(addressed)
+    component_map = task_component_ids(addressed)
     active_components = {
         component_id
-        for task_id, component_ids in scope["task_component_ids"].items()
+        for task_id, component_ids in component_map.items()
         if task_id in active_tasks
         for component_id in component_ids
     }
@@ -69,10 +69,10 @@ def requirements_from_scientific_architecture(
         RequirementRequest(
             requirement=name,
             import_names=tuple(sorted(import_names_for_requirement(name))),
-            requested_by="foundation_baseline",
+            requested_by="project_baseline",
             reason="shared numerical and figure runtime used by generated projects",
         )
-        for name in _FOUNDATION_BASELINE_REQUIREMENTS
+        for name in _PROJECT_BASELINE_REQUIREMENTS
     ]
     components = architecture.get("components") if isinstance(architecture, Mapping) else []
     for index, component in enumerate(components if isinstance(components, list) else []):

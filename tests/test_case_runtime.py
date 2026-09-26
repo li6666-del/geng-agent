@@ -810,7 +810,7 @@ class CaseRuntimeCapabilityTests(unittest.TestCase):
             capabilities[0]["evidence"][
                 "declared_component_capabilities_verification"
             ],
-            "deferred_to_foundation_or_task_runtime_tests",
+            "deferred_to_task_runtime",
         )
 
     def test_unknown_framework_cannot_fake_advanced_capabilities(self) -> None:

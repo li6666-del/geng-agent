@@ -291,28 +291,11 @@ class ReproTaskBackfillHandoff(StrictModel):
     inferred: bool = False
 
 
-ExecutionRelationshipKind = Literal[
-    "same_run_outputs",
-    "checkpoint_flow",
-    "shared_pretraining",
-    "shared_random_realization",
-    "shared_dataset_partition",
-    "shared_definition",
-    "other",
-]
-ExecutionRelationshipStrength = Literal["strong", "weak"]
+class TaskArtifactDependency(StrictModel):
+    """A file handoff explicitly requested by the planner."""
 
-
-class TaskExecutionRelationship(StrictModel):
-    """Scientific execution dependency between otherwise atomic reproduction tasks."""
-
-    relationship_id: NonEmptyStr
-    kind: ExecutionRelationshipKind
-    strength: ExecutionRelationshipStrength
-    task_ids: list[NonEmptyStr] = Field(min_length=2)
-    producer_task_id: NonEmptyStr | None = None
-    consumer_task_ids: list[NonEmptyStr] = Field(default_factory=list)
-    artifact_ids: list[NonEmptyStr] = Field(default_factory=list)
+    task_id: str
+    artifacts: list[str] = Field(default_factory=list)
     rationale: str = ""
 
 
@@ -336,6 +319,8 @@ class ReproTask(StrictModel):
     baseline_definitions: list[TaskSpecificationItem] = Field(default_factory=list)
     statistical_protocol: list[TaskSpecificationItem] = Field(default_factory=list)
     validation_anchors: list[TaskSpecificationItem] = Field(default_factory=list)
+    experiments: list[dict[str, Any]] = Field(default_factory=list)
+    depends_on: list[TaskArtifactDependency] = Field(default_factory=list)
 
 
 class BackfillFieldResolution(StrictModel):
@@ -359,9 +344,6 @@ class ReproTasksDocument(StrictModel):
     schema_version: Literal["2.0"] = "2.0"
     backfill_handoff: ReproTaskBackfillHandoff = Field(
         default_factory=ReproTaskBackfillHandoff
-    )
-    execution_relationships: list[TaskExecutionRelationship] = Field(
-        default_factory=list
     )
     repro_tasks: list[ReproTask] = Field(min_length=1)
 
@@ -494,7 +476,7 @@ class ArchitectureBinding(StrictModel):
 
 class ArchitectureInvariant(StrictModel):
     id: NonEmptyStr
-    kind: Literal["reference", "shape", "unit", "normalization", "global_override", "consistency", "foundation_ownership", "other"] = "other"
+    kind: Literal["reference", "shape", "unit", "normalization", "global_override", "consistency", "other"] = "other"
     subjects: list[NonEmptyStr] = Field(default_factory=list)
     task_ids: list[NonEmptyStr] = Field(default_factory=list)
     severity: Literal["error", "warning"]

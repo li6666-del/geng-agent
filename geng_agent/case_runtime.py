@@ -42,7 +42,7 @@ from .case_runtime_contracts import (
     _CAPABILITY_PROBE_PREFIX,
     _CASE_VENV_MARKER,
     _DISTRIBUTION_ALIASES,
-    _FOUNDATION_BASELINE_REQUIREMENTS,
+    _PROJECT_BASELINE_REQUIREMENTS,
     _INSTALL_TAINT_SUFFIX,
     _LOCAL_RUNTIME_NAMES,
     _coerce_normalized_request,

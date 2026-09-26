@@ -175,7 +175,7 @@ class PackagingTests(unittest.TestCase):
             original = (project / "constraints.repro.txt").read_bytes()
             self.assertIn(b"childlib==2.1", original)
             kwargs = dict(repro_project_dir=project, output_dir=output, task_manifest={"tasks": []},
-                expected_paths=set(), analysis_snapshot_hash="a", foundation_snapshot_hash="f", environment_hash="e")
+                expected_paths=set(), analysis_snapshot_hash="a", environment_hash="e")
             with patch("geng_agent.task_writer_packaging.validate_repro_project_portability", return_value={"portable": True}), \
                  patch("geng_agent.task_writer_packaging._manifest_from_project", side_effect=lambda **k: {"_meta": {}}):
                 _freeze_repro_project_package(**kwargs, run_smoke=True, audit_path=output / "audit/03c_project_portability.json")

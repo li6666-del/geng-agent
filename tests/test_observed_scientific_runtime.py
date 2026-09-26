@@ -25,7 +25,7 @@ def scientific_workspace():
 
 
 @pytest.mark.skipif(importlib.util.find_spec("torch") is None, reason="optional PyTorch scientific runtime is not installed")
-def test_real_training_shared_checkpoint_and_stale_producer_rejection(scientific_workspace):
+def test_real_training_checkpoint_and_stale_producer_observation(scientific_workspace):
     tmp_path = scientific_workspace
     project, audit = tmp_path / "project", tmp_path / "audit"
     (project / "tasks").mkdir(parents=True)
@@ -75,8 +75,10 @@ def main(config):
     evaluation = broker.execute({"task_id": "evaluate", "mode": "full",
         "inputs": ["execution_units/shared/model.pt"]})
     assert evaluation["returncode"] == 0, evaluation.get("stderr_tail")
-    assert validate_receipt(project, evaluation, task_id="evaluate")["passed"]
+    checked = validate_receipt(project, evaluation, task_id="evaluate")
+    assert checked["passed"], checked
     assert evaluation["input_hashes"]["execution_units/shared/model.pt"] == training["produced_artifacts"]["execution_units/shared/model.pt"]
     train_source.write_text(train_source.read_text(encoding="utf-8").replace("lr=0.08", "lr=0.02"), encoding="utf-8")
-    with pytest.raises(ValueError, match="no current producer receipt"):
-        broker.execute({"task_id": "evaluate", "mode": "full", "inputs": ["execution_units/shared/model.pt"]})
+    result = broker.execute({"task_id": "evaluate", "mode": "full", "inputs": ["execution_units/shared/model.pt"]})
+    assert result["returncode"] == 0
+    assert result["dependency_issues"]

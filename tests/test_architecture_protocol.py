@@ -3,7 +3,6 @@ from copy import deepcopy
 import pytest
 
 from geng_agent.architecture_protocol import ArchitectureAddressError, architecture_runtime_view
-from geng_agent.foundation_scope import derive_foundation_scope
 
 
 def _alias_architecture():
@@ -128,18 +127,3 @@ def test_none_missing_fields_and_unfamiliar_members_are_not_filled_or_dropped():
     with pytest.raises(ArchitectureAddressError) as error:
         architecture_runtime_view([])
     assert error.value.path == "$"
-
-
-def test_explicit_addresses_recover_shared_private_and_transitive_dependency_scope():
-    source = _alias_architecture()
-    plan = {"task_to_execution_unit": {"a": "unit-a", "b": "unit-b"}}
-    scope = derive_foundation_scope(architecture_runtime_view(source), plan)
-    assert derive_foundation_scope(source, plan) == scope
-    assert scope["component_ids"] == ["base", "shared"]
-    assert scope["private_component_ids"] == ["left", "right"]
-    assert scope["module_paths"] == ["src/base.py", "src/shared.py"]
-    assert scope["private_module_paths"] == ["src/left.py", "src/right.py"]
-    assert scope["task_component_ids"] == {
-        "a": ["base", "left", "shared"], "b": ["base", "right", "shared"],
-    }
-    assert scope["component_execution_unit_ids"]["base"] == ["unit-a", "unit-b"]

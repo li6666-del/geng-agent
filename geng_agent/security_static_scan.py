@@ -26,7 +26,7 @@ def classify_static_security_issue(issue: dict[str, Any]) -> str:
 
     Classification is intentionally based on the scanner message rather than a
     caller-provided severity/category. This keeps the global scanner strict while
-    allowing a narrow consumer, such as the clean Foundation case sandbox, to
+    allowing a narrow consumer, such as the clean task case sandbox, to
     downgrade only explicitly approved categories.
     """
 
@@ -55,7 +55,7 @@ def classify_static_security_issue(issue: dict[str, Any]) -> str:
     if message.startswith("dangerous reflection: "):
         return "dangerous_reflection"
     if message.startswith("dangerous environment access: "):
-        # Foundation executes under a host-owned, scrubbed environment. Reads,
+        # task executes under a host-owned, scrubbed environment. Reads,
         # dynamic keys, and even bulk/mutating access through ``os.environ`` are
         # therefore advisory there; the same findings remain errors for every
         # strict scanner consumer because severity is assigned by

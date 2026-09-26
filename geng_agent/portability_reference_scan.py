@@ -4,7 +4,7 @@ import os
 import stat
 from pathlib import Path, PurePosixPath
 from typing import Any
-from .foundation_snapshot import path_is_foundation_link
+from .artifact_paths import path_is_link
 from .portability_contracts import _issue, _is_absolute_cross_platform, _URL, _PARENT_SEGMENT
 from .portability_inventory import _is_ignored_directory, _is_ignored_file
 
@@ -17,7 +17,7 @@ def _filesystem_issues(root: Path) -> list[dict[str, Any]]:
         for name in sorted(dirnames):
             path = directory_path / name
             relative = path.relative_to(root).as_posix()
-            if path_is_foundation_link(path):
+            if path_is_link(path):
                 issues.append(_issue("filesystem_link", relative, "directory link is not a self-contained project entry"))
                 continue
             if not _is_ignored_directory(name):
@@ -26,7 +26,7 @@ def _filesystem_issues(root: Path) -> list[dict[str, Any]]:
         for name in sorted(filenames):
             path = directory_path / name
             relative = path.relative_to(root).as_posix()
-            if path_is_foundation_link(path):
+            if path_is_link(path):
                 issues.append(_issue("filesystem_link", relative, "file link is not a self-contained project entry"))
                 continue
             if not stat.S_ISREG(path.lstat().st_mode):

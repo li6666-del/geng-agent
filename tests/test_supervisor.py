@@ -17,7 +17,7 @@ def _transport(monkeypatch, decide=None):
     def run(**kwargs):
         packet = json.loads((kwargs["work_dir"] / "incident.json").read_text(encoding="utf-8"))
         calls.append(packet)
-        action = "approve"
+        action = "block"
         if packet["trigger"] == "run_dispatch":
             action = "start" if packet["context"]["ready"] else "finish"
         decision = {"schema_version": "1.0", "action": action, "diagnosis": "交接证据已检查",
@@ -57,8 +57,8 @@ def test_scientific_non_support_is_a_valid_handoff(monkeypatch, tmp_path):
     assert supervisor.snapshot()["nodes"][0]["status"] == "published"
 
 
-def test_explicit_failed_operation_cannot_be_approved(monkeypatch, tmp_path):
-    calls = _transport(monkeypatch)
+def test_explicit_failed_operation_uses_moderator_stop(monkeypatch, tmp_path):
+    calls = _transport(monkeypatch, lambda packet, kwargs: {"action":"block"})
 
     def operation():
         raise module.NodeFailure("full进程失败", result={"returncode": 1})
@@ -147,15 +147,16 @@ def test_control_handoff_and_parent_block_do_not_trigger_duplicate_diagnosis(mon
     assert not calls
 
 
-def test_interrupted_execution_requires_receipt_reconciliation(monkeypatch, tmp_path):
+def test_interrupted_execution_without_adapter_is_routed_to_moderator(monkeypatch, tmp_path):
     calls = _transport(monkeypatch)
     supervisor = _supervisor(tmp_path)
     supervisor._save("writer", status="dispatched", inputs={}, attempt=0)
     executed = []
     with module.supervisor_scope(supervisor), pytest.raises(module.StageBlocked) as error:
         module.supervised_call("writer", lambda: executed.append(True))
-    assert error.value.decision["status"] == "reconciliation_required"
-    assert not executed and not calls
+    assert error.value.decision["action"] == "block"
+    assert not executed and len(calls) == 1
+    assert "resume adapter" in calls[0]["context"]["result"]["message"]
 
 
 def test_completed_execution_is_reconciled_without_reexecution(monkeypatch, tmp_path):
@@ -304,9 +305,10 @@ def test_interrupted_new_execution_cannot_reuse_an_older_in_memory_result(monkey
         module.supervised_call("writer", lambda: {"receipt": "old"})
         with pytest.raises(KeyboardInterrupt):
             module.supervised_call("writer", interrupted)
-        with pytest.raises(module.StageBlocked) as blocked:
-            module.supervised_call("writer", lambda: {"receipt": "must-not-run"})
-    assert blocked.value.decision["status"] == "reconciliation_required"
+    assert "writer" not in supervisor._results
+    with module.supervisor_scope(_supervisor(tmp_path)), pytest.raises(module.StageBlocked) as blocked:
+        module.supervised_call("writer", lambda: {"receipt": "must-not-run"})
+    assert blocked.value.decision["action"] == "block"
 
 
 def test_published_owner_instruction_survives_restart_and_changed_inputs_drop_it(monkeypatch, tmp_path):

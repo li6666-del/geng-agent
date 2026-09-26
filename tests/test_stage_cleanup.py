@@ -43,7 +43,6 @@ class StageCleanupV2Tests(unittest.TestCase):
             root = Path(temp)
             paths = (
                 _write(root / "scientific_architecture.json"),
-                _write(root / "foundation_manifest.json"),
                 _write(root / "audit" / "02f_design_scientific_architecture.json"),
                 _write(root / "audit" / "03b_foundation_snapshot" / "src" / "channel.py"),
                 _write(root / "audit" / "03c_task_writer_sandboxes" / "01_task" / "tasks" / "task.py"),
@@ -71,7 +70,7 @@ class StageCleanupV2Tests(unittest.TestCase):
 
             self.assertEqual(architecture.read_text(encoding="utf-8"), "new")
             self.assertTrue(audit.exists())
-            self.assertFalse(foundation.exists())
+            self.assertTrue(foundation.exists())  # Historical files are preserved, not part of new stages.
 
 
 if __name__ == "__main__":

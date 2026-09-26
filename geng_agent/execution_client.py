@@ -58,6 +58,8 @@ def main():
     parser.add_argument("--task", required=True)
     parser.add_argument("--config")
     parser.add_argument("--mode", choices=("smoke", "full"), default="full")
+    parser.add_argument("--device", choices=("cpu", "gpu", "auto"), default="auto",
+                        help="Select CPU or GPU; auto uses a visible GPU, otherwise CPU. GPU runs can execute concurrently.")
     parser.add_argument("--input", action="append", default=[], help="Persistent data/checkpoint consumed by this run, relative to project")
     parser.add_argument("--submit", action="store_true", help="Submit to the active host and return before completion")
     parser.add_argument("--status", action="store_true", help="Read the host's current task execution status")
@@ -87,7 +89,7 @@ def main():
         path = queue / (run_id + ".request.json")
         temporary = path.with_suffix(".tmp")
         temporary.write_text(json.dumps({"task_id": args.task, "config": config,
-            "mode": args.mode, "inputs": args.input}), encoding="utf-8")
+            "mode": args.mode, "device": args.device, "inputs": args.input}), encoding="utf-8")
         temporary.replace(path)
         if args.submit:
             print(json.dumps({"task_id": args.task, "state": "submitted", "request_id": run_id,

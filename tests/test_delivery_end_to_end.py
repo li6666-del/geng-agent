@@ -118,7 +118,7 @@ class DeliveryEndToEndTests(unittest.TestCase):
             expected.update({"tasks/__init__.py", "tasks_manifest.json", "run_experiment.py"})
             _, portability = _freeze_repro_project_package(repro_project_dir=project, output_dir=case,
                 audit_path=case / "audit" / "portability.json", task_manifest=manifest, expected_paths=expected,
-                analysis_snapshot_hash="fixture", foundation_snapshot_hash="", environment_hash="", run_smoke=True,
+                analysis_snapshot_hash="fixture", environment_hash="", run_smoke=True,
                 python_executable=Path(sys.executable))
             self.assertNotIn("clean_environment", portability)
             self.assertTrue((project / "outputs" / "sample" / "execution_receipt.json").is_file())

@@ -1,4 +1,4 @@
-"""Persistent scientific state must retain a current, complete producer chain."""
+"""Describe producer history without vetoing the agent's requested execution."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -47,7 +47,7 @@ def _project(root: Path) -> tuple[Path, ExecutionBroker]:
     return project, ExecutionBroker(project, root / "audit", Path(sys.executable))
 
 
-def test_cached_features_cannot_outlive_their_upstream_training_recipe(producer_workspace: Path) -> None:
+def test_stale_training_recipe_is_observed_without_blocking_consumer(producer_workspace: Path) -> None:
     project, broker = _project(producer_workspace)
     for task, consumed in (("train", []), ("features", ["execution_units/model.txt"]),
                            ("evaluate", ["execution_units/features.txt"]), ("independent", [])):
@@ -64,23 +64,26 @@ def test_cached_features_cannot_outlive_their_upstream_training_recipe(producer_
     assert cached_evaluation["passed"] is False
     assert any("no current producer receipt" in issue for issue in cached_evaluation["issues"])
     assert find_host_execution(project, broker.audit_dir, "independent")["passed"] is True
-    with pytest.raises(ValueError, match="no current producer receipt"):
-        broker.execute({"task_id": "evaluate", "mode": "full", "inputs": ["execution_units/features.txt"]})
+    result = broker.execute({"task_id": "evaluate", "mode": "full", "inputs": ["execution_units/features.txt"]})
+    assert result["returncode"] == 0
+    assert any("no current producer receipt" in issue for issue in result["dependency_issues"])
     assert features.read_bytes() == original_features
 
 
-def test_full_consumer_cannot_use_a_smoke_producer_checkpoint(producer_workspace: Path) -> None:
+def test_smoke_producer_is_described_without_blocking_full_consumer(producer_workspace: Path) -> None:
     _project_dir, broker = _project(producer_workspace)
     smoke = broker.execute({"task_id": "train", "mode": "smoke"})
     assert smoke["returncode"] == 0
-    with pytest.raises(ValueError, match="no current producer receipt"):
-        broker.execute({"task_id": "features", "mode": "full", "inputs": ["execution_units/model.txt"]})
+    result = broker.execute({"task_id": "features", "mode": "full", "inputs": ["execution_units/model.txt"]})
+    assert result["returncode"] == 0
+    assert result["dependency_issues"]
     for task, consumed in (("features", "execution_units/model.txt"), ("evaluate", "execution_units/features.txt")):
         downstream_smoke = broker.execute({"task_id": task, "mode": "smoke", "inputs": [consumed]})
         assert downstream_smoke["returncode"] == 0, downstream_smoke.get("stderr_tail")
         assert downstream_smoke["dependency_issues"] == []
-    with pytest.raises(ValueError, match="no current producer receipt"):
-        broker.execute({"task_id": "evaluate", "mode": "full", "inputs": ["execution_units/features.txt"]})
+    result = broker.execute({"task_id": "evaluate", "mode": "full", "inputs": ["execution_units/features.txt"]})
+    assert result["returncode"] == 0
+    assert result["dependency_issues"]
 
 
 def test_cyclic_producer_claims_have_no_grounded_origin(tmp_path: Path) -> None:

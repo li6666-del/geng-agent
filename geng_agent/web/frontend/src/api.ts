@@ -1,37 +1,53 @@
-import type { Artifact, CaseDetail, CaseSummary, EventPayload } from "./types";
+import type { AuthSession, PaperCase, SiteConfig } from "./types";
+
+let csrfToken = "";
+
+export class ApiError extends Error {
+  constructor(message: string, public status: number) { super(message); }
+}
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, init);
+  const headers = new Headers(init?.headers);
+  if (init?.method && init.method !== "GET" && csrfToken) headers.set("X-CSRF-Token", csrfToken);
+  const response = await fetch(url, { ...init, headers, credentials: "same-origin" });
   if (!response.ok) {
-    const body = await response.json().catch(() => ({ detail: `HTTP ${response.status}` }));
-    throw new Error(body.detail || `HTTP ${response.status}`);
+    const body = await response.json().catch(() => ({}));
+    if (response.status === 401 && !url.startsWith("/api/v1/auth/") && typeof window !== "undefined") {
+      window.dispatchEvent(new Event("session-expired"));
+    }
+    throw new ApiError(typeof body.detail === "string" ? body.detail : "提交信息不完整，请检查后重试。", response.status);
   }
-  return response.json() as Promise<T>;
+  return response.status === 204 ? undefined as T : response.json() as Promise<T>;
+}
+
+async function authenticate(action: "login" | "register", email: string, password: string) {
+  const result = await request<AuthSession>(`/api/v1/auth/${action}`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email, password }),
+  });
+  csrfToken = result.csrf_token;
+  return result.user;
 }
 
 export const api = {
-  health: () => request<{ ok: boolean; max_pdf_bytes: number }>("/api/v1/health"),
-  listCases: () => request<{ items: CaseSummary[] }>("/api/v1/cases"),
-  getCase: (id: string) => request<CaseDetail>(`/api/v1/cases/${id}`),
-  createCase: (form: FormData) => request<{ case_id: string; job_id: string }>("/api/v1/cases", { method: "POST", body: form }),
-  cancelJob: (id: string) => request<{ status: string }>(`/api/v1/jobs/${id}/cancel`, { method: "POST" }),
-  resumeCase: (id: string) => request<{ job_id: string }>(`/api/v1/cases/${id}/jobs`, { method: "POST" }),
-  getArtifact: (id: string) => request<Artifact & { preview: { text?: string; rows?: string[][]; json?: unknown; truncated?: boolean } | null }>(`/api/v1/artifacts/${id}`),
-  createExport: (caseId: string, phase?: string) => request<{ export_id: string; status: string }>(
-    `/api/v1/cases/${caseId}/exports${phase ? `?phase=${encodeURIComponent(phase)}` : ""}`,
-    { method: "POST" },
-  ),
-  getExport: (id: string) => request<{ id: string; status: string; download_url: string | null; error: string | null }>(`/api/v1/exports/${id}`),
+  site: () => request<SiteConfig>("/api/v1/site"),
+  session: async () => {
+    try {
+      const result = await request<AuthSession>("/api/v1/auth/session");
+      csrfToken = result.csrf_token;
+      return result.user;
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) { csrfToken = ""; return null; }
+      throw error;
+    }
+  },
+  authenticate,
+  logout: async () => {
+    try { await request<void>("/api/v1/auth/logout", { method: "POST" }); }
+    catch (error) { if (!(error instanceof ApiError && error.status === 401)) throw error; }
+    csrfToken = "";
+  },
+  listCases: () => request<{ items: PaperCase[] }>("/api/v1/cases"),
+  createCase: (body: FormData) => request<{ case_id: string }>("/api/v1/cases", { method: "POST", body }),
+  retryCase: (id: string) => request(`/api/v1/cases/${id}/retry`, { method: "POST" }),
+  cancelCase: (id: string) => request(`/api/v1/cases/${id}/cancel`, { method: "POST" }),
 };
-
-export function connectEvents(jobId: string, onEvent: (event: EventPayload) => void, onState: (connected: boolean) => void, after = 0): EventSource {
-  const stream = new EventSource(`/api/v1/jobs/${jobId}/events/live?after=${after}`);
-  const types = ["job.started", "job.retrying", "phase.started", "step.started", "step.completed", "phase.completed", "job.finished", "job.failed", "job.cancelled", "artifact.sync_failed"];
-  types.forEach((type) => stream.addEventListener(type, (raw) => {
-    try { onEvent(JSON.parse((raw as MessageEvent).data) as EventPayload); }
-    catch { onState(false); }
-  }));
-  stream.onopen = () => onState(true);
-  stream.onerror = () => onState(false);
-  return stream;
-}

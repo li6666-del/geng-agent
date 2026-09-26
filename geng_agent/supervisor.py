@@ -1,8 +1,7 @@
-"""Durable, evidence-bound run coordination using the existing moderator role.
+"""Record routine handoffs and execute the moderator's recovery instructions.
 
-The host retains execution, ownership and evidence-integrity checks. The run
-supervisor chooses available work, reviews completed handoffs and coordinates
-bounded repairs. It never fabricates a successful operation or scientific result.
+Observations do not approve scientific outputs or impose a repair quota.
+Explicit user cancellation and ownership of active processes remain enforced.
 """
 from __future__ import annotations
 
@@ -17,8 +16,8 @@ from typing import Any, Callable, Iterator
 
 from .moderator import (Moderator, _digest, _event_claim, _file_hash, _read_record,
                         _EXCLUDED, _TEXT, _MEDIA, moderator_scope)
-from .foundation_snapshot import path_is_foundation_link
-from .outputs import write_json
+from .artifact_paths import path_is_link
+from .observations import write_json
 from .progress import PipelineCancelled
 from .security import redact_text
 
@@ -63,7 +62,7 @@ def _evidence_identity(roots: dict[str, Path]) -> list[dict]:
     inventory = []
     for name, root in sorted(roots.items()):
         root = Path(root)
-        if not (root.is_dir() or root.is_file()) or path_is_foundation_link(root):
+        if not (root.is_dir() or root.is_file()) or path_is_link(root):
             inventory.append({"root": name, "unavailable": True})
             continue
         selected_file = root if root.is_file() else None
@@ -73,10 +72,10 @@ def _evidence_identity(roots: dict[str, Path]) -> list[dict]:
         for directory, dirs, files in walk:
             parent = Path(directory)
             dirs[:] = sorted(item for item in dirs if item.lower() not in _EXCLUDED
-                             and not path_is_foundation_link(parent / item))
+                             and not path_is_link(parent / item))
             for filename in sorted(files):
                 path = parent / filename
-                if (path.suffix.lower() not in _TEXT | _MEDIA or path_is_foundation_link(path)
+                if (path.suffix.lower() not in _TEXT | _MEDIA or path_is_link(path)
                         or filename.lower().startswith(".env")
                         or filename.lower() in {"auth.json", "credentials.json", "id_rsa", "id_ed25519"}):
                     continue
@@ -217,7 +216,8 @@ class RunSupervisor:
                 if isinstance(summary, list):
                     detail["summary_count"] = len(summary)
             details.append(detail)
-        return {"goal": self.goal, "nodes": nodes, "node_details": details,
+        from .observations import observation_errors
+        return {"goal": self.goal, "nodes": nodes, "node_details": details, "host_observation_errors": observation_errors(),
                 "detail_omissions": len(records) - len(details),
                 "detail_policy": "All node identities/states are retained. Details prioritize failures and active work; at most two completed summaries. Full scientific documents remain in each node's declared evidence.",
                 "repair_operations": self._repair_specs,
@@ -261,6 +261,8 @@ class RunSupervisor:
             except PipelineCancelled as exc:
                 self.signal_cancelled(exc)
                 raise
+            except Exception as exc:
+                self._emit("supervisor.observation_error", "cancellation", redact_text(str(exc)))
 
     def signal_cancelled(self, error: BaseException) -> None:
         if not self._cancelled.is_set() and str(error):
@@ -289,8 +291,8 @@ class RunSupervisor:
         if record.get("status") == "dispatched" and decision["action"] == "repair_artifacts":
             reconcile = self._repair_reconcilers.get(decision.get("repair_operation", ""))
             if reconcile is None:
-                self._block(node_id, {"action": "block", "diagnosis": "修复派发后中断；此工具未提供产物对账，不能重复修改。",
-                                      "action_record": str(path)}, None)
+                raise NodeFailure("Repair was interrupted and has no resume adapter; choose another repair or handoff.",
+                                  result={"action_record": str(path)})
             reconciled = reconcile(decision.get("repair_arguments", {}), record)
         write_json(path, {"status": "prepared", "decision": decision, "created_at": _now()})
         self._instructions[node_id] = decision
@@ -336,6 +338,7 @@ class RunSupervisor:
             # Owners with external side effects must supply a receipt/cache-aware
             # reconciler. Never infer success or rerun an unknown dispatched job.
             recovered = REPLAY_REQUIRED
+            recovery_error = None
             same_inputs = previous.get("inputs") == inputs and previous.get("goal_id") == self.goal_id
             if not same_inputs:
                 self._instructions.pop(node_id, None)
@@ -346,21 +349,33 @@ class RunSupervisor:
                 if previous_decision.get("action") in {"retry", "repair_artifacts"}:
                     self._instructions[node_id] = previous_decision
                     if previous.get("status") == "repairing":
-                        self._apply_repair(node_id, previous_decision, repair)
+                        try:
+                            self._apply_repair(node_id, previous_decision, repair)
+                        except PipelineCancelled:
+                            raise
+                        except Exception as exc:
+                            recovery_error = exc
             if same_inputs and previous.get("status") in {"dispatched", "completed", "interrupted"}:
                 if node_id in self._results:
                     recovered = self._results[node_id]
                 elif reconcile is not None:
-                    recovered = reconcile(previous)
+                    try:
+                        recovered = reconcile(previous)
+                    except PipelineCancelled:
+                        raise
+                    except Exception as exc:
+                        recovery_error = exc
                 else:
-                    self._block(node_id, {"action": "block", "status": "reconciliation_required",
-                                          "diagnosis": "节点在交接前中断；需从已有进程、收据或缓存对账后继续。"}, None)
+                    recovery_error = NodeFailure("Interrupted node has no resume adapter; decide whether to retry or hand off existing artifacts.", result=previous)
             attempt = int(previous.get("attempt", 0)) if same_inputs else 0
             while True:
                 error: Exception | None = None
                 self._save(node_id, status="prepared", inputs=inputs, attempt=attempt, error=None)
                 try:
                     self._check_cancelled()
+                    if recovery_error is not None:
+                        pending, recovery_error = recovery_error, None
+                        raise pending
                     self._save(node_id, status="dispatched")
                     self._emit("supervisor.node_started", node_id, f"执行节点：{node_id}")
                     if recovered is REPLAY_REQUIRED:
@@ -377,7 +392,10 @@ class RunSupervisor:
                         result = recovered
                     recovered = REPLAY_REQUIRED
                     self._results[node_id] = result
-                    summary = _compact(summarize(result) if summarize else result)
+                    try:
+                        summary = _compact(summarize(result) if summarize else result)
+                    except Exception as exc:
+                        summary = {"observation_error": str(exc), "result_available": True}
                     self._save(node_id, status="completed", summary=summary)
                 except (StageBlocked, PipelineCancelled, *passthrough):
                     self._save(node_id, status="handed_off")
@@ -408,48 +426,54 @@ class RunSupervisor:
                            "previous_instruction": _compact(self._instructions.get(node_id)),
                            "repair_operations": sorted(self._repair_handlers),
                            "repair_tools": self._repair_specs}
-                actions = ["retry"] if repair else []
+                actions = ["retry"]
                 if degrade is not None:
                     actions.append("continue")
                 if self._repair_handlers:
                     actions.append("repair_artifacts")
                 actions.append("block")
-                decision = self._request(node_id, trigger="node_failed",
-                                         context=context, roots=roots, actions=tuple(actions), routine=False)
-                if decision.get("action") == "continue" and degrade is not None:
+                # Failed repair/partial-handoff tools return to the moderator;
+                # they are not host-authored stop decisions or automatic reruns.
+                coordination_round = 0
+                while error is not None:
+                    coordination_round += 1
+                    context["coordination_round"] = coordination_round
+                    decision = self._request(node_id, trigger="node_failed",
+                        context=context, roots=roots, actions=tuple(actions), routine=False)
+                    if decision.get("action") in {"stop", "block"}:
+                        self._block(node_id, decision, error)
+                    if decision.get("status") in {"model_failed", "invalid_or_unavailable", "not_active", "in_progress"}:
+                        raise StageBlocked(node_id, {**decision, "action": "wait",
+                            "diagnosis": "主持人暂不可用；已运行任务和产物保留，等待恢复协调。"}, error)
                     try:
-                        partial = degrade(decision, error)
-                        self._results[node_id] = partial
-                        partial_summary = _compact(summarize(partial) if summarize else partial)
-                        self._save(node_id, status="published", summary=partial_summary,
-                                   decision=_compact(decision), degraded=True,
-                                   operation_completed=False)
-                        self._emit("supervisor.node_handoff", node_id,
-                                   "节点无法完成，主持人保留已有成果并继续交接")
-                        return partial
+                        if decision.get("action") == "continue" and degrade is not None:
+                            partial = degrade(decision, error)
+                            self._results[node_id] = partial
+                            try:
+                                partial_summary = _compact(summarize(partial) if summarize else partial)
+                            except Exception as exc:
+                                partial_summary = {"observation_error": str(exc), "result_available": True}
+                            self._save(node_id, status="published", summary=partial_summary,
+                                       decision=_compact(decision), degraded=True, operation_completed=False)
+                            self._emit("supervisor.node_handoff", node_id, "主持人保留已有成果并继续交接")
+                            return partial
+                        if decision.get("action") not in {"retry", "repair_artifacts"}:
+                            raise ValueError("No available tool for this instruction; choose an offered action.")
+                        attempt += 1
+                        self._save(node_id, status="repairing", decision=_compact(decision), attempt=attempt)
+                        if decision.get("action") == "retry" and repair is None:
+                            self._instructions[node_id] = decision
+                        else:
+                            self._apply_repair(node_id, decision, repair)
+                        error = None
                     except PipelineCancelled:
                         self._save(node_id, status="interrupted")
                         raise
                     except Exception as exc:
-                        self._block(node_id, {"action": "block",
-                            "diagnosis": f"部分交接失败：{redact_text(str(exc))[:2000]}"}, exc)
-                if decision.get("action") not in {"retry", "repair_artifacts"}:
-                    self._block(node_id, decision, error)
-                # A normal check may discover a repair, but repeated rejections
-                # must not create an unbounded loop outside the exception budget.
-                attempt += 1
-                if attempt > 3:
-                    self._block(node_id, {"action": "block", "diagnosis": "节点修复次数已达上限，保留现有成果和问题。"}, error)
-                self._save(node_id, status="repairing", decision=_compact(decision), attempt=attempt)
-                try:
-                    self._apply_repair(node_id, decision, repair)
-                except PipelineCancelled:
-                    self._save(node_id, status="interrupted")
-                    raise
-                except StageBlocked:
-                    raise
-                except Exception as exc:
-                    self._block(node_id, {"action": "block", "diagnosis": f"修复操作未完成：{redact_text(str(exc))[:2000]}"}, exc)
+                        error = exc
+                        context = {**context, "attempt": attempt, "previous_instruction": decision,
+                                   "repair_error": {"kind": type(exc).__name__, "message": redact_text(str(exc))}}
+                        self._save(node_id, status="failed", error=context["repair_error"])
 
 
 def current_supervisor() -> RunSupervisor | None:

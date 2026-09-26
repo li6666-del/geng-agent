@@ -7,8 +7,6 @@ from .verification_result import WRITER_REVIEW_STATUS
 
 TASK_WRITER_TERMINAL_STATUS = WRITER_REVIEW_STATUS
 
-DEFAULT_MAX_EVIDENCE_RERUNS = 8
-
 WRITER_PAPER_FIDELITY_POLICY = """## Highest law: fidelity to the paper's established facts
 Fidelity outranks visual closeness, convenience, prior code, and reporter advice in both an initial implementation and every repair session.
 

@@ -58,90 +58,9 @@ class SemanticMergeTests(unittest.TestCase):
         conflict = merged["_meta"]["semantic_merge"]["fact_conflicts"][0]
         self.assertEqual(conflict["candidate_source"], candidate_fact["source"])
 
-    def test_same_task_id_different_target_records_conflict_without_duplicate(self) -> None:
-        base = {"repro_tasks": [{"task_id": "fig9", "figure_or_claim": "Fig. 9(a)"}]}
-        addition = {"repro_tasks": [{"task_id": "fig9", "figure_or_claim": "Fig. 9(b)"}]}
-        merged, delta = semantic_merge_repro_tasks(base, addition)
-        self.assertEqual(len(merged["repro_tasks"]), 1)
-        self.assertEqual(delta, 1)
-        self.assertEqual(len(merged["_meta"]["semantic_merge"]["task_conflicts"]), 1)
 
-    def test_task_merge_preserves_soft_handoff_metadata(self) -> None:
-        addition = {
-            "repro_tasks": [
-                {"task_id": "fig4", "figure_or_claim": "Fig. 4"}
-            ],
-            "backfill_handoff": {
-                "ready_for_writer": False,
-                "blocking_request_ids": ["fig4_setup"],
-                "reason": "setup changes the experiment",
-                "inferred": False,
-            },
-        }
 
-        merged, _ = semantic_merge_repro_tasks(
-            {"repro_tasks": []}, addition
-        )
 
-        self.assertEqual(
-            merged["backfill_handoff"],
-            addition["backfill_handoff"],
-        )
-        self.assertNotIn("backfill_handoff", merged.get("_meta", {}))
-
-    def test_merge_does_not_copy_untrusted_unrelated_metadata(self) -> None:
-        facts, _ = semantic_merge_engineering_facts(
-            {"engineering_facts": []},
-            {"engineering_facts": [], "_meta": {"untrusted": True}},
-        )
-        tasks, _ = semantic_merge_repro_tasks(
-            {"repro_tasks": []},
-            {"repro_tasks": [], "_meta": {"untrusted": True}},
-        )
-
-        self.assertNotIn("untrusted", facts.get("_meta", {}))
-        self.assertNotIn("untrusted", tasks.get("_meta", {}))
-
-    def test_task_merge_replaces_acceptance_as_one_snapshot(self) -> None:
-        old_contract = {
-            "contract_version": "1.0",
-            "core_conclusions": [{"claim_id": "old", "statement": "old"}],
-            "key_numeric_targets": [{"target_id": "stale"}],
-            "information_gaps": [],
-        }
-        refined_contract = {
-            "contract_version": "1.0",
-            "core_conclusions": [{"claim_id": "final", "statement": "final"}],
-            "key_numeric_targets": [],
-            "information_gaps": [{"gap_id": "known_gap"}],
-        }
-
-        merged, delta = semantic_merge_repro_tasks(
-            {
-                "repro_tasks": [
-                    {
-                        "task_id": "fig4",
-                        "figure_or_claim": "Fig. 4",
-                        "scientific_acceptance": old_contract,
-                    }
-                ]
-            },
-            {
-                "repro_tasks": [
-                    {
-                        "task_id": "fig4",
-                        "figure_or_claim": "Fig. 4",
-                        "scientific_acceptance": refined_contract,
-                    }
-                ]
-            },
-        )
-
-        self.assertEqual(delta, 1)
-        self.assertEqual(
-            merged["repro_tasks"][0]["scientific_acceptance"], refined_contract
-        )
-        self.assertEqual(merged["_meta"]["semantic_merge"]["merge_version"], 4)
     def test_task_coverage_does_not_use_fig9a_to_cover_fig9b(self) -> None:
         facts = {"engineering_facts": [
             {"type": "figure_claim", "name": "Fig. 9(a) BER vs SNR", "value": {}},

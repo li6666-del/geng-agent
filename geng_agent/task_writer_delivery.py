@@ -64,13 +64,10 @@ def _collect_task_writer_delivery(
     host_execution = None
     if writer_status.get("execution_receipts_required"):
         from .execution_receipts import find_host_execution
-        host_execution = find_host_execution(sandbox, Path(writer_status["execution_audit_dir"]), task_id)
-        if writer_status.get("error_kind") in {"foundation_modified", "evidence_modified"}:
-            host_execution["passed"] = False
-            issue = ("Frozen Foundation files changed during Writer execution"
-                     if writer_status.get("error_kind") == "foundation_modified"
-                     else "Original paper evidence changed during Writer execution")
-            host_execution.setdefault("issues", []).append(issue)
+        try:
+            host_execution = find_host_execution(sandbox, Path(writer_status["execution_audit_dir"]), task_id)
+        except Exception as exc:
+            host_execution = {"observed": False, "observation_error": f"{type(exc).__name__}: {exc}"}
     status = TASK_WRITER_TERMINAL_STATUS if delivery_usable else "failed"
     local_images = _collect_writer_images(
         sandbox=sandbox,
@@ -89,7 +86,6 @@ def _collect_task_writer_delivery(
         "writer_observations": {
             "paper_evidence_added_files": writer_status.get("paper_evidence_added_files", []),
             "paper_evidence_changed_files": writer_status.get("paper_evidence_changed_files", []),
-            "foundation_violations": writer_status.get("foundation_violations", []),
             "process_warning": writer_status.get("error") or writer_status.get("blocked_reason"),
         },
         "host_execution": host_execution,

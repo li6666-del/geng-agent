@@ -1,0 +1,99 @@
+.formula-backdrop {
+  position: absolute;
+  z-index: 0;
+  inset: 0;
+  overflow: clip;
+  pointer-events: none;
+  user-select: none;
+}
+
+.formula-note {
+  position: absolute;
+  width: 126px;
+  color: #416dac;
+  opacity: .68;
+  transform: rotate(-7deg);
+  font-family: "Cambria Math", "STIX Two Math", Georgia, serif;
+  font-size: 18px;
+  font-weight: 400;
+  line-height: 1.55;
+  text-align: center;
+}
+
+.formula-note::before {
+  display: block;
+  width: 25px;
+  height: 1px;
+  margin: 0 auto 10px;
+  background: currentColor;
+  opacity: .4;
+  content: "";
+}
+
+.formula-note__label {
+  display: block;
+  margin-bottom: 7px;
+  font-family: "Segoe UI", sans-serif;
+  font-size: 8px;
+  font-weight: 600;
+  letter-spacing: 1.3px;
+  opacity: .85;
+  white-space: nowrap;
+}
+
+.formula-note__equation {
+  display: block;
+  white-space: nowrap;
+}
+
+.formula-note__equation b {
+  font-weight: 700;
+  font-style: italic;
+}
+
+.formula-note__equation sub {
+  font-size: .64em;
+}
+
+.formula-note__continuation {
+  display: block;
+}
+
+.formula-note--capacity,
+.formula-note--ber,
+.formula-note--ofdm {
+  left: max(12px, calc((100% - 1560px) / 2));
+}
+
+.formula-note--channel,
+.formula-note--multipath,
+.formula-note--carrier {
+  right: max(12px, calc((100% - 1560px) / 2));
+  color: #327a86;
+  transform: rotate(7deg);
+}
+
+.formula-note--capacity { top: 160px; }
+.formula-note--channel { top: 264px; }
+.formula-note--ber { top: 474px; }
+.formula-note--multipath { top: 610px; }
+.formula-note--ofdm { top: 835px; }
+.formula-note--carrier { top: 954px; }
+
+@media (max-width: 1500px) {
+  .formula-note {
+    width: 106px;
+    font-size: 15px;
+    opacity: .62;
+  }
+
+  .formula-note__label {
+    font-size: 7px;
+    letter-spacing: .9px;
+  }
+}
+
+/* The equations belong in the margins; compact layouts keep that space clear. */
+@media (max-width: 1400px) {
+  .formula-backdrop { display: none; }
+}

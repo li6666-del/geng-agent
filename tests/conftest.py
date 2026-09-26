@@ -8,6 +8,21 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def no_paid_model_process(monkeypatch):
+    """An accidentally unmocked worker must never spend model credits in tests."""
+    import subprocess
+    from pathlib import Path
+    original = subprocess.Popen
+    def local_only(command, *args, **kwargs):
+        words = [str(part).lower() for part in command] if isinstance(command, (list, tuple)) else [str(command).lower()]
+        cli_names = {"codex", "codex.exe", "codex.cmd", "codex.js", "codex.ps1"}
+        if any(Path(part).name in cli_names for part in words[:3]) and "exec" in words and "--help" not in words:
+            raise RuntimeError("Test attempted an unmocked paid model process")
+        return original(command, *args, **kwargs)
+    monkeypatch.setattr(subprocess, "Popen", local_only)
+
+
+@pytest.fixture(autouse=True)
 def offline_capability_dispatch(request, monkeypatch):
     # Legacy suites isolate professional owner behavior. Do not accidentally
     # invoke a paid scheduling model merely because their adapter now has tools.

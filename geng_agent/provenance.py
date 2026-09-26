@@ -30,7 +30,7 @@ def build_automation_provenance(
         "repro_tasks.json",
         "experiment_index.json",
         "scientific_architecture.json",
-        "foundation_manifest.json",
+
         "repro_project_manifest.json",
         "runtime_result.json",
         "verification_result.json",

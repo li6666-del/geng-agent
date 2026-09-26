@@ -1,0 +1,6 @@
+# Minimal server dependencies. Scientific execution stays on the local worker.
+fastapi==0.141.1
+uvicorn==0.53.0
+python-multipart==0.0.32
+sqlalchemy==2.0.52
+pydantic==2.13.5

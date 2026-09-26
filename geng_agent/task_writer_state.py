@@ -9,7 +9,7 @@ import shutil
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable
 
-from .foundation_snapshot import path_is_foundation_link
+from .artifact_paths import path_is_link
 from .outputs import write_json
 from .paper_evidence import safe_label
 from .scientific_materiality import TERMINAL_SCIENTIFIC_OUTCOMES
@@ -38,7 +38,6 @@ def _load_task_writer_resume_records(
     expected_snapshot_hashes: dict[str, str] | None = None,
     receipt_validator: Callable[[dict[str, Any], Path], bool] | None = None,
     require_execution_receipts: bool = True,
-    declined_foundation_revision_ids: set[str] | None = None,
 ) -> dict[int, dict[str, Any]]:
     path = audit_dir / "03c_task_writers_records.json"
     layouts = _task_writer_resume_layouts(
@@ -64,9 +63,10 @@ def _load_task_writer_resume_records(
             from .execution_receipts import find_host_execution
             observed = find_host_execution(sandbox, audit_dir, str(record.get("task_id") or ""))
             record["host_execution"] = observed
-            return observed.get("passed") is True
-        except (OSError, ValueError, TypeError):
-            return False
+            return True  # Reporter receives the observation; receipt quality is not a rerun command.
+        except (OSError, ValueError, TypeError) as exc:
+            record.setdefault("coordination_observations", []).append(f"Receipt observation unavailable: {exc}")
+            return True
     raw_records: list[Any] = []
     if path.exists():
         try:
@@ -84,8 +84,6 @@ def _load_task_writer_resume_records(
         if index is None:
             continue
         layout = layouts[index]
-        revision = record.get("foundation_revision_request")
-        pending_revision = isinstance(revision, dict) and bool(revision.get("request_id"))
         expected_sandbox = Path(layout["sandbox"])
         sandbox = Path(str(record.get("sandbox") or ""))
         if (
@@ -94,33 +92,21 @@ def _load_task_writer_resume_records(
                 sandbox=expected_sandbox,
             )
             or not sandbox.exists()
-            or path_is_foundation_link(sandbox)
+            or path_is_link(sandbox)
             or sandbox.resolve() != expected_sandbox.resolve()
-            or (_task_writer_runtime_refresh_pending(expected_sandbox) and not pending_revision)
+            or (_task_writer_runtime_refresh_pending(expected_sandbox))
         ):
             continue
         if str(record.get("analysis_snapshot_hash") or "") != expected_hash(layout):
             continue
-        if pending_revision and str(revision["request_id"]) in (declined_foundation_revision_ids or set()):
-            record["scientific_stop_reason"] = "foundation_revision_unresolved"
-        # A stopped scientific repair is preserved as a blocker, never as a
-        # verified full result. Requiring execution here would relaunch the
-        # same impossible repair before the host can report it honestly.
-        if not pending_revision and not receipt_is_current(record, expected_sandbox):
+        # Pass the recorded execution to Reporter; observation quality is not
+        # a host instruction to rerun the science.
+        if not receipt_is_current(record, expected_sandbox):
             invalid_receipt_indexes.add(index)
             continue
         record.setdefault("index", index)
         record.setdefault("execution_unit_id", str(layout["execution_unit_id"]))
         records[index] = record
-
-    # A compound execution unit is atomic for reuse. Never combine a partial
-    # checkpoint from one logical member with a fresh shared run for the rest.
-    for layout in {str(item["execution_unit_id"]): item for item in layouts.values()}.values():
-        indexes = list(layout["member_indexes"])
-        present = [index for index in indexes if index in records]
-        if present and len(present) != len(indexes):
-            for index in present:
-                records.pop(index, None)
 
     recovered_indexes: list[int] = []
     seen_units: set[str] = set()
@@ -143,7 +129,7 @@ def _load_task_writer_resume_records(
                 sandbox=expected_sandbox,
             )
             or not evidence_index.is_file()
-            or path_is_foundation_link(evidence_index)
+            or path_is_link(evidence_index)
         ):
             continue
         try:
@@ -301,7 +287,7 @@ def _sandbox_analysis_handoff_hash(
         != expected_task_ids
     ):
         return None
-    if path_is_foundation_link(sandbox):
+    if path_is_link(sandbox):
         return None
 
     source = evidence.get("paper_source")
@@ -379,7 +365,7 @@ def _trusted_preserved_evidence_file(
     for part in parts:
         cursor = cursor / part
         try:
-            if path_is_foundation_link(cursor):
+            if path_is_link(cursor):
                 return None
         except OSError:
             return None
@@ -399,7 +385,7 @@ def _task_writer_resume_sandbox_is_safe(
     evidence_root = sandbox / PAPER_EVIDENCE_DIR
     try:
         if any(
-            path_is_foundation_link(path)
+            path_is_link(path)
             for path in (audit_dir, task_root, sandbox, evidence_root)
         ):
             return False
@@ -416,7 +402,7 @@ def _task_writer_runtime_refresh_marker(sandbox: Path) -> Path:
 def _task_writer_runtime_refresh_pending(sandbox: Path) -> bool:
     marker = _task_writer_runtime_refresh_marker(sandbox)
     try:
-        return marker.is_file() and not path_is_foundation_link(marker)
+        return marker.is_file() and not path_is_link(marker)
     except OSError:
         return False
 
@@ -486,124 +472,12 @@ def _record_has_terminal_task_verification(record: dict[str, Any]) -> bool:
     """Return whether the Reporter reached any normal scientific terminal outcome."""
 
     verification = record.get("task_verification")
-    task_id = str(record.get("task_id") or "")
     return (
         isinstance(verification, dict)
-        and verification.get("task_id") == task_id
-        and (verification.get("host_action") == "complete" or record.get("coordination_status") == "stopped")
+        and (verification.get("host_action") != "rerun_writer" or record.get("coordination_status") == "stopped")
     )
 
-def _archive_execution_unit_delivery(
-    *,
-    sandbox: Path,
-    members: list[tuple[int, dict[str, Any], dict[str, Any]]],
-    execution_unit_id: str,
-    round_no: int,
-    session_status: dict[str, Any],
-) -> None:
-    progress_dir = sandbox / "writer_progress" / f"round_{round_no:03d}"
-    progress_dir.mkdir(parents=True, exist_ok=True)
-    archived_paths: list[str] = []
-    task_ids = [
-        str(task.get("task_id") or entry.get("task_id") or f"task_{index}")
-        for index, task, entry in members
-    ]
-    active_outputs = sandbox / "outputs"
-    if active_outputs.exists():
-        _move_writer_generation_to_archive(active_outputs, progress_dir / "outputs")
-        archived_paths.append("outputs")
 
-    unit_result_path = sandbox / "execution_unit_result.json"
-    unit_result = _read_optional_json_object(unit_result_path)
-    unit_asset_relative = Path("execution_units") / safe_label(execution_unit_id)
-    unit_asset_root = sandbox / unit_asset_relative
-    # Preserve expensive shared checkpoints. Reuse is decided from producer
-    # receipts and current dependency hashes, never from mere file existence.
-    unit_asset_root.mkdir(parents=True, exist_ok=True)
-
-    raw_lineage = unit_result.get("artifact_lineage")
-    for raw_entry in raw_lineage if isinstance(raw_lineage, list) else []:
-        if not isinstance(raw_entry, dict):
-            continue
-        artifact = _active_writer_artifact_path(
-            sandbox=sandbox,
-            raw_path=raw_entry.get("path"),
-        )
-        if artifact is None or not artifact.exists():
-            continue
-        try:
-            relative = artifact.relative_to(sandbox)
-        except ValueError:
-            continue
-        # Namespace artifacts were moved as one atomic tree above. Outputs are
-        # also already archived per logical task.
-        if relative.parts[: len(unit_asset_relative.parts)] == unit_asset_relative.parts:
-            continue
-        if relative.parts and relative.parts[0] == "outputs":
-            continue
-        destination = progress_dir / "shared_artifacts" / relative
-        _move_writer_generation_to_archive(artifact, destination)
-        archived_paths.append(relative.as_posix())
-
-    if unit_result_path.is_file():
-        _move_writer_generation_to_archive(
-            unit_result_path,
-            progress_dir / "execution_unit_result.json",
-        )
-        archived_paths.append("execution_unit_result.json")
-    write_json(
-        progress_dir / "session_status.json",
-        {
-            "terminal": False,
-            "reason": "execution_unit_generation_archived_before_continuation",
-            "task_ids": task_ids,
-            "session_status": session_status,
-            "archived_active_paths": sorted(set(archived_paths)),
-            "preserved_shared_artifact_root": unit_asset_relative.as_posix(),
-        },
-    )
-
-def _active_writer_artifact_path(*, sandbox: Path, raw_path: Any) -> Path | None:
-    normalized = str(raw_path or "").strip().replace("\\", "/")
-    if not normalized:
-        return None
-    portable = PurePosixPath(normalized)
-    if (
-        portable.is_absolute()
-        or PureWindowsPath(normalized).is_absolute()
-        or PureWindowsPath(normalized).drive
-        or ".." in portable.parts
-    ):
-        return None
-    candidate = sandbox / Path(*portable.parts)
-    try:
-        candidate.resolve().relative_to(sandbox.resolve())
-    except (OSError, ValueError):
-        return None
-    protected_roots = {
-        "configs",
-        PAPER_EVIDENCE_DIR,
-        "src",
-        "tasks",
-        "writer_progress",
-    }
-    if portable.parts and portable.parts[0] in protected_roots:
-        return None
-    protected_root_files = {
-        "config.json",
-        "config_smoke.json",
-        "execution_unit_result.json",
-        "execution_plan.json",
-        "README.md",
-        "requirements.txt",
-        "run_experiment.py",
-        "tasks_manifest.json",
-    }
-    if len(portable.parts) == 1 and portable.name in protected_root_files:
-        return None
-    if candidate.is_symlink():
-        return None
-    return candidate
 
 def _move_writer_generation_to_archive(source: Path, destination: Path) -> None:
     target = destination
@@ -614,126 +488,11 @@ def _move_writer_generation_to_archive(source: Path, destination: Path) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(source), str(target))
 
-def _complete_execution_unit_runtime_refresh(
-    *,
-    records: list[dict[str, Any]],
-    marker: Path,
-    required: bool,
-    writer_status: dict[str, Any],
-) -> bool:
-    if not required:
-        return False
-    fresh_delivery_usable = (
-        writer_status.get("ok") is True
-        and not writer_status.get("error_kind")
-        and bool(records)
-        and all(
-            record.get("writer_completed") is True
-            and record.get("task_writer_status") == TASK_WRITER_TERMINAL_STATUS
-            for record in records
-        )
-    )
-    if fresh_delivery_usable:
-        try:
-            marker.unlink(missing_ok=True)
-        except OSError:
-            fresh_delivery_usable = False
-    for record in records:
-        record["runtime_refresh_required"] = True
-        record["runtime_refresh_completed"] = bool(fresh_delivery_usable)
-        record["environment_refresh_required"] = True
-        record["environment_refresh_completed"] = bool(fresh_delivery_usable)
-    return bool(fresh_delivery_usable)
-
-def _rerun_evidence_fingerprint(evidence: Any, progress: str = "") -> str:
-    """Return an order-stable scientific rerun identity for loop detection."""
-
-    value = evidence if isinstance(evidence, dict) else {}
-
-    def _normalized_list(key: str) -> list[str]:
-        raw = value.get(key)
-        if not isinstance(raw, list):
-            return []
-        return sorted({str(item).strip().casefold() for item in raw if str(item).strip()})
-
-    payload = {
-        "rerun_reason": str(value.get("rerun_reason") or "none").strip().casefold(),
-        "contract_item_ids": _normalized_list("contract_item_ids"),
-        "change_targets": _normalized_list("change_targets"),
-        "progress": progress,
-    }
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
-def _writer_progress_fingerprint(sandbox: Path) -> str:
-    """Compare actual numerical progress, falling back to source before a run.
 
-    Rewording a rerun request or changing source comments is not progress. A
-    changed numerical result may justify another scientific inspection even
-    when the same method or trend still needs work.
-    """
-    paths = [p for p in (sandbox / "outputs").rglob("*") if p.is_file()
-             and p.suffix.lower() in {".csv", ".npy", ".npz", ".json"}
-             and p.name not in {"execution_receipt.json", "task_agent_result.json"}]
-    digest = hashlib.sha256()
-    # A real method correction can leave the headline metric unchanged. Keep
-    # executable changes in the state, but ignore comments and formatting so
-    # cosmetic edits cannot manufacture progress.
-    for path in sorted([p for name in ("tasks", "src") for p in (sandbox / name).rglob("*.py") if p.is_file() and not p.is_symlink()]):
-        digest.update(path.relative_to(sandbox).as_posix().encode())
-        try:
-            digest.update(ast.dump(ast.parse(path.read_text(encoding="utf-8-sig")), include_attributes=False).encode())
-        except (ValueError, OSError, SyntaxError):
-            digest.update(b"<invalid-source>")
-    paths += [p for p in (sandbox / "configs").rglob("*.json") if p.is_file()]
-    paths += [sandbox / name for name in ("config.json", "config_smoke.json") if (sandbox / name).is_file()]
-    for path in sorted(paths):
-        digest.update(path.relative_to(sandbox).as_posix().encode())
-        with path.open("rb") as handle:
-            for block in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(block)
-    return digest.hexdigest()
 
-def _writer_source_config_fingerprint(sandbox: Path) -> str:
-    """Hash task-owned source and run configuration, excluding outputs."""
 
-    digest = hashlib.sha256()
-    paths = list(_task_owned_files(sandbox))
-    src_dir = sandbox / "src"
-    if src_dir.is_dir():
-        paths.extend(
-            path
-            for path in src_dir.rglob("*.py")
-            if path.is_file() and not path.is_symlink()
-        )
-    configs_dir = sandbox / "configs"
-    if configs_dir.is_dir():
-        paths.extend(
-            path
-            for path in configs_dir.rglob("*")
-            if path.is_file() and not path.is_symlink()
-        )
-    for name in ("config.json", "config_smoke.json", "requirements.txt"):
-        path = sandbox / name
-        if path.is_file() and not path.is_symlink():
-            paths.append(path)
-    for path in sorted(set(paths), key=lambda item: item.relative_to(sandbox).as_posix()):
-        relative = path.relative_to(sandbox).as_posix()
-        digest.update(relative.encode("utf-8"))
-        digest.update(b"\0")
-        try:
-            with path.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
-        except OSError:
-            digest.update(b"<unreadable>")
-        digest.update(b"\0")
-    return digest.hexdigest()
-
-def _record_source_config_fingerprint(record: dict[str, Any], fallback: Path) -> str:
-    raw_sandbox = str(record.get("sandbox") or "").strip()
-    sandbox = Path(raw_sandbox) if raw_sandbox else fallback
-    return _writer_source_config_fingerprint(sandbox)
 
 def _terminalize_rerun_request(
     *,
@@ -764,7 +523,10 @@ def _complete_task_writer_runtime_refresh(
     record["runtime_refresh_completed"] = True
     record["environment_refresh_required"] = True
     record["environment_refresh_completed"] = True
-    marker.unlink(missing_ok=True)
+    try:
+        marker.unlink(missing_ok=True)
+    except OSError as exc:
+        record.setdefault("coordination_observations", []).append(f"Refresh marker cleanup failed: {exc}")
     return record
 
 def _next_writer_progress_round(sandbox: Path) -> int:

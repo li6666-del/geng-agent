@@ -80,7 +80,7 @@ def test_unversioned_address_aliases_keep_task_ownership_and_original_document()
     assert binding['configuration_issues'] == []
     assert binding['experiment_ids'] == ['exp_1']
     assert binding['components'][0]['component_id'] == 'shared_model'
-    assert binding['components'][0]['ownership'] == 'foundation'
+    assert binding['components'][0]['ownership'] == 'task'
     assert binding['components'][0]['execution'] == component['execution']
     assert json.dumps(architecture, ensure_ascii=False) == original
 
@@ -123,7 +123,6 @@ def _brief(binding: dict | None) -> str:
         paper_context_json='',
         paper_thesis=None,
         run_repro=True,
-        foundation_enabled=True,
         execution_binding=binding,
     )
 
@@ -145,7 +144,7 @@ class TaskWriterExecutionBindingTests(unittest.TestCase):
         final_template = prompt.split('## Required final files', 1)[1]
         usage_key = json.dumps('component_usage') + ':'
         self.assertIn(usage_key, final_template)
-        self.assertIn('An audit-only call', prompt)
+        self.assertIn('independent Reporter', prompt)
         self.assertIn('Follow each bound component execution.primary_framework', prompt)
         self.assertNotIn('prefer a real Torch CUDA implementation', prompt)
 
@@ -171,50 +170,13 @@ class TaskWriterExecutionBindingTests(unittest.TestCase):
                 sandbox,
                 {'task_id': 'fig_1'},
                 {'task_id': 'fig_1', 'module': 'fig_1'},
-                foundation_enabled=True,
-            )
+                )
 
-            self.assertFalse((sandbox / 'requirements.txt').exists())
+            self.assertTrue((sandbox / 'requirements.txt').exists())
             self.assertFalse((sandbox / 'src' / 'channel.py').exists())
             self.assertTrue((sandbox / 'config.json').is_file())
             self.assertTrue((sandbox / 'tasks' / 'fig_1.py').is_file())
 
-    def test_foundation_merge_does_not_reinject_legacy_numpy_requirements(self) -> None:
-        with TemporaryDirectory() as temp:
-            root = Path(temp)
-            sandbox = root / 'sandbox'
-            repro = root / 'repro'
-            (sandbox / 'tasks').mkdir(parents=True)
-            (sandbox / 'tasks' / 'fig_1.py').write_text('VALUE = 1\n', encoding='utf-8')
-            (sandbox / 'requirements.txt').write_text('torch\n', encoding='utf-8')
-            expected = {
-                'README.md',
-                'config.json',
-                'config_smoke.json',
-                'requirements.txt',
-                'tasks/fig_1.py',
-            }
-            with patch(
-                'geng_agent.task_writer_packaging.install_foundation_snapshot',
-                return_value={'requirements.txt'},
-            ):
-                _merge_task_writer_deliveries(
-                    repro_project_dir=repro,
-                    task_manifest={'version': 1, 'tasks': []},
-                    expected_paths=expected,
-                    task_records=[
-                        {
-                            'task_id': 'fig_1',
-                            'module': 'fig_1',
-                            'output_subdir': 'fig_1',
-                            'sandbox': str(sandbox),
-                        }
-                    ],
-                    foundation={'manifest': {}},
-                )
-
-            requirements = (repro / 'requirements.txt').read_text(encoding='utf-8')
-            self.assertEqual(requirements, 'torch\n')
 
 
 if __name__ == '__main__':

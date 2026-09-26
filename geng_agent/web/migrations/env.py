@@ -4,7 +4,7 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 from geng_agent.web.db import Base
-from geng_agent.web.models import ArtifactRecord, CaseRecord, ExportRecord, JobEvent, JobRecord  # noqa: F401
+from geng_agent.web import models  # noqa: F401
 from geng_agent.web.settings import settings
 
 config = context.config

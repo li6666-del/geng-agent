@@ -146,7 +146,7 @@ class ScientificStateMachineSafetyTests(unittest.TestCase):
             self.assertEqual(record["task_verification"]["host_action"], "rerun_writer")
             self.assertEqual(record["coordination_status"], "stopped")
             self.assertEqual(record["scientific_stop_reason"], "moderator_stopped_revision")
-            self.assertTrue(moderate.call_args.kwargs["context"]["ownership"]["evidence_observations"])
+            self.assertEqual(moderate.call_args.kwargs["context"]["reporter_verification"], verification)
 
     def test_missing_sandbox_does_not_read_caller_working_directory(self) -> None:
         with TemporaryDirectory() as temp:
@@ -168,165 +168,9 @@ class ScientificStateMachineSafetyTests(unittest.TestCase):
                 os.chdir(old_cwd)
             self.assertFalse((repro / "tasks" / "leak.py").exists())
 
-    def test_rerun_fingerprint_is_order_and_case_stable(self) -> None:
-        first = {
-            "rerun_reason": "core_conclusion_failed",
-            "contract_item_ids": ["B", "a"],
-            "change_targets": ["Y.py", "x.py"],
-            "causal_change": "  Fix   Data Path ",
-            "predicted_effect": "Finite Output",
-        }
-        second = {
-            "rerun_reason": "core_conclusion_failed",
-            "contract_item_ids": ["A", "b"],
-            "change_targets": ["x.PY", "y.PY"],
-            "causal_change": "use completely different wording",
-            "predicted_effect": "describe the same target with different prose",
-        }
-        self.assertEqual(
-            writers._rerun_evidence_fingerprint(first),
-            writers._rerun_evidence_fingerprint(second),
-        )
 
-    def test_writer_emergency_cap_stops_unique_rerun_requests(self) -> None:
-        with TemporaryDirectory() as temp:
-            root = Path(temp)
-            base_record = _writer_record()
-            attach_calls = 0
 
-            def attach(**_kwargs):
-                nonlocal attach_calls
-                attach_calls += 1
-                evidence = {
-                    "rerun_reason": "core_conclusion_failed",
-                    "contract_item_ids": [f"claim.{attach_calls}"],
-                    "paper_evidence_files": ["paper_evidence/source/paper.pdf"],
-                    "causal_change": f"change {attach_calls}",
-                    "change_targets": [f"tasks/change_{attach_calls}.py"],
-                    "predicted_effect": "improve",
-                }
-                return "writer_revision", {
-                    "task_id": "task_a",
-                    "run_valid": True,
-                    "host_action": "rerun_writer",
-                    "rerun_reason": "core_conclusion_failed",
-                    "rerun_evidence": evidence,
-                    "remaining_uncertainties": [],
-                }
 
-            run_mock = unittest.mock.Mock(return_value={"ok": True})
-            with ExitStack() as stack:
-                stack.enter_context(patch.object(writer_runner, "_prepare_task_writer_sandbox"))
-                stack.enter_context(patch.object(writer_runner, "_load_task_execution_binding", return_value=None))
-                stack.enter_context(patch.object(writer_runner, "_build_task_writer_brief", return_value="prompt"))
-                stack.enter_context(patch.object(writer_runner, "_run_task_writer_codex_session", run_mock))
-                stack.enter_context(patch.object(writer_runner, "_restore_trusted_files"))
-                stack.enter_context(patch.object(writer_runner, "_collect_task_writer_delivery", side_effect=lambda **_kwargs: dict(base_record)))
-                stack.enter_context(patch.object(writer_runner, "_attach_task_reporter_review", side_effect=attach))
-                stack.enter_context(patch.object(writer_runner, "_archive_nonterminal_writer_delivery"))
-                state_no = iter(range(100))
-                stack.enter_context(patch.object(
-                    writer_runner,
-                    "_record_source_config_fingerprint",
-                    side_effect=lambda *_args: f"state-{next(state_no)}",
-                ))
-                result = writers._run_one_task_writer(
-                    index=1,
-                    reuse_existing=False,
-                    task=_task(),
-                    manifest_entry={"task_id": "task_a", "module": "task_a", "output_subdir": "task_a"},
-                    facts={},
-                    experiment_index={},
-                    paper={},
-                    paper_path=root / "paper.pdf",
-                    paper_context_json="{}",
-                    paper_images=[],
-                    paper_thesis={},
-                    analysis_snapshot_hash="hash",
-                    analysis_artifacts={},
-                    task_root=root / "sandboxes",
-                    audit_dir=root / "audit",
-                    run_repro=True,
-                    task_review_callback=lambda *_args: {},
-                )
-            self.assertEqual(run_mock.call_count, writers.DEFAULT_MAX_EVIDENCE_RERUNS + 1)
-            self.assertEqual(
-                result["scientific_stop_reason"],
-                "external_rerun_budget_exhausted",
-            )
-
-    def test_writer_rerun_budget_has_finite_default_and_configuration_override(self) -> None:
-        with patch.dict(
-            os.environ,
-            {"GENG_TASK_WRITER_MAX_EVIDENCE_RERUNS": ""},
-        ):
-            self.assertEqual(writers._external_writer_rerun_budget(), writers.DEFAULT_MAX_EVIDENCE_RERUNS)
-        with patch.dict(
-            os.environ,
-            {"GENG_TASK_WRITER_MAX_EVIDENCE_RERUNS": "2"},
-        ):
-            self.assertEqual(writers._external_writer_rerun_budget(), 2)
-
-    def test_unchanged_writer_continuation_stops_before_second_reporter_call(self) -> None:
-        with TemporaryDirectory() as temp:
-            root = Path(temp)
-            base_record = _writer_record()
-            verification = {
-                "task_id": "task_a",
-                "run_valid": True,
-                "host_action": "rerun_writer",
-                "rerun_reason": "core_conclusion_failed",
-                "rerun_evidence": _rerun_note()["rerun_evidence"],
-                "remaining_uncertainties": [],
-            }
-            run_mock = unittest.mock.Mock(return_value={"ok": True})
-            attach_mock = unittest.mock.Mock(
-                return_value=("writer_revision", verification)
-            )
-            with ExitStack() as stack:
-                stack.enter_context(patch.object(writer_runner, "_prepare_task_writer_sandbox"))
-                stack.enter_context(patch.object(writer_runner, "_load_task_execution_binding", return_value=None))
-                stack.enter_context(patch.object(writer_runner, "_build_task_writer_brief", return_value="prompt"))
-                stack.enter_context(patch.object(writer_runner, "_run_task_writer_codex_session", run_mock))
-                stack.enter_context(patch.object(writer_runner, "_restore_trusted_files"))
-                stack.enter_context(patch.object(
-                    writer_runner,
-                    "_collect_task_writer_delivery",
-                    side_effect=lambda **_kwargs: dict(base_record),
-                ))
-                stack.enter_context(patch.object(writer_runner, "_attach_task_reporter_review", attach_mock))
-                stack.enter_context(patch.object(writer_runner, "_archive_nonterminal_writer_delivery"))
-                stack.enter_context(patch.object(
-                    writer_runner,
-                    "_record_source_config_fingerprint",
-                    return_value="unchanged",
-                ))
-                result = writers._run_one_task_writer(
-                    index=1,
-                    reuse_existing=False,
-                    task=_task(),
-                    manifest_entry={"task_id": "task_a", "module": "task_a", "output_subdir": "task_a"},
-                    facts={},
-                    experiment_index={},
-                    paper={},
-                    paper_path=root / "paper.pdf",
-                    paper_context_json="{}",
-                    paper_images=[],
-                    paper_thesis={},
-                    analysis_snapshot_hash="hash",
-                    analysis_artifacts={},
-                    task_root=root / "sandboxes",
-                    audit_dir=root / "audit",
-                    run_repro=True,
-                    task_review_callback=lambda *_args: {},
-                )
-
-            self.assertEqual(run_mock.call_count, 2)
-            self.assertEqual(attach_mock.call_count, 1)
-            self.assertEqual(
-                result["scientific_stop_reason"],
-                "writer_continuation_without_source_change",
-            )
 
 
 if __name__ == "__main__":

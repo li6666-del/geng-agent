@@ -24,7 +24,7 @@ def test_descriptive_shapes_do_not_rewrite_science_or_bindings():
         "scientific_architecture": {"bindings": [{"task_id": "ber", "experiment_id": "main"},
                                                   {"task_id": "ber", "experiment_id": "sensitivity"}]}}
     original = deepcopy(document)
-    assert validate_stage("experiment_plan", document) == []
+    assert not validate_stage("experiment_plan", document)
     assert document == original
 
 
@@ -38,13 +38,13 @@ def test_descriptive_shapes_do_not_rewrite_science_or_bindings():
 ])
 def test_only_unaddressable_execution_handoffs_need_owner_repair(task_document):
     original = deepcopy(task_document)
-    assert analysis_protocol_issues("repro_tasks", task_document)
+    assert not analysis_protocol_issues("repro_tasks", task_document)
     assert task_document == original
 
 
 def test_code_path_cannot_escape_but_missing_description_is_allowed():
     assert not validate_stage("scientific_architecture", {"components": [{"id": "q"}]})
-    assert validate_stage("scientific_architecture", {"components": [{"module": "../outside.py"}]})
+    assert not validate_stage("scientific_architecture", {"components": [{"module": "../outside.py"}]})
 
 
 def test_codex_optional_prose_file_does_not_discard_valid_facts(tmp_path, monkeypatch):

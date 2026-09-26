@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any
 
 from .outputs import write_json
-from .security import FOUNDATION_STATIC_SECURITY_ADVISORY_CATEGORIES, split_static_security_issues
 from .task_writer_files import _read_optional_json_object
 from .verification_result import FINAL_MATCHED_STATUS, WRITER_REVIEW_STATUS
 
@@ -107,59 +106,8 @@ def _task_writer_runtime_result(
         "requirements_warnings": requirement_warnings,
         "requirements_issues": blocking_requirements,
         "security_issues": security_issues,
-        "foundation_integrity_violations": (
-            validation.get("foundation_violations")
-            if isinstance(validation.get("foundation_violations"), list)
-            else []
-        ),
     }
 
-def _classify_task_writer_security_issues(
-    issues: list[dict[str, Any]],
-    *,
-    foundation: dict[str, Any] | None,
-    foundation_integrity_issues: list[dict[str, Any]] | None = None,
-) -> list[dict[str, str]]:
-    """Apply the Foundation-only advisory exception to strict scanner findings.
-
-    The global scanner remains fail-closed. A finding is downgraded only when
-    its category is explicitly approved for Foundation code, its file is owned
-    by the validated Foundation manifest, and the assembled project still
-    matches the Foundation hashes and frozen layout. Task Writer files
-    therefore remain strict even when a Foundation is installed in the same
-    project. Omitting the integrity result is deliberately fail-closed.
-    """
-
-    foundation_paths: set[str] = set()
-    foundation_is_current = (
-        isinstance(foundation, dict)
-        and foundation_integrity_issues is not None
-        and not foundation_integrity_issues
-    )
-    if foundation_is_current:
-        assert isinstance(foundation, dict)
-        manifest = foundation.get("manifest")
-        files = manifest.get("files") if isinstance(manifest, dict) else None
-        for item in files if isinstance(files, list) else []:
-            if isinstance(item, dict):
-                path = str(item.get("path") or "").replace("\\", "/")
-                if path:
-                    foundation_paths.add(path)
-
-    classified: list[dict[str, str]] = []
-    for issue in issues:
-        issue_file = str(issue.get("file") or "").replace("\\", "/")
-        advisory_categories = (
-            FOUNDATION_STATIC_SECURITY_ADVISORY_CATEGORIES
-            if issue_file in foundation_paths
-            else frozenset()
-        )
-        blocking, warnings = split_static_security_issues(
-            [issue],
-            advisory_categories=advisory_categories,
-        )
-        classified.extend(warnings or blocking)
-    return classified
 
 def _task_writer_runtime_task_passed(record: dict[str, Any]) -> bool:
     host = record.get("host_execution")

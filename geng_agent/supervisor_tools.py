@@ -17,7 +17,7 @@ import time
 from uuid import uuid4
 
 from .moderator import _digest, _event_claim, _read_record
-from .outputs import write_json
+from .observations import write_json
 from .progress import PipelineCancelled
 from .security import redact_text
 
@@ -144,9 +144,9 @@ class SupervisorTools:
                     "diagnosis": "工具已有活跃执行者；保留其现场，不重复启动。"})
             previous = self.status(scope, tool.name)
             interrupted = previous.get("status") in {"running", "interrupted"}
-            if interrupted and tool.resume is None:
-                raise StageBlocked(tool.name, {"action": "block", "status": "reconciliation_required",
-                    "diagnosis": "该工具上次执行中断且没有对账适配器，不能盲目重放。"})
+            if interrupted and tool.resume is None and decision.get("action") != "retry":
+                from .supervisor import NodeFailure
+                raise NodeFailure("该工具上次执行中断且没有对账适配器；请主持人决定是否重试或交付已有结果。")
             action = {"name": tool.name, "scope": scope, "identity": identity,
                       "goal_id": self.supervisor.goal_id, "decision": decision,
                       "attempt": int(previous.get("attempt", 0)) + 1,
@@ -161,7 +161,7 @@ class SupervisorTools:
                 self._active[(scope, tool.name)] = time.monotonic()
             try:
                 self.supervisor._check_cancelled()
-                result = (tool.resume if interrupted else tool.invoke)(decision)
+                result = (tool.resume if interrupted and tool.resume is not None else tool.invoke)(decision)
                 self.supervisor._check_cancelled()
             except BaseException as exc:
                 if isinstance(exc, (PipelineCancelled, KeyboardInterrupt)):
@@ -185,6 +185,7 @@ class SupervisorTools:
             state: Callable[[], dict], on_result: Callable[[str, Any], None],
             on_error: Callable[[str, Exception], None], poll_seconds: float = 0.2,
             check_interval: float = 300.0,
+            concurrency: int | None = None,
             on_dispatch: Callable[[list[str], dict], None] | None = None,
             routine_selector: Callable[[dict], dict | None] | None = None) -> dict:
         """Drive a capability session. Offers express prerequisites, not order.
@@ -199,11 +200,6 @@ class SupervisorTools:
         invocation = uuid4().hex
         last_wake = time.monotonic()
         terminal = None
-        from .config import get_config_value
-        try:
-            action_budget = max(1, int(get_config_value("GENG_SUPERVISOR_MAX_ACTIONS") or 128))
-        except (TypeError, ValueError):
-            action_budget = 128
         dispatched = 0
         with _event_claim(self.root / ("controller_" + _digest(scope)[:20])) as acquired:
             if not acquired:
@@ -211,7 +207,7 @@ class SupervisorTools:
             # Worker operations retain the calling model config, supervisor and
             # activity contexts. No state/catalog lock spans a model invocation.
             with self._controller_scope(scope), ThreadPoolExecutor(
-                    max_workers=max(1, len(offer())), thread_name_prefix="supervisor-tool") as pool, self._cancel_workers_on_interrupt():
+                    max_workers=max(1, concurrency or len(offer())), thread_name_prefix="supervisor-tool") as pool, self._cancel_workers_on_interrupt():
                 while True:
                     self.supervisor._check_cancelled()
                     finished = [future for future in running if future.done()]
@@ -257,7 +253,7 @@ class SupervisorTools:
                                "active_observations": self.active(),
                                "process_observations": self.process_observations(),
                                "history": history[-12:], "event_id": observation["event_id"],
-                               "invocation": invocation, "remaining_action_budget": action_budget - dispatched,
+                               "invocation": invocation, "dispatched_actions": dispatched,
                                "purpose": "自主安排工具。可并行启动互不冲突的工具；有活跃工作可等待；可明确保留未完成事项后结束。"}
                     actions = (("start",) if ready else ()) + (("wait",) if running else ("finish",))
                     evidence = {"e_" + _digest(str(path))[:16]: path for tool in ready.values()
@@ -273,8 +269,16 @@ class SupervisorTools:
                         decision = self.supervisor._request("tools:" + scope, trigger="tool_dispatch",
                             context=context, roots=evidence, actions=actions, routine=False)
                     elif decision.get("action") not in actions:
-                        raise ValueError("routine selector chose an unavailable action")
+                        decision = self.supervisor._request("tools:" + scope, trigger="dispatch_unavailable",
+                            context={**context, "unavailable_instruction": decision}, roots=evidence,
+                            actions=actions, routine=False)
                     last_wake = time.monotonic()
+                    if decision.get("action") == "unavailable":
+                        # Drain in-flight tools before returning the unresolved
+                        # coordination state. Never turn transport loss into a
+                        # model-authored stop, or spin on paid model retries.
+                        terminal = decision
+                        continue
                     if decision.get("action") in {"stop", "block", "finish"}:
                         if running:
                             # Do not silently abandon running side effects.
@@ -286,19 +290,20 @@ class SupervisorTools:
                         continue
                     selected = decision.get("next_nodes") or [decision.get("next_node")]
                     if decision.get("action") != "start" or not selected or any(name not in ready for name in selected):
-                        raise StageBlocked(scope, {"action": "block", "diagnosis": "主持人未提供可执行的工具地址。", "decision": decision})
-                    if len(selected) != len(set(selected)):
-                        raise StageBlocked(scope, {"action": "block", "diagnosis": "同一批次不能重复启动同一工具。"})
+                        history.append({"status": "dispatch_unavailable", "decision": decision,
+                                        "error": "No selected tool address is currently executable; clarify the instruction."})
+                        continue
+                    selected = list(dict.fromkeys(selected))
                     selected_resources: set[str] = set()
+                    executable = []
                     for name in selected:
                         tool = ready[name]
                         if selected_resources.intersection(tool.resources):
-                            raise StageBlocked(scope, {"action": "block", "diagnosis": "同批工具写入范围冲突。"})
+                            # Keep conflicting work in the offer for the next batch.
+                            continue
                         selected_resources.update(tool.resources)
-                    if dispatched + len(selected) > action_budget:
-                        terminal = {"action": "block", "status": "budget_exhausted",
-                                    "diagnosis": "工具动作预算已用完；保存状态，未完成事项不转为科研结论。"}
-                        continue
+                        executable.append(name)
+                    selected = executable
                     self.event("decision", scope, decision=decision)
                     if on_dispatch is not None:
                         on_dispatch(selected, decision)

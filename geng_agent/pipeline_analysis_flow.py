@@ -12,7 +12,7 @@ from .analysis_prompt_context import (
     analysis_paper_context, ledger_for_prompt, resolution_for_prompt,
     scientific_prompt_value, tasks_for_backfill,
 )
-from .execution_plan import ExecutionPlanError, compile_execution_plan
+from .execution_plan import compile_execution_plan
 from .json_utils import pretty_json
 from .mineru_adapter import figure_index_prompt_summary
 from .outputs import write_json
@@ -322,22 +322,7 @@ def run_analysis_flow(
             handoff_applied_instruction = handoff_repair_instruction
             handoff_repair_instruction = None
             handoff_reconcile_cache = False
-        try:
-            execution_plan = compile_execution_plan(tasks)
-        except ExecutionPlanError as exc:
-            write_json(
-                audit_dir / "02e_execution_plan_error.json",
-                {
-                    "decision": "stop",
-                    "pipeline_can_continue": False,
-                    "error_code": exc.code,
-                    "path": exc.path,
-                    "error": str(exc),
-                },
-            )
-            raise RuntimeError(
-                f"material task execution relationship is not executable: {exc}"
-            ) from exc
+        execution_plan = compile_execution_plan(tasks)
         write_json(output_dir / "execution_plan.json", execution_plan)
         write_json(
             audit_dir / "02e_execution_plan.json",
@@ -345,14 +330,7 @@ def run_analysis_flow(
                 "ok": True,
                 "logical_task_count": execution_plan["logical_task_count"],
                 "execution_unit_count": execution_plan["execution_unit_count"],
-                "compound_unit_count": sum(
-                    1
-                    for unit in execution_plan["execution_units"]
-                    if unit.get("mode") == "compound"
-                ),
-                "weak_consistency_group_count": len(
-                    execution_plan["weak_consistency_groups"]
-                ),
+                "task_policy": execution_plan["task_policy"],
             },
         )
 

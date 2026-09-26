@@ -16,7 +16,7 @@ from typing import Callable, Iterator
 from urllib.parse import urlsplit
 
 
-ROLES = ("analysis", "foundation_writer", "task_writer", "task_reporter", "moderator", "report_editor")
+ROLES = ("analysis", "task_writer", "task_reporter", "moderator", "report_editor")
 DEFAULT_MODEL = "gpt-6-astra"
 REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"})
 _IDENTIFIER = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z")

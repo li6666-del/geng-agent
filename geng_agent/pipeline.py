@@ -67,8 +67,6 @@ from .workflow_policy import (
     CURRENT_WORKFLOW_VERSION,
     UnsupportedWorkflowVersionError,
     _ensure_v2_workflow,
-    _execution_plan_requires_shared_science,
-    _shared_foundation_is_material,
 )
 
 

@@ -33,8 +33,6 @@ def _read_analysis_documents(workspace: Path, documents: dict[str, str]) -> str:
             continue
         if path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction()) or not path.is_file():
             raise ValueError(f"Analysis document is not a regular owned file: {name}")
-        if path.stat().st_size > 4_000_000:
-            raise ValueError(f"Analysis document is too large: {name}")
         raw_document = path.read_text(encoding="utf-8-sig")
         try:
             body = json.loads(raw_document)
@@ -92,9 +90,6 @@ def run_codex_json_stage(
         audit_dir=audit_dir, label=label,
         sandbox="workspace-write" if documents else "read-only",
         command_override=get_config_value("GENG_CODEX_ANALYSIS_CMD"), image_paths=image_paths)
-    if not status.get("ok"):
-        raise NodeFailure(status.get("error") or "Analysis worker did not complete", result={
-            "status": status, "owner_documents": str(workspace), "candidate_snapshot": str(snapshot)})
     try:
         raw = _read_analysis_documents(workspace, documents) if documents else _read_last_message_file(status)
         write_text(snapshot / "raw.txt", raw)
@@ -113,6 +108,8 @@ def run_codex_json_stage(
     write_json(snapshot / "handoff.json", parsed)
     observations = ([{"kind": "json_unreadable", "message": parse_issue}]
                     if parse_issue else [])
+    if not status.get("ok"):
+        observations.append({"kind": "worker_process", "status": status})
     write_json(audit_dir / f"handoff_{stage_label}_attempt_1.json", {
         "handoff_recorded": True, "content_validation_performed": False,
         "observations": observations, "decision_owner": "next_stage",

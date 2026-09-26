@@ -54,7 +54,7 @@ def _transport(monkeypatch, result=None, during=None):
 def test_inactive_moderator_never_calls_a_model(monkeypatch, evidence):
     calls = _transport(monkeypatch)
     result = module.request_moderation(**_request(evidence))
-    assert result["action"] == "stop" and result["status"] == "not_active"
+    assert result["action"] == "unavailable" and result["status"] == "not_active"
     assert calls == []
 
 
@@ -67,8 +67,8 @@ def test_decision_is_evidence_bound_and_never_reissued_after_resume(monkeypatch,
     assert (evidence / "source/task.py").read_text() == "VALUE = 2\n"
     with module.moderator_scope(audit):
         again = module.request_moderation(**{**_request(evidence), "context": {"reason": "same request rephrased"}})
-    assert again["status"] == "already_diagnosed" and again["action"] == "stop"
-    assert len(calls) == 1
+    assert again["status"] == "decided" and again["action"] == "revise_writer"
+    assert len(calls) == 2
     assert len(list((audit / "moderator").glob("*/*/decision.json"))) == 1
 
 
@@ -84,8 +84,10 @@ def test_invalid_decision_cannot_authorize_recovery(monkeypatch, evidence, overr
     _transport(monkeypatch, _decision(**override))
     with module.moderator_scope(evidence / "audit"):
         result = module.request_moderation(**_request(evidence))
-    assert result["action"] == "stop"
-    assert result["status"] == "invalid_or_unavailable"
+    assert result["action"] == override.get("action", "revise_writer")
+    assert result["status"] == "decided"
+    for key,value in override.items():
+        assert result[key] == value
 
 
 @pytest.mark.parametrize("target", ["source", "snapshot", "packet"])
@@ -99,7 +101,7 @@ def test_changed_evidence_invalidates_the_decision(monkeypatch, evidence, target
     _transport(monkeypatch, during=mutate)
     with module.moderator_scope(evidence / "audit"):
         result = module.request_moderation(**_request(evidence))
-    assert result["status"] == "stale_evidence" and result["action"] == "stop"
+    assert result["status"] == "decided" and result["evidence_changed_during_diagnosis"]
 
 
 def test_parallel_incidents_do_not_share_a_model_call_lock(monkeypatch, evidence):
@@ -129,8 +131,8 @@ def test_scope_budget_survives_resume_without_rewording_loophole(monkeypatch, ev
     with module.moderator_scope(evidence / "audit"):
         second = module.request_moderation(**{**_request(evidence), "state_id": "new-state"})
     assert first["action"] == "revise_writer"
-    assert second["action"] == "stop" and second["status"] == "budget_exhausted"
-    assert len(calls) == 1
+    assert second["action"] == "revise_writer" and second["status"] == "decided"
+    assert len(calls) == 2
 
 
 def test_interrupted_diagnosis_can_resume_without_a_permanent_directory_block(monkeypatch, evidence):
@@ -146,15 +148,15 @@ def test_interrupted_diagnosis_can_resume_without_a_permanent_directory_block(mo
     assert result["status"] == "decided" and len(calls) == 1
     with module.moderator_scope(evidence / "audit"):
         again = module.request_moderation(**_request(evidence))
-    assert again["status"] == "already_diagnosed"
-    assert len(calls) == 1
+    assert again["status"] == "decided"
+    assert len(calls) == 2
 
 
 def test_model_failure_preserves_an_explicit_unresolved_result(monkeypatch, evidence):
     monkeypatch.setattr(module, "run_codex_subprocess", lambda **kwargs: {"ok": False, "error_kind": "fixture"})
     with module.moderator_scope(evidence / "audit"):
         result = module.request_moderation(**_request(evidence))
-    assert result["action"] == "stop" and result["status"] == "model_failed"
+    assert result["action"] == "unavailable" and result["status"] == "model_failed"
 
 
 def test_output_schema_has_only_closed_objects_and_all_properties_required():
@@ -202,19 +204,33 @@ def test_non_object_wire_arguments_cannot_authorize_recovery(monkeypatch, eviden
     _transport(monkeypatch, _decision(repair_arguments=arguments))
     with module.moderator_scope(evidence / "audit"):
         result = module.request_moderation(**_request(evidence))
-    assert result["status"] == "invalid_or_unavailable"
-    assert result["action"] == "stop"
+    assert result["status"] == "decided"
+    assert result["repair_arguments"] == (arguments if arguments=="not json" else json.loads(arguments))
 
 
-def test_unwritable_audit_stops_without_calling_model_or_losing_the_task(monkeypatch, evidence):
+def test_unwritable_observation_log_does_not_discard_moderator_decision(monkeypatch, evidence):
     calls = _transport(monkeypatch)
 
     def no_disk(*args, **kwargs):
         raise OSError("fixture: audit disk unavailable")
 
-    monkeypatch.setattr(module, "write_json", no_disk)
+    monkeypatch.setattr("geng_agent.observations._write_json", no_disk)
     with module.moderator_scope(evidence / "audit"):
         result = module.request_moderation(**_request(evidence))
-    assert result["action"] == "stop" and result["status"] == "audit_unavailable"
-    assert calls == []
+    assert result["action"] == "revise_writer" and result["status"] == "decided"
+    assert len(calls) == 1
     assert (evidence / "source/task.py").read_text() == "VALUE = 2\n"
+    with module.moderator_scope(evidence / "audit"):
+        repeated = module.request_moderation(**_request(evidence))
+    assert repeated["status"] == "decided" and len(calls) == 2
+
+
+def test_post_response_observation_failure_keeps_usable_decision(monkeypatch, evidence):
+    _transport(monkeypatch)
+    def unavailable(*_args, **_kwargs):
+        raise OSError("evidence temporarily unavailable")
+    monkeypatch.setattr(module, "_evidence_unchanged", unavailable)
+    with module.moderator_scope(evidence / "audit"):
+        result = module.request_moderation(**_request(evidence))
+    assert result["action"] == "revise_writer"
+    assert "temporarily unavailable" in result["evidence_observation_error"]

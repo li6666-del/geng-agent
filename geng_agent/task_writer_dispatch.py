@@ -8,17 +8,17 @@ from typing import Any, Callable
 
 from .agent_activity import record_agent_cached
 from .case_runtime import CaseRuntime
-from .outputs import write_json
+from .observations import write_json
 from .paper_evidence import safe_label
 from .security import redact_text
 from .task_writer_runner import (
     _review_task_records,
-    _run_one_execution_unit_writer,
     _run_one_task_writer,
     _task_with_experiment_profile,
 )
 from .task_writer_state import _checkpoint_partial_task_writer_records, _task_writer_record_refresh_pending, _task_writer_record_refresh_reusable
 from .task_writer_units import _execution_unit_sandbox, _execution_unit_work_items
+from .task_inputs import dependencies, upstream_input_identity
 
 
 def _public_unit(unit):
@@ -35,7 +35,6 @@ def _dispatch_task_writers(
     paper_context_json: str,
     paper_images: list[Any] | None,
     paper_thesis: dict[str, Any] | None,
-    foundation: dict[str, Any] | None = None,
     analysis_snapshot_hash: str,
     analysis_artifacts: dict[str, Path],
     task_root: Path,
@@ -61,29 +60,16 @@ def _dispatch_task_writers(
     for unit in units:
         members = unit["members"]
         reusable = all(
-            index in existing
-            and (
-                bool(existing[index].get("writer_completed"))
-                or existing[index].get("scientific_stop_reason") == "foundation_revision_unresolved"
-                or isinstance(existing[index].get("foundation_revision_request"), dict)
-            )
-            and (
-                _task_writer_record_refresh_reusable(existing[index])
-                or isinstance(existing[index].get("foundation_revision_request"), dict)
-            )
+            index in existing and bool(existing[index].get("writer_completed"))
+            and _task_writer_record_refresh_reusable(existing[index])
             and str(existing[index].get("task_id") or "") not in forced
             for index, _task, _entry in members
         )
         if reusable:
-            # A terminal old verdict cannot establish that today's Reporter
-            # prompt, source snapshot or report assets are still current.
-            needs_review = task_review_callback is not None and not any(
-                isinstance(existing[index].get("foundation_revision_request"), dict)
-                or existing[index].get("scientific_stop_reason") == "foundation_revision_unresolved"
-                for index, _task, _entry in members
-            )
-            if needs_review:
-                cached_review_unit_ids.add(str(unit["unit_id"]))
+            needs_review = task_review_callback is not None
+            if needs_review or dependencies(members[0][1]):
+                if needs_review:
+                    cached_review_unit_ids.add(str(unit["unit_id"]))
                 pending_units.append(unit)
             else:
                 for index, _task, _entry in members:
@@ -131,73 +117,50 @@ def _dispatch_task_writers(
         supervisor.tools.event("writer_assignment", "writers", unit_id=unit["unit_id"], task_ids=task_ids,
                                decision=decision)
         members = unit["members"]
-        if len(members) == 1:
-            index, task, manifest_entry = members[0]
-            existing_record = existing.get(index)
-            return _resume_or_run_writer(
-                writer_runner=_run_one_task_writer,
-                cached_members=members if str(unit["unit_id"]) in cached_review_unit_ids else [],
-                cached_records=existing,
-                index=index,
-                execution_unit_id=str(unit["unit_id"]),
-                reuse_existing=bool(existing_record),
-                runtime_refresh_required=bool(
-                    isinstance(existing_record, dict)
-                    and _task_writer_record_refresh_pending(existing_record)
-                ),
-                task=task,
-                manifest_entry=manifest_entry,
-                facts=facts,
-                experiment_index=experiment_index,
-                paper=paper,
-                paper_path=paper_path,
-                paper_context_json=paper_context_json,
-                paper_images=paper_images,
-                paper_thesis=paper_thesis,
-                foundation=foundation,
-                analysis_snapshot_hash=(snapshot_hashes or {}).get(str(unit["unit_id"]), analysis_snapshot_hash),
-                analysis_artifacts=analysis_artifacts,
-                task_root=task_root,
-                audit_dir=audit_dir,
-                run_repro=run_repro,
-                review_feedback=feedback_by_id.get(
-                    str(task.get("task_id") or manifest_entry.get("task_id") or "")
-                ),
-                task_review_callback=task_review_callback,
-                case_runtime=case_runtime,
-            )
-        else:
-            reuse_existing_unit = all(
-                index in existing for index, _task, _entry in members
-            )
-            return _resume_or_run_writer(
-                writer_runner=_run_one_execution_unit_writer,
-                cached_members=members if str(unit["unit_id"]) in cached_review_unit_ids else [],
-                cached_records=existing,
-                unit=unit,
-                reuse_existing=reuse_existing_unit,
-                runtime_refresh_required=any(
-                    _task_writer_record_refresh_pending(existing[index])
-                    for index, _task, _entry in members
-                    if index in existing
-                ),
-                facts=facts,
-                experiment_index=experiment_index,
-                paper=paper,
-                paper_path=paper_path,
-                paper_context_json=paper_context_json,
-                paper_images=paper_images,
-                paper_thesis=paper_thesis,
-                foundation=foundation,
-                analysis_snapshot_hash=(snapshot_hashes or {}).get(str(unit["unit_id"]), analysis_snapshot_hash),
-                analysis_artifacts=analysis_artifacts,
-                task_root=task_root,
-                audit_dir=audit_dir,
-                run_repro=run_repro,
-                review_feedback=feedback_by_id,
-                task_review_callback=task_review_callback,
-                case_runtime=case_runtime,
-            )
+        index, task, manifest_entry = members[0]
+        existing_record = existing.get(index)
+        upstream = list(by_index.values())
+        upstream_identity = upstream_input_identity(task, upstream)
+        inputs_changed = bool(dependencies(task) and existing_record and
+                              existing_record.get("upstream_input_identity") != upstream_identity)
+        if (task_review_callback is None and existing_record and existing_record.get("writer_completed")
+                and _task_writer_record_refresh_reusable(existing_record)
+                and str(existing_record.get("task_id")) not in forced and not inputs_changed):
+            return existing_record
+        record = _resume_or_run_writer(
+            writer_runner=_run_one_task_writer,
+            cached_members=members if str(unit["unit_id"]) in cached_review_unit_ids and not inputs_changed else [],
+            cached_records=existing,
+            index=index,
+            execution_unit_id=str(unit["unit_id"]),
+            reuse_existing=bool(existing_record),
+            runtime_refresh_required=bool(
+                isinstance(existing_record, dict)
+                and (_task_writer_record_refresh_pending(existing_record) or inputs_changed)
+            ),
+            task=task,
+            manifest_entry=manifest_entry,
+            facts=facts,
+            experiment_index=experiment_index,
+            paper=paper,
+            paper_path=paper_path,
+            paper_context_json=paper_context_json,
+            paper_images=paper_images,
+            paper_thesis=paper_thesis,
+            analysis_snapshot_hash=(snapshot_hashes or {}).get(str(unit["unit_id"]), analysis_snapshot_hash),
+            analysis_artifacts=analysis_artifacts,
+            task_root=task_root,
+            audit_dir=audit_dir,
+            run_repro=run_repro,
+            review_feedback=feedback_by_id.get(
+                str(task.get("task_id") or manifest_entry.get("task_id") or "")
+            ),
+            task_review_callback=task_review_callback,
+            case_runtime=case_runtime,
+            upstream_records=upstream,
+        )
+        record["upstream_input_identity"] = upstream_identity
+        return record
 
     def reduce_unit(name, result=None, error=None):
         unit = units_by_name[name]
@@ -318,16 +281,27 @@ def _dispatch_task_writers(
 
     def offer():
         result = []
+        waiting = []
         for name, unit in units_by_name.items():
             if name in finished_names:
                 continue
+            declared = dependencies(unit["members"][0][1])
+            completed_ids = {str(record.get("task_id")) for record in by_index.values()}
+            unavailable = [str(item.get("task_id")) for item in declared
+                           if str(item.get("task_id")) not in completed_ids]
             call = lambda decision, unit=unit: run_unit(unit, decision)
-            result.append(SupervisorTool(name,
-                "独立执行单元的 Writer 与就绪 Reporter；strong 依赖保留在同一单元，其他单元可同时启动。",
+            tool = SupervisorTool(name,
+                "一个完整任务的 Writer 与独立 Reporter；无文件依赖的任务可以同时启动。",
                 call, inputs={"unit": _public_unit(unit), "previous_failure": errors.get(name),
                     "snapshot_hash": (snapshot_hashes or {}).get(str(unit["unit_id"]), analysis_snapshot_hash),
+                    "unavailable_upstream_tasks": unavailable,
                     "cached_writer_needs_reporter": str(unit["unit_id"]) in cached_review_unit_ids},
-                resume=call, resources=("writer-unit:" + str(unit["unit_id"]),)))
+                resume=call, resources=("writer-unit:" + str(unit["unit_id"]),))
+            (waiting if unavailable else result).append(tool)
+        if not result and not any(item.get("scope") == "writers" for item in supervisor.tools.active()):
+            # A missing address or dependency cycle is presented to the
+            # moderator with runnable owners, rather than a dead-end gate.
+            return waiting
         return result
 
     def routine_route(snapshot: dict) -> dict | None:
@@ -335,9 +309,16 @@ def _dispatch_task_writers(
             return None
         ready = list(snapshot["ready"])
         if ready:
+            if any(tool.get("inputs", {}).get("unavailable_upstream_tasks")
+                   for tool in snapshot.get("tools", [])):
+                return None
             return {"action": "start", "next_nodes": ready, "status": "routine",
                     "diagnosis": "Independent execution units are ready."}
         if not snapshot["active"]:
+            if set(units_by_name) - finished_names:
+                # Only now is an unresolved address a real scheduling blocker.
+                # Let the moderator choose repair or partial delivery.
+                return None
             return {"action": "finish", "status": "routine",
                     "diagnosis": "All dispatched execution units have returned."}
         return None
@@ -346,9 +327,10 @@ def _dispatch_task_writers(
         decision = supervisor.tools.run("writers", offer,
             state=lambda: {"completed": sorted(finished_names), "failures": errors,
                            "pending": sorted(set(units_by_name) - finished_names),
+                           "pending_tasks": [_public_unit(unit) for name, unit in units_by_name.items() if name not in finished_names],
                            "scientific_conclusions_owned_by": "independent_reporters"},
             on_result=received, on_error=failed, on_dispatch=dispatched,
-            routine_selector=routine_route)
+            routine_selector=routine_route, concurrency=len(units))
         audit["supervisor_decision"] = decision
         for name, unit in units_by_name.items():
             if name not in finished_names and any(index not in by_index for index, *_ in unit["members"]):
@@ -392,9 +374,8 @@ def _resume_or_run_writer(*, writer_runner, cached_members, cached_records, **kw
             for record, (action, feedback) in zip(records, reviews)
             if action == "writer_revision" and isinstance(feedback, dict)
         }
-        # A shared revision must reach the host before any private continuation
-        # recreates this compound sandbox or invalidates a prepared diagnosis.
-        if not revisions or any(record.get("foundation_revision_request") for record in records):
+        # Reuse the owner's review once; a continuation then gets a fresh review.
+        if not revisions:
             return records[0] if len(cached_members) == 1 else records
         kwargs["task_review_callback"] = _reporter_callback_with_replay(
             callback, {str(record["task_id"]): record.get("task_reporter") for record in records},

@@ -62,7 +62,7 @@ class StatusTests(unittest.TestCase):
 
             self.assertEqual(status["next_stage"], "paper")
             for name in (
-                "paper_thesis", "scientific_architecture", "foundation_manifest",
+                "paper_thesis", "scientific_architecture",
                 "review_docx", "reproduction_report_docx", "result_review_docx",
             ):
                 self.assertFalse(by_name[name]["required"])

@@ -143,7 +143,7 @@ def test_parallel_pipelines_propagate_isolated_configs_to_all_dispatch_paths(
         for name in ("model-alpha", "model-beta")
     }
     analysis_barrier = Barrier(2)
-    writer_barrier = Barrier(4)
+    writer_barrier = Barrier(6)
     reporter_barrier = Barrier(6)
     pairs = [({"task_id": task_id}, {"task_id": task_id}) for task_id in ("a", "b", "c")]
     plan = {"execution_units": [{"unit_id": "shared", "task_ids": ["a", "b"]}]}
@@ -193,7 +193,6 @@ def test_parallel_pipelines_propagate_isolated_configs_to_all_dispatch_paths(
     monkeypatch.setattr("geng_agent.pipeline.run_execution_flow", execution)
     monkeypatch.setattr("geng_agent.pipeline.run_report_flow", report)
     monkeypatch.setattr("geng_agent.task_writer_dispatch._run_one_task_writer", single_writer)
-    monkeypatch.setattr("geng_agent.task_writer_dispatch._run_one_execution_unit_writer", compound_writer)
 
     def run_one(name: str):
         result = ReviewPipeline().run(

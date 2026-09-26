@@ -8,7 +8,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .execution_receipts import file_hash, _inside
-from .foundation_snapshot import path_is_foundation_link
+from .artifact_paths import path_is_link
 
 
 def archive_satisfied_environment_request(sandbox: Path, runtime: Any) -> str | None:
@@ -58,11 +58,11 @@ def _regular_file(root: Path, relative: str) -> Path | None:
         return None
     cursor = root
     try:
-        if path_is_foundation_link(cursor):
+        if path_is_link(cursor):
             return None
         for part in parts:
             cursor = cursor / part
-            if path_is_foundation_link(cursor):
+            if path_is_link(cursor):
                 return None
         cursor.resolve().relative_to(root.resolve())
         return cursor if cursor.is_file() else None
@@ -108,10 +108,10 @@ def localize_writer_feedback(feedback: dict[str, Any], *, reporter_root: Path,
             cursor = sandbox
             for part in PurePosixPath(target_relative).parts[:-1]:
                 cursor = cursor / part
-                if path_is_foundation_link(cursor):
+                if path_is_link(cursor):
                     raise ValueError("unsafe Writer feedback destination")
                 cursor.mkdir(exist_ok=True)
-            if path_is_foundation_link(target):
+            if path_is_link(target):
                 raise ValueError("unsafe Writer feedback destination")
             shutil.copyfile(reviewed, target)
         mappings[raw] = {"path": target_relative, "sha256": digest}

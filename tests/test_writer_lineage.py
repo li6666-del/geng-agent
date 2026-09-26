@@ -12,8 +12,7 @@ from geng_agent.execution_plan import compile_execution_plan
 from geng_agent.execution_receipts import source_hashes, artifact_hashes
 from geng_agent.outputs import write_json
 from geng_agent.task_writer_state import _load_task_writer_resume_records
-from geng_agent.writer_lineage import build_writer_unit_lineage, foundation_cache_projection
-from geng_agent.foundation_scope import scoped_foundation_architecture
+from geng_agent.writer_lineage import build_writer_unit_lineage
 
 
 def _fixture(root: Path):
@@ -48,8 +47,7 @@ def _fixture(root: Path):
         ], "installed_distributions": [{"distribution": "scipy", "version": "1.0"}, {"distribution": "numpy", "version": "2.1"}]},
     )
     kwargs = dict(task_pairs=pairs, execution_plan=plan, facts=facts, experiment_index={}, paper_path=paper,
-                  analysis_artifacts={"scientific_architecture.json": architecture_path}, foundation=None,
-                  case_runtime=runtime, task_root=root / "audit/03c_task_writer_sandboxes")
+                  analysis_artifacts={"scientific_architecture.json": architecture_path}, case_runtime=runtime, task_root=root / "audit/03c_task_writer_sandboxes")
     return kwargs, plan
 
 
@@ -103,7 +101,7 @@ def _write_completed_records(root: Path, kwargs: dict, plan: dict) -> dict[str, 
     return hashes
 
 
-def test_resume_rechecks_host_receipt_and_preserves_only_changed_unit_for_refresh(tmp_path: Path) -> None:
+def test_resume_forwards_changed_output_observation_without_ordering_a_rerun(tmp_path: Path) -> None:
     kwargs, plan = _fixture(tmp_path)
     hashes = _write_completed_records(tmp_path, kwargs, plan)
     common = dict(audit_dir=tmp_path / "audit", task_pairs=kwargs["task_pairs"], execution_plan=plan,
@@ -113,12 +111,13 @@ def test_resume_rechecks_host_receipt_and_preserves_only_changed_unit_for_refres
     assert current[2]["writer_completed"] is True
     (kwargs["task_root"] / "01_a/outputs/a/result.csv").write_text("x,y\n1,999\n", encoding="utf-8")
     recovered = _load_task_writer_resume_records(**common)
-    assert recovered[1]["runtime_refresh_required"] is True
+    assert not recovered[1].get("runtime_refresh_required")
+    assert recovered[1]["host_execution"]["passed"] is False
     assert recovered[2]["writer_completed"] is True
     assert (kwargs["task_root"] / "01_a/tasks/a.py").is_file()
 
 
-def test_old_unobserved_delivery_is_not_reused_as_a_verified_full(tmp_path: Path) -> None:
+def test_missing_receipt_is_forwarded_for_reporter_interpretation(tmp_path: Path) -> None:
     kwargs, plan = _fixture(tmp_path)
     hashes = _write_completed_records(tmp_path, kwargs, plan)
     (tmp_path / "audit/execution_runs/a/execution_receipt.json").unlink()
@@ -126,7 +125,8 @@ def test_old_unobserved_delivery_is_not_reused_as_a_verified_full(tmp_path: Path
         audit_dir=tmp_path / "audit", task_pairs=kwargs["task_pairs"], execution_plan=plan,
         expected_analysis_snapshot_hash="old-case", expected_snapshot_hashes=hashes,
     )
-    assert recovered[1]["runtime_refresh_required"] is True
+    assert not recovered[1].get("runtime_refresh_required")
+    assert recovered[1]["host_execution"]["passed"] is False
     assert recovered[2]["writer_completed"] is True
 
 
@@ -181,44 +181,8 @@ def test_explicit_policy_snapshot_is_used_without_rereading_or_aliasing(tmp_path
                for item in first.values())
 
 
-def test_foundation_source_dependency_change_invalidates_only_consumers(tmp_path: Path) -> None:
-    kwargs, plan = _fixture(tmp_path)
-    architecture_path = kwargs["analysis_artifacts"]["scientific_architecture.json"]
-    architecture = json.loads(architecture_path.read_text())
-    architecture["components"].append({"id": "shared_noise", "module": "src/shared_noise.py"})
-    architecture["bindings"].append({"task_id": "c", "experiment_id": "exp_c", "components": ["shared_noise"]})
-    architecture["components"][0]["depends_on"] = ["shared_noise"]
-    write_json(architecture_path, architecture)
-    snapshot = tmp_path / "foundation"
-    (snapshot / "src").mkdir(parents=True)
-    (snapshot / "src/shared_noise.py").write_text("from .variance import scale\n", encoding="utf-8")
-    (snapshot / "src/variance.py").write_text("scale = 1\n", encoding="utf-8")
-    kwargs["foundation"] = {"snapshot_dir": str(snapshot)}
-    before = build_writer_unit_lineage(**kwargs)
-    (snapshot / "src/variance.py").write_text("scale = 0.5\n", encoding="utf-8")
-    after = build_writer_unit_lineage(**kwargs)
-    assert before[plan["task_to_execution_unit"]["a"]]["snapshot_hash"] != after[plan["task_to_execution_unit"]["a"]]["snapshot_hash"]
-    assert before[plan["task_to_execution_unit"]["b"]]["snapshot_hash"] == after[plan["task_to_execution_unit"]["b"]]["snapshot_hash"]
 
 
-def test_foundation_key_ignores_private_contract_and_unused_environment_extension(tmp_path: Path) -> None:
-    kwargs, plan = _fixture(tmp_path)
-    architecture = json.loads(kwargs["analysis_artifacts"]["scientific_architecture.json"].read_text())
-    architecture["bindings"].append({"task_id": "c", "experiment_id": "exp_c", "components": ["solver_a"]})
-    architecture["components"][0]["basis"] = {"evidence_facts": [{"type": "parameter", "name": "noise"}]}
-    def projected():
-        return foundation_cache_projection(architecture=scoped_foundation_architecture(architecture, plan),
-                                           facts=kwargs["facts"], paper_path=kwargs["paper_path"], case_runtime=kwargs["case_runtime"])
-    first = projected()
-    architecture["components"][1]["callable"] = "a_new_private_method"
-    kwargs["facts"]["engineering_facts"][1]["value"] = 10
-    runtime = kwargs["case_runtime"]
-    lock = json.loads(json.dumps(runtime.lock))
-    lock["installed_distributions"].append({"distribution": "unused-package", "version": "1"})
-    kwargs["case_runtime"] = replace(runtime, lock=lock, environment_hash="new-whole-case")
-    assert projected() == first
-    lock["installed_distributions"][1]["version"] = "3.0"
-    assert projected()[2] != first[2]
 
 
 def test_observed_dynamic_backend_maps_to_distribution_and_invalidates_only_its_consumer(tmp_path: Path) -> None:
@@ -251,7 +215,7 @@ def test_observed_dynamic_backend_maps_to_distribution_and_invalidates_only_its_
     assert first[b]["snapshot_hash"] == changed[b]["snapshot_hash"]
 
 
-def test_declined_scientific_repair_is_preserved_without_claiming_a_full_execution(tmp_path: Path) -> None:
+def test_legacy_foundation_request_does_not_stop_task_owned_recovery(tmp_path: Path) -> None:
     kwargs, plan = _fixture(tmp_path)
     hashes = _write_completed_records(tmp_path, kwargs, plan)
     path = tmp_path / "audit/03c_task_writers_records.json"
@@ -262,9 +226,8 @@ def test_declined_scientific_repair_is_preserved_without_claiming_a_full_executi
     recovered = _load_task_writer_resume_records(
         audit_dir=tmp_path / "audit", task_pairs=kwargs["task_pairs"], execution_plan=plan,
         expected_analysis_snapshot_hash="case", expected_snapshot_hashes=hashes,
-        declined_foundation_revision_ids={"unresolved"},
     )
-    assert recovered[1]["scientific_stop_reason"] == "foundation_revision_unresolved"
+    assert not recovered[1].get("scientific_stop_reason")
     assert recovered[1]["writer_completed"] is False
     assert not recovered[1].get("runtime_refresh_required")
     assert recovered[2]["writer_completed"] is True

@@ -10,14 +10,7 @@ import time
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable
 
-from .agentic_foundation import (
-    _assert_foundation_sandbox_layout_safe,
-    foundation_violations,
-    install_foundation_snapshot,
-    restore_foundation_snapshot,
-    validate_foundation_bundle,
-)
-from .foundation_snapshot import path_is_foundation_link
+from .artifact_paths import path_is_link
 from .verification_result import (
     FINAL_MATCHED_STATUS,
     WRITER_REVIEW_STATUS,
@@ -52,7 +45,6 @@ from .case_runtime import (
 )
 from .case_environment import EnvironmentPolicyError, RequirementRequest
 from .execution_plan import compile_execution_plan
-from .foundation_revision import FoundationRevisionRequired, collect_pending_foundation_revisions
 from .writer_lineage import build_writer_unit_lineage, writer_policy_content_hashes
 from .config import get_config_value
 from .supervisor import StageBlocked, REPLAY_REQUIRED, supervised_call
@@ -62,7 +54,6 @@ from .outputs import inspect_output_artifacts, validate_repro_project, write_jso
 from .paper_evidence import facts_for_task, paper_context_for_task, safe_label, thesis_ordering_anchor_for_task
 from .project_portability import build_source_inventory, validate_repro_project_portability
 from .security import (
-    FOUNDATION_STATIC_SECURITY_ADVISORY_CATEGORIES,
     dependency_policy_prompt_text,
     redact_text,
     split_static_security_issues,
@@ -70,11 +61,7 @@ from .security import (
 from .scientific_materiality import CORE_RESULT_STOP_POLICY, TERMINAL_SCIENTIFIC_OUTCOMES
 from .stage_cleanup import _clear_stage_outputs
 from .task_scripts import build_tasks_manifest, write_task_scaffolding
-from .task_writer_contracts import (
-    DEFAULT_MAX_EVIDENCE_RERUNS,
-    TASK_WRITER_TERMINAL_STATUS,
-    WRITER_PAPER_FIDELITY_POLICY,
-)
+from .task_writer_contracts import TASK_WRITER_TERMINAL_STATUS, WRITER_PAPER_FIDELITY_POLICY
 from .task_writer_delivery import _collect_task_writer_delivery, _collect_writer_images
 from .task_writer_execution_binding import _load_task_execution_binding, _task_execution_binding_from_architecture
 
@@ -105,13 +92,10 @@ from .task_writer_packaging import (
     _writer_snapshot_hash,
 )
 from .task_writer_prompts import (
-    _build_execution_unit_continuation_brief,
-    _build_execution_unit_writer_brief,
     _build_task_writer_brief,
     _build_task_writer_continuation_brief,
 )
 from .task_writer_results import (
-    _classify_task_writer_security_issues,
     _compact_task_writer_review,
     _task_writer_alignment_summary,
     _task_writer_blocked_by_codex,
@@ -123,7 +107,6 @@ from .task_writer_results import (
 )
 from .task_writer_sandbox import (
     _ensure_unit_asset_namespace,
-    _prepare_execution_unit_writer_sandbox,
     _prepare_task_writer_sandbox,
     _remove_legacy_writer_scoring_state,
     _write_minimal_shared_project_files,
@@ -133,35 +116,9 @@ from .task_writer_units import (
     _execution_unit_work_items,
     _public_execution_unit,
 )
-from .task_writer_state import (
-    _active_writer_artifact_path,
-    _archive_execution_unit_delivery,
-    _archive_nonterminal_writer_delivery,
-    _checkpoint_partial_task_writer_records,
-    _complete_execution_unit_runtime_refresh,
-    _complete_task_writer_runtime_refresh,
-    _load_task_writer_resume_records,
-    _move_writer_generation_to_archive,
-    _next_writer_progress_round,
-    _record_has_terminal_task_verification,
-    _record_is_valid_current_delivery,
-    _record_source_config_fingerprint,
-    _rerun_evidence_fingerprint,
-    _sandbox_analysis_handoff_hash,
-    _task_writer_record_refresh_pending,
-    _task_writer_record_refresh_reusable,
-    _task_writer_resume_layouts,
-    _task_writer_resume_sandbox_is_safe,
-    _task_writer_runtime_refresh_marker,
-    _task_writer_runtime_refresh_pending,
-    _terminalize_rerun_request,
-    _trusted_preserved_evidence_file,
-    _writer_source_config_fingerprint,
-)
+from .task_writer_state import _archive_nonterminal_writer_delivery, _checkpoint_partial_task_writer_records, _complete_task_writer_runtime_refresh, _load_task_writer_resume_records, _move_writer_generation_to_archive, _next_writer_progress_round, _record_has_terminal_task_verification, _record_is_valid_current_delivery, _sandbox_analysis_handoff_hash, _task_writer_record_refresh_pending, _task_writer_record_refresh_reusable, _task_writer_resume_layouts, _task_writer_resume_sandbox_is_safe, _task_writer_runtime_refresh_marker, _task_writer_runtime_refresh_pending, _terminalize_rerun_request, _trusted_preserved_evidence_file
 from .task_writer_runner import (
     _attach_task_reporter_review,
-    _external_writer_rerun_budget,
-    _run_one_execution_unit_writer,
     _run_one_task_writer,
     _run_task_writer_codex_session,
     _task_with_experiment_profile,
@@ -225,7 +182,7 @@ def _refresh_cached_package_validation(
     write_json(status_path, status)
     for name in ("03c_project_portability.json", "03c_project_portability_final.json"):
         path = audit_dir / name
-        if not path.is_file() or path_is_foundation_link(path):
+        if not path.is_file() or path_is_link(path):
             continue
         record = _read_optional_json_object(path)
         refreshed = _final_package_file_validation(
@@ -357,10 +314,8 @@ def run_codex_task_writer_workflow(
     review_feedback: dict[str, dict[str, Any]] | None = None,
     force_task_ids: set[str] | None = None,
     task_review_callback: Callable[[int, dict[str, Any], dict[str, Any], int], dict[str, Any]] | None = None,
-    foundation: dict[str, Any] | None = None,
     case_runtime: CaseRuntime | None = None,
     execution_plan: dict[str, Any] | None = None,
-    declined_foundation_revision_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     """Third-round autonomous per-task Codex writer workflow.
 
@@ -371,34 +326,17 @@ def run_codex_task_writer_workflow(
     output_dir.mkdir(parents=True, exist_ok=True)
     audit_dir.mkdir(parents=True, exist_ok=True)
 
-    execution_plan = (
-        execution_plan
-        if isinstance(execution_plan, dict)
-        else compile_execution_plan(tasks)
-    )
+    execution_plan = compile_execution_plan(tasks)
     # The Writer handoff hash must include the exact execution contract it is
     # about to follow.  Pipeline callers already persist this file; direct API
     # callers get the same authoritative artifact here.
     write_json(output_dir / "execution_plan.json", execution_plan)
     analysis_artifacts = _collect_writer_analysis_artifacts(output_dir=output_dir)
-    missing_analysis_artifacts = _missing_required_analysis_artifacts(analysis_artifacts)
-    if missing_analysis_artifacts:
-        raise RuntimeError(
-            "task writers require finalized first-two-stage artifacts: "
-            + ", ".join(missing_analysis_artifacts)
-        )
-    if foundation is not None:
-        foundation_issues = validate_foundation_bundle(foundation)
-        if foundation_issues:
-            raise RuntimeError(f"task writers require a valid Foundation snapshot: {foundation_issues[:5]}")
     analysis_handoff_hash = _analysis_snapshot_hash(
         paper_path=paper_path,
         artifacts=analysis_artifacts,
     )
     analysis_snapshot_hash = analysis_handoff_hash
-    foundation_snapshot_hash = str(foundation["manifest"]["snapshot_hash"]) if foundation is not None else ""
-    if foundation_snapshot_hash:
-        analysis_snapshot_hash = _writer_snapshot_hash(analysis_snapshot_hash, foundation_snapshot_hash)
     environment_hash = case_runtime.environment_hash if case_runtime is not None else ""
     if environment_hash:
         analysis_snapshot_hash = _writer_snapshot_hash(analysis_snapshot_hash, environment_hash)
@@ -422,7 +360,6 @@ def run_codex_task_writer_workflow(
             experiment_index=experiment_index,
             paper_path=paper_path,
             analysis_artifacts=analysis_artifacts,
-            foundation=foundation,
             case_runtime=case_runtime,
             task_root=task_root,
             paper_thesis=paper_thesis,
@@ -446,34 +383,12 @@ def run_codex_task_writer_workflow(
             record["unit_lineage_policy"] = current["inputs"]["policy"][0]
             sandbox = Path(str(record.get("sandbox") or ""))
             evidence_path = sandbox / PAPER_EVIDENCE_DIR / "index.json"
-            if evidence_path.is_file() and not path_is_foundation_link(evidence_path):
+            if evidence_path.is_file() and not path_is_link(evidence_path):
                 evidence = _read_optional_json_object(evidence_path)
                 evidence["analysis_snapshot_hash"] = current["snapshot_hash"]
                 write_json(evidence_path, evidence)
         write_json(audit_dir / "03c_writer_unit_lineage.json", lineage)
 
-    def handoff_pending_foundation_revisions(records, dispatch_policy) -> None:
-        # Cached and freshly run Reporters reach the same host-owned shared
-        # repair boundary before any Writer restart or final cached return.
-        requests = collect_pending_foundation_revisions(
-            records, foundation, declined_foundation_revision_ids,
-        )
-        if requests:
-            write_json(audit_dir / "03c_task_writers_records.json", {
-                "dispatch_policy": dispatch_policy, "tasks": records,
-            })
-            validation = {"required_files_present": False, "python_compiles": None,
-                          "host_validation_skipped": True, "packaging_completed": False}
-            runtime = _task_writer_runtime_result(task_records=records, validation=validation,
-                requirement_warnings=[], requirement_issues=[], security_issues=[])
-            runtime["delivery_status"] = "partial"
-            raise FoundationRevisionRequired(requests, partial_result={
-                "manifest": {"files": [], "tasks": task_manifest.get("tasks", []),
-                             "_meta": {"packaging_completed": False}},
-                "task_records": records, "runtime_result": runtime, "written_files": [],
-                "writer_review_doc": {**_task_writer_alignment_summary(records),
-                    "task_writer_reviews": [_compact_task_writer_review(record) for record in records]},
-                "status": {"stop_class": "pending_foundation_revision", "validation": validation}})
 
     review_feedback = dict(review_feedback or {})
     force_task_ids = {str(item) for item in (force_task_ids or set()) if str(item)}
@@ -505,7 +420,6 @@ def run_codex_task_writer_workflow(
             execution_plan=execution_plan,
             expected_snapshot_hashes=snapshot_hashes,
             require_execution_receipts=run_repro,
-            declined_foundation_revision_ids=declined_foundation_revision_ids,
         )
         if resume
         else {}
@@ -534,10 +448,12 @@ def run_codex_task_writer_workflow(
     cached_refresh_complete = cached_all_current and all(
         _task_writer_record_refresh_reusable(record) for record in cached_records
     )
-    cached_foundation_current = (
-        foundation is None
-        or not foundation_violations(repro_project_dir, foundation)
-    )
+    from .task_inputs import dependencies, upstream_input_identity
+    cached_by_task = {str(record.get("task_id")): record for record in cached_records}
+    cached_inputs_current = all(
+        not dependencies(task) or cached_by_task.get(str(task.get("task_id")), {}).get("upstream_input_identity")
+        == upstream_input_identity(task, cached_records)
+        for task, _entry in task_pairs)
     cached_writer_reusable = (
         resume
         and not force_task_ids
@@ -545,7 +461,7 @@ def run_codex_task_writer_workflow(
         and cached_all_current
         and cached_resume_all_current
         and cached_refresh_complete
-        and cached_foundation_current
+        and cached_inputs_current
         and (not run_repro or (cached_runtime_passed and cached_all_deliveries))
     )
     refreshed_cached_records_by_index: dict[int, dict[str, Any]] = {}
@@ -574,7 +490,7 @@ def run_codex_task_writer_workflow(
                 audit_dir / "03c_cached_task_reporters.json",
                 reporter_refresh_audit,
             )
-            handoff_pending_foundation_revisions(cached_records, reporter_refresh_audit)
+
             if reporter_revisions:
                 # Only an evidence-backed Reporter revision re-enters the
                 # existing Writer continuation state machine. Replay the
@@ -629,7 +545,7 @@ def run_codex_task_writer_workflow(
                     output_dir=output_dir, audit_dir=audit_dir,
                 )
         else:
-            handoff_pending_foundation_revisions(cached_records, {"source": "cached artifacts"})
+
             cached["writer_review_doc"] = {
                 "_meta": {"mode": "task_writer_scientific_results"},
                 **_task_writer_alignment_summary(cached_records),
@@ -691,7 +607,6 @@ def run_codex_task_writer_workflow(
         paper_context_json=paper_context_json,
         paper_images=paper_images,
         paper_thesis=paper_thesis,
-        foundation=foundation,
         analysis_snapshot_hash=analysis_snapshot_hash,
         analysis_artifacts=analysis_artifacts,
         task_root=task_root,
@@ -708,7 +623,6 @@ def run_codex_task_writer_workflow(
     )
     write_json(audit_dir / "writer_dispatch.json", dispatch_audit)
 
-    handoff_pending_foundation_revisions(task_records, dispatch_audit)
 
     shared_runtime_refresh = any(
         record.get("writer_error_kind") == "environment_refresh" for record in task_records
@@ -745,9 +659,8 @@ def run_codex_task_writer_workflow(
             repro_project_dir=repro_project_dir,
             output_dir=output_dir, audit_dir=audit_dir,
             task_manifest=task_manifest, task_records=task_records,
-            execution_plan=execution_plan, foundation=foundation,
+            execution_plan=execution_plan,
             case_runtime=case_runtime, analysis_snapshot_hash=analysis_snapshot_hash,
-            foundation_snapshot_hash=foundation_snapshot_hash,
             environment_hash=environment_hash, require_lineage=run_repro,
         )
         validation = _final_package_file_validation(
@@ -778,7 +691,7 @@ def run_codex_task_writer_workflow(
         expected_paths, manifest, portability, validation, requirement_warnings, requirement_issues, security_issues = supervised_call(
             "packaging", assemble_project,
             inputs={"owner": "packaging", "analysis_snapshot_hash": analysis_snapshot_hash,
-                    "foundation_snapshot_hash": foundation_snapshot_hash, "environment_hash": environment_hash,
+                    "environment_hash": environment_hash,
                     "task_manifest": task_manifest,
                     "task_results": [{key: record.get(key) for key in
                         ("task_id", "writer_completed", "task_verification", "execution_summary", "coordination_status", "coordination_observations")}
@@ -791,7 +704,7 @@ def run_codex_task_writer_workflow(
             summarize=lambda value: {"manifest": value[1], "portability": value[2], "validation": value[3]},
             degrade=continue_after_packaging_failure,
             reconcile=lambda _state: REPLAY_REQUIRED,
-            passthrough=(EnvironmentRequestRequired, FoundationRevisionRequired),
+            passthrough=(EnvironmentRequestRequired,),
         )
         if isinstance(portability.get("delivery_blocked"), dict):
             delivery_blocked = portability["delivery_blocked"]

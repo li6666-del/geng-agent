@@ -36,7 +36,7 @@ TASK_REPORTER_PROMPT_VERSION = "isolated_task_reporter_v16_optional_dispatch"
 REPORTER_CONVERGENCE_POLICY = """## Convergence and materiality
 - Enforce paper-explicit scientific facts. Accept reasonable, disclosed choices where the paper is silent.
 - `host_execution.unobserved_artifacts` lists files added or changed after the observed run. They may illustrate the report, but cannot alone establish scientific support; inspect the observed measurements and implementation.
-- `writer_observations` records process, paper-directory and Foundation anomalies. Investigate their effect on the assigned claim; an observation is not itself a scientific verdict. The paper evidence in this workspace is copied afresh from the original source.
+- `writer_observations` records process, paper-directory and Writer anomalies. Investigate their effect on the assigned claim; an observation is not itself a scientific verdict. The paper evidence in this workspace is copied afresh from the original source.
 - Decide numerical materiality from the claim, metric scale and statistical uncertainty, and explain your reasoning. There is no universal factor-of-10 acceptance rule. Separate missing paper information from unavailable execution or review evidence.
 - Recommend another Writer run only for `invalid_run`, `core_conclusion_failed`, or `material_numeric_discrepancy` affecting the assigned task goals, and only with paper evidence plus a concrete causal code/config change and predicted effect. Out-of-scope observations never justify a rerun.
 - Do not speculate. Unsupported but faithfully implemented results without a justified next change are reportable `not_reproduced`; unavailable decisive information is reportable `inconclusive_missing_information`.
@@ -219,6 +219,12 @@ Do not execute the Writer code, expand acceptance, or force a successful result.
 Retain unaffected observations and issue your own complete decision protocol.
 """
     return f"""# Role: isolated scientific task reporter
+
+A final task may merge several experiments. Inspect every experiment, original goal,
+condition and baseline in the assigned task. Preserve per-experiment outcomes and
+uncertainties; one successful experiment does not imply that the others succeeded.
+Read upstream_task_inputs.json and copied upstream files when this task consumes
+another task's checkpoint or data. Judge their scientific suitability yourself.
 
 Verify exactly one reproduction task: `{task_id}`. The paper is the scientific authority. The Writer's prose is evidence, not a verdict.
 

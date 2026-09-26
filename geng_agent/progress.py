@@ -18,7 +18,7 @@ PHASES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     (
         "task_reproduction",
         "任务级复现",
-        ("environment", "foundation", "generation", "runtime", "task_reporters"),
+        ("environment", "generation", "runtime", "task_reporters"),
     ),
     (
         "report_composition",
@@ -41,7 +41,7 @@ STEP_PHASE_ALIASES: dict[str, str] = {
     "case_environment": "task_reproduction",
     "environment_lock": "task_reproduction",
     "repro_project_manifest": "task_reproduction",
-    "foundation_manifest": "task_reproduction",
+
     "repro_project": "task_reproduction",
     "verification_result": "task_reproduction",
     "reproduction_report": "report_composition",

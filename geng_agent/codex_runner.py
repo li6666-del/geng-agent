@@ -34,522 +34,6 @@ DEFAULT_GENG_CODEX_MODEL = DEFAULT_MODEL
 _EPHEMERAL_CAPABILITY_CACHE: dict[tuple[str, ...], dict[str, Any]] = {}
 _EPHEMERAL_CAPABILITY_LOCK = threading.Lock()
 
-_FOUNDATION_UNITTEST_GUARD = r"""
-import builtins
-import dis
-import json
-import os
-import sys
-
-import threading
-
-_PATH_STATE = threading.local()
-_CONFIG = json.loads(sys.argv[1])
-
-
-def _real_path(value):
-    try:
-        path = os.fspath(value)
-    except TypeError:
-        return None
-    if isinstance(path, bytes):
-        path = os.fsdecode(path)
-    if not isinstance(path, str) or not path:
-        return None
-    if not os.path.isabs(path):
-        path = os.path.join(os.getcwd(), path)
-    previous = getattr(_PATH_STATE, "resolving", False)
-    _PATH_STATE.resolving = True
-    try:
-        return os.path.normcase(os.path.realpath(path))
-    finally:
-        _PATH_STATE.resolving = previous
-
-
-def _lexical_path(value):
-    try:
-        path = os.fspath(value)
-    except TypeError:
-        return None
-    if isinstance(path, bytes):
-        path = os.fsdecode(path)
-    if not isinstance(path, str) or not path:
-        return None
-    if not os.path.isabs(path):
-        path = os.path.join(os.getcwd(), path)
-    return os.path.normcase(os.path.abspath(os.path.normpath(path)))
-
-
-def _inside(path, root):
-    try:
-        return os.path.commonpath((path, root)) == root
-    except (TypeError, ValueError):
-        return False
-
-
-_WORK_DIR = _real_path(_CONFIG["work_dir"])
-_SENSITIVE_ROOTS = tuple(
-    path
-    for path in (_real_path(item) for item in _CONFIG["sensitive_roots"])
-    if path is not None
-)
-_TRUSTED_READ_ROOTS = tuple(
-    path
-    for path in (_real_path(item) for item in _CONFIG["trusted_read_roots"])
-    if path is not None
-)
-_WRITE_ROOTS = tuple(
-    path
-    for path in (_real_path(item) for item in _CONFIG["write_roots"])
-    if path is not None
-)
-
-
-def _deny(message):
-    raise PermissionError("Foundation runtime guard: " + message)
-
-
-def _is_sensitive(path):
-    if path is None:
-        return False
-    return any(_inside(path, root) for root in _SENSITIVE_ROOTS)
-
-
-def _require_allowed_read(path, event):
-    if path is None and event in {"os.listdir", "os.scandir"}:
-        path = "."
-    if isinstance(path, int):
-        if path not in (0, 1, 2):
-            _deny(f"{event} via an external file descriptor")
-        return
-    lexical = _lexical_path(path)
-    resolved = _real_path(path)
-    if lexical is None or resolved is None:
-        _deny(f"{event} with an unresolved path: {path!r}")
-    if _inside(lexical, _WORK_DIR) and not _inside(resolved, _WORK_DIR):
-        _deny(f"{event} follows a case symlink outside the sandbox: {path!r}")
-    if _is_sensitive(resolved):
-        _deny(f"host credential read blocked: {path!r}")
-    if _inside(resolved, _WORK_DIR):
-        return
-    if any(_inside(resolved, root) for root in _TRUSTED_READ_ROOTS):
-        return
-    _deny(f"{event} outside case and trusted runtime roots: {path!r}")
-
-
-def _require_case_write(path, event):
-    if isinstance(path, int):
-        if path not in (0, 1, 2):
-            _deny(f"{event} via an external file descriptor")
-        return
-    lexical = _lexical_path(path)
-    resolved = _real_path(path)
-    if lexical is None or resolved is None:
-        _deny(f"{event} with an unresolved path: {path!r}")
-    if not any(
-        _inside(lexical, root) and _inside(resolved, root)
-        for root in _WRITE_ROOTS
-    ):
-        _deny(f"{event} outside Foundation runtime output roots: {path!r}")
-
-
-def _require_case_chdir(path, event):
-    lexical = _lexical_path(path)
-    resolved = _real_path(path)
-    if lexical is None or resolved is None:
-        _deny(f"{event} with an unresolved path: {path!r}")
-    if not _inside(lexical, _WORK_DIR) or not _inside(resolved, _WORK_DIR):
-        _deny(f"{event} outside the case sandbox: {path!r}")
-
-
-def _open_is_write(mode, flags):
-    if isinstance(mode, str) and any(marker in mode for marker in ("w", "a", "x", "+")):
-        return True
-    if not isinstance(flags, int):
-        return False
-    write_flags = (
-        os.O_WRONLY
-        | os.O_RDWR
-        | os.O_APPEND
-        | os.O_CREAT
-        | os.O_TRUNC
-    )
-    tmpfile_flag = getattr(os, "O_TMPFILE", 0)
-    return bool(flags & write_flags) or bool(tmpfile_flag and flags & tmpfile_flag == tmpfile_flag)
-
-
-_MUTATING_PATH_ARGUMENTS = {
-    "os.chmod": (0,),
-    "os.chown": (0,),
-    "os.link": (0, 1),
-    "os.mkdir": (0,),
-    "os.remove": (0,),
-    "os.rename": (0, 1),
-    "os.replace": (0, 1),
-    "os.rmdir": (0,),
-    "os.symlink": (1,),
-    "os.truncate": (0,),
-    "os.utime": (0,),
-    "shutil.copyfile": (1,),
-    "shutil.copymode": (1,),
-    "shutil.copystat": (1,),
-    "shutil.copytree": (1,),
-    "shutil.move": (0, 1),
-    "shutil.rmtree": (0,),
-}
-
-_DIR_FD_AUDIT_ARGUMENTS = {
-    "os.chmod": (2,),
-    "os.chown": (3,),
-    "os.link": (2, 3),
-    "os.mkdir": (2,),
-    "os.remove": (1,),
-    "os.rename": (2, 3),
-    "os.replace": (2, 3),
-    "os.rmdir": (1,),
-    "os.symlink": (2,),
-    "os.utime": (3,),
-}
-
-_READ_PATH_EVENTS = {
-    "os.listdir",
-    "os.scandir",
-    "glob.glob",
-    "glob.glob/2",
-}
-
-
-def _glob_anchor(args):
-    pattern = args[0] if args else "."
-    root_dir = args[2] if len(args) > 2 else None
-    try:
-        pattern = os.fspath(pattern)
-        if root_dir is not None and not os.path.isabs(pattern):
-            pattern = os.path.join(os.fspath(root_dir), pattern)
-    except TypeError:
-        return pattern
-    separators = {os.sep}
-    if os.altsep:
-        separators.add(os.altsep)
-    first_magic = min(
-        (pattern.find(marker) for marker in ("*", "?", "[") if marker in pattern),
-        default=-1,
-    )
-    if first_magic < 0:
-        return pattern
-    prefix = pattern[:first_magic]
-    while prefix and prefix[-1] not in separators:
-        prefix = prefix[:-1]
-    return prefix or "."
-
-
-def _is_case_frame(frame):
-    if frame is None:
-        return False
-    code_filename = frame.f_code.co_filename
-    if (
-        isinstance(code_filename, str)
-        and code_filename.startswith("<")
-        and code_filename.endswith(">")
-    ):
-        return False
-    filename = _real_path(code_filename)
-    return filename is not None and _inside(filename, _WORK_DIR)
-
-
-def _caller_opcode(frame):
-    if frame is None:
-        return ""
-    current = ""
-    try:
-        for instruction in dis.get_instructions(frame.f_code):
-            if instruction.offset > frame.f_lasti:
-                break
-            current = instruction.opname
-    except (TypeError, ValueError):
-        return ""
-    return current
-
-def _is_import_statement(frame):
-    return _caller_opcode(frame).endswith("IMPORT_NAME")
-
-
-def _loaded_name_value(frame, name):
-    if name in frame.f_locals:
-        return frame.f_locals[name]
-    if name in frame.f_globals:
-        return frame.f_globals[name]
-    builtins_scope = frame.f_builtins
-    if isinstance(builtins_scope, dict):
-        return builtins_scope.get(name)
-    return getattr(builtins_scope, name, None)
-
-
-def _direct_builtin_call(frame, guarded_callable, builtin_name):
-    # Recognize a case call to a guarded builtin without blaming C lazy imports.
-    if frame is None:
-        return False
-    try:
-        instructions = list(dis.get_instructions(frame.f_code))
-    except (TypeError, ValueError):
-        return False
-    current_index = -1
-    for index, instruction in enumerate(instructions):
-        if instruction.offset > frame.f_lasti:
-            break
-        current_index = index
-    if current_index < 0:
-        return False
-    for instruction in reversed(instructions[max(0, current_index - 24):current_index]):
-        opname = instruction.opname
-        if opname in {"RETURN_VALUE", "YIELD_VALUE", "POP_TOP"} or opname.startswith("STORE_"):
-            break
-        if opname == "CALL":
-            break
-        if opname in {"LOAD_GLOBAL", "LOAD_NAME", "LOAD_FAST", "LOAD_DEREF"}:
-            if _loaded_name_value(frame, str(instruction.argval)) is guarded_callable:
-                return True
-        if opname in {"LOAD_ATTR", "LOAD_METHOD"} and instruction.argval == builtin_name:
-            return True
-    return False
-
-
-def _call_with_caller_scope(original, args, kwargs, caller):
-    # eval()/exec() with no explicit namespaces inherit their caller's scope.
-    # Calling them through this guard must preserve that Python behavior for
-    # trusted runtime libraries such as NumPy and SciPy.
-    if len(args) == 1 and "globals" not in kwargs and "locals" not in kwargs:
-        return original(args[0], caller.f_globals, caller.f_locals, **kwargs)
-    if len(args) >= 2 and args[1] is None:
-        caller_locals = caller.f_locals if len(args) < 3 or args[2] is None else args[2]
-        return original(
-            args[0],
-            caller.f_globals,
-            caller_locals,
-            *args[3:],
-            **kwargs,
-        )
-    return original(*args, **kwargs)
-
-
-
-_OS_BACKEND = sys.modules.get(os.name)
-
-
-def _reject_case_dir_fds(event, kwargs):
-    if (
-        any(key.endswith("dir_fd") and value is not None for key, value in kwargs.items())
-        and _is_case_frame(sys._getframe(2))
-    ):
-        _deny(f"{event} with dir_fd from case code")
-
-
-def _make_guarded_builtins(original_eval, original_exec, original_compile, original_import):
-    def guarded_eval(*args, **kwargs):
-        caller = sys._getframe(1)
-        if _is_case_frame(caller):
-            _deny("eval called directly by case code")
-        return _call_with_caller_scope(original_eval, args, kwargs, caller)
-
-    def guarded_exec(*args, **kwargs):
-        caller = sys._getframe(1)
-        if _is_case_frame(caller):
-            _deny("exec called directly by case code")
-        return _call_with_caller_scope(original_exec, args, kwargs, caller)
-
-    def guarded_compile(*args, **kwargs):
-        if _is_case_frame(sys._getframe(1)):
-            _deny("compile called directly by case code")
-        return original_compile(*args, **kwargs)
-
-    def guarded_import(*args, **kwargs):
-        caller = sys._getframe(1)
-        if (
-            _is_case_frame(caller)
-            and not _is_import_statement(caller)
-            and _direct_builtin_call(caller, guarded_import, "__import__")
-        ):
-            _deny("__import__ called directly by case code")
-        return original_import(*args, **kwargs)
-
-    return guarded_eval, guarded_exec, guarded_compile, guarded_import
-
-
-def _make_guarded_path_functions(
-    original_stat,
-    original_lstat,
-    original_access,
-    original_readlink,
-):
-    def guarded_stat(path, *args, **kwargs):
-        if getattr(_PATH_STATE, "resolving", False):
-            return original_stat(path, *args, **kwargs)
-        _reject_case_dir_fds("os.stat", kwargs)
-        _require_allowed_read(path, "os.stat")
-        return original_stat(path, *args, **kwargs)
-
-    def guarded_lstat(path, *args, **kwargs):
-        if getattr(_PATH_STATE, "resolving", False):
-            return original_lstat(path, *args, **kwargs)
-        _reject_case_dir_fds("os.lstat", kwargs)
-        _require_allowed_read(path, "os.lstat")
-        return original_lstat(path, *args, **kwargs)
-
-    def guarded_access(path, *args, **kwargs):
-        if getattr(_PATH_STATE, "resolving", False):
-            return original_access(path, *args, **kwargs)
-        _reject_case_dir_fds("os.access", kwargs)
-        _require_allowed_read(path, "os.access")
-        return original_access(path, *args, **kwargs)
-
-    def guarded_readlink(path, *args, **kwargs):
-        if getattr(_PATH_STATE, "resolving", False):
-            return original_readlink(path, *args, **kwargs)
-        _reject_case_dir_fds("os.readlink", kwargs)
-        _require_allowed_read(path, "os.readlink")
-        return original_readlink(path, *args, **kwargs)
-
-    for original, guarded in (
-        (original_stat, guarded_stat),
-        (original_lstat, guarded_lstat),
-        (original_access, guarded_access),
-        (original_readlink, guarded_readlink),
-    ):
-        for name in (
-            "supports_dir_fd",
-            "supports_fd",
-            "supports_follow_symlinks",
-            "supports_effective_ids",
-        ):
-            supported = getattr(os, name, None)
-            if isinstance(supported, set) and original in supported:
-                supported.add(guarded)
-
-    return guarded_stat, guarded_lstat, guarded_access, guarded_readlink
-
-
-(
-    _guarded_eval,
-    _guarded_exec,
-    _guarded_compile,
-    _guarded_import,
-) = _make_guarded_builtins(
-    builtins.eval,
-    builtins.exec,
-    builtins.compile,
-    builtins.__import__,
-)
-(
-    _guarded_stat,
-    _guarded_lstat,
-    _guarded_access,
-    _guarded_readlink,
-) = _make_guarded_path_functions(
-    os.stat,
-    os.lstat,
-    os.access,
-    os.readlink,
-)
-del _make_guarded_builtins
-del _make_guarded_path_functions
-
-
-def _direct_audit_case_caller():
-    try:
-        return _is_case_frame(sys._getframe(2))
-    except ValueError:
-        return False
-
-
-def _audit(event, args):
-    if event.startswith("socket."):
-        _deny(f"network operation blocked ({event})")
-    if (
-        event == "subprocess.Popen"
-        or event == "os.system"
-        or event.startswith("os.spawn")
-        or event.startswith("os.posix_spawn")
-        or event.startswith("os.exec")
-        or event in {"os.fork", "os.forkpty", "pty.fork", "pty.spawn"}
-        or event.startswith("os.startfile")
-    ):
-        _deny(f"process operation blocked ({event})")
-    if event in {"compile", "exec"} and _direct_audit_case_caller():
-        _deny(f"dynamic code execution blocked ({event})")
-    if (
-        event == "import"
-        and _direct_audit_case_caller()
-        and not _is_import_statement(sys._getframe(1))
-    ):
-        _deny("dynamic import blocked")
-    dir_fd_indexes = _DIR_FD_AUDIT_ARGUMENTS.get(event)
-    if dir_fd_indexes and _direct_audit_case_caller():
-        for index in dir_fd_indexes:
-            if index < len(args) and args[index] not in (None, -1):
-                _deny(f"{event} with dir_fd from case code")
-    if event == "open" and args:
-        path = args[0]
-        mode = args[1] if len(args) > 1 else None
-        flags = args[2] if len(args) > 2 else None
-        if mode is None and _direct_audit_case_caller():
-            try:
-                low_level_path = os.fspath(path)
-            except TypeError:
-                low_level_path = None
-            if low_level_path is None or not os.path.isabs(low_level_path):
-                _deny("relative low-level os.open called directly by case code")
-        if _open_is_write(mode, flags):
-            _require_case_write(path, event)
-        else:
-            _require_allowed_read(path, event)
-        return
-    path_indexes = _MUTATING_PATH_ARGUMENTS.get(event)
-    if path_indexes:
-        for index in path_indexes:
-            if index < len(args):
-                _require_case_write(args[index], event)
-        return
-    if event == "os.chdir" and args:
-        _require_case_chdir(args[0], event)
-        return
-    if event in _READ_PATH_EVENTS and args:
-        path = _glob_anchor(args) if event.startswith("glob.") else args[0]
-        _require_allowed_read(path, event)
-
-
-sys.addaudithook(_audit)
-builtins.eval = _guarded_eval
-builtins.exec = _guarded_exec
-builtins.compile = _guarded_compile
-builtins.__import__ = _guarded_import
-os.stat = _guarded_stat
-os.lstat = _guarded_lstat
-os.access = _guarded_access
-os.readlink = _guarded_readlink
-if _OS_BACKEND is not None:
-    for _name, _guarded in (
-        ("stat", _guarded_stat),
-        ("lstat", _guarded_lstat),
-        ("access", _guarded_access),
-        ("readlink", _guarded_readlink),
-    ):
-        if hasattr(_OS_BACKEND, _name):
-            setattr(_OS_BACKEND, _name, _guarded)
-sys.path.insert(0, _WORK_DIR)
-
-import unittest
-
-_START_DIR = _real_path(os.path.join(_WORK_DIR, _CONFIG["start_dir"]))
-if _START_DIR is None or not _inside(_START_DIR, _WORK_DIR):
-    _deny("unittest discovery path escapes the case sandbox")
-_SUITE = unittest.defaultTestLoader.discover(
-    start_dir=_START_DIR,
-)
-_RESULT = unittest.TextTestRunner(verbosity=2).run(_SUITE)
-raise SystemExit(0 if _RESULT.wasSuccessful() else 1)
-"""
-
-
 def run_codex_subprocess(
     *,
     role: str,
@@ -591,15 +75,24 @@ def run_codex_subprocess(
         "last_message_path": None,
         "transcript": None,
         "duration_s": None,
+        "observation_errors": [],
     }
+    def observe(label, operation, fallback=None):
+        try:
+            return operation()
+        except Exception as exc:
+            from .observations import record_error
+            record_error(audit_dir / label, exc)
+            status["observation_errors"].append(redact_text(f"{label}: {type(exc).__name__}: {exc}"))
+            return fallback
     # Record at the transport boundary, after every caller's dynamic additions.
     # Immutable per-invocation copies retain history when a stage label is reused.
     invocation_id = uuid.uuid4().hex
     input_dir = audit_dir / "prompt_inputs" / invocation_id
-    input_dir.mkdir(parents=True, exist_ok=True)
+    observe("prompt_directory", lambda: input_dir.mkdir(parents=True, exist_ok=True))
     prompt_bytes = prompt.encode("utf-8")
-    (input_dir / "brief.md").write_bytes(prompt_bytes)
-    (audit_dir / f"{label}_brief.md").write_bytes(prompt_bytes)
+    observe("prompt_snapshot", lambda: (input_dir / "brief.md").write_bytes(prompt_bytes))
+    observe("prompt_brief", lambda: (audit_dir / f"{label}_brief.md").write_bytes(prompt_bytes))
     from .prompt_identity import file_identity
     input_manifest = {
         "invocation_id": invocation_id, "role": role, "label": label,
@@ -609,12 +102,12 @@ def run_codex_subprocess(
         "prompt_path": str(input_dir / "brief.md"),
         "prompt_sha256": hashlib.sha256(prompt_bytes).hexdigest(),
         "prompt_characters": len(prompt), "prompt_utf8_bytes": len(prompt_bytes),
-        "images": [file_identity(Path(path)) for path in image_paths or []],
-        "output_schema": file_identity(output_schema) if output_schema is not None else None,
+        "images": [observe("image_identity", lambda path=path: file_identity(Path(path)), {"path": str(path)}) for path in image_paths or []],
+        "output_schema": observe("schema_identity", lambda: file_identity(output_schema)) if output_schema is not None else None,
         "context_boundary": "Records project-provided stdin and attachments; CLI system instructions, tools and dynamic reads are not implied by this manifest.",
     }
-    write_json(input_dir / "input.json", input_manifest)
-    write_json(audit_dir / f"{label}_input.json", input_manifest)
+    observe("input_snapshot", lambda: write_json(input_dir / "input.json", input_manifest))
+    observe("input_manifest", lambda: write_json(audit_dir / f"{label}_input.json", input_manifest))
     status.update(label=label, invocation_id=invocation_id, input_manifest=str(input_dir / "input.json"))
     if not argv or resolved is None:
         status["error_kind"] = "missing_cli"
@@ -700,7 +193,7 @@ def run_codex_subprocess(
 
     started = time.monotonic()
     invocation_started_at = time.time()
-    activity = session_started(invocation_id=invocation_id, role=role, label=label, work_dir=work_dir)
+    activity = observe("activity_started", lambda: session_started(invocation_id=invocation_id, role=role, label=label, work_dir=work_dir))
     cancelled = None
     from .supervisor import current_supervisor
     from .progress import PipelineCancelled
@@ -719,6 +212,7 @@ def run_codex_subprocess(
             check=False,
             input=prompt,
         )
+        status["observation_errors"].extend(getattr(completed, "observation_errors", []))
         status["returncode"] = completed.returncode
         status["ok"] = completed.returncode == 0
         transcript = redact_provider_secrets(
@@ -739,7 +233,7 @@ def run_codex_subprocess(
         status["error"] = redact_text(redact_provider_secrets(f"{type(exc).__name__}: {exc}", provider_secrets))
         transcript = ""
     finally:
-        session_finished(activity, ok=bool(status["ok"]), error_kind=status.get("error_kind"))
+        observe("activity_finished", lambda: session_finished(activity, ok=bool(status["ok"]), error_kind=status.get("error_kind")))
     status["duration_s"] = round(time.monotonic() - started, 1)
     if provider_secrets and last_message_path.is_file() and not last_message_path.is_symlink():
         last_text = last_message_path.read_text(encoding="utf-8")
@@ -751,224 +245,28 @@ def run_codex_subprocess(
         status["cost_event"] = record_codex_invocation(
             audit_dir, status, transcript, started_at=invocation_started_at,
         )
-    except OSError as exc:
+    except Exception as exc:
         status["cost_warning"] = f"Invocation accounting unavailable: {type(exc).__name__}"
     transcript_path = audit_dir / f"{label}_transcript.txt"
     redacted_transcript = redact_text(transcript)
-    write_text(transcript_path, redacted_transcript[-MAX_TRANSCRIPT_CHARS:])
+    observe("transcript_tail", lambda: write_text(transcript_path, redacted_transcript[-MAX_TRANSCRIPT_CHARS:]))
     full_transcript_path = input_dir / "transcript.txt.gz"
-    with gzip.open(full_transcript_path, "wt", encoding="utf-8", newline="") as stream:
-        stream.write(redacted_transcript)
+    def save_transcript():
+        with gzip.open(full_transcript_path, "wt", encoding="utf-8", newline="") as stream:
+            stream.write(redacted_transcript)
+    observe("transcript_archive", save_transcript)
     status["full_transcript"] = str(full_transcript_path)
     status["transcript_characters"] = len(redacted_transcript)
     status["transcript_tail_truncated"] = len(redacted_transcript) > MAX_TRANSCRIPT_CHARS
     status["transcript"] = str(transcript_path)
-    write_json(audit_dir / f"{label}.json", status)
+    observe("session_status", lambda: write_json(audit_dir / f"{label}.json", status))
     if cancelled is not None:
         raise cancelled
     return status
 
 
-def run_python_unittest_subprocess(
-    *,
-    work_dir: Path,
-    start_dir: str = "tests",
-    timeout: float = 120.0,
-    python_executable: str | Path | None = None,
-    venv_dir: str | Path | None = None,
-    trusted_runtime_roots: Iterable[str | Path] | None = None,
-) -> dict[str, Any]:
-    """Run generated contract tests through an isolated, host-owned Python."""
-
-    env = build_safe_env()
-    resolved_work_dir = work_dir.resolve()
-    runtime_home = resolved_work_dir / ".runtime_home"
-    runtime_cache = runtime_home / ".cache"
-    runtime_tmp = runtime_home / "tmp"
-    runtime_artifacts = resolved_work_dir / "tests" / "runtime_artifacts"
-    if runtime_home.exists() or runtime_home.is_symlink():
-        shutil.rmtree(runtime_home)
-    runtime_cache.mkdir(parents=True, exist_ok=True)
-    runtime_tmp.mkdir(parents=True, exist_ok=True)
-    runtime_artifacts.mkdir(parents=True, exist_ok=True)
-    env["HOME"] = str(runtime_home)
-    env["USERPROFILE"] = str(runtime_home)
-    env["XDG_CACHE_HOME"] = str(runtime_cache)
-    env["MPLCONFIGDIR"] = str(runtime_cache / "matplotlib")
-    env["TEMP"] = str(runtime_tmp)
-    env["TMP"] = str(runtime_tmp)
-    env["TMPDIR"] = str(runtime_tmp)
-    env["USER"] = "geng-case-runtime"
-    env["LOGNAME"] = "geng-case-runtime"
-    env["LNAME"] = "geng-case-runtime"
-    env["USERNAME"] = "geng-case-runtime"
-    env["TORCH_HOME"] = str(runtime_cache / "torch")
-    env["TORCHINDUCTOR_CACHE_DIR"] = str(runtime_cache / "torchinductor")
-    for key in ("CUDA_HOME", "CUDA_PATH", "CUDA_VISIBLE_DEVICES", "LD_LIBRARY_PATH"):
-        value = os.environ.get(key)
-        if value:
-            env[key] = value
-    selected_python = Path(python_executable or sys.executable).absolute()
-    python_dir = str(selected_python.parent)
-    env["PATH"] = os.pathsep.join([python_dir, env.get("PATH", "")])
-    if os.name == "nt":
-        env["Path"] = env["PATH"]
-    for key in ("PYTHONHOME", "PYTHONPATH", "CONDA_PREFIX", "CONDA_DEFAULT_ENV"):
-        env.pop(key, None)
-    if venv_dir is not None:
-        env["VIRTUAL_ENV"] = str(Path(venv_dir).resolve())
-    env["GENG_PYTHON"] = str(selected_python)
-    env["GENG_PYTHON_EXECUTABLE"] = str(selected_python)
-    guard_config = _foundation_unittest_guard_config(
-        work_dir=resolved_work_dir,
-        start_dir=start_dir,
-        python_executable=selected_python,
-        trusted_runtime_roots=trusted_runtime_roots,
-        write_roots=(runtime_home, runtime_artifacts),
-    )
-    command = [
-        str(selected_python),
-        "-I",
-        "-B",
-        "-c",
-        _FOUNDATION_UNITTEST_GUARD,
-        json.dumps(guard_config, ensure_ascii=True, separators=(",", ":")),
-    ]
-    result: dict[str, Any] | None = None
-    cleanup_error: OSError | None = None
-    try:
-        try:
-            completed = subprocess.run(
-                command,
-                cwd=resolved_work_dir,
-                env=env,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=timeout,
-                check=False,
-            )
-            result = {
-                "passed": completed.returncode == 0,
-                "returncode": completed.returncode,
-                "stdout": completed.stdout[-20_000:],
-                "stderr": completed.stderr[-20_000:],
-            }
-        except subprocess.TimeoutExpired as exc:
-            result = {
-                "passed": False,
-                "timed_out": True,
-                "stdout": str(exc.stdout or "")[-20_000:],
-                "stderr": str(exc.stderr or "")[-20_000:],
-            }
-    finally:
-        try:
-            shutil.rmtree(runtime_home)
-        except FileNotFoundError:
-            pass
-        except OSError as exc:
-            cleanup_error = exc
-    if cleanup_error is not None:
-        assert result is not None
-        result["passed"] = False
-        result["runtime_cleanup_error"] = (
-            f"{type(cleanup_error).__name__}: {cleanup_error}"
-        )
-        result["stderr"] = (
-            str(result.get("stderr") or "")
-            + "\nFoundation runtime cleanup failed: "
-            + result["runtime_cleanup_error"]
-        )[-20_000:]
-    assert result is not None
-    return result
 
 
-def _foundation_unittest_guard_config(
-    *,
-    work_dir: Path,
-    start_dir: str,
-    python_executable: str | Path | None = None,
-    trusted_runtime_roots: Iterable[str | Path] | None = None,
-    write_roots: Iterable[str | Path] | None = None,
-) -> dict[str, Any]:
-    """Build path-only guard input without exposing host environment values."""
-
-    home_candidates: list[Path] = [Path.home()]
-    for name in ("HOME", "USERPROFILE"):
-        value = os.environ.get(name)
-        if value:
-            home_candidates.append(Path(value))
-    sensitive_roots = {
-        str((home / leaf).resolve())
-        for home in home_candidates
-        for leaf in (".ssh", ".codex", ".config")
-    }
-
-    selected_python = Path(python_executable or sys.executable).absolute()
-    trusted_read_roots = {str(work_dir.resolve()), str(selected_python.parent)}
-    supplied_roots = tuple(trusted_runtime_roots or ())
-    if supplied_roots:
-        trusted_read_roots.update(str(Path(path).resolve()) for path in supplied_roots)
-    else:
-        trusted_read_roots.update(
-            {
-                str(Path(sys.prefix).resolve()),
-                str(Path(sys.base_prefix).resolve()),
-            }
-        )
-        try:
-            trusted_read_roots.update(str(Path(path).resolve()) for path in site.getsitepackages())
-        except AttributeError:
-            pass
-        trusted_read_roots.update(
-            str(Path(path).resolve())
-            for path in sysconfig.get_paths().values()
-            if path
-        )
-    if os.name == "nt":
-        system_root = os.environ.get("SystemRoot")
-        if system_root:
-            trusted_read_roots.add(str(Path(system_root).resolve()))
-    else:
-        trusted_read_roots.update(
-            str(path.absolute())
-            for path in (
-                Path("/usr/lib"),
-                Path("/usr/lib64"),
-                Path("/lib"),
-                Path("/lib64"),
-                Path("/usr/share"),
-                Path("/etc/ssl/certs"),
-                Path("/dev/urandom"),
-                Path("/proc/cpuinfo"),
-                Path("/proc/meminfo"),
-                Path("/proc/self/status"),
-                Path("/proc/driver/nvidia"),
-                Path("/sys/bus/pci/devices"),
-                Path("/sys/devices/system/cpu"),
-                Path("/sys/devices/system/node"),
-            )
-            if path.exists()
-        )
-
-    return {
-        "work_dir": str(work_dir.resolve()),
-        "start_dir": str(start_dir),
-        "sensitive_roots": sorted(sensitive_roots),
-        "trusted_read_roots": sorted(trusted_read_roots),
-        "write_roots": sorted(
-            str(Path(path).resolve())
-            for path in (
-                tuple(write_roots)
-                if write_roots is not None
-                else (
-                    work_dir / ".runtime_home",
-                    work_dir / "tests" / "runtime_artifacts",
-                )
-            )
-        ),
-    }
 
 
 def _ephemeral_capability(

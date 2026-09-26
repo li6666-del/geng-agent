@@ -208,7 +208,7 @@ def _clear_stage_outputs(
         "03a_pip_resolution_report.json",
         "03a_pip_install_report.json",
         "audit/03a_case_environment",
-        "foundation_manifest.json",
+
         "repro_project_manifest.json",
         "repro_project",
         "runtime_result.json",
@@ -226,7 +226,7 @@ def _clear_stage_outputs(
         "03a_pip_resolution_report.json",
         "03a_pip_install_report.json",
         "audit/03a_case_environment",
-        "foundation_manifest.json",
+
         "repro_project_manifest.json",
         "repro_project",
         "runtime_result.json",
@@ -241,7 +241,7 @@ def _clear_stage_outputs(
         "03a_pip_resolution_report.json",
         "03a_pip_install_report.json",
         "audit/03a_case_environment",
-        "foundation_manifest.json",
+
         "repro_project_manifest.json",
         "repro_project",
         "runtime_result.json",
@@ -295,10 +295,7 @@ def _clear_stage_audit(output_dir: Path, stage: str) -> None:
         "experiment_index": ["02", "03", "04"],
         "scientific_architecture": ["02f", "03", "04"],
         "environment": ["03a", "03b", "03c", "04"],
-        # Rebuilding task-writer outputs must preserve the already validated
-        # Foundation snapshot from stage 03b. A broad ``03*`` cleanup deletes
-        # the canonical snapshot before stage 03c can install it into task
-        # sandboxes, making every fresh v2 run fail at the hand-off boundary.
+        # Task rebuilds preserve environment preparation and earlier audit data.
         "manifest": ["03c", "04"],
         "project": ["04"],
         "result_review": ["04"],

@@ -1,8 +1,4 @@
-"""One bounded, evidence-bound authority for exceptional recovery routing.
-
-The moderator never executes repairs or supplies a scientific verdict. Callers
-apply a validated instruction through the existing owner and execution checks.
-"""
+"""Agent-owned recovery routing; dispatch tools execute its instructions."""
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -21,10 +17,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .codex_runner import run_codex_subprocess
 from .config import get_config_value
-from .foundation_snapshot import path_is_foundation_link
+from .artifact_paths import path_is_link
 from .json_utils import parse_json_object
 from .model_config import resolve_model_config
-from .outputs import write_json, write_text
+from .outputs import write_text
+from .observations import write_json, record_error
 from .prompts import PromptBook
 from .progress import PipelineCancelled
 from .security import redact_text
@@ -39,8 +36,8 @@ class EvidenceReference(BaseModel):
 class ModeratorDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
     schema_version: Literal["1.0"]
-    action: Literal["stop", "continue", "revise_writer", "revise_foundation", "repair_reporter",
-                    "approve", "retry", "repair_artifacts", "block", "start", "finish", "wait"]
+    action: Literal["stop", "continue", "revise_writer", "repair_reporter",
+                    "retry", "repair_artifacts", "block", "start", "finish", "wait"]
     diagnosis: str = Field(min_length=1)
     instructions: str
     component_ids: list[str]
@@ -72,14 +69,22 @@ def _parse_decision(text: str) -> dict:
     payload = parse_json_object(text)
     # Some providers encode multiline text as arrays of paragraphs despite the
     # closed wire schema requesting strings. Keep paragraph order, then apply
-    # the normal action and evidence validation below.
+    # address decoding below without rejecting descriptive content.
     for field in ("diagnosis", "instructions", "expected_change"):
         value = payload.get(field)
         if isinstance(value, list) and all(isinstance(item, str) for item in value):
             payload[field] = "\n".join(item.strip() for item in value if item.strip())
     if isinstance(payload.get("repair_arguments"), str):
-        payload["repair_arguments"] = json.loads(payload["repair_arguments"])
-    return ModeratorDecision.model_validate(payload).model_dump()
+        try:
+            payload["repair_arguments"] = json.loads(payload["repair_arguments"])
+        except ValueError:
+            pass  # Keep original arguments for the actual tool/owner to handle.
+    # The action is consumed by the selected tool; descriptive content is not
+    # an admission test and unknown fields remain available to the recipient.
+    defaults = {"diagnosis": "", "instructions": "", "expected_change": "",
+                "evidence_refs": [], "component_ids": [], "task_ids": [],
+                "next_nodes": [], "next_node": "", "repair_operation": "", "repair_arguments": {}}
+    return {**defaults, **payload}
 
 
 def _canonical_start_nodes(decision: dict, ready: list[str], scope_id: str) -> list[str]:
@@ -124,26 +129,27 @@ def _file_hash(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _stop(status: str, diagnosis: str, decision_id: str = "") -> dict[str, Any]:
-    return {"schema_version": "1.0", "action": "stop", "status": status,
+def _unavailable(status: str, diagnosis: str, decision_id: str = "") -> dict[str, Any]:
+    # A transport/recording failure is no moderator decision to stop work.
+    return {"schema_version": "1.0", "action": "unavailable", "status": status,
             "diagnosis": diagnosis, "instructions": "", "component_ids": [],
             "evidence_refs": [], "expected_change": "", "decision_id": decision_id}
 
 
 def _regular_source(root: Path, relative: str) -> Path:
     if root.is_file():
-        if relative != root.name or path_is_foundation_link(root):
+        if relative != root.name or path_is_link(root):
             raise ValueError("evidence file root does not authorize sibling files")
         root = root.parent
     parts = relative.replace("\\", "/").split("/")
     if any(part in {"", ".", ".."} or ":" in part for part in parts):
         raise ValueError("unsafe evidence path")
     current = root
-    if path_is_foundation_link(root):
+    if path_is_link(root):
         raise ValueError("linked evidence root")
     for part in parts:
         current /= part
-        if path_is_foundation_link(current):
+        if path_is_link(current):
             raise ValueError("linked evidence path")
     current.resolve(strict=True).relative_to(root.resolve(strict=True))
     if not current.is_file():
@@ -161,7 +167,7 @@ def _snapshot_evidence(workspace: Path, roots: dict[str, Path], *,
         if not name or not all(char.isalnum() or char in "_-" for char in name):
             raise ValueError("invalid evidence root name")
         selected = Path(raw_root)
-        if path_is_foundation_link(selected) or not (selected.is_dir() or selected.is_file()):
+        if path_is_link(selected) or not (selected.is_dir() or selected.is_file()):
             omitted.append({"root": name, "path": ".", "reason": "root_unavailable"})
             continue
         root = selected.parent if selected.is_file() else selected
@@ -173,7 +179,7 @@ def _snapshot_evidence(workspace: Path, roots: dict[str, Path], *,
         for directory, dirs, files in ([] if selected.is_file() else os.walk(root, followlinks=False)):
             parent = Path(directory)
             dirs[:] = sorted(item for item in dirs if item.lower() not in _EXCLUDED
-                             and not path_is_foundation_link(parent / item))
+                             and not path_is_link(parent / item))
             for filename in sorted(files):
                 path = parent / filename
                 if (path.suffix.lower() not in _TEXT | _MEDIA or filename.lower().startswith(".env")
@@ -270,7 +276,10 @@ def _event_claim(event_dir: Path) -> Iterator[bool]:
         if acquired:
             with _CLAIM_LOCK:
                 if _read_record(claim).get("token") == identity["token"]:
-                    claim.unlink(missing_ok=True)
+                    try:
+                        claim.unlink(missing_ok=True)
+                    except OSError as exc:
+                        record_error(claim, exc)
         if handle is not None:
             handle.close()  # OS releases the per-incident lease.
 
@@ -292,42 +301,25 @@ class Moderator:
         event_dir = scope_dir / event_id[:32]
         with _event_claim(event_dir) as acquired:
             if not acquired:
-                return _stop("in_progress", "另一个活跃调用正在处理该节点；等待其真实结果，不重复派发。", event_id)
+                return _unavailable("in_progress", "另一个活跃调用正在处理该节点；等待其真实结果，不重复派发。", event_id)
             previous = _read_record(event_dir / "reservation.json")
             saved = _read_record(event_dir / "decision.json")
-            if saved:
-                if reuse_decision or (reuse_continue and "continue" in allowed_actions):
-                    cached = self._reuse_continue(event_dir, evidence_roots, context, allowed_actions,
-                                                  all_decisions=reuse_decision)
-                    if cached is not None:
-                        return cached
-                if (saved.get("status") in {"model_failed", "invalid_or_unavailable"}
-                        and int(previous.get("attempts", 0)) < 2):
-                    # A failed read-only diagnosis issued no repair. Preserve
-                    # its output and allow one transport/format recovery.
-                    write_json(event_dir / "unavailable_decision_01.json", saved)
-                    (event_dir / "decision.json").unlink()
-                else:
-                    return _stop("already_diagnosed", "该异常状态已有完整决定；由动作账本对账，不重复下发恢复指令。", event_id)
-            if not previous:
-                raw_budget = get_config_value("GENG_MODERATOR_MAX_DECISIONS_PER_SCOPE")
-                try:
-                    budget = max(0, int(raw_budget)) if raw_budget is not None else 3
-                except (TypeError, ValueError):
-                    budget = 3
-                spent = sum(not _read_record(path).get("routine", False)
-                            for path in scope_dir.glob("*/reservation.json"))
-                if not routine and (spent >= budget or budget == 0):
-                    return _stop("budget_exhausted", "主持人对该问题范围的诊断预算已用完，保留当前证据与未解决状态。", event_id)
+            if saved and (reuse_decision or reuse_continue):
+                cached = self._reuse_continue(event_dir, evidence_roots, context, allowed_actions,
+                                              all_decisions=reuse_decision)
+                if cached is not None:
+                    return cached
             attempts = int(previous.get("attempts", 0))
-            if attempts >= 2:
-                return _stop("interruption_budget_exhausted", "同一诊断连续中断，等待恢复执行环境后继续。", event_id)
             reservation = {**previous, "decision_id": event_id, "scope_id": scope_id,
                            "trigger": trigger, "state_id": state_id, "routine": routine,
                            "created_at": previous.get("created_at", datetime.now(timezone.utc).isoformat()),
                            "invocation": uuid4().hex, "attempts": attempts + 1, "status": "prepared"}
             write_json(event_dir / "reservation.json", reservation)
             attempt_dir = event_dir if attempts == 0 else event_dir / f"attempt_{attempts + 1:02d}"
+            while (attempt_dir / "workspace").exists():
+                # A lost observation record must not strand the next diagnosis.
+                attempts += 1
+                attempt_dir = event_dir / f"attempt_{attempts + 1:02d}"
             attempt_dir.mkdir(parents=True, exist_ok=True)
             try:
                 return self._diagnose(event_id=event_id, event_dir=event_dir, attempt_dir=attempt_dir,
@@ -369,53 +361,32 @@ class Moderator:
                 label="moderator", sandbox="read-only",
                 output_schema=attempt_dir / "decision_schema.json" if profile.supports_json_schema else None,
             )
-            if not status.get("ok"):
-                decision = _stop("model_failed", "主持人没有完成诊断，保留原任务状态。", event_id)
+            message = attempt_dir / "moderator_last_message.txt"
+            if not status.get("ok") and not message.is_file():
+                decision = _unavailable("model_failed", "主持人没有完成诊断，保留原任务状态。", event_id)
             else:
-                message = attempt_dir / "moderator_last_message.txt"
-                if path_is_foundation_link(message) or message.stat().st_size > 256 * 1024:
+                if path_is_link(message):
                     raise ValueError("unsafe moderator response")
                 decision = _parse_decision(message.read_text(encoding="utf-8-sig"))
-                if decision["action"] not in {*allowed_actions, "stop"}:
-                    raise ValueError("moderator selected an unavailable recovery action")
-                if decision["action"] not in {"stop", "block"}:
-                    if not decision["instructions"].strip() or not decision["expected_change"].strip() or not decision["evidence_refs"]:
-                        raise ValueError("actionable recovery requires instructions, evidence and an observable change")
-                    available = {(item["root"], item["path"]) for item in inventory}
-                    if any((item["root"], item["path"]) not in available for item in decision["evidence_refs"]):
-                        raise ValueError("moderator cited unavailable evidence")
-                    if trigger == "contextual_check_findings":
-                        required = {("project", str(item.get("file") or "").replace("\\", "/"))
-                                    for item in context.get("findings", [])}
-                        if not required.issubset(available):
-                            raise ValueError("affected checker source was omitted from the evidence snapshot")
-                    if decision["action"] == "revise_foundation" and not decision["component_ids"]:
-                        raise ValueError("shared revision needs explicit component IDs")
-                    if decision["action"] == "start":
-                        selected = _canonical_start_nodes(decision, context.get("ready", []), scope_id)
-                        if len(selected) != len(set(selected)) or any(node not in context.get("ready", []) for node in selected):
-                            raise ValueError("selected node is not ready or duplicated")
-                        decision["next_nodes"] = selected
-                        decision["next_node"] = selected[0] if len(selected) == 1 else ""
-                    if decision["action"] == "wait" and not context.get("active"):
-                        raise ValueError("cannot wait without active work")
-                    if decision["action"] == "finish" and context.get("active"):
-                        raise ValueError("cannot finish while side effects are active")
-                    if decision["action"] == "finish" and context.get("ready") and trigger != "tool_dispatch":
-                        raise ValueError("cannot finish with ready work remaining")
-                    if decision["action"] == "repair_artifacts" and decision["repair_operation"] not in context.get("repair_operations", []):
-                        raise ValueError("repair operation is not registered")
-                if (_file_hash(workspace / "incident.json") != packet_hash
-                        or not _evidence_unchanged(workspace, evidence_roots, inventory)):
-                    decision = _stop("stale_evidence", "诊断期间证据已变化，未采用该恢复指令。", event_id)
-                else:
-                    decision.update(status="decided", decision_id=event_id)
+                if decision.get("action") == "start":
+                    selected = _canonical_start_nodes(decision, context.get("ready", []), scope_id)
+                    decision["next_nodes"] = selected
+                    decision["next_node"] = selected[0] if len(selected) == 1 else ""
+                decision.update(status="decided", decision_id=event_id)
+                try:
+                    decision["evidence_changed_during_diagnosis"] = (
+                        not _evidence_unchanged(workspace, evidence_roots, inventory)
+                        or _file_hash(workspace / "incident.json") != packet_hash)
+                except Exception as exc:
+                    decision["evidence_observation_error"] = redact_text(f"{type(exc).__name__}: {exc}")
+                if not status.get("ok"):
+                    decision["process_observation"] = status
             decision["workspace"] = workspace.relative_to(event_dir).as_posix()
             write_json(event_dir / "decision.json", decision)
         except PipelineCancelled:
             raise
         except Exception as exc:
-            decision = _stop("invalid_or_unavailable", f"主持人诊断未通过交付检查（{type(exc).__name__}），保留原任务状态。", event_id)
+            decision = _unavailable("invalid_or_unavailable", f"主持人响应暂时无法读取（{type(exc).__name__}），保留原任务状态。", event_id)
             write_json(attempt_dir / "failure.json", {"error_kind": type(exc).__name__, "error": redact_text(str(exc))[:2000]})
             write_json(event_dir / "decision.json", decision)
         write_json(event_dir / "reservation.json", {**reservation, "status": "completed",
@@ -430,8 +401,6 @@ class Moderator:
             decision = json.loads((event_dir / "decision.json").read_text(encoding="utf-8"))
             workspace = event_dir / decision.get("workspace", "workspace")
             packet = json.loads((workspace / "incident.json").read_text(encoding="utf-8"))
-            ModeratorDecision.model_validate({key: decision[key] for key in ModeratorDecision.model_fields
-                                               if key in decision})
             if ((decision.get("action") not in {*allowed_actions, "stop"} if all_decisions else decision.get("action") != "continue")
                     or decision.get("status") != "decided"
                     or packet.get("context") != context
@@ -470,7 +439,7 @@ def request_moderation(*, trigger: str, scope_id: str, state_id: str, context: d
                        reuse_continue: bool = False) -> dict:
     moderator = _CURRENT.get()
     if moderator is None:
-        return _stop("not_active", "当前调用未启用主持人工作流，保留原任务的未解决状态。")
+        return _unavailable("not_active", "当前调用未启用主持人工作流，保留原任务的未解决状态。")
     try:
         return moderator.request(trigger=trigger, scope_id=scope_id, state_id=state_id,
                                  context=context, evidence_roots=evidence_roots, allowed_actions=allowed_actions,
@@ -478,10 +447,9 @@ def request_moderation(*, trigger: str, scope_id: str, state_id: str, context: d
     except PipelineCancelled:
         raise
     except Exception as exc:
-        # Without a durable reservation there must be no model call; failure to
-        # write later diagnostics must not destroy an otherwise usable delivery.
-        # KeyboardInterrupt/SystemExit still propagate, preserving cancellation.
-        decision = _stop("audit_unavailable", f"主持人审计记录不可用（{type(exc).__name__}），保留原任务与未解决状态。",
+        # Failure to create an actual workspace/lease is unavailable coordination,
+        # not a scientific stop. Later observation writes are best-effort.
+        decision = _unavailable("audit_unavailable", f"主持人审计记录不可用（{type(exc).__name__}），保留原任务与未解决状态。",
                          _digest([trigger, scope_id, state_id]))
         moderator._emit("moderator.completed", decision["diagnosis"], decision["decision_id"], trigger, decision)
         return decision

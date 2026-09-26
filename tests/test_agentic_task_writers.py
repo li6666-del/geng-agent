@@ -8,7 +8,6 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
-from geng_agent.foundation_snapshot import foundation_snapshot_hash
 from geng_agent.outputs import write_json
 from geng_agent.agentic_task_writers import (
     _build_task_writer_brief,
@@ -93,7 +92,6 @@ def _write_frozen_test_project(root: Path) -> tuple[Path, Path, Path]:
             "source_inventory.json",
         },
         analysis_snapshot_hash="analysis-hash",
-        foundation_snapshot_hash="foundation-hash",
         environment_hash="environment-hash",
         run_smoke=False,
     )
@@ -101,7 +99,7 @@ def _write_frozen_test_project(root: Path) -> tuple[Path, Path, Path]:
 
 
 class AutonomousTaskWriterTests(unittest.TestCase):
-    def test_writer_routes_changed_shared_python_to_environment_refresh(self) -> None:
+    def test_legacy_environment_flag_does_not_override_writer_handoff(self) -> None:
         with TemporaryDirectory() as temp:
             root = Path(temp)
             sandbox = root / "sandbox"
@@ -121,14 +119,15 @@ class AutonomousTaskWriterTests(unittest.TestCase):
             broker.environment_refresh_required = True
             with patch("geng_agent.task_writer_runner.ExecutionBroker", return_value=broker) as broker_factory, patch(
                 "geng_agent.task_writer_runner.run_codex_subprocess",
-                return_value={"ok": False, "error": "shared_runtime_changed"},
+                return_value={"ok": True},
             ):
                 status = _run_task_writer_codex_session(
                     label="changed_runtime", prompt="continue task", sandbox=sandbox,
                     audit_dir=audit_dir, case_runtime=runtime,
                 )
 
-        self.assertEqual(status["error_kind"], "environment_refresh")
+        self.assertTrue(status["ok"])
+        self.assertNotIn("error_kind", status)
         self.assertEqual(broker_factory.call_args.kwargs["expected_installed_distributions"],
                          runtime.lock["installed_distributions"])
 
@@ -210,7 +209,7 @@ class AutonomousTaskWriterTests(unittest.TestCase):
                 "verdict": "accepted",
             },
         }
-        self.assertFalse(_record_has_terminal_task_verification(record))
+        self.assertTrue(_record_has_terminal_task_verification(record))
 
         record["task_verification"] = {
             "schema_version": "2.0",
@@ -813,7 +812,7 @@ class AutonomousTaskWriterTests(unittest.TestCase):
                 _manifest, result = _freeze_repro_project_package(
                     repro_project_dir=project, output_dir=output, audit_path=output / "audit.json",
                     task_manifest={"tasks": []}, expected_paths={"run_experiment.py"},
-                    analysis_snapshot_hash="a", foundation_snapshot_hash="", environment_hash="e", run_smoke=True)
+                    analysis_snapshot_hash="a", environment_hash="e", run_smoke=True)
             self.assertFalse(result["smoke"]["ran"])
             self.assertTrue((output / "audit.json").is_file())
 
@@ -1195,9 +1194,6 @@ class AutonomousTaskWriterTests(unittest.TestCase):
                 "geng_agent.task_writer_runner._collect_task_writer_delivery", side_effect=records
             ), patch(
                 "geng_agent.task_writer_runner._archive_nonterminal_writer_delivery"
-            ), patch(
-                "geng_agent.task_writer_runner._record_source_config_fingerprint",
-                side_effect=["initial-source", "changed-source"],
             ):
                 result = _run_one_task_writer(
                     index=1,
@@ -1442,68 +1438,7 @@ class AutonomousTaskWriterTests(unittest.TestCase):
             run_writer.assert_not_called()
             archive_delivery.assert_not_called()
 
-    def test_fresh_workflow_preserves_foundation_snapshot_before_dispatch(self) -> None:
-        with TemporaryDirectory() as temp:
-            root = Path(temp)
-            output = root / "case"
-            audit = output / "audit"
-            snapshot = audit / "03b_foundation_snapshot"
-            source = snapshot / "src" / "channel.py"
-            source.parent.mkdir(parents=True)
-            source.write_text("VALUE = 1\n", encoding="utf-8")
-            paper = output / "paper.pdf"
-            paper.parent.mkdir(parents=True, exist_ok=True)
-            paper.write_bytes(b"paper")
-            tasks = {"repro_tasks": [{"task_id": "task_1", "figure_or_claim": "Fig. 1"}]}
-            write_json(output / "engineering_facts.json", {"engineering_facts": []})
-            write_json(output / "repro_tasks.json", tasks)
-            write_json(output / "experiment_index.json", {"experiments": []})
-            digest = __import__("hashlib").sha256(source.read_bytes()).hexdigest()
-            files = [{"path": "src/channel.py", "sha256": digest, "bytes": source.stat().st_size}]
-            snapshot_hash = foundation_snapshot_hash(files)
-            manifest = {
-                "schema_version": "1.0",
-                "workflow_version": "2",
-                "contract_version": "1",
-                "input_hash": "a" * 64,
-                "analysis_snapshot_hash": "b" * 64,
-                "snapshot_hash": snapshot_hash,
-                "files": files,
-                "frozen_files": files,
-                "required_modules": ["src/channel.py"],
-                "validation": {"tests_passed": True, "local_imports_resolve": True},
-            }
-            foundation = {
-                "snapshot_dir": str(snapshot),
-                "snapshot_hash": snapshot_hash,
-                "manifest": manifest,
-            }
-
-            class StopAfterDispatchProbe(RuntimeError):
-                pass
-
-            def probe_dispatch(**kwargs):
-                self.assertTrue(source.is_file(), "manifest cleanup deleted the 03b Foundation snapshot")
-                from geng_agent.agentic_foundation import install_foundation_snapshot
-
-                probe = root / "probe_sandbox"
-                installed = install_foundation_snapshot(probe, kwargs["foundation"])
-                self.assertEqual(installed, {"src/channel.py"})
-                self.assertEqual((probe / "src" / "channel.py").read_bytes(), source.read_bytes())
-                raise StopAfterDispatchProbe
-
-            with patch(
-                "geng_agent.agentic_task_writers._dispatch_task_writers",
-                side_effect=probe_dispatch,
-            ):
-                with self.assertRaises(StopAfterDispatchProbe):
-                    run_codex_task_writer_workflow(
-                        facts={"engineering_facts": []}, tasks=tasks,
-                        experiment_index={"experiments": []}, paper={"chunks": []},
-                        paper_path=paper, paper_context_json="", paper_images=[], paper_thesis=None,
-                        output_dir=output, audit_dir=audit, repro_project_dir=output / "repro_project",
-                        run_repro=True, resume=False, foundation=foundation,
-                    )
+    pass  # Retired shared-code/compound execution policy.
 
 
 if __name__ == "__main__":

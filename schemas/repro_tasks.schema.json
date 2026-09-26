@@ -320,6 +320,21 @@
           },
           "title": "Validation Anchors",
           "type": "array"
+        },
+        "experiments": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "title": "Experiments",
+          "type": "array"
+        },
+        "depends_on": {
+          "items": {
+            "$ref": "#/$defs/TaskArtifactDependency"
+          },
+          "title": "Depends On",
+          "type": "array"
         }
       },
       "required": [
@@ -594,72 +609,19 @@
       "title": "ScientificNumericTarget",
       "type": "object"
     },
-    "TaskExecutionRelationship": {
+    "TaskArtifactDependency": {
       "additionalProperties": false,
-      "description": "Scientific execution dependency between otherwise atomic reproduction tasks.",
+      "description": "A file handoff explicitly requested by the planner.",
       "properties": {
-        "relationship_id": {
-          "minLength": 1,
-          "title": "Relationship Id",
+        "task_id": {
+          "title": "Task Id",
           "type": "string"
         },
-        "kind": {
-          "enum": [
-            "same_run_outputs",
-            "checkpoint_flow",
-            "shared_pretraining",
-            "shared_random_realization",
-            "shared_dataset_partition",
-            "shared_definition",
-            "other"
-          ],
-          "title": "Kind",
-          "type": "string"
-        },
-        "strength": {
-          "enum": [
-            "strong",
-            "weak"
-          ],
-          "title": "Strength",
-          "type": "string"
-        },
-        "task_ids": {
+        "artifacts": {
           "items": {
-            "minLength": 1,
             "type": "string"
           },
-          "minItems": 2,
-          "title": "Task Ids",
-          "type": "array"
-        },
-        "producer_task_id": {
-          "anyOf": [
-            {
-              "minLength": 1,
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Producer Task Id"
-        },
-        "consumer_task_ids": {
-          "items": {
-            "minLength": 1,
-            "type": "string"
-          },
-          "title": "Consumer Task Ids",
-          "type": "array"
-        },
-        "artifact_ids": {
-          "items": {
-            "minLength": 1,
-            "type": "string"
-          },
-          "title": "Artifact Ids",
+          "title": "Artifacts",
           "type": "array"
         },
         "rationale": {
@@ -669,12 +631,9 @@
         }
       },
       "required": [
-        "relationship_id",
-        "kind",
-        "strength",
-        "task_ids"
+        "task_id"
       ],
-      "title": "TaskExecutionRelationship",
+      "title": "TaskArtifactDependency",
       "type": "object"
     },
     "TaskSpecificationItem": {
@@ -730,13 +689,6 @@
     },
     "backfill_handoff": {
       "$ref": "#/$defs/ReproTaskBackfillHandoff"
-    },
-    "execution_relationships": {
-      "items": {
-        "$ref": "#/$defs/TaskExecutionRelationship"
-      },
-      "title": "Execution Relationships",
-      "type": "array"
     },
     "repro_tasks": {
       "items": {

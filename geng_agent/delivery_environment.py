@@ -179,7 +179,14 @@ def export_installation(project: Path, *, python_executable: Path | None = None)
                 "python": lock.get("interpreter", {})}
     (project / "installation.json").write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     manifest = _read(project / "tasks_manifest.json")
-    lines = ["# Reproduction project", "", "## Install and run", "",
+    lines = ["# Reproduction project", ""]
+    if (project / "outputs").is_dir():
+        lines += ["## 本次复现结果", "",
+                  "[打开结果目录](outputs/)。其中保留本次运行已有的图表、数据及其他输出，"
+                  "无需重新运行即可查看。各文件保持 Writer 保存时的相对路径；"
+                  "Writer 自定义的 `results/`、`figures/` 等目录也保留在本任务文件夹内。",
+                  "已有文件可能包含 smoke、full 或未完成实验的输出，具体用途与复现结论见两份报告。", ""]
+    lines += ["## Install and run", "",
              "Use Python " + str(lock.get("interpreter", {}).get("python_full_version", "3.11+")) + ".",
              "Create a virtual environment without system site packages:", "", "```sh",
              "python -m venv .venv", "# Linux/macOS", ".venv/bin/python -m pip install -r requirements.repro.txt",

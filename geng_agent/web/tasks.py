@@ -1,83 +1,26 @@
+"""Adapt the scientific pipeline to account-owned, final-delivery Web jobs."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-import threading
 
 from celery import Celery
-from sqlalchemy import select
 
 from geng_agent.pipeline import ReviewPipeline
 from geng_agent.progress import CallbackProgressReporter, PipelineCancelled
 
-from .artifacts import LocalArtifactStore, build_zip, catalog_case_artifacts
 from .db import SessionLocal, init_database
-from .events import append_event
-from .models import ArtifactRecord, CaseRecord, ExportRecord, JobRecord
+from .delivery import build_delivery
+from .models import CaseRecord, JobRecord
+from .observability import logger
 from .settings import settings
-
 
 celery_app = Celery("geng_agent.web", broker=settings.redis_url, backend=settings.redis_url)
 celery_app.conf.update(
-    task_acks_late=True,
-    task_reject_on_worker_lost=True,
-    worker_prefetch_multiplier=1,
-    task_track_started=True,
-    task_always_eager=settings.celery_eager,
-    task_time_limit=None,
-    task_soft_time_limit=None,
+    task_acks_late=True, task_reject_on_worker_lost=True, worker_prefetch_multiplier=1,
+    task_track_started=True, task_always_eager=settings.celery_eager,
+    task_time_limit=None, task_soft_time_limit=None,
 )
-
-
-_ARTIFACT_SYNC_EVENTS = {"step.completed", "phase.completed"}
-_LIVE_ARTIFACT_SYNC_SECONDS = 10.0
-
-
-def _sync_job_artifacts(job_id: str) -> None:
-    with SessionLocal() as session:
-        job = session.get(JobRecord, job_id)
-        case = session.get(CaseRecord, job.case_id) if job else None
-        if case is not None:
-            catalog_case_artifacts(session, case)
-
-
-def _best_effort_sync_job_artifacts(job_id: str) -> Exception | None:
-    try:
-        _sync_job_artifacts(job_id)
-    except Exception as exc:
-        return exc
-    return None
-
-
-def _record_sync_warning(job_id: str, error: Exception, payload: dict | None = None) -> None:
-    payload = payload or {}
-    try:
-        append_event(
-            job_id,
-            {
-                "type": "artifact.sync_failed",
-                "phase": payload.get("phase"),
-                "step": payload.get("step"),
-                "message": "阶段产物索引将在下一边界重试",
-                "data": {"error": str(error)[:1000]},
-            },
-        )
-    except Exception:
-        pass
-
-
-def _record_progress(job_id: str, payload: dict) -> None:
-    sync_error = None
-    if payload.get("type") in _ARTIFACT_SYNC_EVENTS:
-        sync_error = _best_effort_sync_job_artifacts(job_id)
-    append_event(job_id, payload)
-    if sync_error is not None:
-        _record_sync_warning(job_id, sync_error, payload)
-
-
-def _live_artifact_sync(job_id: str, stop: threading.Event) -> None:
-    while not stop.wait(_LIVE_ARTIFACT_SYNC_SECONDS):
-        _best_effort_sync_job_artifacts(job_id)
 
 
 def _cancel_requested(job_id: str) -> bool:
@@ -86,193 +29,79 @@ def _cancel_requested(job_id: str) -> bool:
         return job is None or job.cancel_requested
 
 
+def _finish(job_id: str, status: str, code: str | None = None, error: str | None = None) -> None:
+    with SessionLocal() as session:
+        job = session.get(JobRecord, job_id)
+        if job:
+            job.status, job.error_code, job.error_message = status, code, error
+            job.finished_at = datetime.now(timezone.utc)
+            session.commit()
+
+
 def _is_transient(exc: Exception) -> bool:
-    if isinstance(exc, (ConnectionError, TimeoutError)):
-        return True
-    message = str(exc).lower()
-    return any(token in message for token in ("timeout", "temporar", "connection reset", "http 429", "http 500", "http 502", "http 503", "http 504"))
+    return isinstance(exc, (ConnectionError, TimeoutError)) or any(
+        token in str(exc).lower() for token in
+        ("timeout", "temporar", "connection reset", "http 429", "http 500", "http 502", "http 503", "http 504")
+    )
 
 
 @celery_app.task(bind=True, max_retries=2, name="geng.run_review")
 def run_review(self, job_id: str) -> None:
     init_database()
-    cancelled_before_start = False
     with SessionLocal() as session:
         job = session.get(JobRecord, job_id)
         if job is None or job.status in {"succeeded", "cancelled"}:
             return
-        if job.cancel_requested or job.status == "cancel_requested":
+        if job.cancel_requested:
             job.status = "cancelled"
             job.finished_at = datetime.now(timezone.utc)
             session.commit()
-            cancelled_before_start = True
-        if cancelled_before_start:
-            case = None
-        else:
-            case = session.get(CaseRecord, job.case_id)
+            return
+        case = session.get(CaseRecord, job.case_id)
         if case is None:
-            if not cancelled_before_start:
-                return
-        else:
-            job.status = "running"
-            job.started_at = job.started_at or datetime.now(timezone.utc)
-            job.finished_at = None
-            job.attempt += 1
-            session.commit()
-            case_dir = Path(case.directory)
-            paper_path = Path(case.paper_path)
-            options = dict(job.options or {})
+            return
+        job.status = "running"
+        job.started_at = job.started_at or datetime.now(timezone.utc)
+        job.finished_at = None
+        job.error_code = job.error_message = None
+        job.attempt += 1
+        session.commit()
+        case_dir, paper_path = Path(case.directory), Path(case.paper_path)
+        pipeline_complete = bool((job.options or {}).get("pipeline_complete"))
 
-    if cancelled_before_start:
-        append_event(job_id, {"type": "job.cancelled", "message": "任务已在启动前取消"})
-        return
-
-    append_event(
-        job_id,
-        {"type": "job.started", "message": "复现任务已由 worker 接管", "data": {"attempt": self.request.retries + 1}},
-    )
-    reporter = CallbackProgressReporter(
-        callback=lambda payload: _record_progress(job_id, payload),
-        cancelled=lambda: _cancel_requested(job_id),
-    )
-    sync_stop = threading.Event()
-    sync_thread = threading.Thread(
-        target=_live_artifact_sync,
-        args=(job_id, sync_stop),
-        name=f"geng-artifacts-{job_id[:8]}",
-        daemon=True,
-    )
-    sync_thread.start()
+    # Cancellation still reaches the core. Progress and intermediate artifacts
+    # stay in the core's case records; the Web layer no longer copies them.
+    reporter = CallbackProgressReporter(callback=lambda _payload: None,
+                                        cancelled=lambda: _cancel_requested(job_id))
     try:
-        initial_sync_error = _best_effort_sync_job_artifacts(job_id)
-        if initial_sync_error is not None:
-            _record_sync_warning(job_id, initial_sync_error)
-        pipeline = ReviewPipeline()
-        result = pipeline.run(
-            paper_path=paper_path,
-            output_dir=case_dir,
-            run_repro=bool(options.get("run_repro", True)),
-            resume=True,
-            analysis_backend="codex",
-            progress=reporter,
-        )
-        reporter.check_cancelled()
-        delivery_status = getattr(result, "delivery_status", "complete")
-        incomplete = delivery_status in {"partial", "blocked"}
-        completion_message = {
-            "partial": "已保留部分交付，仍有工程问题待解决；现有代码、结果和报告可以查看",
-            "blocked": "运行受阻，未完成交付；请查看主持人运行记录和已保留成果",
-        }.get(delivery_status, "复现任务已完成交付")
-        final_sync_error = _best_effort_sync_job_artifacts(job_id)
-        with SessionLocal() as session:
-            job = session.get(JobRecord, job_id)
-            case = session.get(CaseRecord, job.case_id) if job else None
-            if job is None or case is None:
+        if not pipeline_complete:
+            result = ReviewPipeline().run(paper_path=paper_path, output_dir=case_dir,
+                                          run_repro=True, resume=True,
+                                          analysis_backend="codex", progress=reporter)
+            reporter.check_cancelled()
+            delivery_status = getattr(result, "delivery_status", "complete")
+            if delivery_status != "complete":
+                _finish(job_id, "failed", f"delivery_{delivery_status}", "复现流程尚未完成交付")
                 return
-            # Keep the existing API/UI status vocabulary. Scientific
-            # not_reproduced is still a successful delivery; engineering
-            # partial/blocked results remain a resumable failed job.
-            job.status = "failed" if incomplete else "succeeded"
-            job.error_code = f"delivery_{delivery_status}" if incomplete else None
-            job.error_message = completion_message if incomplete else None
-            job.finished_at = datetime.now(timezone.utc)
-            session.commit()
-        if final_sync_error is not None:
-            _record_sync_warning(job_id, final_sync_error)
-        append_event(job_id, {"type": "job.finished", "message": completion_message, "data": {
-            "ok": not incomplete, "delivery_status": delivery_status,
-            "supervision_path": str(result.supervision_path) if getattr(result, "supervision_path", None) else None,
-        }})
-    except PipelineCancelled:
-        sync_error = _best_effort_sync_job_artifacts(job_id)
-        if sync_error is not None:
-            _record_sync_warning(job_id, sync_error)
-        with SessionLocal() as session:
-            job = session.get(JobRecord, job_id)
-            if job:
-                job.status = "cancelled"
-                job.finished_at = datetime.now(timezone.utc)
-                session.commit()
-        append_event(job_id, {"type": "job.cancelled", "message": "任务已在安全边界停止"})
-    except Exception as exc:
-        sync_error = _best_effort_sync_job_artifacts(job_id)
-        if sync_error is not None:
-            _record_sync_warning(job_id, sync_error)
-        if _is_transient(exc) and self.request.retries < self.max_retries:
-            next_retry = self.request.retries + 1
             with SessionLocal() as session:
                 job = session.get(JobRecord, job_id)
-                if job:
-                    job.status = "queued"
-                    job.error_code = type(exc).__name__
-                    job.error_message = str(exc)[:4000]
-                    session.commit()
-            append_event(
-                job_id,
-                {"type": "job.retrying", "message": "上游暂时不可用，任务将从缓存恢复", "data": {"retry": next_retry, "max_retries": self.max_retries}},
-            )
-            raise self.retry(exc=exc, countdown=min(60, 10 * (2 ** self.request.retries)))
-        with SessionLocal() as session:
-            job = session.get(JobRecord, job_id)
-            if job:
-                job.status = "failed"
-                job.error_code = type(exc).__name__
-                job.error_message = str(exc)[:4000]
-                job.finished_at = datetime.now(timezone.utc)
+                job.options = {**(job.options or {}), "pipeline_complete": True}
                 session.commit()
-        append_event(
-            job_id,
-            {"type": "job.failed", "message": "复现任务失败", "data": {"code": type(exc).__name__, "detail": str(exc)[:1000]}},
-        )
-        raise
-    finally:
-        sync_stop.set()
-        sync_thread.join(timeout=2.0)
-
-
-@celery_app.task(bind=True, max_retries=1, name="geng.build_export")
-def build_export(self, export_id: str) -> None:
-    init_database()
-    with SessionLocal() as session:
-        export = session.get(ExportRecord, export_id)
-        if export is None or export.status == "ready":
-            return
-        case = session.get(CaseRecord, export.case_id)
-        if case is None:
-            return
-        artifacts = session.scalars(
-            select(ArtifactRecord).where(
-                ArtifactRecord.case_id == case.id,
-                *([ArtifactRecord.phase == export.phase] if export.phase else []),
-            )
-        ).all()
-        export.status = "running"
-        session.commit()
-        case_dir = Path(case.directory)
-        relative = f"exports/{export.id}.zip"
-    try:
-        build_zip(LocalArtifactStore(case_dir), (item.relative_path for item in artifacts), case_dir / relative)
-        with SessionLocal() as session:
-            export = session.get(ExportRecord, export_id)
-            if export:
-                export.status = "ready"
-                export.relative_path = relative
-                export.finished_at = datetime.now(timezone.utc)
-                session.commit()
+            pipeline_complete = True
+        reporter.check_cancelled()
+        build_delivery(case_dir, job_id)
+        reporter.check_cancelled()
+        _finish(job_id, "succeeded")
+    except PipelineCancelled:
+        _finish(job_id, "cancelled")
     except Exception as exc:
-        if self.request.retries < self.max_retries:
+        logger.exception("Web job failed", extra={"job_id": job_id})
+        if not pipeline_complete and _is_transient(exc) and self.request.retries < self.max_retries:
             with SessionLocal() as session:
-                export = session.get(ExportRecord, export_id)
-                if export:
-                    export.status = "queued"
-                    export.error_message = str(exc)[:4000]
-                    session.commit()
-            raise self.retry(exc=exc, countdown=5)
-        with SessionLocal() as session:
-            export = session.get(ExportRecord, export_id)
-            if export:
-                export.status = "failed"
-                export.error_message = str(exc)[:4000]
-                export.finished_at = datetime.now(timezone.utc)
+                job = session.get(JobRecord, job_id)
+                job.status = "queued"
                 session.commit()
-        raise
+            raise self.retry(exc=exc, countdown=min(60, 10 * 2 ** self.request.retries))
+        code = "delivery_package" if pipeline_complete else "execution_failed"
+        _finish(job_id, "failed", code, str(exc)[:4000])
+        # Details remain in server logs and storage, never returned to browsers.

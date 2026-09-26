@@ -89,68 +89,6 @@ class ScientificValueMergeTests(unittest.TestCase):
         self.assertEqual(again["_meta"]["semantic_merge"]["fact_conflicts"], [])
 
 
-class FinalTaskSnapshotTests(unittest.TestCase):
-    def test_final_snapshot_replaces_science_removes_relationship_and_preserves_coverage(self) -> None:
-        first = _task()
-        first.update({
-            "metric_formula": "errors / symbols",
-            "assumptions": [{"name": "old normalization", "default_value": 2}],
-            "parameter_matrix": [{"name": "variance", "value": 10}],
-            "baseline_definitions": [{"name": "B", "value": "old implementation"}],
-        })
-        omitted = _task("experiment_b")
-        relationship = {"relationship_id": "old_coupling", "task_ids": ["experiment_a", "experiment_b"]}
-        base = {"repro_tasks": [first, omitted], "execution_relationships": [relationship]}
-        before = copy.deepcopy(base)
-        updated = _task()
-        updated.update({
-            "assumptions": [], "parameter_matrix": [{"name": "variance", "value": 1.0}],
-            "baseline_definitions": [{"name": "B", "value": "paper implementation"}],
-        })
-        merged, _ = semantic_merge_repro_tasks(
-            base, {"repro_tasks": [updated], "execution_relationships": []}, merge_mode="snapshot"
-        )
-        self.assertEqual(base, before)
-        self.assertEqual(merged["repro_tasks"], [updated, omitted])
-        self.assertEqual(merged["execution_relationships"], [])
-        changes = merged["_meta"]["semantic_merge"]
-        self.assertEqual(changes["preserved_task_ids"], ["experiment_b"])
-        self.assertEqual(changes["removed_relationship_ids"], ["old_coupling"])
-
-    def test_incremental_supplement_does_not_revoke_omitted_evidence(self) -> None:
-        first = _task()
-        first["assumptions"] = [{"name": "retained evidence"}]
-        relationship = {"relationship_id": "shared", "task_ids": ["experiment_a", "experiment_b"]}
-        merged, _ = semantic_merge_repro_tasks(
-            {"repro_tasks": [first], "execution_relationships": [relationship]},
-            {"repro_tasks": [{**_task(), "assumptions": []}], "execution_relationships": []},
-        )
-        self.assertEqual(merged["repro_tasks"][0]["assumptions"], first["assumptions"])
-        self.assertEqual(merged["execution_relationships"], [relationship])
-
-    def test_final_snapshot_does_not_duplicate_current_named_specification(self) -> None:
-        first = {**_task(), "formula_chain": [{"name": "NMSE", "note": "old wording"}]}
-        latest = {**_task(), "formula_chain": [{"name": "NMSE", "note": "clearer wording"}]}
-        result, _ = semantic_merge_repro_tasks(
-            {"repro_tasks": [first]}, {"repro_tasks": [latest]}, merge_mode="snapshot"
-        )
-        self.assertEqual(result["repro_tasks"][0]["formula_chain"], latest["formula_chain"])
-
-    def test_recovered_task_identity_is_applied_to_relationship_references(self) -> None:
-        original = {**_task("old_id"), "figure_or_claim": "Fig. 2"}
-        updated = {**_task("new_id"), "figure_or_claim": "Fig. 2"}
-        other = _task("other")
-        result, _ = semantic_merge_repro_tasks(
-            {"repro_tasks": [original, other]},
-            {"repro_tasks": [updated, other], "execution_relationships": [{
-                "relationship_id": "flow", "task_ids": ["new_id", "other"],
-                "producer_task_id": "new_id", "consumer_task_ids": ["other"],
-            }]},
-            merge_mode="snapshot",
-        )
-        self.assertEqual(result["repro_tasks"][0]["task_id"], "old_id")
-        self.assertEqual(result["execution_relationships"][0]["task_ids"], ["old_id", "other"])
-        self.assertEqual(result["execution_relationships"][0]["producer_task_id"], "old_id")
 
 
 class ReporterObservationTests(unittest.TestCase):

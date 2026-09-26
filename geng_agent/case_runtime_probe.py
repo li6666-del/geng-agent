@@ -401,7 +401,7 @@ for item in request.get("requests", []):
         if declared_capabilities:
             result["evidence"]["declared_component_capabilities"] = declared_capabilities
             result["evidence"]["declared_component_capabilities_verification"] = (
-                "deferred_to_foundation_or_task_runtime_tests"
+                "deferred_to_task_runtime"
             )
         result["ok"] = True
         result["error"] = None
