@@ -33,4 +33,19 @@ describe("account and final-delivery API", () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ detail: "论文任务不存在" }), { status: 404 })));
     await expect(api.retryCase("missing")).rejects.toThrow("论文任务不存在");
   });
+
+  it("fetches the delivered result and downloads a report without navigation", async () => {
+    const fetch = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify({ case_id: "c1", available: true })))
+      .mockResolvedValueOnce(new Response("report-bytes", { headers: { "Content-Type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document" } }));
+    vi.stubGlobal("fetch", fetch);
+    expect((await api.result("c1")).available).toBe(true);
+    expect(await (await api.downloadReport("c1", "comparison")).text()).toBe("report-bytes");
+    expect(fetch.mock.calls[1][0]).toBe("/api/v1/cases/c1/reports/comparison");
+    expect(fetch.mock.calls[1][1].credentials).toBe("same-origin");
+  });
+
+  it("keeps unavailable-report errors in the page", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ detail: "报告暂不可读取，请下载完整交付包查看" }), { status: 404 })));
+    await expect(api.downloadReport("c1", "reproduction")).rejects.toThrow("请下载完整交付包查看");
+  });
 });

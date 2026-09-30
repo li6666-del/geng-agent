@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly Geng Agent artifact cleanup
+
+[Timer]
+OnCalendar=Mon *-*-* 04:00:00 Asia/Shanghai
+Persistent=true
+RandomizedDelaySec=5m
+Unit=geng-agent-cleanup.service
+
+[Install]
+WantedBy=timers.target

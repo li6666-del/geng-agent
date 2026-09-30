@@ -20,6 +20,7 @@ from geng_agent.artifact_paths import path_is_link
 from .db import get_session
 from .delivery import bundle_path, local_file
 from .models import CaseRecord, JobRecord, WorkerAssignment, utc_now
+from .retention import cleanup_candidates
 from .settings import settings
 
 ACTIVE = {"running", "cancel_requested"}
@@ -77,11 +78,18 @@ def _owned_job(session: Session, job_id: str, worker_id: str, *, lock: bool = Fa
 def _job_body(job: JobRecord, case: CaseRecord) -> dict:
     return {"job_id": job.id, "case_id": case.id, "display_name": case.display_name,
             "paper_url": f"/api/v1/worker/jobs/{job.id}/paper",
-            "pipeline_complete": bool((job.options or {}).get("pipeline_complete"))}
+            "pipeline_complete": bool((job.options or {}).get("pipeline_complete")),
+            "local_generation": (job.options or {}).get("local_generation")}
 
 
 def _status(job: JobRecord) -> dict:
     return {"status": job.status, "cancel_requested": bool(job.cancel_requested or job.status == "cancel_requested")}
+
+
+@router.post("/cleanup-candidates")
+def cleanup_work(body: WorkerRequest, session: Session = Depends(get_session)) -> dict:
+    return {"items": cleanup_candidates(session, body.worker_id),
+            "retention_days": settings.artifact_retention_days}
 
 
 @router.post("/claim")

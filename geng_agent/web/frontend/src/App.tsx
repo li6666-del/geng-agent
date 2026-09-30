@@ -8,9 +8,10 @@ import FormulaBackdrop from "./FormulaBackdrop";
 import researcherIllustration from "./assets/telecom-researcher-v1.png";
 import satelliteIllustration from "./assets/telecom-satellite-v1.png";
 import { WelcomeNotice } from "./WelcomeNotice";
+import ResultPage, { resultHref, resultId } from "./ResultPage";
 
 // Bump the notice version when its content materially changes.
-const WELCOME_NOTICE_KEY = "geng-agent:welcome-notice:2026-09-26";
+const WELCOME_NOTICE_KEY = "geng-agent:welcome-notice:2026-09-30-retention";
 
 function shouldShowWelcomeNotice() {
   try { return localStorage.getItem(WELCOME_NOTICE_KEY) !== "read"; }
@@ -75,8 +76,10 @@ function UploadCard({ site, onCreated }: { site: SiteConfig; onCreated: () => Pr
 }
 
 export function CaseRow({ item, busy, onAction }: { item: PaperCase; busy: boolean; onAction: (item: PaperCase, cancel: boolean) => void }) {
-  return <article className="case-row"><span className="paper-icon"><FileText size={21} /></span><div className="case-description"><h3>{item.display_name}</h3><p>{formatDate(item.created_at)}<span>·</span>{item.message}</p></div><span className={`status status-${item.status}`}><i />{statusText[item.status] || "待确认"}</span><div className="row-action">
-    {item.download_url ? <a className="button download" href={item.download_url}><ArrowDownToLine size={16} />下载交付包</a> : item.can_retry ? <button className="button" disabled={busy} onClick={() => onAction(item, false)}>{busy ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}继续处理</button> : isActive(item.status) && item.status !== "cancel_requested" ? <button className="text-button muted" disabled={busy} onClick={() => onAction(item, true)}>停止</button> : <span className="subtle">—</span>}
+  const hasResult = item.status === "succeeded";
+  return <article className="case-row"><span className="paper-icon"><FileText size={21} /></span><div className="case-description"><h3>{hasResult ? <a className="case-result-link" href={resultHref(item.id)}>{item.display_name}</a> : item.display_name}</h3><p>{formatDate(item.created_at)}<span>·</span>{item.message}</p></div><span className={`status status-${item.artifacts_expired_at ? "expired" : item.status}`}><i />{item.artifacts_expired_at ? "文件已清理" : statusText[item.status] || "待确认"}</span><div className={`row-action${hasResult ? " with-result" : ""}`}>
+    {hasResult && <a className="text-button" href={resultHref(item.id)}>查看成果<ArrowRight size={14} /></a>}
+    {item.download_url ? <a className="button download" href={item.download_url}><ArrowDownToLine size={16} />下载交付包</a> : item.can_retry ? <button className="button" disabled={busy} onClick={() => onAction(item, false)}>{busy ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}{item.artifacts_expired_at ? "重新复现" : "继续处理"}</button> : isActive(item.status) && item.status !== "cancel_requested" ? <button className="text-button muted" disabled={busy} onClick={() => onAction(item, true)}>停止</button> : <span className="subtle">—</span>}
   </div></article>;
 }
 
@@ -107,10 +110,11 @@ function Dashboard({ site }: { site: SiteConfig }) {
     <section className="cases-section"><div className="cases-heading"><h2>我的论文 <span>{cases.length}</span></h2><div className="list-tools"><label className="search"><Search size={16} /><input aria-label="搜索我的论文" value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索论文名称" /></label><button className="icon-button" aria-label="刷新任务列表" onClick={() => void load()}><RefreshCw size={17} /></button></div></div>
       {notice && <div className="notice" role="status"><Check size={17} /><span>{notice}</span><button className="icon-button" aria-label="关闭提示" onClick={() => setNotice("")}><X size={16} /></button></div>}{error && <ErrorNote>{error}</ErrorNote>}
       {!loaded && !error ? <div className="empty"><LoaderCircle className="spin" size={22} /><p>正在读取你的论文</p></div> : !visible.length ? <div className="empty"><span className="empty-paper"><FileText size={27} /></span><h3>{cases.length ? "没有找到匹配的论文" : "你的第一份复现成果，从这里开始"}</h3><p>{cases.length ? "换个关键词试试。" : "提交上方的论文，完成后即可下载报告与代码。"}</p></div> : <div className="case-list">{visible.map(item => <CaseRow key={item.id} item={item} busy={busyId === item.id} onAction={(entry, cancel) => void action(entry, cancel)} />)}</div>}
-    </section><footer className="site-footer"><span>BUPT · 耿同学</span><span>报告如实记录复现结论、假设和差异。处理完成不代表所有结论均已复现。</span></footer></main>;
+    </section><p className="retention-note">任务结束后的交付文件与本地实验现场至少保留 {site.artifact_retention_days ?? 7} 天，随后每周清理一次。请及时下载保存。</p><footer className="site-footer"><span>BUPT · 耿同学</span><span>报告如实记录复现结论、假设和差异。处理完成不代表所有结论均已复现。</span></footer></main>;
 }
 
 export default function App() {
+  const [selectedResult, setSelectedResult] = useState(() => resultId(window.location.hash));
   const [noticeOpen, setNoticeOpen] = useState(shouldShowWelcomeNotice);
   const [user, setUser] = useState<User | null>(null); const [site, setSite] = useState<SiteConfig | null>(null);
   const [ready, setReady] = useState(false); const [error, setError] = useState(""); const [loggingOut, setLoggingOut] = useState(false);
@@ -120,6 +124,7 @@ export default function App() {
     catch (reason) { setError(message(reason)); }
   }, []);
   useEffect(() => { void initialize(); const expired = () => setUser(null); window.addEventListener("session-expired", expired); return () => window.removeEventListener("session-expired", expired); }, [initialize]);
+  useEffect(() => { const changed = () => setSelectedResult(resultId(window.location.hash)); window.addEventListener("hashchange", changed); return () => window.removeEventListener("hashchange", changed); }, []);
   async function logout() { setLoggingOut(true); try { await api.logout(); setUser(null); setError(""); } catch (reason) { setError(message(reason)); } finally { setLoggingOut(false); } }
   function acknowledgeNotice() {
     try { localStorage.setItem(WELCOME_NOTICE_KEY, "read"); } catch { /* Reading the notice does not require browser storage. */ }
@@ -127,7 +132,7 @@ export default function App() {
   }
   return <div className="site-shell"><FormulaBackdrop /><header className="topbar"><div className="page-width header-inner"><Brand /><div className="header-actions"><button type="button" className="notice-trigger" onClick={() => setNoticeOpen(true)}><BookOpen size={15} />使用说明</button>{user ? <div className="account"><span className="account-avatar" aria-hidden="true">{user.email.slice(0, 1).toUpperCase()}</span><span className="account-email">{user.email}</span><button className="text-button logout-button" aria-label="退出登录" title="退出登录" disabled={loggingOut} onClick={() => void logout()}><LogOut size={16} /><span>退出登录</span></button></div> : <span className="header-note"><span /> 通信论文复现与独立核验</span>}</div></div></header>
     {error && <div className="page-width app-error"><ErrorNote>{error}<button className="text-button" onClick={() => void initialize()}>重新连接</button></ErrorNote></div>}
-    {!ready || !site ? !error && <main className="empty"><LoaderCircle size={25} className="spin" /><p>正在打开研究空间</p></main> : user ? <Dashboard key={user.id} site={site} /> : <AuthPage site={site} onLogin={setUser} />}
+    {!ready || !site ? !error && <main className="empty"><LoaderCircle size={25} className="spin" /><p>正在打开研究空间</p></main> : user ? selectedResult ? <ResultPage key={`${user.id}:${selectedResult}`} caseId={selectedResult} /> : <Dashboard key={user.id} site={site} /> : <AuthPage site={site} onLogin={setUser} />}
     <WelcomeNotice open={noticeOpen} onDismiss={() => setNoticeOpen(false)} onAcknowledge={acknowledgeNotice} />
   </div>;
 }

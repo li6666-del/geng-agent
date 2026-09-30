@@ -25,6 +25,7 @@ class WebSettings:
     execution_mode: str = "local"
     worker_token: str = ""
     max_bundle_bytes: int = 2 * 1024 * 1024 * 1024
+    artifact_retention_days: int = 7
 
     @classmethod
     def load(cls) -> "WebSettings":
@@ -42,6 +43,7 @@ class WebSettings:
             execution_mode=os.getenv("GENG_EXECUTION_MODE", "local").strip().lower(),
             worker_token=os.getenv("GENG_WORKER_TOKEN", ""),
             max_bundle_bytes=int(os.getenv("GENG_MAX_BUNDLE_BYTES", str(2 * 1024 * 1024 * 1024))),
+            artifact_retention_days=max(1, int(os.getenv("GENG_ARTIFACT_RETENTION_DAYS", "7"))),
         )
 
 

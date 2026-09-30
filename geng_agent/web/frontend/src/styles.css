@@ -163,6 +163,8 @@ input:focus { border-color: #739be1; box-shadow: 0 0 0 3px #2b5ed709; }
 .status-running { color: #3466b2; background: #edf3fe; }
 .status-succeeded { color: #347763; background: #eef7f2; }
 .status-failed { color: #95652e; background: #fcf4e9; }
+.status-expired { color: #758194; background: #edf0f4; }
+.retention-note { color: var(--muted); font-size: 11px; margin-top: 18px; line-height: 1.9; }
 .row-action { min-width: 132px; display: flex; justify-content: flex-end; }
 .download { color: #315fab; background: #f6f9ff; border-color: #dbe5f5; font-size: 11px; min-height: 36px; }
 .empty { display: flex; align-items: center; justify-content: center; flex-direction: column; text-align: center; padding: 37px 25px; color: #7c8fa6; border: 1px solid #e3eaf2; background: #ffffff94; border-radius: 13px; gap: 10px; }

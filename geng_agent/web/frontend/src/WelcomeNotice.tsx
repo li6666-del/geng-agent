@@ -61,6 +61,7 @@ export function WelcomeNotice({ open, onDismiss, onAcknowledge }: WelcomeNoticeP
         <h3 id="welcome-limits">需要您知道的是</h3>
         <p>由于论文必定会缺少部分参数，且目前 LLM 并非全知全能的神，最终的本地复现旨在帮助您更好理解论文。</p>
         <p>由于目前硬件限制，请谨慎上传在复现过程中需要大规模并行运算的论文。</p>
+        <p>任务结束后的交付文件与本地实验现场至少保留 7 天，随后每周清理一次。请及时下载报告和复现项目保存；原论文与账号记录会保留。</p>
       </section>
 
       <section className="welcome-section" aria-labelledby="welcome-model">

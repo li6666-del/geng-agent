@@ -100,7 +100,8 @@ def test_serial_claim_recovery_and_no_heartbeat_expiry_reassignment(client):
     second_case, second_id, _root = create_paper(client)
     first = claim(client).json()["job"]
     assert first == {"job_id": job_id, "case_id": case_id, "display_name": "本地论文",
-                     "paper_url": f"{BASE}/jobs/{job_id}/paper", "pipeline_complete": False}
+                     "paper_url": f"{BASE}/jobs/{job_id}/paper", "pipeline_complete": False,
+                     "local_generation": None}
     with SessionLocal() as session:
         assignment = session.get(WorkerAssignment, job_id)
         assignment.heartbeat_at = utc_now() - timedelta(days=30)

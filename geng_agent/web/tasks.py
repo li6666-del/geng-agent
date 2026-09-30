@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import os
 from pathlib import Path
+import uuid
 
 from celery import Celery
 
@@ -68,6 +70,8 @@ def run_review(self, job_id: str) -> None:
         session.commit()
         case_dir, paper_path = Path(case.directory), Path(case.paper_path)
         pipeline_complete = bool((job.options or {}).get("pipeline_complete"))
+        generation = (job.options or {}).get("local_generation")
+        science_dir = case_dir / "runs" / str(uuid.UUID(generation)) if generation else case_dir
 
     # Cancellation still reaches the core. Progress and intermediate artifacts
     # stay in the core's case records; the Web layer no longer copies them.
@@ -75,7 +79,7 @@ def run_review(self, job_id: str) -> None:
                                         cancelled=lambda: _cancel_requested(job_id))
     try:
         if not pipeline_complete:
-            result = ReviewPipeline().run(paper_path=paper_path, output_dir=case_dir,
+            result = ReviewPipeline().run(paper_path=paper_path, output_dir=science_dir,
                                           run_repro=True, resume=True,
                                           analysis_backend="codex", progress=reporter)
             reporter.check_cancelled()
@@ -89,7 +93,12 @@ def run_review(self, job_id: str) -> None:
                 session.commit()
             pipeline_complete = True
         reporter.check_cancelled()
-        build_delivery(case_dir, job_id)
+        archive = build_delivery(science_dir, job_id)
+        if science_dir != case_dir:
+            from .delivery import bundle_path
+            destination = bundle_path(case_dir, job_id)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(archive, destination)
         reporter.check_cancelled()
         _finish(job_id, "succeeded")
     except PipelineCancelled:

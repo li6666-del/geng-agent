@@ -1,4 +1,4 @@
-import type { AuthSession, PaperCase, SiteConfig } from "./types";
+import type { AuthSession, CaseResult, PaperCase, SiteConfig } from "./types";
 
 let csrfToken = "";
 
@@ -10,6 +10,11 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   if (init?.method && init.method !== "GET" && csrfToken) headers.set("X-CSRF-Token", csrfToken);
   const response = await fetch(url, { ...init, headers, credentials: "same-origin" });
+  await checkResponse(response, url);
+  return response.status === 204 ? undefined as T : response.json() as Promise<T>;
+}
+
+async function checkResponse(response: Response, url: string) {
   if (!response.ok) {
     const body = await response.json().catch(() => ({}));
     if (response.status === 401 && !url.startsWith("/api/v1/auth/") && typeof window !== "undefined") {
@@ -17,7 +22,6 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
     }
     throw new ApiError(typeof body.detail === "string" ? body.detail : "提交信息不完整，请检查后重试。", response.status);
   }
-  return response.status === 204 ? undefined as T : response.json() as Promise<T>;
 }
 
 async function authenticate(action: "login" | "register", email: string, password: string) {
@@ -47,6 +51,14 @@ export const api = {
     csrfToken = "";
   },
   listCases: () => request<{ items: PaperCase[] }>("/api/v1/cases"),
+  getCase: (id: string) => request<PaperCase>(`/api/v1/cases/${encodeURIComponent(id)}`),
+  result: (id: string) => request<CaseResult>(`/api/v1/cases/${encodeURIComponent(id)}/result`),
+  downloadReport: async (id: string, report: "comparison" | "reproduction") => {
+    const url = `/api/v1/cases/${encodeURIComponent(id)}/reports/${report}`;
+    const response = await fetch(url, { credentials: "same-origin" });
+    await checkResponse(response, url);
+    return response.blob();
+  },
   createCase: (body: FormData) => request<{ case_id: string }>("/api/v1/cases", { method: "POST", body }),
   retryCase: (id: string) => request(`/api/v1/cases/${id}/retry`, { method: "POST" }),
   cancelCase: (id: string) => request(`/api/v1/cases/${id}/cancel`, { method: "POST" }),

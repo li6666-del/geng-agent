@@ -257,6 +257,10 @@ class LocalWorker:
 
     def run_forever(self) -> None:
         while True:
+            # The long-lived worker holds the case-root lock. Maintenance runs
+            # here, between papers, so it never races an active reproduction.
+            from .local_retention import cleanup_if_due
+            cleanup_if_due(self)
             if not self.run_once():
                 self._sleep(self.config.poll_seconds)
 
@@ -346,13 +350,16 @@ class LocalWorker:
             job_id, case_id = str(uuid.UUID(job["job_id"])), str(uuid.UUID(job["case_id"]))
         except (KeyError, ValueError, TypeError, AttributeError) as exc:
             raise WorkerError("Cloud job and case identifiers must be UUIDs") from exc
-        job = {**job, "job_id": job_id, "case_id": case_id}
-        case_dir = _safe_local_path(self.config.case_root, f"cloud_{case_id}")
+        from .local_retention import local_case_name, normalize_generation
+        generation = normalize_generation(job.get("local_generation"))
+        job = {**job, "job_id": job_id, "case_id": case_id, "local_generation": generation}
+        case_dir = _safe_local_path(self.config.case_root, local_case_name(case_id, generation))
         case_dir.mkdir(parents=True, exist_ok=True)
         state_path = _safe_local_path(case_dir, ".cloud-worker.json")
-        state = _read_json(state_path) if state_path.exists() else {"case_id": case_id}
-        if state.get("case_id") != case_id:
+        state = _read_json(state_path) if state_path.exists() else {"case_id": case_id, "local_generation": generation}
+        if state.get("case_id") != case_id or state.get("local_generation") != generation:
             raise WorkerError("Local worker state does not belong to this case")
+        state["local_generation"] = generation
         complete = state.get("pipeline_complete") is True or job.get("pipeline_complete") is True
         state["pipeline_complete"] = complete
         cancelled, stopped = threading.Event(), threading.Event()

@@ -52,6 +52,18 @@ python -m geng_agent.web.local_worker --config D:\geng-artifacts\local-worker.js
 
 上传的 ZIP 内只有一个 `复现交付包/` 总目录，顶层放两份中文 Word 报告，`复现任务/` 下按任务分目录，每个任务仅含 `代码/`、`复现结果/` 和逐文件说明 `readme.md`。代码目录保留依赖、配置和运行输入，已有结果另放结果目录；审计、日志、交接 JSON、缓存及临时文件留在本地。此整理只影响最终下载包，不删除案例现场，也不重跑科学实验。
 
+## 每周清理与成果保留
+
+网站任务结束后至少保留 7 天，随后每周清理一次；实际保留时间通常为 7～14 天。服务器的 `geng-agent-cleanup.timer` 每周一北京时间 04:00 左右删除数据库登记的到期交付 ZIP，并记录 `artifacts_expired_at`。账号、原论文和任务历史保留；排队、运行或仍有活动工作机归属的案例不清理。保留天数由 `GENG_ARTIFACT_RETENTION_DAYS` 配置，默认 7。
+
+本地 `GengAgent-WeeklyCleanup` 每周一北京时间 04:10 执行；电脑错过时间时登录后补执行。常驻 worker 同时在论文之间检查本周是否需要维护，避免独立计划任务被正在运行的 worker 锁跳过后无人清理。维护仅请求当前电脑拥有的已过期任务列表，匹配本地状态后删除相应网站案例；手动案例、开发记录和共享 Python 环境不在范围内。若进程仍引用案例目录，则保留至以后维护。网络或清理失败只记录并延后，不影响正常接单。
+
+清理前会将目录移入案例根下 `.cloud-trash`，留下授权记录；未删完的目录后续继续处理。目录链接只删除入口，不递归删除共享目标。独立命令 `python -m geng_agent.web.local_retention --config worker.json` 默认只预览，加 `--apply` 才清理；服务器对应 `python -m geng_agent.web.retention` 同样默认预览。
+
+清理后的网页显示文件已清理，重新复现从保留的原 PDF 开始。新运行使用 `local_generation` 对应的独立 `cloud_<generation>` 目录；同一代次中断重启继续使用该目录。清理前的任务仍使用原 `cloud_<case_id>` 路径，旧目录不会被新一轮复现复用。网页本机执行模式使用 `case_<case_id>/runs/<generation>`，交付包仍存到该案例的 `exports` 中。
+
+安装本地周任务：`tools/install_weekly_cleanup.ps1 -Config <既有 worker 配置路径>`。该操作不会立即删除案例。安装服务器周任务时复制 `deploy/web/geng-agent-cleanup.{service,timer}` 至 systemd 单元目录并启用 timer；需使用既有网页运行环境，不安装科学计算依赖。
+
 `readme.md` 的内容由 Writer 基于真实代码与结果撰写，解释各文件实现的通信模型、算法、实验和结果含义。宿主透传 `delivery_readme.md`，不把列名、字段名或英文源码注释当作给用户的科研解释；补写导读属于文档修订，不另起科学运行。
 
 这项写作职责通过 [`task_delivery_readme.md`](../geng_agent/prompts/task_delivery_readme.md) 注入实际 Writer 提示词，覆盖初次执行、续跑返修和仅准备代码的任务。提示词同时交代最终打包后的配置路径及依赖文件用途，避免导读只适用于 Writer 工作区。以后调整导读的表达要求可直接修改该提示词文件；宿主不会因此新增内容验收或要求重跑实验。

@@ -8,9 +8,10 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import case as sql_case, select, update
 from sqlalchemy.exc import IntegrityError
@@ -21,6 +22,8 @@ from .db import SessionLocal, get_session, init_database
 from .delivery import bundle_path, local_file
 from .models import CaseRecord, JobRecord, UserRecord
 from .observability import logger
+from .result_details import REPORT_MEMBERS, ZIP_READ_ERRORS, read_report, result_details
+from .retention import begin_write, expired_at
 from .settings import settings
 from .worker_api import router as worker_router
 
@@ -92,21 +95,24 @@ async def response_headers(request: Request, call_next):
     return response
 
 
-def _authorized_case(session: Session, case_id: str, user: UserRecord) -> CaseRecord:
-    case = session.scalar(select(CaseRecord).where(CaseRecord.id == case_id, CaseRecord.owner_id == user.id))
+def _authorized_case(session: Session, case_id: str, user: UserRecord, *, lock: bool = False) -> CaseRecord:
+    statement = select(CaseRecord).where(CaseRecord.id == case_id, CaseRecord.owner_id == user.id)
+    case = session.scalar(statement.with_for_update() if lock else statement)
     if case is None:
         raise HTTPException(404, "论文任务不存在")
     return case
 
 
 def _latest_job(session: Session, case_id: str) -> JobRecord | None:
-    return session.scalar(select(JobRecord).where(JobRecord.case_id == case_id).order_by(JobRecord.created_at.desc()))
+    return session.scalar(select(JobRecord).where(JobRecord.case_id == case_id)
+                          .order_by(JobRecord.created_at.desc(), JobRecord.id.desc()))
 
 
 def _case_body(case: CaseRecord, job: JobRecord | None) -> dict:
     status = job.status if job else "idle"
+    expiration = expired_at(job)
     download_url = None
-    if job and status == "succeeded":
+    if job and status == "succeeded" and not expiration:
         try:
             local_file(Path(case.directory), f"exports/{job.id}.zip")
             download_url = f"/api/v1/cases/{case.id}/download"
@@ -119,13 +125,16 @@ def _case_body(case: CaseRecord, job: JobRecord | None) -> dict:
         "failed": "本次处理未完成，已有运行记录已保留，可继续处理。",
     }
     message = messages.get(status, "尚未开始处理。")
-    if job and job.error_code == "delivery_package":
+    if job and job.error_code == "delivery_package" and not expiration:
         message = "复现流程已结束，交付包尚未生成。重试只重新打包。"
-    if status == "succeeded" and not download_url:
+    if expiration:
+        message = "交付包和本地实验现场已进入定期清理，原论文已保留，可重新开始复现。"
+    elif status == "succeeded" and not download_url:
         message = "交付包暂不可用，可以重新打包。"
     return {"id": case.id, "display_name": case.display_name,
             "created_at": case.created_at.isoformat(), "status": status, "message": message,
-            "download_url": download_url, "can_retry": status in {"failed", "cancelled", "idle"} or (status == "succeeded" and not download_url)}
+            "download_url": download_url, "artifacts_expired_at": expiration,
+            "can_retry": status in {"failed", "cancelled", "idle"} or (status == "succeeded" and not download_url)}
 
 
 @app.get("/api/v1/health")
@@ -138,7 +147,8 @@ def health(session: Session = Depends(get_session)) -> dict:
 
 @app.get("/api/v1/site")
 def site_config() -> dict:
-    return {"max_pdf_bytes": settings.max_pdf_bytes, "registration_enabled": settings.registration_enabled}
+    return {"max_pdf_bytes": settings.max_pdf_bytes, "registration_enabled": settings.registration_enabled,
+            "artifact_retention_days": settings.artifact_retention_days}
 
 
 @app.get("/api/v1/cases")
@@ -195,12 +205,24 @@ def get_case(case_id: str, user: UserRecord = Depends(current_user), session: Se
 
 @app.post("/api/v1/cases/{case_id}/retry", status_code=202)
 def retry_case(case_id: str, user: UserRecord = Depends(current_user), session: Session = Depends(get_session)) -> dict:
-    case = _authorized_case(session, case_id, user)
+    # Authentication already read this session. Start a fresh write transaction
+    # before checking retention, so cleanup and retry cannot act on stale state.
+    session.rollback()
+    begin_write(session)
+    case = _authorized_case(session, case_id, user, lock=True)
     previous = _latest_job(session, case.id)
     if previous and (previous.status in ACTIVE or (previous.status == "succeeded" and _case_body(case, previous)["download_url"])):
         raise HTTPException(409, "该任务正在处理或已完成交付")
-    job = JobRecord(id=str(uuid.uuid4()), case_id=case_id, status="queued",
-                    options={"pipeline_complete": bool(previous and (previous.options or {}).get("pipeline_complete"))})
+    job_id = str(uuid.uuid4())
+    previous_options = (previous.options or {}) if previous else {}
+    was_expired = bool(expired_at(previous))
+    options = {"pipeline_complete": bool(previous_options.get("pipeline_complete") and not was_expired)}
+    if was_expired:
+        # A fresh directory prevents cleanup of old work from racing new work.
+        options.update(reset_local_case=True, local_generation=job_id)
+    elif previous_options.get("local_generation"):
+        options["local_generation"] = previous_options["local_generation"]
+    job = JobRecord(id=job_id, case_id=case_id, status="queued", options=options)
     session.add(job)
     try:
         session.commit()
@@ -237,6 +259,8 @@ def cancel_case(case_id: str, user: UserRecord = Depends(current_user), session:
 def download_case(case_id: str, user: UserRecord = Depends(current_user), session: Session = Depends(get_session)) -> FileResponse:
     case = _authorized_case(session, case_id, user)
     job = _latest_job(session, case.id)
+    if expired_at(job):
+        raise HTTPException(410, "交付包已按保留期限清理，请重新开始复现")
     if not job or job.status != "succeeded":
         raise HTTPException(409, "最终交付包尚未生成")
     try:
@@ -244,6 +268,57 @@ def download_case(case_id: str, user: UserRecord = Depends(current_user), sessio
     except (OSError, ValueError) as exc:
         raise HTTPException(404, "交付包暂不可用，请重新打包") from exc
     return FileResponse(path, media_type="application/zip", filename=f"论文复现交付-{case.id[:8]}.zip")
+
+
+@app.get("/api/v1/cases/{case_id}/result")
+def get_result(case_id: str, user: UserRecord = Depends(current_user), session: Session = Depends(get_session)) -> dict:
+    case = _authorized_case(session, case_id, user)
+    job = _latest_job(session, case.id)
+    finished_at = job.finished_at if job else None
+    if finished_at and finished_at.tzinfo is None:
+        finished_at = finished_at.replace(tzinfo=timezone.utc)
+    empty = {"case_id": case.id, "available": False, "message": _case_body(case, job)["message"],
+             "finished_at": finished_at.isoformat() if finished_at else None,
+             "artifacts_expired_at": expired_at(job),
+             "bundle": None, "reports": [], "excerpt": [], "tasks": []}
+    if not job or job.status != "succeeded" or expired_at(job):
+        return empty
+    try:
+        path = local_file(Path(case.directory), f"exports/{job.id}.zip")
+        details = result_details(path, case.id, empty["finished_at"])
+        details["artifacts_expired_at"] = None
+        return details
+    except (OSError, ValueError):
+        empty["message"] = "交付包暂不可用，可以重新打包。"
+        return empty
+
+
+@app.get("/api/v1/cases/{case_id}/reports/{report_id}")
+def download_report(case_id: str, report_id: str, user: UserRecord = Depends(current_user),
+                    session: Session = Depends(get_session)) -> Response:
+    case = _authorized_case(session, case_id, user)
+    if report_id not in REPORT_MEMBERS:
+        raise HTTPException(404, "报告不存在")
+    job = _latest_job(session, case.id)
+    if expired_at(job):
+        raise HTTPException(410, "报告已随交付包定期清理，请重新开始复现")
+    if not job or job.status != "succeeded":
+        raise HTTPException(409, "最终报告尚未生成")
+    try:
+        path = local_file(Path(case.directory), f"exports/{job.id}.zip")
+    except (OSError, ValueError) as exc:
+        raise HTTPException(404, "交付包暂不可用，请重新打包") from exc
+    try:
+        content = read_report(path, report_id)
+    except KeyError as exc:
+        raise HTTPException(404, "交付包中没有这份报告，请下载完整交付包查看") from exc
+    except ValueError as exc:
+        raise HTTPException(413, "报告暂不支持单独下载，请下载完整交付包") from exc
+    except ZIP_READ_ERRORS as exc:
+        raise HTTPException(404, "报告暂不可读取，请下载完整交付包查看") from exc
+    filename = REPORT_MEMBERS[report_id].rsplit("/", 1)[-1]
+    return Response(content, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"})
 
 
 if (_FRONTEND_DIST / "assets").exists():
