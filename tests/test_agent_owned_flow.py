@@ -288,7 +288,7 @@ def test_changed_upstream_copy_archives_old_files_and_delivery_keeps_new_inputs(
     archived = list((sandbox / "writer_progress").glob("upstream_*/t1/outputs/t1/result.csv"))
     assert len(archived) == 1 and archived[0].read_text(encoding="utf-8") == "value\n1\n"
     _package_task_directories(**inputs)
-    delivered = inputs["repro_project_dir"] / "task_packages/t02_t2/upstream_tasks/t1/outputs/t1/result.csv"
+    delivered = inputs["repro_project_dir"] / "task_packages/t02/upstream_tasks/t1/outputs/t1/result.csv"
     assert delivered.read_text(encoding="utf-8") == "value\n3\n"
 
 
@@ -322,7 +322,7 @@ def test_model_result_survives_transcript_and_status_write_failure(tmp_path, mon
     from geng_agent import codex_runner
     monkeypatch.setattr(codex_runner.shutil, "which", lambda _: sys.executable)
     monkeypatch.setattr(codex_runner, "get_config_value", lambda _: None)
-    monkeypatch.setattr(codex_runner, "_ephemeral_capability", lambda *_: {"supported": True})
+    monkeypatch.setattr(codex_runner, "_ephemeral_capability", lambda *_, **__: {"supported": True})
     run = Mock(return_value=subprocess.CompletedProcess([], 0, "completed output", ""))
     monkeypatch.setattr(codex_runner.subprocess, "run", run)
     monkeypatch.setattr(codex_runner, "write_text", Mock(side_effect=OSError("transcript unavailable")))

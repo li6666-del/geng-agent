@@ -4,7 +4,7 @@ import gzip
 import json
 import subprocess
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from geng_agent.codex_runner import run_codex_subprocess
 from geng_agent.prompt_identity import role_contract_identity, scientific_cache_value
@@ -49,8 +49,13 @@ def test_transport_records_exact_stdin_and_untruncated_history(tmp_path):
     with patch("geng_agent.codex_runner.shutil.which", return_value="codex"), \
          patch("geng_agent.codex_runner._ephemeral_capability", return_value={"supported": True}), \
          patch("geng_agent.codex_runner.subprocess.run", return_value=subprocess.CompletedProcess([], 0, transcript, "")) as run:
+        # Exercise transport recording without launching the native Writer domain.
+        # Windows Writers now use boundary.run rather than subprocess.run.
+        boundary = Mock(spec=("policy", "run", "allow_runtime_read", "allow_write"),
+                        policy={"provider": "transport_test_boundary"}, run=run)
         result = run_codex_subprocess(role="task_writer", work_dir=tmp_path, prompt=prompt,
-            audit_dir=audit, label="writer", sandbox="workspace-write", image_paths=[image])
+            audit_dir=audit, label="writer", sandbox="workspace-write", image_paths=[image],
+            process_boundary=boundary)
     assert run.call_args.kwargs["input"] == prompt
     assert (audit / "writer_brief.md").read_bytes() == prompt.encode()
     manifest = json.loads(Path(result["input_manifest"]).read_text(encoding="utf-8"))

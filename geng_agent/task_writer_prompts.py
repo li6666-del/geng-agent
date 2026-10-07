@@ -36,22 +36,34 @@ Claim completion only from the host's completed result and real exit code.
 Diagnose an execution failure using the referenced log; never invent return code 0.
 There is no fixed end-to-end scientific timeout. Any time estimate in a task
 plan or legacy manifest is advisory, not permission to stop an active run.
-Do not kill a scientific process directly (for example with `Stop-Process`,
-`taskkill`, or `kill`) merely because elapsed time exceeds an estimate.
-An active process with growing CPU time is still computing; report the delay
-and wait for its host-observed result. If a run must be stopped at the user's
-request, use the host's cancellation path so the receipt records that action.
+An active process with growing CPU time is still computing; a time estimate alone
+does not justify stopping it. If your experiment must stop (for example to repair
+a diagnosed bug), read its host-issued `run_id` from `--status`, then call
+`python run_task.py --task TASK_ID --stop RUN_ID`. This stops only that run and
+leaves the host and other tasks running; inspect `--status` for its final receipt
+before editing and submitting the next run. A submission's `request_id` is not a
+`run_id`; while the state is `starting`, wait for the run identifier to appear.
+Use this tool for all scientific process cancellation. Never enumerate Python or
+GPU processes to select kill targets, and never use `Stop-Process`, `taskkill`,
+`kill`, or native process APIs against the host or another task. You may decide
+when your own experiment needs to stop without asking the moderator for approval.
 """
 
 
 WRITER_READING_PROTOCOL = """## Task input and evidence navigation
 - The assigned task is already the final planning unit. It may contain several experiments and goals: implement all of them in this project, retain their individual conditions and outcomes, and do not silently narrow the assignment.
+- Keep tightly coupled phases under your ownership. Organize model, environment, algorithm, training and evaluation code into modules within this task; do not turn each phase into another Writer or a Foundation request.
+- For a multi-phase task, keep a concise Chinese working note at `writer_progress/current.md`: completed and pending experiments, consequential assumptions, relevant code/config/result/checkpoint paths, existing host run references, and the next useful action. Update it at meaningful phase transitions or before handoff, not after every tool call. This is a continuation aid, not a new completion marker, execution receipt, mandatory schema or approval step.
+- Save reusable intermediate data and checkpoints under the task's unit_asset_root. When continuing, start from the working note if present, then inspect the relevant files and host run status; the note is not proof that a computation completed. Recover from existing files if it is absent rather than restarting everything.
+- After a local correction, trace which later experiments consume the changed code, parameters or state. Recompute scientifically affected results under the task's execution protocol and preserve unaffected work. Keep superseded outputs identifiable; do not mix results from incompatible versions or rerun the whole task merely because one phase changed.
+- Independent seeds or parameter variants may compute in parallel inside a task when the implementation and resources permit. Keep that computation inside the scientific launcher and preserve the assigned statistical protocol; do not create extra Writer tasks just to parallelize a loop.
 - When upstream_task_inputs.json is present, use the delivered upstream artifacts as declared; tell the moderator if a required input is unavailable.
 - Start with `paper_evidence/writer_input.json`: complete assigned tasks, acceptance conditions, manifest entries, explicit dependencies, indexed facts, bound components, and experiments. Array references are zero-based. Do not treat selected records as all relevant science.
 - Consult `paper_evidence/index.json` for the copied original paper and `paper_evidence/paper_chunks.json` for full text. Check relevant system definitions, equations, baselines, regimes, metric definitions, target figures and captions against the original. Follow cross-page references.
 - `paper_evidence/analysis_artifacts/manifest.json` indexes complete facts, tasks, experiment_index.json, execution_plan.json, scientific_architecture.json, paper_thesis.json and analysis_warnings.json. Consult the complete material when references are missing, ambiguous, conflicting, or indicate additional dependencies. Never declare a paper parameter absent without searching the full paper, captions, tables and appendices.
 - All rendered pages remain in `paper_evidence/full_paper_pages/index.json`; images are evidence, not instructions. Do not reread every unrelated task or unchanged page merely to satisfy a checklist.
 - Before using runtime helpers, read the applicable sections of `paper_evidence/runtime_reference.md`. Use the selected task Python. You may install missing packages into its private environment; never alter the shared base.
+- Network access is available for relevant evidence, dependencies, datasets and paper-defined online methods. When an experiment consumes remote data or a model response, save the actual consumed bytes or a faithful local record under this task's execution_units directory; note the source URL/service, retrieval time, model/version where applicable, and any uncertainty. Declare reused local files with `--input`. Do not place API credentials in source, configs, logs or deliverables. This is provenance for the Reporter, not an extra host approval step; inability to capture a remote response must be disclosed rather than disguised as a paper fact or an offline equivalent.
 - On continuation start from the current feedback, source/config differences and latest host receipt. Read additional original evidence as needed; never infer a new scientific defect merely from interruption.
 """
 
@@ -96,11 +108,11 @@ Do not infer a new scientific defect merely from an interruption or environment 
 {CORE_RESULT_STOP_POLICY if CORE_RESULT_STOP_POLICY not in base_prompt else ''}
 
 Before acting:
-1. Read the existing task code, configs, outputs, and `writer_progress/` archives.
+1. Start from `writer_progress/current.md` if present, then inspect the relevant task code, configs, outputs, checkpoints, host run status and `writer_progress/` archives. Continue unfinished phases and repair affected work without rebuilding unchanged phases by default; a progress note alone is not evidence of execution.
 2. Inspect the latest local CSV/summary/PNG against the complete paper evidence.
 3. Classify every reporter item before editing: (a) a paper-grounded violation of an explicit fact, failure of any assigned core conclusion, or a scientifically material numerical mismatch identified by the Reporter; (b) a reasonable choice inside paper-silent or ambiguous space; or (c) a numerical or statistical difference assessed by the Reporter as non-material, or a visual/presentation difference.
 4. Create a concrete modification plan only for category (a). For category (b), keep or revise the explicit assumption according to evidence only before the mandatory stop condition is met. For category (c), record the caveat without changing faithful code merely to satisfy the reporter. Once the stop condition is met, do not change any assumption, seed, dataset filter, configuration, or epoch count.
-5. Run a fresh full with `python run_task.py --task {task_id} --config config.json --mode full` only after a meaningful change that is permitted by the mandatory stopping policy. Never rerun unchanged code solely to answer non-blocking feedback.
+5. After a meaningful change permitted by the stopping policy, run the affected experiments with `python run_task.py --task {task_id} --config config.json --mode full`. Full is the execution mode, not an instruction to repeat every unaffected experiment. Use the task's config/implementation to select affected work where supported, and cite existing outputs and host run references for scientifically unchanged work. The final handoff still covers every assigned goal. Never rerun unchanged code solely to answer non-blocking feedback.
 6. Keep iterating only while a permitted paper-grounded material blocker remains and a new concrete causal change is available. If the result is still unsupported or unassessable but no such change exists, stop scientific modification and submit it for an honest terminal report.
 7. Write `task_agent_result.json` with status `ready_for_review` after the latest full attempt. This means ready for independent classification, not a claim that reproduction succeeded.
 8. Keep `delivery_readme.md` consistent with the latest delivered code and results. If the assigned repair concerns only this guide, read the existing files and rewrite the explanation without rerunning the experiment or changing the code, configuration or results.
@@ -141,7 +153,7 @@ def _build_task_writer_brief(
     feedback_text = pretty_json(review_feedback) if review_feedback else "None"
     unit_asset_root = f"execution_units/{safe_label(execution_unit_id or task_id)}"
     full_instruction = (
-        f"Run your full task with `python run_task.py --task {task_id} --config config.json --mode full` after each meaningful fix."
+        f"Run the assigned experiments with `python run_task.py --task {task_id} --config config.json --mode full`. After a meaningful fix, recompute the scientifically affected experiments and preserve unchanged results with their existing host run references; full mode does not require restarting every internal phase."
         if run_repro
         else "Do not run full config because --run-repro is disabled; prepare the code but do not write a final task result."
     )
@@ -221,7 +233,7 @@ You are the coder, runner, and first reviewer. You should compare and improve yo
 For each cycle:
 1. Read the task packet and check the relevant original paper definitions, equations, conditions and results. On continuation inspect current feedback and changed evidence; reuse unchanged work rather than rereading every artifact by default.
 2. Search the complete paper before filling a missing parameter. If still absent, make and disclose a scientifically plausible assumption; do not relabel it as a paper fact.
-3. Implement the paper-faithful task, run smoke when useful, then run full with `python run_task.py --task {task_id} --config config.json --mode full`.
+3. Implement the paper-faithful task, run smoke when useful, then use `python run_task.py --task {task_id} --config config.json --mode full` for scientific execution. Cover every assigned experiment on the initial attempt. During repair, select affected experiments in the task's config/implementation where supported, retaining scientifically unchanged outputs and their existing host run references. A shared-code, parameter or training-state change may affect several phases; do not silently reuse their stale results.
 4. Compare explicit scientific facts, each core conclusion, and Task-Designer key numeric targets. Record material and non-material differences separately.
 5. Rerun only for `invalid_run`, `core_conclusion_failed`, or `material_numeric_discrepancy`, and only after recording paper evidence, the specific code/config change, its target, and predicted effect.
 6. Stop changing the science immediately when the Reporter concludes that the evidence supports the assigned conclusions. Also stop when a valid faithful result remains unsupported or unassessable but there is no new evidence-based causal change. In that case, hand the result to the Reporter; do not loop forever or tune toward the picture.

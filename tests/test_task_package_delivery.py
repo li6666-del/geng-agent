@@ -1,6 +1,7 @@
 """Offline delivery checks for per-task Writer packages."""
 
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -12,7 +13,7 @@ import pytest
 from geng_agent.agentic_report_editor import _project_delivery_materials
 from geng_agent.outputs import validate_repro_project
 from geng_agent.schemas import validate_stage
-from geng_agent.task_writer_packaging import _package_task_directories
+from geng_agent.task_writer_packaging import _package_staging_root, _package_task_directories
 from geng_agent.project_portability import validate_repro_project_portability
 from geng_agent.task_writer_support import _load_cached_task_writer_workflow
 from geng_agent.web.delivery import REPORTS, build_delivery
@@ -74,18 +75,18 @@ def test_independent_units_keep_conflicting_executed_source_and_outputs(tmp_path
     assert portability["portable"] is True
     assert manifest["_meta"]["package_layout"] == "task_directories"
     assert not validate_stage("repro_project_manifest", manifest)
-    assert "task_packages/t01_t1/src/common/shared.py" in paths
-    assert "task_packages/t02_t2/src/common/shared.py" in paths
+    assert "task_packages/t01/src/common/shared.py" in paths
+    assert "task_packages/t02/src/common/shared.py" in paths
     assert not (project / "src" / "common" / "shared.py").exists()
-    assert (project / "task_packages/t01_t1/src/common/shared.py").read_text() == "VALUE = 1\n"
-    assert (project / "task_packages/t02_t2/src/common/shared.py").read_text() == "VALUE = 2\n"
-    assert (project / "task_packages/t01_t1/outputs/t1/result.csv").read_text() == "value\n1\n"
-    assert (project / "task_packages/t02_t2/outputs/t2/result.csv").read_text() == "value\n2\n"
-    assert (project / "task_packages/t01_t1/run_experiment.py").is_file()
-    assert (project / "task_packages/t02_t2/run_experiment.py").is_file()
+    assert (project / "task_packages/t01/src/common/shared.py").read_text() == "VALUE = 1\n"
+    assert (project / "task_packages/t02/src/common/shared.py").read_text() == "VALUE = 2\n"
+    assert (project / "task_packages/t01/outputs/t1/result.csv").read_text() == "value\n1\n"
+    assert (project / "task_packages/t02/outputs/t2/result.csv").read_text() == "value\n2\n"
+    assert (project / "task_packages/t01/run_experiment.py").is_file()
+    assert (project / "task_packages/t02/run_experiment.py").is_file()
     assert validate_repro_project_portability(project, run_smoke=False)["portable"] is True
     index = json.loads((project / "package_index.json").read_text(encoding="utf-8"))
-    assert [task["directory"] for task in index["tasks"]] == ["task_packages/t01_t1", "task_packages/t02_t2"]
+    assert [task["directory"] for task in index["tasks"]] == ["task_packages/t01", "task_packages/t02"]
     materials = _project_delivery_materials(project)
     assert [task["task_id"] for task in materials["task_packages"]] == ["t1", "t2"]
     assert _project_delivery_materials(
@@ -130,6 +131,107 @@ def test_successful_replacement_archives_previous_project(tmp_path):
     assert (previous / "README.md").read_text(encoding="utf-8") == "previous delivery"
 
 
+def test_long_checkpoint_paths_survive_staging_publication_and_zip(tmp_path, monkeypatch):
+    # Match the long case prefix that triggered LERE's WinError 206. Keep the
+    # short scratch root outside it, including when pytest uses long node names.
+    root = tmp_path / ("c" * max(1, 89 - len(str(tmp_path))))
+    inputs = _unit_inputs(root)
+    monkeypatch.setenv("GENG_PACKAGE_TMP", str(tmp_path.parents[1] / "pk"))
+    task_id = "T2_comm_marl_main_comparison"
+    unit_id = f"task_02_{task_id}"
+    record = inputs["task_records"][1]
+    record.update(task_id=task_id, execution_unit_id=unit_id)
+    inputs["task_manifest"]["tasks"][1]["task_id"] = task_id
+    inputs["execution_plan"]["execution_units"][1].update(unit_id=unit_id, task_ids=[task_id])
+    relative = f"execution_units/{unit_id}/checkpoints/sensitivity_EUREKA-style@x2.0_seed1/train_meta.json"
+    source = Path(record["sandbox"]) / relative
+    source.parent.mkdir(parents=True)
+    contents = b'{"seed": 1, "checkpoint": "original bytes"}\n'
+    source.write_bytes(contents)
+    old_target = inputs["audit_dir"] / "pkg_stages/deadbeef/task_packages" / f"t02_{task_id}" / relative
+    assert len(str(old_target)) >= 260
+
+    original_copy = shutil.copy2
+    copied_targets = []
+
+    def copy_with_legacy_limit(source, target, **kwargs):
+        copied_targets.append(str(target))
+        if len(str(target)) >= 260:
+            raise OSError(206, "filename too long", str(target))
+        return original_copy(source, target, **kwargs)
+
+    def cross_drive_copy(source, target):
+        # Exercise the copy branch even on test hosts with only one volume.
+        shutil.copytree(source, target, copy_function=copy_with_legacy_limit)
+        return str(target)
+
+    monkeypatch.setattr(shutil, "copy2", copy_with_legacy_limit)
+    monkeypatch.setattr(shutil, "move", cross_drive_copy)
+    _package_task_directories(**inputs)
+    project = inputs["repro_project_dir"]
+    assert source.read_bytes() == contents
+    assert (project / "task_packages/t02" / relative).read_bytes() == contents
+    assert len(str(project / "task_packages/t02" / relative)) < 260
+    assert copied_targets and max(map(len, copied_targets)) < 260
+    index = json.loads((project / "package_index.json").read_text(encoding="utf-8"))
+    assert index["tasks"][1]["task_id"] == task_id
+    assert index["tasks"][1]["execution_unit_id"] == unit_id
+    for name in REPORTS:
+        (inputs["output_dir"] / name).write_bytes(b"offline report fixture")
+    with ZipFile(build_delivery(inputs["output_dir"], str(uuid4()))) as archive:
+        assert archive.read(f"复现交付包/复现任务/t02/代码/{relative}") == contents
+
+
+def test_failed_cross_drive_transfer_keeps_previous_delivery_and_partial_copy(tmp_path, monkeypatch):
+    inputs = _unit_inputs(tmp_path)
+    project = inputs["repro_project_dir"]
+    project.mkdir(parents=True)
+    (project / "README.md").write_text("previous delivery", encoding="utf-8")
+
+    def interrupted_copy(source, target):
+        target = Path(target)
+        target.mkdir()
+        shutil.copy2(Path(source) / "package_index.json", target / "package_index.json")
+        raise OSError("copy interrupted")
+
+    monkeypatch.setattr(shutil, "move", interrupted_copy)
+    with pytest.raises(OSError, match="copy interrupted"):
+        _package_task_directories(**inputs)
+    assert (project / "README.md").read_text(encoding="utf-8") == "previous delivery"
+    workspace = json.loads((inputs["audit_dir"] / "03c_package_workspace.json").read_text(encoding="utf-8"))
+    assert (Path(workspace["stage"]) / "package_index.json").is_file()
+    assert (Path(workspace["incoming"]) / "package_index.json").is_file()
+    assert not Path(workspace["previous_project"]).exists()
+
+
+def test_failed_final_rename_restores_old_delivery(tmp_path, monkeypatch):
+    inputs = _unit_inputs(tmp_path)
+    project = inputs["repro_project_dir"]
+    project.mkdir(parents=True)
+    (project / "README.md").write_text("previous delivery", encoding="utf-8")
+    original_rename = Path.rename
+
+    def fail_publication(path, target):
+        if path.name.startswith("_p") and Path(target) == project:
+            raise PermissionError("destination busy")
+        return original_rename(path, target)
+
+    monkeypatch.setattr(Path, "rename", fail_publication)
+    with pytest.raises(PermissionError, match="destination busy"):
+        _package_task_directories(**inputs)
+    assert (project / "README.md").read_text(encoding="utf-8") == "previous delivery"
+    workspace = json.loads((inputs["audit_dir"] / "03c_package_workspace.json").read_text(encoding="utf-8"))
+    assert (Path(workspace["incoming"]) / "package_index.json").is_file()
+
+
+def test_staging_roots_are_case_scoped_and_configurable(tmp_path, monkeypatch):
+    monkeypatch.setenv("GENG_PACKAGE_TMP", str(tmp_path / "scratch"))
+    first = _package_staging_root(tmp_path / "case_a")
+    assert first.parent == tmp_path / "scratch"
+    assert first == _package_staging_root(tmp_path / "case_a")
+    assert first != _package_staging_root(tmp_path / "case_b")
+
+
 def test_strongly_coupled_tasks_each_receive_the_complete_executed_unit(tmp_path):
     inputs = _unit_inputs(tmp_path)
     joint = inputs["task_records"][0]["sandbox"]
@@ -149,7 +251,7 @@ def test_strongly_coupled_tasks_each_receive_the_complete_executed_unit(tmp_path
 
     _package_task_directories(**inputs)
     project = inputs["repro_project_dir"]
-    for directory in ("task_packages/t01_t1", "task_packages/t02_t2"):
+    for directory in ("task_packages/t01", "task_packages/t02"):
         assert (project / directory / "tasks/t1.py").is_file()
         assert (project / directory / "tasks/t2.py").is_file()
         assert (project / directory / "outputs/t1/result.csv").is_file()
@@ -243,11 +345,11 @@ def test_missing_task_results_do_not_block_code_delivery(tmp_path):
     with ZipFile(delivery) as archive:
         names = set(archive.namelist())
         prefix = "复现交付包/复现任务"
-        assert f"{prefix}/t01_t1/代码/tasks/t1.py" in names
-        assert f"{prefix}/t01_t1/复现结果/outputs/t1/result.csv" not in names
-        assert archive.read(f"{prefix}/t02_t2/复现结果/outputs/t2/result.csv") == remaining_result
-        _assert_task_readme_lists_files(archive, prefix + "/t01_t1")
-    assert (project / "task_packages/t01_t1/tasks/t1.py").is_file()
+        assert f"{prefix}/t01/代码/tasks/t1.py" in names
+        assert f"{prefix}/t01/复现结果/outputs/t1/result.csv" not in names
+        assert archive.read(f"{prefix}/t02/复现结果/outputs/t2/result.csv") == remaining_result
+        _assert_task_readme_lists_files(archive, prefix + "/t01")
+    assert (project / "task_packages/t01/tasks/t1.py").is_file()
 
 
 def test_writer_authored_readme_survives_internal_packaging_and_final_zip(tmp_path):
@@ -268,7 +370,7 @@ def test_writer_authored_readme_survives_internal_packaging_and_final_zip(tmp_pa
     with ZipFile(build_delivery(inputs["output_dir"], str(uuid4()))) as archive:
         assert not any(name.endswith("delivery_readme.md") for name in archive.namelist())
         for index, task_id in enumerate(guides, start=1):
-            assert archive.read(f"复现交付包/复现任务/t{index:02d}_{task_id}/readme.md") == guides[task_id]
+            assert archive.read(f"复现交付包/复现任务/t{index:02d}/readme.md") == guides[task_id]
 
 
 def test_extracted_task_runs_with_original_input_paths_without_internal_archives(tmp_path):

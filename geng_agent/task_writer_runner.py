@@ -27,7 +27,7 @@ from .task_writer_state import _archive_nonterminal_writer_delivery, _complete_t
 from .task_writer_support import PAPER_EVIDENCE_DIR, _restore_trusted_files
 from .verification_result import task_verification_issues
 from .writer_recovery import localize_writer_feedback, writer_recovery_context
-from .writer_environment import ensure_writer_environment, snapshot_writer_environment
+from .writer_environment import ensure_writer_environment, snapshot_writer_environment, writer_environment_root
 from .task_recovery import resolve_revision_owner
 from .supervisor import StageBlocked, REPLAY_REQUIRED, current_supervisor, supervised_call
 
@@ -456,10 +456,22 @@ def _run_task_writer_codex_session(
     case_runtime: CaseRuntime | None = None,
     request_source: str = "task_writer",
     require_execution_receipt: bool = True,
+    _process_boundary=None,
 ) -> dict[str, Any]:
+    if sys.platform == "win32" and _process_boundary is None:
+        from .windows_process_boundary import WriterProcessDomain
+        roots = [writer_environment_root(sandbox, case_runtime)] if case_runtime is not None else []
+        with WriterProcessDomain(sandbox, extra_write_roots=roots) as boundary:
+            if case_runtime is not None:
+                boundary.allow_runtime_read(case_runtime.venv_dir)
+            return _run_task_writer_codex_session(
+                label=label, prompt=prompt, sandbox=sandbox, audit_dir=audit_dir,
+                case_runtime=case_runtime, request_source=request_source,
+                require_execution_receipt=require_execution_receipt, _process_boundary=boundary,
+            )
     write_text(audit_dir / f"{label}_brief.md", prompt)
     selected_python = (
-        ensure_writer_environment(sandbox, case_runtime)
+        ensure_writer_environment(sandbox, case_runtime, process_boundary=_process_boundary)
         if case_runtime is not None else Path(sys.executable).absolute()
     )
     python_dir = selected_python.parent
@@ -483,7 +495,7 @@ def _run_task_writer_codex_session(
                          expected_installed_distributions=(
                              case_runtime.lock.get("installed_distributions")
                              if case_runtime and "installed_distributions" in case_runtime.lock else None),
-                         allow_full=require_execution_receipt) as broker:
+                         allow_full=require_execution_receipt, process_boundary=_process_boundary) as broker:
         runtime_env["GENG_EXECUTION_BROKER"] = broker.session_id
         prompt += ("\n\nHost-observed execution: invoke the selected Python using your shell's syntax and use the task's actual config path. "
                    "Use `run_task.py --task TASK_ID --status` to inspect an in-flight or completed execution, "
@@ -491,6 +503,10 @@ def _run_task_writer_codex_session(
                    "Declare consumed persistent checkpoint/data files with repeatable --input RELATIVE_PATH. "
                    "The host records the real process exit, source/config/input/output hashes; raw Python executions are exploratory "
                    "and cannot establish delivery provenance. Wait for an in-flight execution; do not launch it again after a CLI polling timeout. "
+                   "For a long run use --submit, inspect --status, and stop your own active run with "
+                   "`run_task.py --task TASK_ID --stop RUN_ID`. The host stops only that owned run; "
+                   "you may repair and submit another run afterwards. Never enumerate and kill global Python/Codex "
+                   "processes or attempt to terminate the host or another task. "
                    "If the observed execution fails, inspect its stderr_tail and repair before submitting another run. "
                    "The Writer shell hides CUDA to prevent out-of-band GPU use; this does not mean the host lacks a GPU. "
                    "Inspect nvidia-smi and use a brokered smoke run to test CUDA. Declare `--device cpu` for "
@@ -507,8 +523,9 @@ def _run_task_writer_codex_session(
             command_override=get_config_value("GENG_CODEX_TASK_WRITER_CMD"),
             image_paths=unique_image_paths(sorted(path.resolve() for path in (sandbox / PAPER_EVIDENCE_DIR / "full_paper_pages").glob("paper_page_*.png") if path.is_file())),
             extra_env=runtime_env, path_prepend=[python_dir],
-            workspace_network_access=case_runtime is not None,
+            workspace_network_access=True,
             workspace_writable_roots=[selected_python.parent.parent] if case_runtime else None,
+            process_boundary=_process_boundary,
         )
     if case_runtime is not None:
         try:

@@ -13,6 +13,8 @@ import sysconfig
 import threading
 import time
 import uuid
+from contextlib import ExitStack
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -48,8 +50,25 @@ def run_codex_subprocess(
     extra_env: dict[str, str] | None = None,
     path_prepend: list[Path | str] | None = None,
     workspace_network_access: bool = False,
+    read_only_network_access: bool = False,
     workspace_writable_roots: list[Path] | None = None,
+    process_boundary=None,
 ) -> dict[str, Any]:
+    # The whole Writer CLI and its descendants run inside the OS boundary.
+    # Restricting only brokered science leaves the Writer shell unrestricted.
+    if role == "task_writer" and os.name == "nt" and process_boundary is None:
+        from .windows_process_boundary import WriterProcessDomain
+        with WriterProcessDomain(work_dir, extra_write_roots=workspace_writable_roots or ()) as boundary:
+            return run_codex_subprocess(
+                role=role, work_dir=work_dir, prompt=prompt, audit_dir=audit_dir,
+                label=label, sandbox=sandbox, command_override=command_override,
+                output_schema=output_schema, image_paths=image_paths,
+                extra_env=extra_env, path_prepend=path_prepend,
+                workspace_network_access=workspace_network_access,
+                read_only_network_access=read_only_network_access,
+                workspace_writable_roots=workspace_writable_roots,
+                process_boundary=boundary,
+            )
     raw_cmd = command_override or get_config_value("GENG_CODEX_CMD") or "codex"
     model_config = resolve_model_config(role, getter=get_config_value)
     model = model_config.model
@@ -66,6 +85,7 @@ def run_codex_subprocess(
         "model": model,
         "provider": model_config.provider if model_config.managed else "inherited",
         "model_config": model_config.identity(),
+        "transport_config": model_config.transport_identity(),
         "reasoning_effort": resolved_reasoning_effort,
         "command": None,
         "returncode": None,
@@ -99,6 +119,7 @@ def run_codex_subprocess(
         "work_dir": str(work_dir.resolve()), "sandbox": sandbox,
         "model": model, "reasoning_effort": resolved_reasoning_effort,
         "model_config": model_config.identity(),
+        "transport_config": model_config.transport_identity(),
         "prompt_path": str(input_dir / "brief.md"),
         "prompt_sha256": hashlib.sha256(prompt_bytes).hexdigest(),
         "prompt_characters": len(prompt), "prompt_utf8_bytes": len(prompt_bytes),
@@ -114,6 +135,25 @@ def run_codex_subprocess(
         status["error"] = f"codex CLI not found: {raw_cmd!r} (install it or set GENG_CODEX_CMD)"
         write_json(audit_dir / f"{label}.json", status)
         return status
+
+    if process_boundary is not None:
+        compatibility_check = getattr(process_boundary, "check_codex_compatibility", None)
+        if compatibility_check is not None:
+            compatibility = compatibility_check()
+            if not compatibility["ready"]:
+                status.update(error_kind="writer_boundary_setup_required",
+                    error="Windows Writer 隔离已启用，但盘符查询权限尚未设置。请以管理员身份运行 "
+                          "tools/setup_writer_appcontainer_access.py --apply，再重试。隔离不会降级。",
+                    process_isolation=dict(process_boundary.policy),
+                    boundary_setup=compatibility)
+                write_json(audit_dir / f"{label}.json", status)
+                return status
+        # The executable is selected by the host configuration. Never infer new
+        # runtime grants from a Writer-controlled pyvenv.cfg or command text.
+        # Desktop installations may expose bin through a version-directory
+        # junction. Resolve the host-selected executable before authorizing it;
+        # Writer-controlled input paths still use the boundary's reparse checks.
+        process_boundary.allow_runtime_read(Path(resolved).resolve().parent)
 
     # Every current project Worker is one-shot: project-owned transcript,
     # last-message, JSON and case artifacts are its durable state. A future
@@ -137,132 +177,178 @@ def run_codex_subprocess(
         write_json(audit_dir / f"{label}.json", status)
         return status
 
-    probe_env = env
-    if model_config.managed:
-        probe_env = {key: value for key, value in env.items()
-                     if key.upper() not in {ACTIVE_CREDENTIAL_ENV, "OPENAI_API_KEY"}}
-    capability = _ephemeral_capability(command_prefix, probe_env, work_dir)
-    status["ephemeral_capability"] = capability
-    if not capability["supported"]:
-        detail = str(capability.get("error") or "--ephemeral is absent from codex exec --help")
-        status["error_kind"] = "unsupported_cli_feature"
-        status["blocked_reason"] = "Codex CLI does not support required ephemeral Worker sessions"
-        status["error"] = (
-            "Codex CLI must support codex exec --ephemeral; run codex update "
-            f"or upgrade the CLI, restart the project process, and retry. Detail: {detail}"
-        )
-        write_json(audit_dir / f"{label}.json", status)
+    with ExitStack() as contexts:
+        if process_boundary is not None:
+            from .writer_auth import writer_auth_home
+            auth_env = dict(env)
+            auth_env["TEMP"] = r"D:\geng-artifacts\tmp"
+            env = contexts.enter_context(writer_auth_home(process_boundary, model_config, auth_env))
+        probe_env = env
+        if model_config.managed:
+            probe_env = {key: value for key, value in env.items()
+                         if key.upper() not in {ACTIVE_CREDENTIAL_ENV, "OPENAI_API_KEY"}}
+        capability = _ephemeral_capability(command_prefix, probe_env, work_dir,
+            process_runner=process_boundary.run if process_boundary is not None else None)
+        status["ephemeral_capability"] = capability
+        if not capability["supported"]:
+            detail = str(capability.get("error") or "--ephemeral is absent from codex exec --help")
+            status["error_kind"] = "unsupported_cli_feature"
+            status["blocked_reason"] = "Codex CLI does not support required ephemeral Worker sessions"
+            status["error"] = (
+                "Codex CLI must support codex exec --ephemeral; run codex update "
+                f"or upgrade the CLI, restart the project process, and retry. Detail: {detail}"
+            )
+            write_json(audit_dir / f"{label}.json", status)
+            return status
+
+        if model_config.managed and not capability.get("ignore_user_config_supported"):
+            status.update(error_kind="unsupported_cli_feature",
+                          error="项目模型配置需要支持 --ignore-user-config 的 Codex CLI；请升级 CLI 后重试。")
+            write_json(audit_dir / f"{label}.json", status)
+            return status
+
+        last_message_path = audit_dir / f"{label}_last_message.txt"
+        launch_model_config = model_config
+        if process_boundary is not None:
+            if model_config.model_catalog_json is not None:
+                # The host may be able to read a catalog owned by an installer
+                # or another account without being allowed to change its ACL.
+                # Copy bytes before granting the invocation directory; authorize
+                # only our own copy and leave the source file's permissions alone.
+                catalog_copy = input_dir / "model_catalog.json"
+                shutil.copyfile(model_config.model_catalog_json, catalog_copy)
+                launch_model_config = replace(model_config, model_catalog_json=catalog_copy)
+                status["model_catalog_snapshot"] = str(catalog_copy)
+            # Grant this invocation's output directory, never the shared audit tree.
+            process_boundary.allow_write(input_dir)
+            last_message_path = input_dir / "last_message.txt"
+            runtime_dir = work_dir / ".geng_agent_runtime"
+            runtime_dir.mkdir(parents=True, exist_ok=True)
+            for name in ("TEMP", "TMP", "TMPDIR", "CODEX_SQLITE_HOME"):
+                env[name] = str(runtime_dir.resolve())
+        effective_sandbox = "danger-full-access" if process_boundary is not None else sandbox
+        read_only_network_profile = read_only_network_access and sandbox == "read-only"
+        command = [
+            *command_prefix,
+            "exec",
+            "--ephemeral",
+            "--json",
+            "--skip-git-repo-check",
+            "--cd",
+            str(work_dir),
+            "--output-last-message",
+            str(last_message_path),
+            "--model",
+            model,
+        ]
+        if read_only_network_profile:
+            # Codex's legacy read-only sandbox has no network switch. A named
+            # profile extends its read-only filesystem policy and changes only
+            # command networking; --sandbox cannot be combined with profiles.
+            profile = "geng_readonly_network"
+            command.extend([
+                "--config", f'default_permissions="{profile}"',
+                "--config", f'permissions.{profile}.extends=":read-only"',
+                "--config", f"permissions.{profile}.network.enabled=true",
+            ])
+        else:
+            command.extend(["--sandbox", effective_sandbox])
+        if workspace_network_access and sandbox == "workspace-write":
+            command.extend(["--config", "sandbox_workspace_write.network_access=true"])
+        if workspace_writable_roots and sandbox == "workspace-write":
+            command.extend(["--config", "sandbox_workspace_write.writable_roots=" +
+                            json.dumps([str(path.resolve()) for path in workspace_writable_roots])])
+        command.extend(model_cli_options(launch_model_config, env,
+            windows_sandbox="unelevated" if process_boundary is not None else None))
+        if output_schema is not None:
+            command.extend(["--output-schema", str(output_schema)])
+        for image_path in image_paths or []:
+            command.extend(["--image", str(image_path)])
+        command.append("-")
+        status["command"] = [redact_text(redact_provider_secrets(arg, provider_secrets))
+                             for arg in command[:-1]] + ["<brief via stdin>"]
+        status["last_message_path"] = str(last_message_path)
+        if process_boundary is not None:
+            status["process_isolation"] = dict(process_boundary.policy)
+
+        started = time.monotonic()
+        invocation_started_at = time.time()
+        activity = observe("activity_started", lambda: session_started(invocation_id=invocation_id, role=role, label=label, work_dir=work_dir))
+        cancelled = None
+        from .supervisor import current_supervisor
+        from .progress import PipelineCancelled
+        supervisor = current_supervisor()
+        try:
+            from .supervisor_process import run_observed_process
+            observed_options = {"process_factory": process_boundary.popen} if process_boundary is not None and supervisor is not None else {}
+            run_process = process_boundary.run if process_boundary is not None else subprocess.run
+            completed = run_observed_process(command, supervisor=supervisor, label=f"{role}:{label}",
+                cwd=work_dir, env=env, input=prompt, **observed_options) if supervisor is not None else run_process(
+                command,
+                cwd=work_dir,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                input=prompt,
+            )
+            status["observation_errors"].extend(getattr(completed, "observation_errors", []))
+            status["returncode"] = completed.returncode
+            status["ok"] = completed.returncode == 0
+            transcript = redact_provider_secrets(
+                (completed.stdout or "") + ("\n--- stderr ---\n" + completed.stderr if completed.stderr else ""),
+                provider_secrets,
+            )
+            if completed.returncode != 0:
+                _annotate_codex_failure(status, transcript)
+                status["error"] = f"codex exited with status {completed.returncode}"
+        except PipelineCancelled as exc:
+            cancelled = exc
+            status.update(ok=False, error_kind="cancelled", error="用户停止运行",
+                          returncode=getattr(exc, "returncode", None))
+            transcript = redact_provider_secrets(str(getattr(exc, "stdout", "") or "") + "\n" +
+                                                str(getattr(exc, "stderr", "") or ""), provider_secrets)
+        except Exception as exc:
+            status["error_kind"] = "subprocess_error"
+            status["error"] = redact_text(redact_provider_secrets(f"{type(exc).__name__}: {exc}", provider_secrets))
+            transcript = ""
+        finally:
+            observe("activity_finished", lambda: session_finished(activity, ok=bool(status["ok"]), error_kind=status.get("error_kind")))
+        status["duration_s"] = round(time.monotonic() - started, 1)
+        if provider_secrets and last_message_path.is_file() and not last_message_path.is_symlink():
+            last_text = last_message_path.read_text(encoding="utf-8")
+            safe_last_text = redact_provider_secrets(last_text, provider_secrets)
+            if safe_last_text != last_text:
+                write_text(last_message_path, safe_last_text)
+        if process_boundary is not None and last_message_path.is_file() and not last_message_path.is_symlink():
+            # Preserve the established host-owned location for existing consumers.
+            observe("last_message_copy", lambda: write_text(audit_dir / f"{label}_last_message.txt",
+                last_message_path.read_text(encoding="utf-8")))
+        from .codex_cost import record_codex_invocation
+        try:
+            status["cost_event"] = record_codex_invocation(
+                audit_dir, status, transcript, started_at=invocation_started_at,
+            )
+        except Exception as exc:
+            status["cost_warning"] = f"Invocation accounting unavailable: {type(exc).__name__}"
+        transcript_path = audit_dir / f"{label}_transcript.txt"
+        redacted_transcript = redact_text(transcript)
+        observe("transcript_tail", lambda: write_text(transcript_path, redacted_transcript[-MAX_TRANSCRIPT_CHARS:]))
+        full_transcript_path = input_dir / "transcript.txt.gz"
+        def save_transcript():
+            with gzip.open(full_transcript_path, "wt", encoding="utf-8", newline="") as stream:
+                stream.write(redacted_transcript)
+        observe("transcript_archive", save_transcript)
+        status["full_transcript"] = str(full_transcript_path)
+        status["transcript_characters"] = len(redacted_transcript)
+        status["transcript_tail_truncated"] = len(redacted_transcript) > MAX_TRANSCRIPT_CHARS
+        status["transcript"] = str(transcript_path)
+        observe("session_status", lambda: write_json(audit_dir / f"{label}.json", status))
+        if cancelled is not None:
+            raise cancelled
         return status
-
-    if model_config.managed and not capability.get("ignore_user_config_supported"):
-        status.update(error_kind="unsupported_cli_feature",
-                      error="项目模型配置需要支持 --ignore-user-config 的 Codex CLI；请升级 CLI 后重试。")
-        write_json(audit_dir / f"{label}.json", status)
-        return status
-
-    last_message_path = audit_dir / f"{label}_last_message.txt"
-    command = [
-        *command_prefix,
-        "exec",
-        "--ephemeral",
-        "--json",
-        "--skip-git-repo-check",
-        "--sandbox",
-        sandbox,
-        "--cd",
-        str(work_dir),
-        "--output-last-message",
-        str(last_message_path),
-        "--model",
-        model,
-    ]
-    if workspace_network_access and sandbox == "workspace-write":
-        command.extend(["--config", "sandbox_workspace_write.network_access=true"])
-    if workspace_writable_roots and sandbox == "workspace-write":
-        command.extend(["--config", "sandbox_workspace_write.writable_roots=" +
-                        json.dumps([str(path.resolve()) for path in workspace_writable_roots])])
-    command.extend(model_cli_options(model_config, env))
-    if output_schema is not None:
-        command.extend(["--output-schema", str(output_schema)])
-    for image_path in image_paths or []:
-        command.extend(["--image", str(image_path)])
-    command.append("-")
-    status["command"] = [redact_text(redact_provider_secrets(arg, provider_secrets))
-                         for arg in command[:-1]] + ["<brief via stdin>"]
-    status["last_message_path"] = str(last_message_path)
-
-    started = time.monotonic()
-    invocation_started_at = time.time()
-    activity = observe("activity_started", lambda: session_started(invocation_id=invocation_id, role=role, label=label, work_dir=work_dir))
-    cancelled = None
-    from .supervisor import current_supervisor
-    from .progress import PipelineCancelled
-    supervisor = current_supervisor()
-    try:
-        from .supervisor_process import run_observed_process
-        completed = run_observed_process(command, supervisor=supervisor, label=f"{role}:{label}",
-            cwd=work_dir, env=env, input=prompt) if supervisor is not None else subprocess.run(
-            command,
-            cwd=work_dir,
-            env=env,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-            input=prompt,
-        )
-        status["observation_errors"].extend(getattr(completed, "observation_errors", []))
-        status["returncode"] = completed.returncode
-        status["ok"] = completed.returncode == 0
-        transcript = redact_provider_secrets(
-            (completed.stdout or "") + ("\n--- stderr ---\n" + completed.stderr if completed.stderr else ""),
-            provider_secrets,
-        )
-        if completed.returncode != 0:
-            _annotate_codex_failure(status, transcript)
-            status["error"] = f"codex exited with status {completed.returncode}"
-    except PipelineCancelled as exc:
-        cancelled = exc
-        status.update(ok=False, error_kind="cancelled", error="用户停止运行",
-                      returncode=getattr(exc, "returncode", None))
-        transcript = redact_provider_secrets(str(getattr(exc, "stdout", "") or "") + "\n" +
-                                            str(getattr(exc, "stderr", "") or ""), provider_secrets)
-    except Exception as exc:
-        status["error_kind"] = "subprocess_error"
-        status["error"] = redact_text(redact_provider_secrets(f"{type(exc).__name__}: {exc}", provider_secrets))
-        transcript = ""
-    finally:
-        observe("activity_finished", lambda: session_finished(activity, ok=bool(status["ok"]), error_kind=status.get("error_kind")))
-    status["duration_s"] = round(time.monotonic() - started, 1)
-    if provider_secrets and last_message_path.is_file() and not last_message_path.is_symlink():
-        last_text = last_message_path.read_text(encoding="utf-8")
-        safe_last_text = redact_provider_secrets(last_text, provider_secrets)
-        if safe_last_text != last_text:
-            write_text(last_message_path, safe_last_text)
-    from .codex_cost import record_codex_invocation
-    try:
-        status["cost_event"] = record_codex_invocation(
-            audit_dir, status, transcript, started_at=invocation_started_at,
-        )
-    except Exception as exc:
-        status["cost_warning"] = f"Invocation accounting unavailable: {type(exc).__name__}"
-    transcript_path = audit_dir / f"{label}_transcript.txt"
-    redacted_transcript = redact_text(transcript)
-    observe("transcript_tail", lambda: write_text(transcript_path, redacted_transcript[-MAX_TRANSCRIPT_CHARS:]))
-    full_transcript_path = input_dir / "transcript.txt.gz"
-    def save_transcript():
-        with gzip.open(full_transcript_path, "wt", encoding="utf-8", newline="") as stream:
-            stream.write(redacted_transcript)
-    observe("transcript_archive", save_transcript)
-    status["full_transcript"] = str(full_transcript_path)
-    status["transcript_characters"] = len(redacted_transcript)
-    status["transcript_tail_truncated"] = len(redacted_transcript) > MAX_TRANSCRIPT_CHARS
-    status["transcript"] = str(transcript_path)
-    observe("session_status", lambda: write_json(audit_dir / f"{label}.json", status))
-    if cancelled is not None:
-        raise cancelled
-    return status
 
 
 
@@ -273,6 +359,7 @@ def _ephemeral_capability(
     command_prefix: list[str],
     env: dict[str, str],
     work_dir: Path,
+    *, process_runner=None,
 ) -> dict[str, Any]:
     """Fail closed unless this exact Codex command supports one-shot sessions.
 
@@ -284,7 +371,7 @@ def _ephemeral_capability(
         cached = _EPHEMERAL_CAPABILITY_CACHE.get(key)
         if cached is not None:
             return {**cached, "cached": True}
-        result = _probe_ephemeral_capability(command_prefix, env, work_dir)
+        result = _probe_ephemeral_capability(command_prefix, env, work_dir, process_runner=process_runner)
         _EPHEMERAL_CAPABILITY_CACHE[key] = result
         return {**result, "cached": False}
 
@@ -293,6 +380,7 @@ def _probe_ephemeral_capability(
     command_prefix: list[str],
     env: dict[str, str],
     work_dir: Path,
+    *, process_runner=None,
 ) -> dict[str, Any]:
     command = [*command_prefix, "exec", "--help"]
     result: dict[str, Any] = {
@@ -304,7 +392,8 @@ def _probe_ephemeral_capability(
         "error": None,
     }
     try:
-        completed = subprocess.run(
+        run_process = process_runner or subprocess.run
+        completed = run_process(
             command,
             cwd=work_dir,
             env=env,

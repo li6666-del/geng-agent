@@ -80,6 +80,22 @@ class ModelConfigTests(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             configs.model = "mutated"
 
+    def test_proxy_routing_does_not_invalidate_scientific_cache_identity(self):
+        document = self.document()
+        inherited = self.load(document)
+        document["profiles"]["writer"]["proxy_mode"] = "direct"
+        direct = self.load(document)
+        self.assertEqual(direct.identity(), inherited.identity())
+        self.assertEqual(direct.transport_identity(), {"proxy_mode": "direct"})
+        self.assertEqual(inherited.transport_identity(), {"proxy_mode": "inherit"})
+
+    def test_bundled_deepseek_configuration_is_direct(self):
+        configs = Path(__file__).resolve().parents[1] / "configs"
+        direct = load_model_config(configs / "models.deepseek-v4.1-flash.json", getter=lambda _: None)
+        self.assertEqual(direct.proxy_mode, "direct")
+        example = json.loads((configs / "models.example.json").read_text(encoding="utf-8"))
+        self.assertEqual(example["profiles"]["deepseek"]["proxy_mode"], "direct")
+
     def test_explicit_file_wins_over_environment_file(self):
         configs = load_model_config(self.write(self.document()), getter={"GENG_MODEL_CONFIG": "does-not-exist.json"}.get)
         self.assertEqual(configs.provider, "deepseek")
@@ -162,6 +178,7 @@ class ModelConfigTests(unittest.TestCase):
             ("supported_reasoning_efforts", ["high", "high"]),
             ("env_key", "secret-marker"), ("env_key", "PATH"), ("env_key", "codex_home"),
             ("base_url", None), ("env_key", None),
+            ("proxy_mode", "secret-marker"), ("proxy_mode", []), ("proxy_mode", None),
         )
         for field, value in bad_fields:
             with self.subTest(field=field, value=value):

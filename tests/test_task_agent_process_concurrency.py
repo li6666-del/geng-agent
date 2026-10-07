@@ -64,8 +64,6 @@ raise SystemExit(request.get("exit_code", 0))
 
 @pytest.fixture
 def offline_workers(tmp_path: Path, monkeypatch):
-    script = tmp_path / "local_offline_worker.py"
-    script.write_text(textwrap.dedent(_LOCAL_WORKER), encoding="utf-8")
     barriers = tmp_path / "process_barriers"
     barriers.mkdir()
     profile = CodexModelConfig(
@@ -74,17 +72,21 @@ def offline_workers(tmp_path: Path, monkeypatch):
     )
     monkeypatch.setenv("GENG_OFFLINE_FIXTURE_KEY", "local-fixture-value")
     _clear_ephemeral_capability_cache()
-    command = f'"{sys.executable}" -B "{script}"'
-
     def invoke(name: str, role: str, peers: list[str], *, fail: bool = False):
         workspace = tmp_path / "workspaces" / name
         workspace.mkdir(parents=True)
+        # A real Windows Writer domain can read its own workspace, not a script
+        # placed beside it. The shared barrier is an explicit fixture-only root.
+        script = workspace / "local_offline_worker.py"
+        script.write_text(textwrap.dedent(_LOCAL_WORKER), encoding="utf-8")
+        command = f'"{sys.executable}" -B "{script}"'
         status = run_codex_subprocess(
             role=role, work_dir=workspace,
             prompt=json.dumps({"barrier_root": str(barriers), "name": name,
                                "wait_for": peers, "exit_code": 7 if fail else 0}),
             audit_dir=tmp_path / "audit" / name, label="worker",
             sandbox="workspace-write", command_override=command,
+            workspace_writable_roots=[barriers],
         )
         return status, workspace
 

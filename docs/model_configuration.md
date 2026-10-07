@@ -24,6 +24,14 @@ python -m geng_agent review paper.pdf --out case_001 --run-repro --model-config 
 
 DeepSeek V4.1 Flash 的现成配置为 `configs/models.deepseek-v4.1-flash.json`，使用正式 API 标识 `deepseek-flash`、最高推理档 `max` 和随项目固定的官方模型目录 `configs/deepseek-models.json`。先在启动进程中提供 `DEEPSEEK_API_KEY`，再把这份文件传给 `--model-config`。密钥不能写入 JSON。
 
+项目自带及示例模型配置均把 `web_search` 设为 `live`，选中的同一模型供所有角色按需使用 Codex 网页搜索。事实分析、规划、Writer、Reporter、主持人和报告编辑器也都获得其职责范围内的命令行出站网络能力；网络查询并非每一步的必做动作。Writer 仍在独立 Windows AppContainer 内运行，Reporter 和报告编辑器仍只写各自工作区；主持人和不交付文件的分析调用采用继承只读文件权限的网络配置，不因此获得文件写权限。原论文和本地执行记录的证据地位不因外部查询而改变。
+
+命令行网络使用 Codex 的 `sandbox_workspace_write.network_access` 或只读网络权限配置；[Codex 配置参考](https://learn.chatgpt.com/docs/config-file/config-reference)和[权限配置](https://learn.chatgpt.com/docs/permissions)分别说明两者。只读网络配置需要支持自定义权限配置的 Codex CLI；本地 0.153.4 的无模型探针确认该配置可解析、写入受拒，且能连接 `api.deepseek.com:443`。第三方模型对 Codex 托管 `web_search=live` 的实际支持及权限配置在完整模型调用中的表现尚未用付费调用验证；如果服务商拒绝搜索工具，需依据真实调用错误处理，不能把配置声明当作已通过的网页搜索实测。
+
+正式科学实验也允许出站网络，Windows AppContainer 与其他系统的科学沙箱仍保留各自的进程和文件边界，宿主收据如实记录 `network_enabled=true`。本机使用真正的隔离科学进程，免费完成了到 `api.deepseek.com:443` 的 TCP/TLS 1.3 握手；没有发送 HTTP 请求或调用模型。网络权限不自动提供 API 密钥：科学进程继续使用去除模型凭据的最小环境。若论文算法本身需要调用付费模型，仍需另行设计该实验的凭据交付；不要把已开放网络误写成已完成在线模型实验。Writer 使用联网获取的科学输入或模型响应时，应在任务内保存实际消费的数据及来源，供后续独立审查。
+
+这份 DeepSeek 配置及示例中的 DeepSeek profile 默认使用 `proxy_mode: "direct"`。论文理解、规划、Writer、Reporter、主持人和报告编辑器统一直连：仅在各智能体子进程中移除继承的 HTTP/HTTPS/ALL_PROXY（不区分大小写），并设置 NO_PROXY 为 `*`。不修改系统代理、浏览器设置或宿主环境。Writer 的 AppContainer 进程隔离保持启用，直连无需向其开放本机代理的回环访问。配置在运行开始时冻结；已有运行不热切换、不重启。
+
 ## 配置字段
 
 顶层字段为 `schema_version: 1`、`default`、`profiles`。profile 名称是自定义的小写标识。未知字段、重复 JSON 字段和不存在的 profile 引用都会报配置错误。
@@ -35,13 +43,14 @@ DeepSeek V4.1 Flash 的现成配置为 `configs/models.deepseek-v4.1-flash.json`
 | `base_url` | 自定义服务的接口根地址；只接受 HTTP(S)，不允许在地址中附凭据或查询参数 |
 | `env_key` | 存放 API 密钥的环境变量**名称**；不能写密钥本身 |
 | `wire_api` | 当前实现只接受 `responses` |
+| `proxy_mode` | `direct` 为智能体进程直连；`inherit` 继承启动环境的代理设置。省略时为 `inherit`，项目自带 DeepSeek 配置显式选择 `direct` |
 | `reasoning_effort` | 模型接受的推理等级；省略、`null` 或 `omit` 表示项目不显式覆盖 Codex 的模型推理设置；`none` 是实际发送的等级，与 `omit` 不同 |
 | `supported_reasoning_efforts` | 可选的受支持等级列表；设置后会拒绝列表之外的显式推理等级 |
 | `supports_images` | 是否允许该模型接收阶段图片，默认 `true` |
 | `supports_tools` | 是否支持工具调用，默认 `true`；项目智能体必须具备此能力 |
 | `supports_json_schema` | 是否允许 Codex 的 `--output-schema`，默认 `true`；不等于能输出普通 JSON |
 | `model_catalog_json` | 可选的 Codex 模型目录文件；相对路径以这份配置文件所在目录为基准 |
-| `web_search` | 可选 `disabled`、`cached`、`live`，按服务商支持情况配置 |
+| `web_search` | 可选 `disabled`、`cached`、`live`；`live` 提供实时网页搜索，实际工具可用性仍取决于所选服务商与模型 |
 
 这些能力标记是配置声明，不是实际能力测试。当前主要智能体通过工作文件交付结构化结果，不要求 `--output-schema`；因此第三方示例保守地将该项设为 `false`。将来调用方要求此参数时会在启动前说明不兼容，不能靠吞掉参数继续运行。
 
@@ -53,7 +62,7 @@ DeepSeek V4.1 Flash 的现成配置为 `configs/models.deepseek-v4.1-flash.json`
 
 文件配置模式要求 CLI 同时支持 `--ephemeral` 和 `--ignore-user-config`。项目对单次 Worker 跳过个人 `config.toml`，指定模型与 provider，并禁止命令包装中再附带 profile、config、model 或模型功能覆盖。个人配置文件不会被修改，内建 OpenAI 认证仍可使用 Codex 自己的凭据。
 
-Windows Worker 显式使用 `windows.sandbox = "elevated"`，保留本机原生沙箱；否则忽略个人配置可能使 `workspace-write` 被降为只读。本机需先完成 Codex 原生沙箱设置，不自动退回完全访问模式。自定义服务商使用 `env_key` 和 `requires_openai_auth = false` 认证，不设置会影响全局登录状态的 `forced_login_method`。
+Windows 的 Task Writer 使用项目建立的独立 AppContainer，覆盖 Codex 与所有后续进程。只有外层 Windows 隔离已经建立，内部 CLI 才使用 `danger-full-access`，避免再次切换沙箱账户；它不表示获得宿主权限，也没有关闭外层隔离的失败回退。其他 Worker 继续显式设置 `windows.sandbox = "elevated"`。初次部署的 Windows 路径查询兼容设置见 [Writer 进程隔离](writer_process_isolation.md)。自定义服务商仍使用 `env_key` 和 `requires_openai_auth = false`，不设置会影响全局登录状态的 `forced_login_method`。
 
 Worker 不继承祖先项目的 Codex 配置；如果其工作目录自身存在 `.codex/config.toml`，则明确停止该次调用。系统和组织级约束仍由 Codex 执行。个人配置中的 MCP/插件等扩展不会随文件配置自动启用，当前项目依赖的是 Codex 基础文件和命令工具；需要额外扩展时应另行显式设计其配置与身份记录。
 
@@ -71,6 +80,7 @@ Worker 不继承祖先项目的 Codex 配置；如果其工作目录自身存在
 
 - `audit/model_configs/<run_id>.json` 保存每次运行的唯一模型配置；`audit/model_config.json` 是最新快照。新版快照 `schema_version: 2` 使用单个 `config` 字段，旧历史记录保留原样。
 - 调用的 `input.json`、Worker 状态和用量事件保存对应模型身份。
+- 运行快照的 `transport`、调用输入及状态的 `transport_config` 单独记录代理模式。连接路线不参与科研缓存身份，改为直连不会使已完成的论文理解和规划失效。
 - 服务商、端点摘要、模型、推理设置、能力声明和模型目录内容均参与模型身份，供分析、Foundation、Writer、Reporter 和 Editor 现有缓存机制使用。
 - 恢复运行重新解析当前配置；相关阶段的缓存按身份重新核对，不会强行套用上一次选择，也不删除原始运行记录。
 - 用量继续记录 Codex 返回的 token 数据，金额没有可靠计价依据时保持未知，不把第三方 API 费用视为零。

@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -59,15 +60,26 @@ def _observed_runtime_distributions(
     return {name: executed_versions.get(name, versions.get(name, "")) for name in sorted(consumed)}
 
 
-def probe_execution_environment(python: Path) -> dict[str, Any]:
+def probe_execution_environment(python: Path, *, process_boundary=None) -> dict[str, Any]:
     """Observe the selected runtime's installed versions without importing science."""
     from .security_env import build_safe_env
+    if os.name == "nt" and process_boundary is None:
+        # -I still loads site/.pth, and the private python.exe is Writer-owned.
+        # Even a metadata probe must not execute that environment as the host.
+        from .windows_process_boundary import WriterProcessDomain
+        with tempfile.TemporaryDirectory(prefix="geng-runtime-probe-") as temporary:
+            with WriterProcessDomain(Path(temporary)) as boundary:
+                # The selected environment may be Writer-owned. Grant only this
+                # probe identity read access, never the shared runtime capability.
+                boundary.allow_read(_runtime_prefix(python))
+                return probe_execution_environment(python, process_boundary=boundary)
     started = time.monotonic()
     script = ("import importlib.metadata as m,json,sys;print(json.dumps({"
               "'python':sys.version,'packages':sorted([(d.metadata.get('Name','').lower(),d.version) "
               "for d in m.distributions()])},sort_keys=True))")
     try:
-        completed = subprocess.run([str(python), "-I", "-c", script], env=build_safe_env(),
+        run_process = process_boundary.run if process_boundary is not None else subprocess.run
+        completed = run_process([str(python), "-I", "-c", script], env=build_safe_env(),
                                    capture_output=True, text=True, timeout=30, check=True)
         inventory = json.loads(completed.stdout)
         digest = hashlib.sha256(json.dumps(inventory, sort_keys=True).encode()).hexdigest()
@@ -205,10 +217,13 @@ class ExecutionBroker:
 
     def __init__(self, root: Path, audit_dir: Path, python: Path, *, environment_hash: str = "", allow_full: bool = True,
                  expected_installed_distributions: list[dict[str, str]] | None = None,
-                 shared_runtime_python: Path | None = None):
+                 shared_runtime_python: Path | None = None, process_boundary=None):
         self.root, self.audit_dir, self.python = root.resolve(), audit_dir.resolve(), python
         self.environment_hash = environment_hash
         self.shared_runtime_python = shared_runtime_python or python
+        self._explicit_shared_runtime = shared_runtime_python is not None
+        self.process_boundary = process_boundary
+        self._owns_process_boundary = False
         self.expected_installed_distributions = expected_installed_distributions
         self.environment_refresh_required = False
         self.allow_full = allow_full
@@ -226,12 +241,36 @@ class ExecutionBroker:
         self.heartbeat_thread = threading.Thread(target=self._heartbeat, daemon=True)
         self.completed_pending: dict[str, dict[str, Any]] = {}
         self.process: subprocess.Popen | None = None
+        self.process_lock = threading.RLock()
+        self.active_run_id: str | None = None
+        self.active_task_id: str | None = None
+        self.run_stop_requested = threading.Event()
+        self.run_owners: dict[str, str] = {}
         self.cancelled = threading.Event()
         self.closing = threading.Event()
         self.stopped = threading.Event()
         self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.control_thread = threading.Thread(target=self._serve_controls, daemon=True)
 
     def __enter__(self):
+        try:
+            return self._start()
+        except BaseException:
+            self.closing.set()
+            self.stopped.set()
+            if self._owns_process_boundary:
+                self.process_boundary.close()
+            raise
+
+    def _start(self):
+        if os.name == "nt" and self.process_boundary is None:
+            from .windows_process_boundary import WriterProcessDomain
+            self.process_boundary = WriterProcessDomain(self.root)
+            self._owns_process_boundary = True
+            self.process_boundary.__enter__()
+            self.process_boundary.allow_read(_runtime_prefix(self.python))
+            if self._explicit_shared_runtime:
+                self.process_boundary.allow_runtime_read(_runtime_prefix(self.shared_runtime_python))
         _io_path(self.queue).mkdir(parents=True, exist_ok=True)
         try:
             self._publish_status()
@@ -239,6 +278,7 @@ class ExecutionBroker:
             from .observations import record_error
             record_error(self.queue / "status.json", exc)
         self.heartbeat_thread.start()
+        self.control_thread.start()
         self.thread.start()
         return self
 
@@ -264,7 +304,11 @@ class ExecutionBroker:
             raise
         finally:
             self.stopped.set()
+            if self.control_thread.is_alive():
+                self.control_thread.join(timeout=12)
             self.heartbeat_thread.join(timeout=2)
+            if self._owns_process_boundary:
+                self.process_boundary.close()
 
     def _publish_status(self) -> None:
         _io_path(_inside(self.root, self.queue.relative_to(self.root).as_posix())).mkdir(parents=True, exist_ok=True)
@@ -306,20 +350,64 @@ class ExecutionBroker:
 
     def _stop_process(self) -> None:
         """Cancel the sandbox supervisor and science child as one execution."""
-        process = self.process
-        if process is None or process.poll() is not None:
-            return
-        try:
-            if os.name == "nt":
-                subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                               capture_output=True, timeout=10, check=True)
-            else:
-                os.killpg(process.pid, signal.SIGKILL)
-        except (OSError, subprocess.SubprocessError):
-            # Race with normal process completion is harmless. Preserve a
-            # direct termination fallback if the system tree utility failed.
-            if process.poll() is None:
-                process.kill()
+        with self.process_lock:
+            process = self.process
+            if process is None or process.poll() is not None:
+                return
+            if hasattr(process, "kill_tree"):
+                # A platform-owned job/handle avoids resolving a PID again.
+                process.kill_tree()
+                return
+            try:
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                                   capture_output=True, timeout=10, check=True)
+                else:
+                    os.killpg(process.pid, signal.SIGKILL)
+            except (OSError, subprocess.SubprocessError):
+                # Race with normal process completion is harmless. Preserve a
+                # direct termination fallback if the system tree utility failed.
+                if process.poll() is None:
+                    process.kill()
+
+    def stop_run(self, task_id: str, run_id: str) -> dict[str, Any]:
+        """Stop one run owned by this broker; callers never supply a PID."""
+        with self.process_lock:
+            response = {"task_id": task_id, "run_id": run_id}
+            if self.run_owners.get(run_id) != task_id:
+                return {**response, "returncode": 2, "state": "run_not_owned",
+                        "error": "Use the run_id from this task's --status response; no process was stopped."}
+            if (self.active_run_id != run_id or self.active_task_id != task_id
+                    or self.process is None or self.process.poll() is not None):
+                return {**response, "returncode": 0, "state": "already_finished"}
+            self.run_stop_requested.set()
+            self._set_status(task_id, {"state": "stopping", "stop_requested_by": "writer"})
+            self._stop_process()
+            return {**response, "returncode": 0, "state": "stop_requested"}
+
+    def _serve_controls(self) -> None:
+        # execute() waits in the serial launch thread. A separate control lane
+        # lets a Writer stop that run without stopping the broker or its queue.
+        handled: set[str] = set()
+        while not self.stopped.is_set():
+            for item in _io_path(self.queue).glob("*.stop.json"):
+                if item.name in handled:
+                    continue
+                handled.add(item.name)
+                path = self.queue / item.name
+                result_path = path.with_name(path.name.replace(".stop.", ".result."))
+                try:
+                    request = json.loads(_io_path(_inside(self.root, path.relative_to(self.root).as_posix())).read_text(encoding="utf-8"))
+                    result = self.stop_run(str(request.get("task_id") or ""), str(request.get("run_id") or ""))
+                    self._publish_response(result_path, result)
+                except Exception as exc:
+                    try:
+                        self._publish_response(result_path, {"returncode": 1, "state": "stop_failed",
+                            "error": f"{type(exc).__name__}: {exc}"})
+                    except (OSError, ValueError):
+                        from .observations import record_error
+                        record_error(path, exc)
+            self.stopped.wait(0.15)
 
     def _serve(self):
         handled: set[str] = set()
@@ -490,6 +578,18 @@ class ExecutionBroker:
             return self._execute_with_runtime_lease(request, allocation=allocation)
 
     def _execute_with_runtime_lease(self, request: dict[str, Any], *, allocation) -> dict[str, Any]:
+        if os.name == "nt" and self.process_boundary is None:
+            # Direct execute() callers need the same boundary as queued runs.
+            from .windows_process_boundary import WriterProcessDomain
+            with WriterProcessDomain(self.root) as boundary:
+                boundary.allow_read(_runtime_prefix(self.python))
+                if self._explicit_shared_runtime:
+                    boundary.allow_runtime_read(_runtime_prefix(self.shared_runtime_python))
+                self.process_boundary = boundary
+                try:
+                    return self._execute_with_runtime_lease(request, allocation=allocation)
+                finally:
+                    self.process_boundary = None
         from .scientific_process import DRIVER
         from .security_env import build_safe_env
 
@@ -513,7 +613,8 @@ class ExecutionBroker:
             config_doc = {}
         if not isinstance(config_doc, dict):
             config_doc = {}
-        environment_before = observe("environment_before", lambda: probe_execution_environment(self.python), {})
+        environment_before = observe("environment_before", lambda: probe_execution_environment(
+            self.python, process_boundary=self.process_boundary), {})
         module = str(entry["module"])
         output_rel = str(entry.get("output_subdir") or task_id)
         output = _inside(self.root, f"outputs/{output_rel}")
@@ -559,23 +660,54 @@ class ExecutionBroker:
         started = time.time()
         write_json(run_dir / "started.json", {"run_id": run_id, "task_id": task_id,
                    "source_hashes": before, "input_hashes": inputs, "started_at": started})
-        from .execution_sandbox import scientific_sandbox_launch
-        launch = scientific_sandbox_launch([str(self.python), "-I", "-B", "-c", guard, json.dumps(guard_config)],
-            work_dir=self.root, write_roots=(self.root,), env=env)
+        science_command = [str(self.python), "-I", "-B", "-c", guard, json.dumps(guard_config)]
+        if self.process_boundary is not None:
+            # The external AppContainer covers native code and all descendants;
+            # do not invoke another identity-changing Codex sandbox broker.
+            launch = {"command": science_command, "env": env,
+                      "policy": {**self.process_boundary.policy, "network_enabled": True}}
+        else:
+            from .execution_sandbox import scientific_sandbox_launch
+            launch = scientific_sandbox_launch(science_command,
+                work_dir=self.root, write_roots=(self.root,), env=env)
         with (run_dir / "stdout.log").open("w", encoding="utf-8") as stdout, (run_dir / "stderr.log").open("w", encoding="utf-8") as stderr:
-            process = subprocess.Popen(launch["command"], cwd=self.root, env=launch["env"], stdout=stdout, stderr=stderr,
-                start_new_session=os.name != "nt", creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0)
-            self.process = process
-            self._set_status(task_id, {"state": "running", "run_id": run_id,
-                "pid": process.pid, "pid_kind": "os_sandbox_supervisor",
-                "device_request": allocation.request, "gpu_uuid": allocation.gpu_uuid,
-                "stdout_log": str(run_dir / "stdout.log"), "stderr_log": str(run_dir / "stderr.log"),
-                "started_at": started})
-            if self.cancelled.is_set():
-                self._stop_process()
-            returncode = process.wait()
-            self.process = None
-        environment_after = observe("environment_after", lambda: probe_execution_environment(self.python), {})
+            if self.process_boundary is not None:
+                # The Writer receives these exact logs in --status. Grant only
+                # this run's two open files, never the shared execution_runs tree.
+                self.process_boundary.allow_read(Path(stdout.name))
+                self.process_boundary.allow_read(Path(stderr.name))
+            with self.process_lock:
+                launch_process = self.process_boundary.popen if self.process_boundary is not None else subprocess.Popen
+                process_options = {"allow_network": True} if self.process_boundary is not None else {}
+                process = launch_process(launch["command"], cwd=self.root, env=launch["env"], stdout=stdout, stderr=stderr,
+                    start_new_session=os.name != "nt", creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+                    **process_options)
+                self.process = process
+                self.active_run_id, self.active_task_id = run_id, task_id
+                self.run_owners[run_id] = task_id
+                self.run_stop_requested.clear()
+                self._set_status(task_id, {"state": "running", "run_id": run_id,
+                    "pid": process.pid, "pid_kind": "os_sandbox_supervisor",
+                    "device_request": allocation.request, "gpu_uuid": allocation.gpu_uuid,
+                    "stdout_log": str(run_dir / "stdout.log"), "stderr_log": str(run_dir / "stderr.log"),
+                    "started_at": started})
+                if self.cancelled.is_set():
+                    self._stop_process()
+            try:
+                returncode = process.wait()
+            finally:
+                with self.process_lock:
+                    # A completed main program can leave children behind. Close
+                    # this run's Job before observing outputs or accepting the
+                    # next run; the Writer CLI belongs to a different Job.
+                    close_run = getattr(process, "close_run", None)
+                    if close_run is not None:
+                        close_run()
+                    writer_stopped = self.run_stop_requested.is_set()
+                    self.process = None
+                    self.active_run_id = self.active_task_id = None
+        environment_after = observe("environment_after", lambda: probe_execution_environment(
+            self.python, process_boundary=self.process_boundary), {})
         environment_stable = bool(environment_after.get("ok")) and environment_before.get("sha256") == environment_after.get("sha256")
         after = observe("source_after", lambda: source_hashes(self.root), {})
         after[config_rel] = observed_hash(config)
@@ -632,7 +764,9 @@ class ExecutionBroker:
             "observed_import_roots": observed_import_roots,
             "observed_distributions": observed_distributions,
             "input_observation_scope": "Python file events plus explicit --input and configuration file paths; native loads require one of those declarations",
-            "cancelled": self.cancelled.is_set(), "observation_errors": observation_errors,
+            "cancelled": self.cancelled.is_set() or writer_stopped,
+            "stop_requested_by": "writer" if writer_stopped else "host" if self.cancelled.is_set() else None,
+            "observation_errors": observation_errors,
             "unchanged_output_paths": sorted(p for p, h in output_hashes.items() if old_outputs.get(p) == h),
             "stderr_tail": "\n".join(line for line in stderr_text.splitlines() if not line.startswith("GENG_OBSERVED_"))[-12000:]}
         write_json(run_dir / "execution_receipt.json", receipt)

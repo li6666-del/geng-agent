@@ -9,7 +9,7 @@
       "supports_images": true,
       "supports_tools": true,
       "supports_json_schema": true,
-      "web_search": "disabled"
+      "web_search": "live"
     }
   }
 }

@@ -11,8 +11,11 @@ from .progress import PipelineCancelled
 
 
 def _terminate_owned_tree(process):
-    from .mineru_runner import _terminate_process_tree
-    _terminate_process_tree(process)
+    if hasattr(process, "kill_tree"):
+        process.kill_tree()
+    else:
+        from .mineru_runner import _terminate_process_tree
+        _terminate_process_tree(process)
     try:
         return process.communicate(timeout=5)
     except subprocess.TimeoutExpired:
@@ -21,7 +24,7 @@ def _terminate_owned_tree(process):
 
 
 def run_observed_process(command, *, supervisor, label, cwd, env, input,
-                         check_interval=0.5):
+                         check_interval=0.5, process_factory=None):
     observations = deque(maxlen=100)
     def observe(pid, **values):
         try:
@@ -39,7 +42,8 @@ def run_observed_process(command, *, supervisor, label, cwd, env, input,
 
     check_cancelled()
     flags = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {"start_new_session": True}
-    with subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.PIPE,
+    launch_process = process_factory or subprocess.Popen
+    with launch_process(command, cwd=cwd, env=env, stdin=subprocess.PIPE,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           text=True, encoding="utf-8", errors="replace", **flags) as process:
         started = time.monotonic()

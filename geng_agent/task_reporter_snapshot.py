@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 import hashlib
 import json
 import os
@@ -272,7 +273,10 @@ def _looks_like_text_source(path: Path) -> bool:
     if b"\x00" in sample:
         return False
     try:
-        sample.decode("utf-8-sig")
+        # A byte sample may end midway through a valid UTF-8 character. Only
+        # require a complete character when the sample reaches the file end.
+        decoder = codecs.getincrementaldecoder("utf-8-sig")()
+        decoder.decode(sample, final=size <= len(sample))
     except UnicodeDecodeError:
         return False
     return True

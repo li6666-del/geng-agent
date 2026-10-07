@@ -223,6 +223,14 @@ Retain unaffected observations and issue your own complete decision protocol.
 A final task may merge several experiments. Inspect every experiment, original goal,
 condition and baseline in the assigned task. Preserve per-experiment outcomes and
 uncertainties; one successful experiment does not imply that the others succeeded.
+One failed or unexecuted experiment does not automatically invalidate independent
+experiments either. Trace whether a failed model, parameter choice or checkpoint
+actually affects each later experiment, including dependencies inside one task.
+Describe the affected conclusions and any conditional interpretation in your
+existing observations and decision_reason; do not invent a new required schema.
+Do not collapse mixed results into a blanket success or failure. For a justified
+repair, identify the affected implementation and experiments so the same Writer
+can preserve unaffected work; no separate review is required at each internal phase.
 Read upstream_task_inputs.json and copied upstream files when this task consumes
 another task's checkpoint or data. Judge their scientific suitability yourself.
 
@@ -231,7 +239,7 @@ Verify exactly one reproduction task: `{task_id}`. The paper is the scientific a
 {repair_block}
 
 ## Boundaries
-- Inspect the copied Writer source statically; do not execute it, edit it, install packages, or access the network.
+- Inspect the copied Writer source statically; do not execute it, edit it, or install packages. You may consult public online sources to clarify methods or software behavior when useful. Cite their URLs separately from the original paper and recorded local evidence; online material cannot establish an unobserved run or replace the paper's assigned goals.
 - Read `inputs/task_report_input.json`, Writer outputs/source, and the paper evidence. {page_policy}
 - Judge the scientific conclusion, not pixel alignment or private implementation identity.
 - Establish acceptance scope from the assigned task goals, target conditions and `task.scientific_acceptance`. The small acceptance object is a navigation aid within those goals. Use its IDs when available. If an ID or optional field is missing, recover the intended goal from the task and paper and record uncertainty; never reject merely for missing structure. If the goal itself is ambiguous, explain the unresolved interpretation rather than expanding it to the whole figure or paper.

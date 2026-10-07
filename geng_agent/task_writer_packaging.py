@@ -5,7 +5,9 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import os
 import shutil
+import tempfile
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 from uuid import uuid4
@@ -116,6 +118,19 @@ def _freeze_repro_project_package(
     return manifest, portability
 
 
+def _package_staging_root(case_dir: Path) -> Path:
+    """Keep temporary copies short and scoped to this case for recovery."""
+    configured = os.environ.get("GENG_PACKAGE_TMP")
+    if configured:
+        root = Path(configured).resolve()
+    elif os.name == "nt" and Path("D:/").is_dir():
+        root = Path("D:/geng-artifacts/tmp")
+    else:
+        root = Path(tempfile.gettempdir())
+    case_key = hashlib.sha256(str(case_dir.resolve()).encode("utf-8")).hexdigest()[:12]
+    return root / f"pkg_{case_key}"
+
+
 def _package_task_directories(
     *,
     repro_project_dir: Path,
@@ -134,8 +149,9 @@ def _package_task_directories(
     Historical multi-task sandboxes retain their original files when packaged;
     new plans always dispatch one complete task per Writer. The aggregate root
     never claims to be a unified scientific program.
-    Build it beside the current project so a failed attempt preserves the old
-    tree and every Writer sandbox for supervisor recovery.
+    Build in a short scratch directory, then transfer to a short sibling of the
+    destination before replacing it. Failed attempts preserve the old project
+    and every Writer sandbox for supervisor recovery, including across drives.
     """
     case_root = output_dir.resolve()
     for path in (repro_project_dir, audit_dir):
@@ -146,8 +162,21 @@ def _package_task_directories(
     if path_is_link(repro_project_dir) or path_is_link(audit_dir):
         raise ValueError("linked package destination")
 
-    stage = audit_dir / "pkg_stages" / uuid4().hex[:8]
+    attempt_id = uuid4().hex[:8]
+    stage = _package_staging_root(case_root) / attempt_id
     stage.mkdir(parents=True)
+    incoming = repro_project_dir.parent / f"_p{attempt_id}"
+    previous = repro_project_dir.parent / f"_b{attempt_id}"
+    # These paths are host-owned siblings. Verify their resolved destinations
+    # before any recursive transfer; do not follow an existing redirect.
+    for path in (incoming, previous):
+        path.resolve().relative_to(case_root)
+        if path.exists() or path_is_link(path):
+            raise FileExistsError(path)
+    write_json(audit_dir / "03c_package_workspace.json", {
+        "stage": str(stage), "incoming": str(incoming),
+        "previous_project": str(previous), "destination": str(repro_project_dir),
+    })
     tasks_root = stage / "task_packages"
     tasks_root.mkdir()
     task_entries: list[dict[str, Any]] = []
@@ -178,7 +207,9 @@ def _package_task_directories(
                      "task_policy": "planner_final_tasks"}
         for task_id in task_ids:
             index = task_order[task_id]
-            relative_root = f"task_packages/t{index:02d}_{safe_label(task_id)}"
+            # Full task identities remain in the index and README; repeating
+            # them here needlessly lengthens every checkpoint/output path.
+            relative_root = f"task_packages/t{index:02d}"
             task_root = stage / relative_root
             _prepare_project_workspace(task_root, unit_manifest)
             task_expected = _merge_task_writer_deliveries(
@@ -279,16 +310,18 @@ def _package_task_directories(
         run_smoke=False, package_layout="task_directories",
     )
     frozen["_meta"]["task_packages"] = task_entries
-    previous = None
+    # A cross-drive move may leave a partial copy on error. Finish that copy
+    # before touching the existing delivery, so it can never replace it.
+    shutil.move(str(stage), str(incoming))
     if repro_project_dir.exists():
-        previous = audit_dir / "pkg_previous" / uuid4().hex[:8]
-        previous.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(repro_project_dir), str(previous))
+        repro_project_dir.rename(previous)
+    else:
+        previous = None
     try:
-        shutil.move(str(stage), str(repro_project_dir))
+        incoming.rename(repro_project_dir)
     except Exception:
         if previous is not None and not repro_project_dir.exists():
-            shutil.move(str(previous), str(repro_project_dir))
+            previous.rename(repro_project_dir)
         raise
     write_json(output_dir / "repro_project_manifest.json", frozen)
     write_json(audit_dir / "03c_task_package_delivery.json", {

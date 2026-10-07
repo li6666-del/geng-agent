@@ -283,7 +283,7 @@ class FinalReportEditorTests(unittest.TestCase):
             self.assertIn("不是科研成功次数", brief)
             self.assertEqual(
                 REPORT_EDITOR_PROMPT_VERSION,
-                "final_report_editor_v19_complete_planning_sources",
+                "final_report_editor_v20_download_directory_mapping",
             )
 
     def test_human_readable_task_headings_do_not_require_machine_task_ids(self) -> None:

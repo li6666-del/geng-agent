@@ -254,6 +254,7 @@ class ReviewPipeline:
             "schema_version": 2,
             "run_id": context.run_id,
             "config": model_configs.identity(),
+            "transport": model_configs.transport_identity(),
         }
         write_json(audit_dir / "model_configs" / f"{context.run_id}.json", model_snapshot)
         write_json(audit_dir / "model_config.json", model_snapshot)

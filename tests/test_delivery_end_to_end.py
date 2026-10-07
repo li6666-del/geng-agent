@@ -78,7 +78,9 @@ class DeliveryEndToEndTests(unittest.TestCase):
             (sandbox / "config_smoke.json").write_text('{"run_profile":"smoke","smoke":true}', encoding="utf-8")
             (sandbox / "requirements.txt").write_text("# stdlib only\n", encoding="utf-8")
             shutil.copyfile(Path(__file__).parents[1] / "geng_agent" / "execution_client.py", sandbox / "run_task.py")
-            generator = base / "generator.py"
+            # The offline CLI fixture belongs to the Writer's readable workspace;
+            # the isolated process deliberately cannot read arbitrary siblings.
+            generator = sandbox / "generator.py"
             generator.write_text(textwrap.dedent(GENERATOR), encoding="utf-8")
             command = f'"{sys.executable}" "{generator}"'
             task_audit = case / "audit" / "writer_observer"

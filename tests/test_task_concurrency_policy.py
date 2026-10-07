@@ -39,7 +39,7 @@ def test_legacy_relationships_do_not_override_final_tasks():
     assert compile_execution_plan(document)["execution_unit_count"] == 2
 
 
-def test_actual_combined_planner_receives_balanced_boundaries_and_state_protection(monkeypatch, tmp_path):
+def test_actual_combined_planner_receives_merge_first_boundaries_and_state_protection(monkeypatch, tmp_path):
     pipeline = ReviewPipeline()
     captured = {}
 
@@ -57,15 +57,18 @@ def test_actual_combined_planner_receives_balanced_boundaries_and_state_protecti
                          paper={"source_sha256": "fixture"}, paper_context="fixture",
                          paper_images=[], figure_index={}, host_capabilities={})
 
-    prompt = captured["prompt"]
+    prompt = " ".join(captured["prompt"].split())
+    assert "Default to merging tightly coupled, continuous scientific work" in prompt
     assert "single Writer's workload" in prompt
-    assert "independent review and repair" in prompt
+    assert "internal phases, modular code and durable progress notes" in prompt
+    assert "Split only when there is a clear independent boundary" in prompt
+    assert "phases are not new task IDs or approval nodes" in prompt
     assert "brief rationale in Chinese" in prompt
     assert "Avoid unnecessary supplementary experiments" in prompt
-    assert "producer\nhandoff follows its Writer/Reporter process" in prompt
+    assert "producer handoff follows its Writer/Reporter process" in prompt
     assert "Component reuse or compatible implementations must not silently merge tasks" in prompt
-    assert "ONE task with ONE task_id" not in prompt
-    assert "already merged compatible experiments" not in prompt
+    assert "Components are code modules, not separate Writer tasks" in prompt
+    assert "Prefer separate tasks for independently meaningful goals" not in prompt
     assert "Preserve every" in prompt
     assert "original goal, condition, baseline" in prompt
     assert "Each final task receives one independent Reporter" in prompt

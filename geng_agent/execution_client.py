@@ -61,19 +61,27 @@ def main():
     parser.add_argument("--device", choices=("cpu", "gpu", "auto"), default="auto",
                         help="Select CPU or GPU; auto uses a visible GPU, otherwise CPU. GPU runs can execute concurrently.")
     parser.add_argument("--input", action="append", default=[], help="Persistent data/checkpoint consumed by this run, relative to project")
-    parser.add_argument("--submit", action="store_true", help="Submit to the active host and return before completion")
-    parser.add_argument("--status", action="store_true", help="Read the host's current task execution status")
+    controls = parser.add_mutually_exclusive_group()
+    controls.add_argument("--submit", action="store_true", help="Submit to the active host and return before completion")
+    controls.add_argument("--status", action="store_true", help="Read the host's current task execution status")
+    controls.add_argument("--stop", metavar="RUN_ID", help="Stop this task's host-issued run_id; never accepts a process ID")
     args = parser.parse_args()
     root = Path(__file__).resolve().parent
     os.chdir(root)
-    entries = json.loads((root / "tasks_manifest.json").read_text(encoding="utf-8"))["tasks"]
-    entry = next(t for t in entries if t["task_id"] == args.task)
-    config = args.config or entry.get("config_smoke" if args.mode == "smoke" else "config_full") or "config.json"
     session = os.environ.get("GENG_EXECUTION_BROKER")
     if session:
         if not session.isalnum():
             raise ValueError("invalid execution session")
         queue = _io_path(root / ".geng_execution" / session)
+        if args.stop:
+            control_id = uuid.uuid4().hex
+            path = queue / (control_id + ".stop.json")
+            temporary = path.with_suffix(".tmp")
+            temporary.write_text(json.dumps({"task_id": args.task, "run_id": args.stop}), encoding="utf-8")
+            temporary.replace(path)
+            result = _wait_for_result(queue, control_id, args.task)
+            print(json.dumps(result, ensure_ascii=True))
+            return int(result.get("returncode", 1))
         status_path = queue / "status.json"
         status = {}
         if status_path.is_file():
@@ -81,10 +89,13 @@ def main():
         if args.status:
             print(json.dumps(status or {"task_id": args.task, "state": "not_started"}, ensure_ascii=True))
             return 0
-        if status.get("state") in {"starting", "running"}:
+        if status.get("state") in {"starting", "running", "stopping"}:
             print(json.dumps({"state": "in_flight_conflict", "active_execution": status,
                 "error": "Wait for the active task execution, then resubmit if another run is scientifically required."}, ensure_ascii=True))
             return 75  # A launch request must never look like a completed success.
+        entries = json.loads((root / "tasks_manifest.json").read_text(encoding="utf-8"))["tasks"]
+        entry = next(t for t in entries if t["task_id"] == args.task)
+        config = args.config or entry.get("config_smoke" if args.mode == "smoke" else "config_full") or "config.json"
         run_id = uuid.uuid4().hex
         path = queue / (run_id + ".request.json")
         temporary = path.with_suffix(".tmp")
@@ -98,10 +109,13 @@ def main():
         result = _wait_for_result(queue, run_id, args.task)
         print(json.dumps(result, ensure_ascii=True))
         return int(result.get("returncode", 1))
-    if args.status or args.submit:
-        print(json.dumps({"state": "host_unavailable", "error": "--status and --submit require an active orchestration host"}))
+    if args.status or args.submit or args.stop:
+        print(json.dumps({"state": "host_unavailable", "error": "--status, --submit and --stop require an active orchestration host"}))
         return 1
     # Third-party execution does not claim observation by the original host.
+    entries = json.loads((root / "tasks_manifest.json").read_text(encoding="utf-8"))["tasks"]
+    entry = next(t for t in entries if t["task_id"] == args.task)
+    config = args.config or entry.get("config_smoke" if args.mode == "smoke" else "config_full") or "config.json"
     module = importlib.import_module("tasks." + entry["module"])
     result = module.main(config)
     return result if isinstance(result, int) and not isinstance(result, bool) else 0

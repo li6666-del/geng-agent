@@ -7,11 +7,12 @@ import json
 from pathlib import Path
 import subprocess
 import tomllib
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
-from geng_agent.codex_provider import ACTIVE_CREDENTIAL_ENV
+from geng_agent.codex_provider import ACTIVE_CREDENTIAL_ENV, provider_environment
 from geng_agent.codex_runner import _clear_ephemeral_capability_cache, run_codex_subprocess
 from geng_agent.model_config import ROLES, load_model_config, model_config_scope
 
@@ -61,6 +62,16 @@ def _invoke(directory, configs, *, env=None, help_text=HELP_TEXT,
             raise failure
         Path(command[command.index("--output-last-message") + 1]).write_text(stdout, encoding="utf-8")
         return subprocess.CompletedProcess(command, 0, stdout, "")
+
+    # Provider-unit tests do not create a real OS domain. Native boundary tests
+    # separately prove the AppContainer token and cross-process denial.
+    if role == "task_writer":
+        arguments.setdefault("process_boundary", SimpleNamespace(
+            run=fake_run, allow_write=lambda _path: None,
+            allow_read=lambda _path: None,
+            allow_runtime_read=lambda _path: None,
+            policy={"provider": "unit_test_process_boundary"},
+        ))
 
     with model_config_scope(configs), \
          patch("geng_agent.codex_runner.shutil.which", return_value="C:\\tools\\codex.exe"), \
@@ -113,7 +124,8 @@ def test_custom_provider_argv_is_valid_toml_and_preserves_execution_inputs(tmp_p
     assert policy["ignore_default_excludes"] is False
     assert policy["filters"][ACTIVE_CREDENTIAL_ENV] == "exclude"
     assert policy["filters"]["OPENAI_API_KEY"] == "exclude"
-    assert policy["set"] == runtime
+    assert {key: policy["set"][key] for key in runtime} == runtime
+    assert Path(policy["set"]["TEMP"]).is_relative_to(tmp_path)
     worker_env = arguments["env"]
     assert worker_env[ACTIVE_CREDENTIAL_ENV] == FAKE_CREDENTIAL
     assert not {"GLM_API_KEY", "OPENAI_API_KEY", "OTHER_TOKEN"} & worker_env.keys()
@@ -131,9 +143,48 @@ def test_all_workers_use_identical_provider_model_and_reasoning(tmp_path):
         result, calls = _invoke(tmp_path, config, role=role)
         assert result["ok"]
         command = calls[-1][0]
-        selections.append((command[command.index("--model") + 1], _config_values(command)))
+        settings = _config_values(command)
+        settings.pop("windows.sandbox", None)  # Execution identity is role-specific; model selection is not.
+        settings.pop("shell_environment_policy", None)
+        selections.append((command[command.index("--model") + 1], settings))
         assert result["model_config"] == config.identity()
     assert all(selection == selections[0] for selection in selections)
+
+
+@pytest.mark.parametrize("role", (*ROLES, "auxiliary"))
+def test_direct_mode_removes_inherited_proxies_for_every_worker(tmp_path, role):
+    config = _configs(tmp_path, proxy_mode="direct")
+    env = {"GLM_API_KEY": FAKE_CREDENTIAL, "HTTPS_PROXY": "http://127.0.0.1:12334",
+           "http_proxy": "http://127.0.0.1:12334", "All_Proxy": "socks5://127.0.0.1:1080",
+           "No_Proxy": "localhost", "PATH": "C:\\tools"}
+    before = dict(env)
+    child, _ = provider_environment(config, env, getter=lambda _: None)
+    assert env == before
+    assert child["NO_PROXY"] == child["no_proxy"] == "*"
+    result, calls = _invoke(tmp_path, config, env=env, role=role)
+    assert result["ok"]
+    for _command, arguments in calls:
+        actual = arguments["env"]
+        assert not {key.upper() for key in actual} & {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"}
+        assert actual["NO_PROXY"] == actual["no_proxy"] == "*"
+    settings = _config_values(calls[-1][0])
+    assert settings["shell_environment_policy"]["set"]["NO_PROXY"] == "*"
+    assert result["transport_config"] == {"proxy_mode": "direct"}
+    manifest = json.loads(Path(result["input_manifest"]).read_text(encoding="utf-8"))
+    assert manifest["transport_config"] == {"proxy_mode": "direct"}
+    assert "127.0.0.1:12334" not in json.dumps(result)
+
+
+def test_inherit_mode_preserves_caller_proxy_selection(tmp_path):
+    config = _configs(tmp_path)
+    env = {"GLM_API_KEY": FAKE_CREDENTIAL, "https_proxy": "http://proxy.example:8888",
+           "NO_PROXY": "localhost"}
+    result, calls = _invoke(tmp_path, config, env=env, role="analysis")
+    assert result["ok"]
+    actual = calls[-1][1]["env"]
+    assert actual["https_proxy"] == env["https_proxy"]
+    assert actual["NO_PROXY"] == "localhost"
+    assert result["transport_config"] == {"proxy_mode": "inherit"}
 
 
 def test_single_worker_cannot_override_global_reasoning(tmp_path):
@@ -142,12 +193,15 @@ def test_single_worker_cannot_override_global_reasoning(tmp_path):
 
 
 @pytest.mark.parametrize("platform", ["win32", "linux"])
-def test_managed_windows_worker_explicitly_keeps_native_sandbox(tmp_path, platform):
+def test_managed_writer_uses_external_domain_without_elevated_inner_broker(tmp_path, platform):
     with patch("geng_agent.codex_provider.sys.platform", platform):
         result, calls = _invoke(tmp_path, _configs(tmp_path))
     assert result["ok"]
     settings = _config_values(calls[-1][0])
-    assert settings.get("windows.sandbox") == ("elevated" if platform == "win32" else None)
+    assert settings.get("windows.sandbox") == ("unelevated" if platform == "win32" else None)
+    command = calls[-1][0]
+    assert command[command.index("--sandbox") + 1] == "danger-full-access"
+    assert result["process_isolation"]["provider"] == "unit_test_process_boundary"
 
 
 def test_bare_non_openai_credential_is_redacted_from_persisted_transcripts(tmp_path):

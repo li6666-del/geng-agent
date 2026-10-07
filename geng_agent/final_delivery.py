@@ -11,6 +11,13 @@ from urllib.parse import quote, urlsplit
 from .artifact_paths import path_is_link
 
 
+DELIVERY_ROOT = "复现交付包"
+REPORTS = {
+    "result_review.docx": f"{DELIVERY_ROOT}/论文复现结果对比报告.docx",
+    "reproduction_report.docx": f"{DELIVERY_ROOT}/本地复现报告.docx",
+}
+
+
 _CACHE_DIRS = {
     "__pycache__", "node_modules", "venv", "env", "envs", "site-packages",
     "cache", "caches", "tmp", "temp", "scratch", "debug", "repair_logs",
@@ -107,6 +114,86 @@ def _json(path: Path | None) -> dict[str, Any]:
         return value if isinstance(value, dict) else {}
     except (OSError, ValueError, UnicodeError):
         return {}
+
+
+def task_delivery_directories(project: Path) -> list[tuple[str, str | None, Path]]:
+    """Use existing task directories; an optional index only supplies task names."""
+    labels: dict[str, str] = {}
+    index = _json(_safe_file(project, "package_index.json"))
+    entries = index.get("tasks", [])
+    for item in entries if isinstance(entries, list) else []:
+        if isinstance(item, dict) and isinstance(item.get("directory"), str) and item.get("task_id"):
+            labels[item["directory"].replace("\\", "/")] = str(item["task_id"])
+    packages = project / "task_packages"
+    if path_is_link(packages):
+        raise ValueError("复现任务目录不能是外部链接")
+    tasks = []
+    if packages.is_dir():
+        for task_root in sorted(packages.iterdir()):
+            if task_root.name.startswith("."):
+                continue
+            if path_is_link(task_root):
+                raise ValueError("复现任务目录不能是外部链接")
+            if task_root.is_dir():
+                task_id = labels.get(task_root.relative_to(project).as_posix())
+                task_id = task_id or re.sub(r"^t\d+_", "", task_root.name)
+                tasks.append((task_root.name, task_id, task_root))
+    # Older cases used a single project directory instead of task_packages.
+    return tasks or [("t01_task", None, project)]
+
+
+def task_download_paths(directory: str) -> dict[str, str]:
+    prefix = f"{DELIVERY_ROOT}/复现任务/{directory}"
+    return {
+        "download_directory": prefix,
+        "code_directory": f"{prefix}/代码",
+        "results_directory": f"{prefix}/复现结果",
+        "readme_path": f"{prefix}/readme.md",
+    }
+
+
+def describe_download_layout(project: Path, *, package_manifest: dict | None = None) -> dict:
+    """Give the editor the ZIP's paths, without creating or approving a delivery."""
+    layout = {
+        "root": DELIVERY_ROOT,
+        "reports": [path.split("/", 1)[1] for path in REPORTS.values()],
+        "contents": ["代码/", "复现结果/", "readme.md"],
+        "tasks": [],
+        "scope": "Directory mapping only, not proof of export, upload or successful rerunning.",
+        "instructions": (
+            "Use tasks[].code_directory as the download user's working directory and "
+            "tasks[].readme_path as the task guide. recorded_commands are existing task-relative "
+            "commands, passed through unchanged; do not prepend internal task_packages paths. "
+            "Existing results are under results_directory with their original relative paths. "
+            "New runs write into code_directory at the program's original output paths. "
+            "The ZIP root contains two Word reports and 复现任务, not the internal project README, "
+            "manifests, audit records or receipts. Internal engineering paths are for provenance only."
+        ),
+    }
+    if not project.is_dir() or path_is_link(project):
+        return layout
+    manifest = package_manifest if package_manifest is not None else _json(
+        _safe_file(project, "reproducibility_manifest.json"))
+    records = manifest.get("task_packages")
+    by_directory = {
+        item["directory"].replace("\\", "/"): item
+        for item in records if isinstance(item, dict) and isinstance(item.get("directory"), str)
+    } if isinstance(records, list) else {}
+    try:
+        for directory, task_id, task_root in task_delivery_directories(project):
+            internal = task_root.relative_to(project).as_posix()
+            record = manifest if task_root == project else by_directory.get(internal, {})
+            layout["tasks"].append({
+                "task_id": task_id,
+                "internal_directory": internal,
+                **task_download_paths(directory),
+                "recorded_commands": {key: record[key] for key in ("full_command", "smoke_command")
+                                      if key in record},
+            })
+    except (OSError, ValueError) as exc:
+        # Missing optional directory material is an observation, not a report gate.
+        layout["observation"] = f"Download directory mapping unavailable: {type(exc).__name__}: {exc}"
+    return layout
 
 
 def _excluded(relative: str, *, observed_input: bool = False) -> bool:

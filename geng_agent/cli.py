@@ -94,7 +94,7 @@ def main(argv: list[str] | None = None) -> int:
             configs = load_model_config(args.config)
         except ValueError as exc:
             parser.error(str(exc))
-        print(json.dumps(configs.identity(),
+        print(json.dumps({**configs.identity(), "transport": configs.transport_identity()},
                          ensure_ascii=False, indent=2))
         return 0
 

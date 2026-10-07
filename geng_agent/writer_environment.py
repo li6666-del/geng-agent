@@ -47,7 +47,7 @@ def _site_packages(root: Path) -> Path:
     return candidates[0]
 
 
-def ensure_writer_environment(sandbox: Path, runtime: CaseRuntime) -> Path:
+def ensure_writer_environment(sandbox: Path, runtime: CaseRuntime, *, process_boundary=None) -> Path:
     """Give one Writer a private install target while reusing large base packages.
 
     The virtual environment lives in a separate writable root granted only to
@@ -64,8 +64,10 @@ def ensure_writer_environment(sandbox: Path, runtime: CaseRuntime) -> Path:
     created = not python.is_file()
     if created:
         root.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            [str(runtime.python_executable), "-m", "venv", str(root)],
+        run_process = process_boundary.run if process_boundary is not None else subprocess.run
+        run_process(
+            [str(runtime.python_executable), "-I", "-m", "venv",
+             *(["--without-pip"] if process_boundary is not None and os.name == "nt" else []), str(root)],
             cwd=sandbox, check=True, capture_output=True, text=True, timeout=180,
         )
     local_site = _site_packages(root)
@@ -83,13 +85,41 @@ def ensure_writer_environment(sandbox: Path, runtime: CaseRuntime) -> Path:
             raise RuntimeError(f"Writer environment marker is unreadable: {marker_path}") from exc
         if previous.get("shared_python") != expected["shared_python"]:
             raise RuntimeError("Writer environment base Python changed; preserve the existing task environment before rebuilding")
-    # UTF-8 is needed for Windows user names; Python's site module reads .pth.
-    (local_site / "geng_shared_science.pth").write_text(
-        str(shared_site.resolve()) + "\n", encoding="utf-8",
-    )
-    write_json(marker_path, expected)
+    # These destinations belong to the Writer and may contain reparse points
+    # after a prior session. Perform writes with that Writer's OS rights, never
+    # lend the host's rights to a restored environment. -S avoids loading .pth
+    # while maintaining this environment itself.
+    pth_path = local_site / "geng_shared_science.pth"
+    pth_text = str(shared_site.resolve()) + "\n"
+    if process_boundary is not None:
+        files = [(str(pth_path), pth_text),
+                 (str(marker_path), json.dumps(expected, ensure_ascii=False, indent=2))]
+        if os.name == "nt":
+            files.extend([
+                (str(local_site / "geng_appcontainer_compat.py"),
+                 Path(__file__).with_name("writer_python_compat.py").read_text(encoding="utf-8")),
+                (str(local_site / "00_geng_appcontainer_compat.pth"), "import geng_appcontainer_compat\n"),
+            ])
+        script = ("import json,sys;from pathlib import Path;"
+                  "files=json.loads(sys.argv[1]);"
+                  "[Path(path).write_text(text,encoding='utf-8') for path,text in files]")
+        process_boundary.run(
+            [str(runtime.python_executable), "-I", "-S", "-c", script,
+             json.dumps(files)],
+            cwd=sandbox, check=True, capture_output=True, text=True, timeout=30,
+        )
+    else:
+        pth_path.write_text(pth_text, encoding="utf-8")
+        write_json(marker_path, expected)
     if created:
-        _restore_writer_additions(sandbox, runtime, python)
+        if process_boundary is not None and os.name == "nt":
+            # Bootstrap after the private compatibility module is available to
+            # this Python and pip's children. Uses CPython's bundled wheels only.
+            process_boundary.run(
+                [str(python), "-I", "-m", "ensurepip", "--upgrade", "--default-pip"],
+                cwd=sandbox, check=True, capture_output=True, text=True, timeout=180,
+            )
+        _restore_writer_additions(sandbox, runtime, python, process_boundary=process_boundary)
     return python
 
 
@@ -120,7 +150,7 @@ def snapshot_writer_environment(sandbox: Path, runtime: CaseRuntime) -> Path:
     return path
 
 
-def _restore_writer_additions(sandbox: Path, runtime: CaseRuntime, python: Path) -> None:
+def _restore_writer_additions(sandbox: Path, runtime: CaseRuntime, python: Path, *, process_boundary=None) -> None:
     path = sandbox / _LOCK
     if not path.is_file():
         return
@@ -138,8 +168,9 @@ def _restore_writer_additions(sandbox: Path, runtime: CaseRuntime, python: Path)
         ):
             requirements.append(f"{name}=={version}")
     if requirements:
-        subprocess.run(
-            [str(python), "-m", "pip", "install", *requirements],
+        run_process = process_boundary.run if process_boundary is not None else subprocess.run
+        run_process(
+            [str(python), "-I", "-m", "pip", "install", *requirements],
             cwd=sandbox, check=True, capture_output=True, text=True, timeout=1800,
         )
 

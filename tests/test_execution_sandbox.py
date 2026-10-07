@@ -38,6 +38,24 @@ class ExecutionSandboxTests(unittest.TestCase):
                 scientific_sandbox_launch([sys.executable, "-c", "print(1)"], work_dir=root,
                     write_roots=[output], env={}, codex_executable=root / "missing-codex")
 
+    def test_launch_allows_network_and_keeps_filesystem_profile(self):
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "output"
+            output.mkdir()
+            executable = root / "codex.exe"
+            executable.touch()
+            with patch("geng_agent.execution_sandbox._sandbox_prefix",
+                       return_value=(str(executable), "sandbox")):
+                launch = scientific_sandbox_launch([sys.executable, "-c", "print(1)"],
+                    work_dir=root, write_roots=[output], env={}, codex_executable=executable)
+            self.assertEqual(launch["command"][:2], [str(executable), "sandbox"])
+            self.assertIn("permissions.geng-science.network.enabled=true", launch["command"])
+            self.assertTrue(any(arg.startswith("permissions.geng-science.filesystem=")
+                                for arg in launch["command"]))
+            self.assertEqual(launch["policy"]["native_write_roots"], [str(output)])
+            self.assertTrue(launch["policy"]["network_enabled"])
+
     def test_real_os_sandbox_blocks_python_and_native_writes_outside_outputs(self):
         with native_sandbox_temporary_directory() as temporary:
             base = Path(temporary)

@@ -29,7 +29,7 @@ _RESERVED_ENV_NAMES = frozenset({
 _PROFILE_FIELDS = frozenset({
     "provider", "model", "reasoning_effort", "base_url", "env_key", "wire_api",
     "supports_images", "supports_tools", "supports_json_schema", "model_catalog_json",
-    "web_search", "supported_reasoning_efforts",
+    "web_search", "supported_reasoning_efforts", "proxy_mode",
 })
 ConfigGetter = Callable[[str], str | None]
 
@@ -83,9 +83,12 @@ class CodexModelConfig:
     supported_reasoning_efforts: tuple[str, ...] | None = None
     model_catalog_sha256: str | None = None
     managed: bool = False
+    proxy_mode: str = "inherit"
 
     def identity(self) -> dict[str, object]:
         """Return a stable, secret-free identity suitable for caches and audit."""
+        # Proxy routing is transport configuration. Changing it must not
+        # invalidate completed paper understanding or scientific task caches.
         return {
             "config_contract": "codex-model-config-v1",
             "managed": self.managed,
@@ -102,6 +105,9 @@ class CodexModelConfig:
             "web_search": self.web_search,
             "supported_reasoning_efforts": list(self.supported_reasoning_efforts) if self.supported_reasoning_efforts is not None else None,
         }
+
+    def transport_identity(self) -> dict[str, str]:
+        return {"proxy_mode": self.proxy_mode}
 
     def validate_catalog_unchanged(self) -> None:
         """Reject a mutable catalog that no longer matches the run snapshot."""
@@ -192,6 +198,9 @@ def _profile(value: object, config_dir: Path) -> CodexModelConfig:
     web_search = value.get("web_search")
     if web_search is not None and (not isinstance(web_search, str) or web_search not in {"disabled", "cached", "live"}):
         raise _fail("web_search 只能是 disabled、cached 或 live。")
+    proxy_mode = value.get("proxy_mode", "inherit")
+    if not isinstance(proxy_mode, str) or proxy_mode not in {"inherit", "direct"}:
+        raise _fail("proxy_mode 只能是 inherit 或 direct。")
     catalog_path = None
     catalog_hash = None
     if value.get("model_catalog_json") is not None:
@@ -208,7 +217,8 @@ def _profile(value: object, config_dir: Path) -> CodexModelConfig:
         provider=provider, model=model, reasoning_effort=reasoning,
         base_url=base_url, env_key=env_key, wire_api=wire_api,
         model_catalog_json=catalog_path, model_catalog_sha256=catalog_hash,
-        web_search=web_search, supported_reasoning_efforts=supported, managed=True, **capabilities,
+        web_search=web_search, supported_reasoning_efforts=supported, managed=True,
+        proxy_mode=proxy_mode, **capabilities,
     )
 
 

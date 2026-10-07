@@ -179,13 +179,13 @@ def test_writer_dispatch_preserves_chinese_guide_through_final_zip(tmp_path, mon
         case_runtime=None, analysis_snapshot_hash="offline-snapshot",
         environment_hash="", require_lineage=False,
     )
-    packaged = project / "task_packages/t01_qfunc"
+    packaged = project / "task_packages/t01"
     assert (packaged / "delivery_readme.md").read_bytes() == authored_guides[-1]
     for name in REPORTS:
         (case / name).write_bytes(b"opaque report fixture")
 
     with ZipFile(build_delivery(case, str(uuid4()))) as archive:
-        prefix = "复现交付包/复现任务/t01_qfunc"
+        prefix = "复现交付包/复现任务/t01"
         assert archive.read(f"{prefix}/readme.md") == authored_guides[-1]
         assert archive.read(f"{prefix}/复现结果/outputs/qfunc/errors.csv") == result_versions[-1]
         assert archive.read(f"{prefix}/代码/tasks/qfunc.py") == (packaged / "tasks/qfunc.py").read_bytes()

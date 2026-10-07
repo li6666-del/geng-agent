@@ -39,6 +39,14 @@ def validate_model_use(config: CodexModelConfig, *, images: bool, schema: bool,
 
 def provider_environment(config: CodexModelConfig, env: dict[str, str], *,
                          getter: Callable[[str], str | None]) -> tuple[dict[str, str], tuple[str, ...]]:
+    if config.proxy_mode == "direct":
+        # Work on the child environment only. Inherited desktop loopback proxies
+        # cannot be reached from an isolated Writer; all roles use this policy.
+        env = {key: value for key, value in env.items()
+               if key.upper() not in {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"}}
+        # Also bypass automatically discovered/system proxies in clients that
+        # support them, without changing Windows or the caller's environment.
+        env.update(NO_PROXY="*", no_proxy="*")
     if not config.managed:
         return env, ()
     env = dict(env)
@@ -61,7 +69,8 @@ def provider_environment(config: CodexModelConfig, env: dict[str, str], *,
     return env, (credential,) if credential else ()
 
 
-def model_cli_options(config: CodexModelConfig, env: dict[str, str]) -> list[str]:
+def model_cli_options(config: CodexModelConfig, env: dict[str, str], *,
+                      windows_sandbox: str | None = None) -> list[str]:
     options: list[str] = []
 
     def toml(value: object) -> str:
@@ -77,13 +86,15 @@ def model_cli_options(config: CodexModelConfig, env: dict[str, str]) -> list[str
     if config.reasoning_effort is not None:
         setting("model_reasoning_effort", config.reasoning_effort)
     if not config.managed:
+        if windows_sandbox is not None and sys.platform == "win32":
+            setting("windows.sandbox", windows_sandbox)
         return options
     options.append("--ignore-user-config")
     if sys.platform == "win32":
         # Ignoring personal config also hides [windows]. Without an explicit
         # native sandbox Codex can downgrade workspace-write to read-only.
         # Keep the stronger OS sandbox; never use an unsandboxed fallback.
-        setting("windows.sandbox", "elevated")
+        setting("windows.sandbox", windows_sandbox or "elevated")
     # No ancestor project configuration is needed inside a staged Worker. Do
     # not override system/organization policies or disable their enforcement.
     setting("project_root_markers", [])
@@ -108,7 +119,8 @@ def model_cli_options(config: CodexModelConfig, env: dict[str, str]) -> list[str
     setting("shell_environment_policy", {
         "inherit": "core", "ignore_default_excludes": False,
         "filters": {name: "exclude" for name in (ACTIVE_CREDENTIAL_ENV, "OPENAI_API_KEY")},
-        "set": {name: env[name] for name in _RUNTIME_ENV if name in env},
+        "set": {**{name: env[name] for name in _RUNTIME_ENV if name in env},
+                **({"NO_PROXY": "*", "no_proxy": "*"} if config.proxy_mode == "direct" else {})},
     })
     return options
 

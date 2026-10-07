@@ -5,6 +5,7 @@ The run controller has its own integration tests in test_supervisor_*.py; it mus
 not accidentally start a paid model from an older phase-only fixture.
 """
 import pytest
+from geng_agent import windows_process_boundary
 
 
 @pytest.fixture(autouse=True)
@@ -13,13 +14,20 @@ def no_paid_model_process(monkeypatch):
     import subprocess
     from pathlib import Path
     original = subprocess.Popen
-    def local_only(command, *args, **kwargs):
+    original_boundary = windows_process_boundary.WriterProcessDomain.popen
+    def check_local(command):
         words = [str(part).lower() for part in command] if isinstance(command, (list, tuple)) else [str(command).lower()]
         cli_names = {"codex", "codex.exe", "codex.cmd", "codex.js", "codex.ps1"}
         if any(Path(part).name in cli_names for part in words[:3]) and "exec" in words and "--help" not in words:
             raise RuntimeError("Test attempted an unmocked paid model process")
+    def local_only(command, *args, **kwargs):
+        check_local(command)
         return original(command, *args, **kwargs)
+    def boundary_local_only(self, command, *args, **kwargs):
+        check_local(command)
+        return original_boundary(self, command, *args, **kwargs)
     monkeypatch.setattr(subprocess, "Popen", local_only)
+    monkeypatch.setattr(windows_process_boundary.WriterProcessDomain, "popen", boundary_local_only)
 
 
 @pytest.fixture(autouse=True)

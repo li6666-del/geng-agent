@@ -359,6 +359,7 @@ class Moderator:
             status = run_codex_subprocess(
                 role="moderator", work_dir=workspace, prompt=prompt, audit_dir=attempt_dir,
                 label="moderator", sandbox="read-only",
+                read_only_network_access=True,
                 output_schema=attempt_dir / "decision_schema.json" if profile.supports_json_schema else None,
             )
             message = attempt_dir / "moderator_last_message.txt"

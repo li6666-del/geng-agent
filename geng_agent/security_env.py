@@ -54,6 +54,7 @@ def build_safe_env() -> dict[str, str]:
     safe_env["MPLCONFIGDIR"] = safe_env.get("TEMP") or safe_env.get("TMP") or "."
     for key in SENSITIVE_ENV_KEYS:
         safe_env.pop(key, None)
+    safe_env.update(NO_PROXY="*", no_proxy="*")
     return safe_env
 
 

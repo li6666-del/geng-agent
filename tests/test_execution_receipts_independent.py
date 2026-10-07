@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import py_compile
 from pathlib import Path
+import subprocess
 import sys
 import time
 from tests.test_execution_sandbox import native_sandbox_temporary_directory as TemporaryDirectory
@@ -25,6 +26,39 @@ class ExecutionReceiptIndependentTests(unittest.TestCase):
             "module": "sample", "output_subdir": "sample", "config_full": "config.json",
             "config_smoke": "config_smoke.json"}]}), encoding="utf-8")
         return project, ExecutionBroker(project, root / "audit", Path(sys.executable))
+
+    def test_writer_receives_only_its_own_run_log_paths(self):
+        class RecordingBoundary:
+            policy = {"provider": "test_recording_boundary"}
+
+            def __init__(self):
+                self.read_grants = []
+
+            def allow_read(self, path):
+                path = Path(path)
+                assert path.is_file()
+                self.read_grants.append(path)
+
+            def run(self, *args, **kwargs):
+                return subprocess.run(*args, **kwargs)
+
+            def popen(self, *args, **kwargs):
+                assert kwargs.pop("allow_network") is True
+                assert [path.name for path in self.read_grants] == ["stdout.log", "stderr.log"]
+                return subprocess.Popen(*args, **kwargs)
+
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project, _ = self._project(root, "def main(config):\n    return 0\n")
+            boundary = RecordingBoundary()
+            broker = ExecutionBroker(project, root / "audit", Path(sys.executable),
+                                     process_boundary=boundary)
+            receipt = broker.execute({"task_id": "sample", "mode": "full"})
+            own_run = root / "audit" / "execution_runs" / receipt["run_id"]
+            self.assertEqual(boundary.read_grants,
+                             [own_run / "stdout.log", own_run / "stderr.log"])
+            self.assertEqual(receipt["returncode"], 0)
+            self.assertTrue(receipt["sandbox_policy"]["network_enabled"])
 
     def test_changed_shared_python_is_observed_without_rejecting_execution(self):
         with TemporaryDirectory() as temporary:

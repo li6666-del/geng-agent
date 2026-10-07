@@ -245,6 +245,7 @@ def run_codex_task_reporter_workflow(
         audit_dir=task_audit_dir,
         label=f"round_{reporter_round_no:03d}",
         sandbox="workspace-write",
+        workspace_network_access=True,
         command_override=get_config_value("GENG_CODEX_TASK_REPORTER_CMD"),
         image_paths=image_paths,
     )

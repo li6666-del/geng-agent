@@ -27,6 +27,19 @@ class CodexRunnerEphemeralTests(unittest.TestCase):
         temporary = TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.case_root = Path(temporary.name)
+        class TransportOnlyBoundary:
+            policy = {"provider": "unit_test_process_boundary"}
+            def __init__(self, *_args, **_kwargs): pass
+            def __enter__(self): return self
+            def __exit__(self, *_args): pass
+            def allow_write(self, _path): pass
+            def allow_read(self, _path): pass
+            def allow_runtime_read(self, _path): pass
+            def run(self, *args, **kwargs): return subprocess.run(*args, **kwargs)
+            def popen(self, *args, **kwargs): return subprocess.Popen(*args, **kwargs)
+        boundary_patch = patch("geng_agent.windows_process_boundary.WriterProcessDomain", TransportOnlyBoundary)
+        boundary_patch.start()
+        self.addCleanup(boundary_patch.stop)
 
     def _invoke(
         self,
@@ -38,6 +51,8 @@ class CodexRunnerEphemeralTests(unittest.TestCase):
         help_text: str = "Usage: codex exec [OPTIONS]\n  --ephemeral",
         output_schema: Path | None = None,
         image_paths: list[Path] | None = None,
+        workspace_network_access: bool = False,
+        read_only_network_access: bool = False,
     ):
         calls: list[tuple[list[str], dict]] = []
         writes: list[tuple[Path, dict]] = []
@@ -65,6 +80,8 @@ class CodexRunnerEphemeralTests(unittest.TestCase):
                 command_override=command_override,
                 output_schema=output_schema,
                 image_paths=image_paths,
+                workspace_network_access=workspace_network_access,
+                read_only_network_access=read_only_network_access,
             )
         return status, calls, writes
 
@@ -116,6 +133,24 @@ class CodexRunnerEphemeralTests(unittest.TestCase):
         self.assertEqual(kwargs["input"], "test prompt")
         self.assertTrue(kwargs["capture_output"])
         self.assertEqual(status["reasoning_effort"], "medium")
+
+    def test_workspace_network_uses_workspace_switch_without_expanding_sandbox(self) -> None:
+        _, calls, _ = self._invoke(role="task_reporter", sandbox="workspace-write",
+                                   workspace_network_access=True)
+        command, _ = next(item for item in calls if "--ephemeral" in item[0])
+        self.assertEqual(command[command.index("--sandbox") + 1], "workspace-write")
+        self.assertIn("sandbox_workspace_write.network_access=true", command)
+        self.assertFalse(any("default_permissions=" in arg for arg in command))
+
+    def test_read_only_network_profile_keeps_read_only_filesystem_parent(self) -> None:
+        _, calls, _ = self._invoke(role="moderator", sandbox="read-only",
+                                   read_only_network_access=True)
+        command, _ = next(item for item in calls if "--ephemeral" in item[0])
+        self.assertNotIn("--sandbox", command)
+        self.assertIn('default_permissions="geng_readonly_network"', command)
+        self.assertIn('permissions.geng_readonly_network.extends=":read-only"', command)
+        self.assertIn("permissions.geng_readonly_network.network.enabled=true", command)
+        self.assertFalse(any("workspace_write" in arg for arg in command))
 
     def test_unsupported_cli_feature_fails_closed_without_worker_launch(self) -> None:
         status, calls, writes = self._invoke(help_text="Usage: codex exec [OPTIONS]")
