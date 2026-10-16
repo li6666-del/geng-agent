@@ -245,26 +245,6 @@ def _run_one_task_writer(
     output_subdir = str(manifest_entry.get("output_subdir") or task_id)
     unit_id = str(execution_unit_id or f"unit_task_{index:02d}_{safe_label(task_id)}")
     refresh_marker = _task_writer_runtime_refresh_marker(sandbox)
-    if runtime_refresh_required and reuse_existing and sandbox.is_dir():
-        write_json(
-            refresh_marker,
-            {
-                "schema_version": 1,
-                "reason": "scientific_handoff_match_combined_snapshot_changed",
-                "task_id": task_id,
-                "target_analysis_snapshot_hash": analysis_snapshot_hash,
-            },
-        )
-        refresh_archive_round = _next_writer_progress_round(sandbox)
-        _archive_nonterminal_writer_delivery(
-            sandbox=sandbox,
-            output_subdir=output_subdir,
-            round_no=refresh_archive_round,
-            session_status={
-                "ok": True,
-                "source": "runtime_refresh_required",
-            },
-        )
     _prepare_task_writer_sandbox(
         sandbox=sandbox,
         task=task,
@@ -280,7 +260,20 @@ def _run_one_task_writer(
         execution_unit_id=unit_id,
     )
     from .task_inputs import copy_upstream_inputs
-    copy_upstream_inputs(sandbox, task, upstream_records or [])
+    copy_upstream_inputs(sandbox, task, upstream_records or [], audit_dir=audit_dir)
+    # A failed input transfer must not archive an existing scientific result.
+    if runtime_refresh_required and reuse_existing and sandbox.is_dir():
+        write_json(refresh_marker, {
+            "schema_version": 1,
+            "reason": "scientific_handoff_match_combined_snapshot_changed",
+            "task_id": task_id,
+            "target_analysis_snapshot_hash": analysis_snapshot_hash,
+        })
+        _archive_nonterminal_writer_delivery(
+            sandbox=sandbox, output_subdir=output_subdir,
+            round_no=_next_writer_progress_round(sandbox),
+            session_status={"ok": True, "source": "runtime_refresh_required"},
+        )
     execution_binding = _load_task_execution_binding(sandbox, task_id)
     write_writer_input(sandbox=sandbox, members=[(index, task, manifest_entry)], facts=facts,
                        experiment_index=experiment_index, bindings={task_id: execution_binding},

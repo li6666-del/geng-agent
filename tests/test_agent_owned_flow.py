@@ -135,15 +135,16 @@ def test_local_paper_edits_are_observations(tmp_path):
     assert status["paper_evidence_changed_files"]
 
 
-def test_upstream_files_are_copied_with_missing_input_observation(tmp_path):
-    from geng_agent.task_inputs import copy_upstream_inputs
+def test_missing_required_upstream_file_does_not_publish_partial_delivery(tmp_path):
+    from geng_agent.task_inputs import copy_upstream_inputs, UpstreamHandoffError
     producer = tmp_path / "producer"
     (producer / "checkpoints").mkdir(parents=True)
     (producer / "checkpoints/model.bin").write_bytes(b"actual state")
     consumer = tmp_path / "consumer"
-    copy_upstream_inputs(consumer, {"depends_on": [{"task_id": "train", "artifacts": ["checkpoints/model.bin", "absent"]}]},
-                         [{"task_id": "train", "sandbox": str(producer), "writer_completed": False}])
-    assert (consumer / "upstream_tasks/train/checkpoints/model.bin").read_bytes() == b"actual state"
+    with pytest.raises(UpstreamHandoffError):
+        copy_upstream_inputs(consumer, {"depends_on": [{"task_id": "train", "artifacts": ["checkpoints/model.bin", "absent"]}]},
+                             [{"task_id": "train", "sandbox": str(producer), "writer_completed": True}])
+    assert not (consumer / "upstream_tasks").exists()
     assert json.loads((consumer / "upstream_task_inputs.json").read_text(encoding="utf-8"))["inputs"][0]["errors"]
 
 

@@ -110,6 +110,19 @@ def write_writer_input(*, sandbox: Path, members: list[tuple[int, dict, dict]],
                          if assigned == set(candidate.get("task_ids", []))), None)
     packet = build_writer_input(members=members, facts=facts, experiment_index=experiment_index,
                                 bindings=bindings, unit=unit)
+    # Give producers the exact downstream addresses before they implement a
+    # dataset layout. Explicit aliases replace guesses about paths or stems.
+    assigned_ids = {str(task.get("task_id") or entry.get("task_id")) for _, task, entry in members}
+    packet["requested_exports"] = []
+    plan_path = root / "analysis_artifacts" / "execution_plan.json"
+    if plan_path.is_file():
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        from .task_inputs import dependencies
+        for consumer in plan.get("execution_units", []):
+            for dependency in dependencies(consumer):
+                if str(dependency.get("task_id")) in assigned_ids:
+                    packet["requested_exports"].append({"consumer_task_ids": consumer.get("task_ids", []),
+                                                        "dependency": dependency})
     write_json(sandbox / WRITER_INPUT_PATH, packet)
     # Preserve full chunks, including late definitions and cross-page conditions.
     write_json(root / "paper_chunks.json", {"chunks": paper.get("chunks", [])})

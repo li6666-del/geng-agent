@@ -569,6 +569,8 @@ class ExecutionBroker:
             raise ValueError("full execution is disabled for this preparation session; smoke remains available")
         if self.cancelled.is_set():
             raise PipelineCancelled("execution cancelled before launch")
+        from .task_inputs import require_verified_handoff
+        require_verified_handoff(self.root, self.audit_dir)
         allocation = select_compute(str(request.get("device") or "auto"))
         # Experiments share this runtime read lock and may use the same GPU
         # concurrently. Only package installation takes the exclusive lock.
@@ -715,13 +717,17 @@ class ExecutionBroker:
         asset_stats_after = observe("assets_after", lambda: _persistent_asset_stats(self.root), {})
         stderr_text = observe("stderr", lambda: (run_dir / "stderr.log").read_text(encoding="utf-8", errors="replace"), "")
         observed_reads: dict[str, str] = {}
+        generated_reads: dict[str, str] = {}
         written_paths: set[str] = set()
         observed_import_roots: list[str] = []
         for line in stderr_text.splitlines():
             if line.startswith("GENG_OBSERVED_READ "):
                 try:
                     item = json.loads(line[len("GENG_OBSERVED_READ "):])
-                    observed_reads.setdefault(item["path"], item["sha256"])
+                    # A truncating write before the first read produces a new
+                    # value in this run. Append/r+ and read-before-write remain inputs.
+                    reads = generated_reads if item.get("generated_in_run") and item["path"] not in inputs else observed_reads
+                    reads.setdefault(item["path"], item["sha256"])
                 except (ValueError, KeyError, TypeError):
                     continue
             elif line.startswith("GENG_OBSERVED_MODULES "):
@@ -747,7 +753,8 @@ class ExecutionBroker:
         inputs_stable = environment_stable and before == after and all(observe(p, lambda p=p: file_hash(_inside(self.root, p)), None) == h for p, h in inputs.items()) and not observation_errors
         observed_distributions = observe("runtime_distributions", lambda: _observed_runtime_distributions(
             self.python, observed_import_roots, environment_before.get("inventory")), {})
-        receipt = {"schema_version": 1, "observer": "orchestration_host", "run_id": run_id,
+        receipt = {"schema_version": 2, "observer": "orchestration_host", "run_id": run_id,
+            "workspace": str(self.root), "generated_reads": generated_reads,
             "task_id": task_id, "output_subdir": output_rel,
             "mode": str(request.get("mode") or "full"), "config": config_rel, "config_observation": config_doc,
             "python_executable": str(self.python), "environment_hash": self.environment_hash,
@@ -783,12 +790,16 @@ class ExecutionBroker:
 def _producer_chain_issues(
     root: Path, audit_dir: Path, inputs: dict[str, str], *, required_mode: str = "full",
     python_executable: Path | None = None, current_inventory: dict | None = None,
+    _upstream_ancestry: set | None = None,
 ) -> list[str]:
     """Revalidate only the supplied assets' ancestry, for execution and resume."""
     generated_inputs = {path: digest for path, digest in inputs.items()
                         if path.startswith(("execution_units/", "outputs/"))}
+    from .upstream_lineage import upstream_input_issues
+    upstream_issues = upstream_input_issues(root, audit_dir, inputs, required_mode=required_mode,
+                                           ancestry=_upstream_ancestry)
     if not generated_inputs:
-        return []
+        return upstream_issues
     candidates = []
     for path in (audit_dir / "execution_runs").glob("*/execution_receipt.json"):
         try:
@@ -835,6 +846,7 @@ def _producer_chain_issues(
             return True
         producers = [r for r in candidates if (r.get("produced_artifacts", {}).get(relative)
             or r.get("output_hashes", {}).get(relative)) == expected
+            and (not r.get("workspace") or r["workspace"] == str(root.resolve()))
             and r.get("observer") == "orchestration_host"
             and r.get("mode") in ({"smoke", "full"} if mode == "smoke" else {"full"})
             and r.get("returncode") == 0]
@@ -848,7 +860,9 @@ def _producer_chain_issues(
                 valid = all(file_hash(_inside(root, p)) == h for p, h in dependencies.items())
             except (OSError, ValueError):
                 valid = False
-            if valid and all(
+            inherited_upstream_issues = upstream_input_issues(root, audit_dir, producer.get("input_hashes", {}),
+                required_mode=str(producer["mode"]), ancestry=_upstream_ancestry)
+            if valid and not inherited_upstream_issues and all(
                 current_producer_chain(path, digest, str(producer["mode"]), visiting | {key})
                 for path, digest in producer.get("input_hashes", {}).items()
                 if path.startswith(("execution_units/", "outputs/"))
@@ -858,7 +872,7 @@ def _producer_chain_issues(
                 return True
         return False
 
-    return [f"persistent generated input has no current producer receipt: {relative}"
+    return upstream_issues + [f"persistent generated input has no current producer receipt: {relative}"
             for relative, expected in generated_inputs.items()
             if not current_producer_chain(relative, expected, required_mode, set())]
 

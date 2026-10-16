@@ -7,6 +7,8 @@ sys.path.insert(0, _ROOT)
 _observation_stream = sys.stderr
 _busy = False
 _seen = set()
+_written_values = {}
+_read_before_write = set()
 def _observe(event, args):
     global _busy
     if event != "open" or _busy or not args or not isinstance(args[0], (str, bytes)):
@@ -22,6 +24,13 @@ def _observe(event, args):
         mode = args[1] if len(args) > 1 else "r"
         flags = args[2] if len(args) > 2 else 0
         writing = (isinstance(mode, str) and any(c in mode for c in "wax+")) or (isinstance(flags, int) and flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC))
+        truncating = (isinstance(mode, str) and any(c in mode for c in "wx")) or (isinstance(flags, int) and flags & (os.O_TRUNC | os.O_EXCL))
+        if writing:
+            if truncating and relative not in _read_before_write and relative not in _written_values:
+                previous = os.stat(path) if os.path.isfile(path) else None
+                _written_values[relative] = (previous.st_size, previous.st_mtime_ns) if previous else None
+        elif relative not in _written_values:
+            _read_before_write.add(relative)
         key = (relative, bool(writing))
         if key in _seen:
             return
@@ -29,6 +38,9 @@ def _observe(event, args):
         if not writing:
             with open(path, "rb") as f:
                 item["sha256"] = hashlib.file_digest(f, "sha256").hexdigest()
+            current = os.stat(path)
+            item["generated_in_run"] = (relative in _written_values and relative not in _read_before_write
+                and _written_values[relative] != (current.st_size, current.st_mtime_ns))
         _observation_stream.write(("GENG_OBSERVED_WRITE " if writing else "GENG_OBSERVED_READ ") + json.dumps(item) + "\n")
         _observation_stream.flush()
         _seen.add(key)

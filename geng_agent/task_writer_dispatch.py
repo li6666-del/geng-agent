@@ -18,7 +18,7 @@ from .task_writer_runner import (
 )
 from .task_writer_state import _checkpoint_partial_task_writer_records, _task_writer_record_refresh_pending, _task_writer_record_refresh_reusable
 from .task_writer_units import _execution_unit_sandbox, _execution_unit_work_items
-from .task_inputs import dependencies, upstream_input_identity
+from .task_inputs import dependencies, upstream_input_identity, legacy_upstream_input_identity
 
 
 def _public_unit(unit):
@@ -121,8 +121,11 @@ def _dispatch_task_writers(
         existing_record = existing.get(index)
         upstream = list(by_index.values())
         upstream_identity = upstream_input_identity(task, upstream)
+        accepted_identities = {upstream_identity}
+        if existing_record and not existing_record.get("upstream_input_identity_version"):
+            accepted_identities.add(legacy_upstream_input_identity(task, upstream))
         inputs_changed = bool(dependencies(task) and existing_record and
-                              existing_record.get("upstream_input_identity") != upstream_identity)
+                              existing_record.get("upstream_input_identity") not in accepted_identities)
         if (task_review_callback is None and existing_record and existing_record.get("writer_completed")
                 and _task_writer_record_refresh_reusable(existing_record)
                 and str(existing_record.get("task_id")) not in forced and not inputs_changed):
@@ -160,6 +163,7 @@ def _dispatch_task_writers(
             upstream_records=upstream,
         )
         record["upstream_input_identity"] = upstream_identity
+        record["upstream_input_identity_version"] = 2
         return record
 
     def reduce_unit(name, result=None, error=None):
@@ -230,6 +234,11 @@ def _dispatch_task_writers(
                     error=f"{type(exc).__name__}: {exc}",
                 )
                 by_index[index]["execution_unit_id"] = str(unit["unit_id"])
+                from .task_inputs import UpstreamHandoffError
+                if isinstance(exc, UpstreamHandoffError):
+                    by_index[index].update(writer_error_kind="upstream_handoff_failed",
+                                           blocked_reason=redact_text(str(exc)),
+                                           upstream_handoff_state="failed")
         audit["attempts"].append(
             {
                 "execution_unit_id": str(unit["unit_id"]),
